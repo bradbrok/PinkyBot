@@ -285,7 +285,8 @@ def test_merge_requires_user_provenance_or_opt_in_for_privileged_grants(
     ) == expected
 
 
-def test_discovery_repairs_patterns_even_when_body_is_unchanged(store):
+def test_discovery_reports_pattern_drift_without_repairing_registered_row(store):
+    """Disk tool drift requires an explicit update rather than startup registration."""
     broken = ["['mcp__pinky-self__create_task',", "'mcp__pinky-self__complete_task']"]
     repaired = ["mcp__pinky-self__create_task", "mcp__pinky-self__complete_task"]
     store.register(
@@ -307,11 +308,12 @@ def test_discovery_repairs_patterns_even_when_body_is_unchanged(store):
 
     result = register_discovered_skills(store, [parsed], overwrite=False)
 
-    assert result == {"registered": [], "skipped": [], "updated": ["project-management"]}
-    assert store.get("project-management").tool_patterns == repaired
+    assert result["drifted"] == [{"name": "project-management", "fields": ["tool_patterns"]}]
+    assert store.get("project-management").tool_patterns == broken
 
 
-def test_discovery_invalidates_opt_in_when_privileged_patterns_change(store):
+def test_discovery_preserves_opt_in_and_patterns_until_explicit_update(store):
+    """Unapproved disk edits must not replace an existing operator grant."""
     store.register(
         "operator-reviewed",
         description="before",
@@ -342,10 +344,12 @@ def test_discovery_invalidates_opt_in_when_privileged_patterns_change(store):
     reviewed = store.get("operator-reviewed")
     discovered = store.get("fresh-privileged")
 
-    assert result["updated"] == ["operator-reviewed"]
+    assert result["updated"] == []
+    assert result["drifted"] == [{"name": "operator-reviewed", "fields": ["description", "directive", "tool_patterns"]}]
     assert result["registered"] == ["fresh-privileged"]
-    assert reviewed.self_assignable is False
-    assert reviewed.privileged_tool_opt_in is False
+    assert reviewed.tool_patterns == ["Bash"]
+    assert reviewed.self_assignable is True
+    assert reviewed.privileged_tool_opt_in is True
     assert discovered.self_assignable is False
     assert discovered.privileged_tool_opt_in is False
 

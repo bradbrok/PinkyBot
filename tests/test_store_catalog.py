@@ -743,6 +743,8 @@ def test_create_api_registers_all_authoritative_stores_and_validates_once(
         "outreach_config",
         "user_profiles",
         "agents",
+        "schedule_fire_trace",
+        "schedule_fire_trace_read",
         "agent_signing_keys",
         "tool_policy",
         "sessions",
@@ -762,8 +764,8 @@ def test_create_api_registers_all_authoritative_stores_and_validates_once(
         "librarian_state",
         "dream_state",
     }
-    assert len(records) == 25
-    assert len({record.resolved_path for record in records}) == 23
+    assert len(records) == 27
+    assert len({record.resolved_path for record in records}) == 24
     assert {record.journal_mode for record in records} == {"truncate", "wal"}
     policy_record = next(record for record in records if record.logical_name == "tool_policy")
     assert policy_record.owner == "ToolPolicyStore"

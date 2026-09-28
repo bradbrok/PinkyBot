@@ -37,6 +37,7 @@ from pinky_daemon.codex_home import (
     prepare_agent_codex_home,
     validate_agent_codex_home,
 )
+from pinky_daemon.codex_mcp_env import mcp_cli_config, with_mcp_header_env
 from pinky_daemon.context_estimator import ContextTextEstimator
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.streaming_session import (
@@ -271,6 +272,7 @@ class CodexSession(TransportReplacementMixin):
                 openai_api_key=self._openai_api_key,
                 agent_config=config,
                 soul_version_store=registry,
+                registry=registry,
                 log=_log,
             )
         self._app_client: CodexAppServerClient | None = None
@@ -1001,16 +1003,8 @@ class CodexSession(TransportReplacementMixin):
             cmd.extend(["-c", f'model_reasoning_effort="{effort}"'])
 
         # Inject MCP servers via -c flags (works on both new and resume calls)
-        for server_name, server_config in self._mcp_servers.items():
-            url = server_config.get("url", "")
-            if url:
-                cmd.extend(["-c", f'mcp_servers.{server_name}.url="{url}"'])
-                # Inject custom headers (e.g. X-Agent-Name for identity scoping)
-                headers = server_config.get("headers", {})
-                for hdr_key, hdr_val in headers.items():
-                    cmd.extend([
-                        "-c", f'mcp_servers.{server_name}.http_headers.{hdr_key}="{hdr_val}"'
-                    ])
+        mcp_args, _ = mcp_cli_config(self._mcp_servers)
+        cmd.extend(mcp_args)
 
         # Pass prompt via stdin to avoid shell escaping issues
         cmd.append("-")
@@ -1024,6 +1018,8 @@ class CodexSession(TransportReplacementMixin):
         prepared_home = self._prepare_agent_codex_home()
         if prepared_home is not None:
             env["CODEX_HOME"] = prepared_home
+        if not self._use_app_server:
+            env = with_mcp_header_env(env, self._mcp_servers)
         return env
 
     def _prepare_agent_codex_home(self) -> str | None:

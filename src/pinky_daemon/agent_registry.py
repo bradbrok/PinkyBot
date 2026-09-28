@@ -43,6 +43,7 @@ from pinky_daemon.agent_signing_key_store import (
 )
 from pinky_daemon.cron_utils import _field_matches
 from pinky_daemon.effort import is_ultracode
+from pinky_daemon.schedule_fire_trace import ScheduleFireTrace, trace_event
 from pinky_daemon.store_catalog import (
     StoreCatalog,
     StoreConnectionPolicy,
@@ -156,9 +157,15 @@ def replace_agent_text(
     agent_dir: str | Path,
     path: str | Path,
     content: str,
+    *,
+    create_only: bool = False,
 ) -> Path:
-    """Atomically replace one contained agent file without following links."""
-    target = resolve_agent_path(agent_name, agent_dir, path)
+    """Publish a contained file; create-only refuses even dangling leaf links."""
+    if create_only:
+        requested = Path(path)
+        target = resolve_agent_path(agent_name, agent_dir, requested.parent) / requested.name
+    else:
+        target = resolve_agent_path(agent_name, agent_dir, path)
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
     temp_path = Path(temp_name)
@@ -167,10 +174,14 @@ def replace_agent_text(
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temp_path, target)
-    except Exception:
+        if create_only:
+            # Same-directory hard-link publication is atomic and fails with
+            # EEXIST if any concurrent creator has claimed the destination.
+            os.link(temp_path, target, follow_symlinks=False)
+        else:
+            os.replace(temp_path, target)
+    finally:
         temp_path.unlink(missing_ok=True)
-        raise
     return target
 
 
@@ -848,6 +859,9 @@ class PendingScheduleWake:
     # supersession floor cannot be dodged by any park-reason text. Cleared
     # when the row is parked again.
     released_at: float = 0.0
+    pasted_at: float = 0.0
+    pasted_session_id: str = ""
+    pasted_prompt: str = ""
 
     @property
     def name(self) -> str:
@@ -890,6 +904,9 @@ class PendingScheduleWake:
             "abandoned_at": self.abandoned_at,
             "drain_parked_at": self.drain_parked_at,
             "released_at": self.released_at,
+            "pasted_at": self.pasted_at,
+            "pasted_session_id": self.pasted_session_id,
+            "pasted_prompt": self.pasted_prompt,
             "state": self.ledger_state,
         }
 
@@ -1157,6 +1174,8 @@ sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 body = {{
     "session_id": payload_in.get("session_id", ""),
+    "agent_id": payload_in.get("agent_id", ""),
+    "agent_type": payload_in.get("agent_type", ""),
     "tool_use_id": payload_in.get("tool_use_id", ""),
     "tool_name": tool_name,
     "tool_input": payload_in.get("tool_input") or {{}},
@@ -1238,6 +1257,8 @@ sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 body = {{
     "session_id": payload_in.get("session_id", ""),
+    "agent_id": payload_in.get("agent_id", ""),
+    "agent_type": payload_in.get("agent_type", ""),
     "tool_use_id": payload_in.get("tool_use_id", ""),
     "tool_name": tool_name,
     "is_error": is_error,
@@ -1405,10 +1426,32 @@ req.add_header("Content-Type", "application/json")
 req.add_header("x-pinky-agent", agent)
 req.add_header("x-pinky-timestamp", str(ts))
 req.add_header("x-pinky-signature", sig)
-try:
-    urllib.request.urlopen(req, timeout=2)
-except Exception:
-    pass
+for attempt in range(3):
+    if attempt:
+        time.sleep((0.5, 1.5)[attempt - 1])
+    try:
+        urllib.request.urlopen(req, timeout=5).close()
+        break
+    except Exception as exc:
+        failure_type = type(exc).__name__
+else:
+    # Diagnostics contain only fixed fields and an exception class, never values.
+    try:
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        failure_log = Path(__file__).with_name("hook_failures.log")
+        line = (
+            f"{{datetime.now(timezone.utc).isoformat()}} "
+            f"SessionStart {{failure_type}} attempts=3\\n"
+        )
+        size = failure_log.stat().st_size if failure_log.exists() else 0
+        mode = "w" if size + len(line.encode()) > 64 * 1024 else "a"
+        with failure_log.open(mode, encoding="utf-8") as handle:
+            handle.write(line)
+    except Exception:
+        pass
+sys.exit(0)
 '''
 
 
@@ -1427,13 +1470,12 @@ def _configure_agents_db_connection(
 ) -> str:
     """Put the agents-DB connection into rollback (TRUNCATE) journal mode.
 
-    Why not WAL (#797/#220): the WAL wal-index ``-shm`` is always memory-mapped
-    in WAL mode. Under the daemon's long-lived registry connection plus the
-    per-request read-only signing-key resolver churn, that mapped ``-shm`` page
-    went stale and a SQLite pager read SIGBUS'd the daemon (``si_addr`` confirmed
-    inside ``conversations_agents.db-shm``; ``mmap_size=0`` was already set, so
-    the main-db is not mapped — the ``-shm`` is the inherent fault surface).
-    Rollback journal mode has no ``-shm`` at all, so the daemon never maps it.
+    The WAL index is always memory-mapped. The observed SIGBUS required the
+    daemon's DMS lock to have been dropped by a raw in-process file close.
+    A subsequent external opener then believed it was the first connection
+    and truncated shared memory beneath that mapping. An idle WAL connection
+    with intact locks prevents this. Rollback mode removes shared memory as
+    defense in depth; preserving SQLite's locks is still required.
 
     Must run BEFORE table init and before any local MCP / agent-session resume
     can spawn stdio children that hold the DB.
@@ -1539,6 +1581,7 @@ class AgentRegistry:
         # different entries, and one write loses.
         self._rmw_lock = threading.RLock()
         self._init_tables()
+        self._fire_trace = ScheduleFireTrace(self._db_path, self._db, catalog=catalog)
 
     def _init_tables(self) -> None:
         self._db.executescript("""
@@ -1624,6 +1667,9 @@ class AgentRegistry:
                 abandoned_at REAL NOT NULL DEFAULT 0,
                 drain_parked_at REAL NOT NULL DEFAULT 0,
                 released_at REAL NOT NULL DEFAULT 0,
+                pasted_at REAL NOT NULL DEFAULT 0,
+                pasted_session_id TEXT NOT NULL DEFAULT '',
+                pasted_prompt TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
                 UNIQUE(schedule_id, fired_at)
             );
@@ -2151,6 +2197,9 @@ class AgentRegistry:
             ("abandoned_at", "REAL NOT NULL DEFAULT 0"),
             ("drain_parked_at", "REAL NOT NULL DEFAULT 0"),
             ("released_at", "REAL NOT NULL DEFAULT 0"),
+            ("pasted_at", "REAL NOT NULL DEFAULT 0"),
+            ("pasted_session_id", "TEXT NOT NULL DEFAULT ''"),
+            ("pasted_prompt", "TEXT NOT NULL DEFAULT ''"),
         ]
         for col, typedef in wake_migrations:
             if col not in wake_existing:
@@ -2566,8 +2615,8 @@ class AgentRegistry:
         and (since #429) effort-drift verification.
 
         Creates ``.claude/`` directory with hook scripts and settings.json.
-        Existing scripts are not overwritten; settings.json is idempotently
-        merged so the verify_effort hook can be added to agents whose
+        Managed scripts are updated when their source changes; settings.json
+        is idempotently merged so the verify_effort hook can be added to agents whose
         settings predate #429 without nuking their existing hooks.
         """
         # Re-validate even though ``register()`` already did. ``_setup_hooks``
@@ -2587,6 +2636,17 @@ import hashlib, hmac, base64, time, urllib.request, json, os, subprocess, sys, t
 
 agent = "{agent_name}"
 status = "{status}"
+
+# Background tool activity must not overwrite the main conversation's idle.
+# Missing or malformed hook input retains the main-thread status behavior.
+if status == "working":
+    try:
+        payload_in = json.loads(sys.stdin.read())
+    except Exception:
+        payload_in = {{}}
+    agent_id = payload_in.get("agent_id") if isinstance(payload_in, dict) else None
+    if isinstance(agent_id, str) and agent_id:
+        sys.exit(0)
 
 def emit_failure(literal, detail):
     message = "%s agent=%s status=%s error=%s" % (literal, agent, status, detail)
@@ -2698,9 +2758,9 @@ except Exception as exc:
         #
         # Task #93: PreToolUse + PostToolUse hooks for tmux tool-use tracking.
         #
-        # All five are ALWAYS rewritten (unlike hook_working / hook_idle which
-        # are left alone if present) — they're fully PinkyBot-managed and
-        # getting the latest semantics on disk matters across releases. The
+        # Like the status hooks above, these managed hooks are rewritten
+        # whenever their generated source changes so updates reach existing
+        # workspaces. The
         # tmux hooks are installed unconditionally; the daemon endpoint
         # returns ``ok: True, session: None`` for non-tmux runtimes, so each
         # is a cheap no-op for SDK / codex agents (one extra POST per turn).
@@ -4739,7 +4799,8 @@ except Exception as exc:
         return cursor.rowcount > 0
 
     def build_system_prompt(
-        self, agent_name: str, skill_store=None, effort: str | None = None
+        self, agent_name: str, skill_store=None, effort: str | None = None,
+        *, user_profile_store=None,
     ) -> str:
         """Build a complete system prompt from agent config + directives + skill directives.
 
@@ -4752,6 +4813,9 @@ except Exception as exc:
         it is the ``ultracode`` tier (#151), the ULTRACODE_DIRECTIVE section
         is injected so workflow-by-default orchestration holds regardless of
         CLI version. Defaults to the agent's persistent ``thinking_effort``.
+
+        ``user_profile_store`` lets daemon callers reuse their owned store;
+        callers that omit it retain the standalone profile-store behavior.
 
         All content is scanned for prompt injection / exfiltration threats
         before inclusion. Threats are logged and the offending section is
@@ -4855,7 +4919,7 @@ except Exception as exc:
         # Inject learned user profiles (from dream consolidation)
         try:
             from pinky_daemon.user_profile_store import UserProfileStore
-            profile_store = UserProfileStore()
+            profile_store = user_profile_store if user_profile_store is not None else UserProfileStore()
             known_users = profile_store.get_all_users()
             profile_sections = []
             for uid in known_users:
@@ -5548,6 +5612,9 @@ except Exception as exc:
                 schedule_id, timestamp
             )
             self._db.commit()
+        trace_event(self, "enqueue", fire_id=row[0], schedule_id=schedule_id,
+                    fired_at=timestamp, enqueued_at=created_at, agent_name=agent_name,
+                    schedule_name=schedule_name, prompt=prompt)
         return True, PendingScheduleWake(*row)
 
     def _select_schedule_wake_by_fire(
@@ -5556,7 +5623,8 @@ except Exception as exc:
         return self._db.execute(
             """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                       fired_at, created_at, attempts, parked_at, accepted_at,
-                      failed_at, last_error, abandoned_at, drain_parked_at, released_at
+                      failed_at, last_error, abandoned_at, drain_parked_at, released_at,
+                      pasted_at, pasted_session_id, pasted_prompt
                FROM pending_schedule_wakes
                WHERE schedule_id=? AND fired_at=?""",
             (schedule_id, fired_at),
@@ -5600,13 +5668,38 @@ except Exception as exc:
             row = self._db.execute(
                 """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                           fired_at, created_at, attempts, parked_at, accepted_at,
-                          failed_at, last_error, abandoned_at, drain_parked_at, released_at
+                          failed_at, last_error, abandoned_at, drain_parked_at, released_at,
+                      pasted_at, pasted_session_id, pasted_prompt
                    FROM pending_schedule_wakes
                    WHERE schedule_id=? AND fired_at=?""",
                 (schedule_id, fired_at),
             ).fetchone()
             self._db.commit()
+        if created:
+            trace_event(self, "enqueue", fire_id=row[0], schedule_id=schedule_id,
+                        fired_at=fired_at, enqueued_at=created_at, agent_name=agent_name,
+                        schedule_name=schedule_name, prompt=prompt)
         return PendingScheduleWake(*row), created
+
+    def mark_schedule_wake_pasted(
+        self, schedule_id: int, fired_at: float, *, pasted_at: float, session_id: str,
+        pasted_prompt: str = "",
+    ) -> bool:
+        """Write ahead of an irreversible paste; this is never acceptance.
+
+        A second submission cannot claim the same exact fire, including after
+        restart. A crash after this commit can lose work, but cannot duplicate it.
+        """
+        with self._rmw_lock:
+            result = self._db.execute(
+                """UPDATE pending_schedule_wakes SET pasted_at=?, pasted_session_id=?, pasted_prompt=?
+                   WHERE schedule_id=? AND fired_at=? AND pasted_at=0
+                     AND accepted_at=0 AND abandoned_at=0 AND parked_at=0
+                     AND drain_parked_at=0""",
+                (pasted_at, session_id, pasted_prompt, schedule_id, fired_at),
+            )
+            self._db.commit()
+            return result.rowcount == 1
 
     def list_pending_schedule_wakes(
         self,
@@ -5623,7 +5716,8 @@ except Exception as exc:
         """
         sql = """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                         fired_at, created_at, attempts, parked_at, accepted_at,
-                        failed_at, last_error, abandoned_at, drain_parked_at, released_at
+                        failed_at, last_error, abandoned_at, drain_parked_at, released_at,
+                      pasted_at, pasted_session_id, pasted_prompt
                  FROM pending_schedule_wakes"""
         conditions: list[str] = []
         params: list = []
@@ -5713,7 +5807,8 @@ except Exception as exc:
             raise ValueError(f"invalid scheduler wake ledger state: {state}")
         sql = """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                         fired_at, created_at, attempts, parked_at, accepted_at,
-                        failed_at, last_error, abandoned_at, drain_parked_at, released_at
+                        failed_at, last_error, abandoned_at, drain_parked_at, released_at,
+                      pasted_at, pasted_session_id, pasted_prompt
                  FROM pending_schedule_wakes"""
         conditions: list[str] = []
         params: list = []
@@ -5877,6 +5972,8 @@ except Exception as exc:
                 (timestamp, timestamp, reason, pending_id),
             )
             self._db.commit()
+        if cursor.rowcount > 0:
+            trace_event(self, "abandon", fire_id=pending_id, at=timestamp, reason="drain_parked")
         return cursor.rowcount > 0
 
     def release_drain_parked_schedule_wakes(self, agent_name: str) -> int:
@@ -5892,16 +5989,20 @@ except Exception as exc:
         recurrence-supersession floor keys on the column and no park-reason
         text — any case, any content — can dodge it.
         """
+        timestamp = time.time()
         with self._rmw_lock:
             released = self._release_drain_parked_locked(
-                agent_name, time.time()
+                agent_name, timestamp
             )
             self._db.commit()
-        return released
+        for fire_id, schedule_id, fired_at in released:
+            trace_event(self, "abandon", at=timestamp, release_agent=agent_name, reason="released",
+                        fire_id=fire_id, schedule_id=schedule_id, fired_at=fired_at)
+        return len(released)
 
     def _release_drain_parked_locked(
         self, agent_name: str, timestamp: float
-    ) -> int:
+    ) -> list[tuple[int, int, float]]:
         """Release one agent's drain-parked rows; caller holds the rmw lock.
 
         Shared by the public release and both durable confirm transitions:
@@ -5914,10 +6015,11 @@ except Exception as exc:
                SET drain_parked_at=0,
                    released_at=?
                WHERE agent_name=? AND drain_parked_at>0
-                 AND accepted_at=0 AND parked_at=0 AND abandoned_at=0""",
+                 AND accepted_at=0 AND parked_at=0 AND abandoned_at=0
+               RETURNING id, schedule_id, fired_at""",
             (timestamp, agent_name),
         )
-        return cursor.rowcount
+        return cursor.fetchall()
 
     def has_released_pending_wakes(self, agent_name: str) -> bool:
         """Whether this agent holds active rows released from drain parking.
@@ -5972,6 +6074,8 @@ except Exception as exc:
                 (timestamp, timestamp, reason, pending_id),
             )
             self._db.commit()
+        if cursor.rowcount > 0:
+            trace_event(self, "abandon", fire_id=pending_id, at=timestamp, reason=reason)
         return cursor.rowcount > 0
 
     def collapse_pending_schedule_wake(
@@ -6002,7 +6106,8 @@ except Exception as exc:
         return cursor.rowcount > 0
 
     def confirm_pending_schedule_wake(
-        self, pending_id: int, *, delivered_at: float = 0.0
+        self, pending_id: int, *, delivered_at: float = 0.0,
+        trace_matched_by: str = "turn_complete"
     ) -> bool:
         """Atomically retain a positive receipt and retire it from replay."""
         timestamp = delivered_at or time.time()
@@ -6034,8 +6139,13 @@ except Exception as exc:
             )
             # A durable positive receipt is release evidence for every
             # other drain-parked row this agent holds (#635, #991 seam).
-            self._release_drain_parked_locked(str(row[3]), timestamp)
+            released = self._release_drain_parked_locked(str(row[3]), timestamp)
             self._db.commit()
+        trace_event(self, "accept", fire_id=pending_id, schedule_id=row[0], fired_at=float(row[2]),
+                    at=timestamp, result=True, matched_by=trace_matched_by)
+        for released_id, released_schedule, released_fire in released:
+            trace_event(self, "abandon", at=timestamp, release_agent=str(row[3]), reason="released",
+                        fire_id=released_id, schedule_id=released_schedule, fired_at=released_fire)
         return True
 
     def confirm_pending_schedule_wake_by_fire(
@@ -6044,6 +6154,7 @@ except Exception as exc:
         fired_at: float,
         *,
         delivered_at: float = 0.0,
+        trace_matched_by: str = "on_accept",
     ) -> bool:
         """Atomically persist acceptance for one exact fire before replay."""
         timestamp = delivered_at or time.time()
@@ -6076,8 +6187,13 @@ except Exception as exc:
             )
             # A durable positive receipt is release evidence for every
             # other drain-parked row this agent holds (#635, #991 seam).
-            self._release_drain_parked_locked(str(row[2]), timestamp)
+            released = self._release_drain_parked_locked(str(row[2]), timestamp)
             self._db.commit()
+        trace_event(self, "accept", fire_id=row[0], schedule_id=schedule_id, fired_at=fired_at,
+                    at=timestamp, result=True, matched_by=trace_matched_by)
+        for released_id, released_schedule, released_fire in released:
+            trace_event(self, "abandon", at=timestamp, release_agent=str(row[2]), reason="released",
+                        fire_id=released_id, schedule_id=released_schedule, fired_at=released_fire)
         newly_receipted = float(row[1]) == 0
         if newly_receipted:
             _log(
@@ -6221,6 +6337,10 @@ except Exception as exc:
                     (*params, int(batch_size)),
                 ).fetchall()
                 self._db.commit()
+                if metric_field == "abandoned":
+                    for row in rows:
+                        trace_event(self, "abandon", fire_id=row[1], schedule_id=row[2],
+                                    fired_at=row[3], at=observed_at, reason="reaper")
                 for row in rows:
                     agent_metrics = _agent_metrics(str(row[0]))
                     agent_metrics[metric_field] = (
@@ -6314,7 +6434,7 @@ except Exception as exc:
                        SET abandoned_at=?, parked_at=0, drain_parked_at=0
                        WHERE id IN (
                            SELECT id FROM pending_schedule_wakes
-                           WHERE accepted_at=0 AND abandoned_at=0
+                           WHERE accepted_at=0 AND abandoned_at=0 AND pasted_at=0
                              AND (
                                  (parked_at=0 AND fired_at < ?)
                                  OR (
@@ -6324,7 +6444,7 @@ except Exception as exc:
                              )
                            ORDER BY id ASC LIMIT ?
                        )
-                       RETURNING agent_name""",
+                       RETURNING agent_name, id, schedule_id, fired_at""",
                     (observed_at, abandon_cutoff),
                     "abandoned",
                 )
@@ -8228,6 +8348,7 @@ except Exception as exc:
         ("anthropic", "claude-mythos-5-1", "Claude Mythos 5.1", "Claude Fable 5.1 capabilities without the safety classifiers. Limited availability via Project Glasswing (approved customers only).", "fable", 1_000_000, 1, 10.0, 50.0, 0.25, 1, 2),
         ("anthropic", "claude-fable-5", "Claude Fable 5", "Anthropic's most capable widely-released model (2026-06-09). Demanding reasoning + long-horizon agentic work. 1M context; adaptive thinking always on (use effort to control depth).", "fable", 1_000_000, 1, 10.0, 50.0, 1.0, 1, 1),
         ("anthropic", "claude-mythos-5", "Claude Mythos 5", "Claude Fable 5 capabilities without the safety classifiers. Limited availability via Project Glasswing (approved customers only).", "fable", 1_000_000, 1, 10.0, 50.0, 1.0, 1, 2),
+        ("anthropic", "claude-opus-5-5", "Claude Opus 5.5", "Current Opus (2026-09-22). Built for long-running agentic coding and knowledge work at $4/$20 per MTok with a 5% cache read; 1M context, 128K output; adaptive thinking always on, effort defaults to medium. Knowledge cutoff Jun 2026.", "opus", 1_000_000, 1, 4.0, 20.0, 0.2, 1, 2),
         ("anthropic", "claude-opus-5", "Claude Opus 5", "For complex agentic coding + enterprise work. 1M context; effort defaults high; adaptive thinking. Knowledge cutoff May 2026.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 2),
         ("anthropic", "claude-opus-4-8", "Claude Opus 4.8", "Newest Opus (2026-05-28). Sharper judgement, more honest progress reporting, longer independent runs. Effort defaults to high; adaptive thinking triggers only when needed.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 3),
         ("anthropic", "claude-opus-4-7", "Claude Opus 4.7", "Stricter instruction-following, xhigh effort, larger vision.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 5),
@@ -8950,5 +9071,9 @@ except Exception as exc:
                 self.set_mesh_outbound_allowlist(agent_name, kept)
             return removed
 
+    def prune_schedule_fire_trace(self, *, now: float, retention_days: int = 30) -> None:
+        trace_event(self, "prune", at=now, retention_days=retention_days)
+
     def close(self) -> None:
+        self._fire_trace.close()
         self._db.close()

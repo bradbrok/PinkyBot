@@ -7,13 +7,14 @@ in the dream_state table so the morning wake context can include it.
 
 Usage:
     runner = DreamRunner(db_path="data/dream_state.db")
-    if runner.should_dream("oleg", agent_config):
-        summary = await runner.run_dream("oleg", agent_config)
+    if runner.should_dream("agent-name", agent_config):
+        summary = await runner.run_dream("agent-name", agent_config)
 """
 
 from __future__ import annotations
 
 import asyncio
+import errno
 import fcntl
 import inspect
 import json
@@ -33,6 +34,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
+from pinky_daemon.agent_registry import _AGENT_NAME_RE
 from pinky_daemon.auth import (
     build_internal_auth_headers,
     resolve_request_signing_secret,
@@ -61,6 +63,36 @@ def _kg_proactive_enabled() -> bool:
     already computed while it was on.
     """
     return os.environ.get("PINKY_KG_PROACTIVE", "0").strip() == "1"
+
+_DREAM_SKILL_MODES = ("propose", "install", "off")
+_DREAM_SKILL_MODE_DEFAULT = "propose"
+# A proposal nobody picks up is dropped after this long.
+_DREAM_SKILL_PROPOSAL_TTL_S = 14 * 86400
+
+
+def _dream_skill_mode() -> str:
+    """What a dream may do with the skills it proposes.
+
+    ``propose`` (default): write each proposal to the review folder
+    (``<data>/dream_skill_proposals/<agent>/``) and index it; nothing reaches
+    the skill catalog until a human builds it on purpose.
+    ``install``: legacy behavior, create the skill live via ``/skills/from-md``
+    and assign it to the dreaming agent with no review.
+    ``off``: discard proposals.
+
+    Set with ``PINKY_DREAM_SKILL_MODE``; unknown values fall back to
+    ``propose`` and are logged once per call.
+    """
+    raw = os.environ.get("PINKY_DREAM_SKILL_MODE", "").strip().lower()
+    if not raw:
+        return _DREAM_SKILL_MODE_DEFAULT
+    if raw in _DREAM_SKILL_MODES:
+        return raw
+    _log(
+        f"dream-runner: unknown PINKY_DREAM_SKILL_MODE={raw!r}; "
+        f"using {_DREAM_SKILL_MODE_DEFAULT!r}"
+    )
+    return _DREAM_SKILL_MODE_DEFAULT
 
 
 # How long between dream runs (seconds). Default: 20 hours so nightly cron
@@ -1321,7 +1353,10 @@ class DreamRunner:
             self._extract_proposed_skills, summary, agent_name, agent_config
         )
         if skills_created:
-            _log(f"dream-runner: '{agent_name}' created {skills_created} skill draft(s)")
+            _log(
+                f"dream-runner: '{agent_name}' handled {skills_created} skill "
+                f"proposal(s) (mode={_dream_skill_mode()})"
+            )
 
         # Post-dream: extract KG triples from dream output (inline extraction)
         kg_dream_count = await asyncio.to_thread(
@@ -1840,14 +1875,21 @@ class DreamRunner:
     def _extract_proposed_skills(
         self, dream_output: str, agent_name: str, agent_config
     ) -> int:
-        """Parse <proposed_skills> JSON from dream output and create skill drafts.
+        """Parse <proposed_skills> JSON from dream output and handle each one.
 
-        Proposals from isolated agents are skipped. For other agents, skills
-        are created via the /skills/from-md API endpoint, written as SKILL.md,
-        and assigned to the agent that dreamed them.
+        Proposals from isolated agents are skipped. What happens to the rest
+        depends on :func:`_dream_skill_mode`: ``propose`` (default) records
+        them in the review folder for a human to build on purpose, ``install``
+        creates them live via the /skills/from-md API endpoint (written as
+        SKILL.md and assigned to the dreaming agent), ``off`` discards them.
 
-        Returns the number of skills successfully created.
+        Returns the number of proposals recorded or skills created.
         """
+        # Housekeeping runs on every dream in propose mode, whether or not
+        # this dream proposes anything, so expiry is not gated on new output.
+        if _dream_skill_mode() == "propose":
+            self._maintain_skill_proposals(agent_name)
+
         match = re.search(
             r"<proposed_skills>\s*(\[.*?\])\s*</proposed_skills>",
             dream_output,
@@ -1869,6 +1911,14 @@ class DreamRunner:
             _log(
                 f"dream-runner: skipped {len(skills_data)} proposed skill(s) "
                 f"for isolated agent '{agent_name}'"
+            )
+            return 0
+
+        mode = _dream_skill_mode()
+        if mode == "off":
+            _log(
+                f"dream-runner: discarded {len(skills_data)} proposed skill(s) "
+                f"for '{agent_name}' (PINKY_DREAM_SKILL_MODE=off)"
             )
             return 0
 
@@ -1901,6 +1951,11 @@ class DreamRunner:
                 f"Auto-generated during dream cycle from observed workflow patterns.\n"
                 f"Source: {source}\n"
             )
+
+            if mode == "propose":
+                if self._write_skill_proposal(agent_name, name, skill_md, source):
+                    count += 1
+                continue
 
             # Create via API
             try:
@@ -1943,6 +1998,323 @@ class DreamRunner:
                 _log(f"dream-runner: failed to create skill '{name}': {e}")
 
         return count
+
+    # ── Dream skill proposals (review folder) ────────────
+
+    def _skill_proposals_dir(self) -> Path:
+        """Root of the review folder, a sibling of the dream state DB."""
+        return Path(self._db_path).parent / "dream_skill_proposals"
+
+    @staticmethod
+    def _proposal_component(value: str) -> str:
+        """Reduce a skill name to a safe single path component (lowercase, hyphens)."""
+        return re.sub(r"[^a-z0-9-]", "-", str(value or "").lower())[:60].strip("-")
+
+    def _checked_agent_dir(self, agent_name: str) -> Path | None:
+        """The agent's review directory, or None (logged) when it is unsafe.
+
+        The agent name must be a registry-valid name and is used verbatim, so
+        distinct registered agents never share a directory. Neither the root
+        nor the agent directory may be a symlink, and the agent directory's
+        real path must be exactly the intended location under the real parent
+        of the root (not under whatever the root itself might resolve to).
+        Safe to call before the directory exists.
+        """
+        if not isinstance(agent_name, str) or not _AGENT_NAME_RE.fullmatch(agent_name):
+            _log(f"dream-runner: refused skill proposal for invalid agent name {agent_name!r}")
+            return None
+        root = self._skill_proposals_dir()
+        agent_dir = root / agent_name
+        try:
+            if root.is_symlink() or agent_dir.is_symlink():
+                _log(f"dream-runner: refused skill proposal, symlink in review folder: {agent_dir}")
+                return None
+            intended = root.parent.resolve() / root.name / agent_name
+            if agent_dir.resolve() != intended:
+                _log(f"dream-runner: refused skill proposal outside the review folder: {agent_dir}")
+                return None
+        except OSError as e:
+            _log(f"dream-runner: refused skill proposal, cannot check {agent_dir}: {e}")
+            return None
+        return agent_dir
+
+    @staticmethod
+    def _write_all(fd: int, data: bytes) -> None:
+        """Write ``data`` completely or raise; a short write is a failure.
+
+        Regular-file writes are only short when the disk is failing or full,
+        and a partially written row or file must never be published, so the
+        caller cleans up and the next dream retries.
+        """
+        written = os.write(fd, data)
+        if written != len(data):
+            raise OSError(errno.EIO, f"short write: {written} of {len(data)} bytes")
+
+    @staticmethod
+    def _read_proposal_index(agent_dir: Path) -> list[dict]:
+        """Rows of index.jsonl in file order; a torn or foreign line is skipped."""
+        path = agent_dir / "index.jsonl"
+        rows: list[dict] = []
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            return rows
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get("name"):
+                rows.append(row)
+        return rows
+
+    def _append_proposal_index(self, agent_dir: Path, row: dict) -> None:
+        """Append one event as its own line, durably, never through a symlink.
+
+        A torn tail (a partial last line with no newline) gets a newline first
+        so the new row cannot be glued to it. The bytes are written in full
+        and fsynced before returning: callers rely on the row existing once
+        this returns.
+        """
+        path = agent_dir / "index.jsonl"
+        if path.is_symlink():
+            raise OSError(errno.EPERM, f"index is a symlink: {path}")
+        line = json.dumps(row, sort_keys=True).encode("utf-8") + b"\n"
+        needs_newline = False
+        try:
+            rfd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            rfd = -1
+        if rfd >= 0:
+            try:
+                size = os.lseek(rfd, 0, os.SEEK_END)
+                if size > 0:
+                    os.lseek(rfd, -1, os.SEEK_END)
+                    needs_newline = os.read(rfd, 1) != b"\n"
+            finally:
+                os.close(rfd)
+        fd = os.open(
+            path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600
+        )
+        try:
+            self._write_all(fd, (b"\n" if needs_newline else b"") + line)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _prune_skill_proposals(self, agent_dir: Path, *, now: float | None = None) -> int:
+        """Expire proposals past their recorded deadline; returns how many.
+
+        The deadline is the ``expires_at`` written when the proposal was
+        recorded, so touching or copying a file never extends it, and a
+        proposal whose file has gone missing still expires from its index row.
+        A file with no index row (an orphan) falls back to its mtime plus the
+        TTL. A file whose latest row is already closed is stale residue and is
+        removed without a new row.
+        """
+        now = time.time() if now is None else now
+        latest: dict[str, dict] = {}
+        for row in self._read_proposal_index(agent_dir):
+            latest[str(row["name"])] = row
+        files = {path.stem.split("_", 1)[-1]: path for path in agent_dir.glob("*.md")}
+        removed = 0
+        for name, row in latest.items():
+            if row.get("status") != "proposed":
+                residue = files.pop(name, None)
+                if residue is not None and not residue.is_symlink():
+                    try:
+                        residue.unlink()
+                    except OSError:
+                        pass  # best effort: residue cleanup; the index row is the record
+                continue
+            try:
+                deadline = float(row.get("expires_at") or 0.0)
+            except (TypeError, ValueError):
+                deadline = 0.0
+            if now < deadline:
+                files.pop(name, None)
+                continue
+            path = files.pop(name, None)
+            if path is not None and not path.is_symlink():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass  # best effort: the expired row below is the record either way
+            removed += 1
+            self._append_proposal_index(
+                agent_dir,
+                {
+                    "ts": now,
+                    "agent": agent_dir.name,
+                    "name": name,
+                    "path": str(row.get("path") or (path or "")),
+                    "status": "expired",
+                },
+            )
+        for name, path in files.items():  # orphans: no index row at all
+            try:
+                if path.is_symlink() or now < path.stat().st_mtime + _DREAM_SKILL_PROPOSAL_TTL_S:
+                    continue
+                path.unlink()
+            except OSError:
+                continue
+            removed += 1
+            self._append_proposal_index(
+                agent_dir,
+                {
+                    "ts": now,
+                    "agent": agent_dir.name,
+                    "name": name,
+                    "path": str(path),
+                    "status": "expired",
+                },
+            )
+        return removed
+
+    def _maintain_skill_proposals(self, agent_name: str) -> int:
+        """Expire stale proposals for one agent; safe to call on every dream.
+
+        Applies the same name, symlink and containment refusals as a write,
+        and is silent when the agent has no review folder yet. Returns how
+        many proposals were expired.
+        """
+        agent_dir = self._checked_agent_dir(agent_name)
+        if agent_dir is None:
+            return 0
+        try:
+            if not agent_dir.is_dir() or (agent_dir / "index.jsonl").is_symlink():
+                return 0
+            return self._prune_skill_proposals(agent_dir)
+        except OSError as e:
+            _log(f"dream-runner: skill proposal housekeeping failed for {agent_name}: {e}")
+            return 0
+
+    def _write_skill_proposal(
+        self, agent_name: str, name: str, skill_md: str, source: str
+    ) -> bool:
+        """Record one proposal in the review folder instead of the catalog.
+
+        Layout: ``<data>/dream_skill_proposals/<agent>/<YYYYMMDD>_<name>.md``
+        holds the SKILL.md text exactly as the install path would have written
+        it; ``index.jsonl`` beside it gets one row per event (``proposed`` /
+        ``expired`` / ``failed``) carrying the ``expires_at`` deadline.
+
+        Ordering: the SKILL.md is written in full to a temp file and fsynced,
+        the ``proposed`` row is appended and fsynced, and only then is the
+        file renamed into place, so a visible proposal always has its audit
+        row. Any failure from the moment the row append starts (including a
+        short write, a failed fsync or a failed rename) appends a ``failed``
+        row so the name is never stuck pending; the temp file is removed and
+        the next dream retries.
+
+        Dedupe keys off the index: a name whose latest row is ``proposed``,
+        not yet expired, and whose file is present is not written twice. A
+        ``proposed`` row with no file is an incomplete transaction: it gets a
+        ``failed`` row and the name is proposed again. The agent name must be
+        registry-valid and is used verbatim; symlinks at the root, the agent
+        directory, the index or the target are refused, and containment is
+        checked before and after the directory is created. Returns True when
+        a new proposal file was written.
+        """
+        if not name:
+            return False
+        agent_dir = self._checked_agent_dir(agent_name)
+        if agent_dir is None:
+            return False
+        path: Path | None = None
+        tmp: Path | None = None
+        indexed = False
+        try:
+            agent_dir.mkdir(parents=True, exist_ok=True)
+            if self._checked_agent_dir(agent_name) is None:
+                return False
+            if (agent_dir / "index.jsonl").is_symlink():
+                _log(f"dream-runner: refused skill proposal, index is a symlink: {agent_dir}")
+                return False
+            self._prune_skill_proposals(agent_dir)
+            latest = None
+            for row in self._read_proposal_index(agent_dir):
+                if row.get("name") == name:
+                    latest = row
+            if latest is not None and latest.get("status") == "proposed":
+                recorded = Path(str(latest.get("path") or ""))
+                if recorded.is_file():
+                    _log(
+                        f"dream-runner: skill proposal '{name}' for {agent_name} "
+                        f"already pending (recorded {recorded}); not re-proposed"
+                    )
+                    return False
+                self._append_proposal_index(
+                    agent_dir,
+                    {
+                        "ts": time.time(),
+                        "agent": agent_name,
+                        "name": name,
+                        "path": str(recorded),
+                        "status": "failed",
+                        "error": "file missing: incomplete proposal transaction",
+                    },
+                )
+            now = time.time()
+            stamp = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y%m%d")
+            path = agent_dir / f"{stamp}_{name}.md"
+            if path.is_symlink():
+                _log(f"dream-runner: refused skill proposal, target is a symlink: {path}")
+                return False
+            tmp = agent_dir / f".{stamp}_{name}.md.tmp"
+            fd = os.open(
+                tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+            )
+            try:
+                self._write_all(fd, skill_md.encode("utf-8"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            indexed = True  # from here on any failure gets a failed row
+            self._append_proposal_index(
+                agent_dir,
+                {
+                    "ts": now,
+                    "agent": agent_name,
+                    "name": name,
+                    "path": str(path),
+                    "source_pattern": source,
+                    "expires_at": now + _DREAM_SKILL_PROPOSAL_TTL_S,
+                    "status": "proposed",
+                },
+            )
+            os.replace(tmp, path)
+        except OSError as e:
+            _log(f"dream-runner: failed to record skill proposal '{name}': {e}")
+            if tmp is not None:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass  # best effort: a leftover temp file is invisible to readers
+            if indexed:
+                try:
+                    self._append_proposal_index(
+                        agent_dir,
+                        {
+                            "ts": time.time(),
+                            "agent": agent_name,
+                            "name": name,
+                            "path": str(path),
+                            "status": "failed",
+                            "error": str(e),
+                        },
+                    )
+                except OSError:
+                    pass  # best effort: the failure is already logged above
+            return False
+        _log(
+            f"dream-runner: proposed skill '{name}' for {agent_name} -> {path} "
+            f"(not installed; PINKY_DREAM_SKILL_MODE=propose)"
+        )
+        return True
 
     # ── KG triple extraction ─────────────────────────────
 

@@ -1,0 +1,41 @@
+{
+  "captured_date": "2026-09-21",
+  "fixtures": {
+    "0.155.1.jsonl": {
+      "source_basename": "rollout-2026-09-19T13-38-19-01a0bb64-2bc3-7733-b0e3-ba928a82948d.jsonl",
+      "cli_version": "0.155.1",
+      "byte_offset": 1333285,
+      "sha256": "e213f03f2dd4d8933bc088a6380ac1add6d4477404b2f0eff83a732db45804f2",
+      "replaced_fields": [
+        "prompt text -> scheduled work",
+        "turn/thread/message/client ids -> fixture placeholders",
+        "passthrough metadata -> null",
+        "item_completed user content and legacy image/text elements -> empty lists"
+      ],
+      "removed_fields": [
+        "all rows except session_meta, task_started, user message, user item_completed, task_complete",
+        "session_meta fields except cli_version/originator",
+        "timestamps, task settings, durations, task_complete last_agent_message"
+      ],
+      "secret_scan": "passed; allowlisted structural output contains no source prompt, tool output or assistant text"
+    },
+    "0.144.0.jsonl": {
+      "source_basename": "rollout-2026-08-01T05-45-28-019fbd5b-a6f8-75b3-b42f-2fce93b2a260.jsonl",
+      "cli_version": "0.144.0",
+      "byte_offset": 48564,
+      "sha256": "8b621c4dd2f46fe0c11aa2d62fdeb48ff6fc564d6b1bf6662fa761c3ad03f7ad",
+      "replaced_fields": [
+        "prompt text -> scheduled work",
+        "turn/thread/message/client ids -> fixture placeholders",
+        "passthrough metadata -> null",
+        "item_completed user content and legacy image/text elements -> empty lists"
+      ],
+      "removed_fields": [
+        "all rows except session_meta, task_started, user message, user item_completed, task_complete",
+        "session_meta fields except cli_version/originator",
+        "timestamps, task settings, durations, task_complete last_agent_message"
+      ],
+      "secret_scan": "passed; allowlisted structural output contains no source prompt, tool output or assistant text"
+    }
+  }
+}

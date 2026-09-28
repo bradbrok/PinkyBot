@@ -23,7 +23,7 @@ def _stored_context(message_id: str, *, agent_name: str = "barsik") -> dict:
         "is_group": False,
         "source_was_voice": True,
         "attachments": [{"type": "voice", "file_id": "voice-1"}],
-        "metadata": {"chat_title": "Brad"},
+        "metadata": {"chat_title": "Brad", "direction": "inbound"},
     }
 
 

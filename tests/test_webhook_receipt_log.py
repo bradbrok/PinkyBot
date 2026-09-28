@@ -125,9 +125,12 @@ class TestWebhookReceiptLog:
 
         now = time_module.time()
         triggers_module._hook_ip_buckets["testclient"] = [now] * 20
-        response = client.post(f"/hooks/{TOKEN}", json={})
+        response = client.post(f"/hooks/{UNKNOWN_TOKEN}", json={})
         assert response.status_code == 429
         assert len(_receipts(logs)) == 1
+        _assert_token_never_logged(logs, UNKNOWN_TOKEN)
+        assert client.post(f"/hooks/{TOKEN}", json={}).status_code == 200
+        assert len(_receipts(logs)) == 2
         _assert_token_never_logged(logs, TOKEN)
 
     def test_every_attempt_gets_its_own_receipt(self, rig):
@@ -145,9 +148,9 @@ class TestRateLimiterClockWedge:
     (``now - t`` is negative), so timestamps written under a fast clock that
     NTP later corrects backwards occupy the bucket until process death —
     every delivery is then silently rejected while the sender sees 429s.
-    Observed in production 2026-08-18: a host power-cut's clock correction
-    silenced a webhook token for the process's entire remaining life, cured
-    only by restart. Future debris is clock damage, not load: discard it.
+    A clock corrected backwards can leave future-dated stamps that would
+    otherwise hold the bucket until restart. Future debris is clock damage,
+    not load: discard it.
     """
 
     def test_future_stamped_token_bucket_recovers(self, rig):
@@ -165,8 +168,8 @@ class TestRateLimiterClockWedge:
         client, _ = rig
         now = time.time()
         triggers_module._hook_ip_buckets["testclient"] = [now + 3_600.0] * 20
-        response = client.post(f"/hooks/{TOKEN}", json={})
-        assert response.status_code == 200
+        response = client.post(f"/hooks/{UNKNOWN_TOKEN}", json={})
+        assert response.status_code == 404
 
     def test_genuine_token_flood_still_limited_and_loud(self, rig):
         client, logs = rig
@@ -221,20 +224,18 @@ class TestAccessLogTokenRedaction:
         )
         assert len(access_capture) == 1
         assert TOKEN not in access_capture[0]
-        assert f"/hooks/{TOKEN[:8]}*" in access_capture[0]
+        assert "/hooks/<redacted>" in access_capture[0]
 
     def test_non_hook_paths_pass_through_unchanged(self, access_capture):
         logging.getLogger("uvicorn.access").info(
             '%s - "%s %s HTTP/%s" %d',
             "127.0.0.1:12345",
             "GET",
-            "/agents/barsik/status",
+            "/agents/example/status",
             "1.1",
             200,
         )
-        assert access_capture == [
-            '127.0.0.1:12345 - "GET /agents/barsik/status HTTP/1.1" 200'
-        ]
+        assert access_capture == ['127.0.0.1:12345 - "GET /agents/example/status HTTP/1.1" 200']
 
     def test_uvicorn_log_config_wires_redaction_into_access_handler(self):
         import uvicorn.config
@@ -253,7 +254,7 @@ class TestAccessLogTokenRedaction:
         self, monkeypatch, capfd
     ):
         """End-to-end with the production log config: the emitted access
-        record must carry the token prefix, never the full credential."""
+        record must redact the entire credential segment."""
         import threading
         import urllib.request
 
@@ -295,7 +296,7 @@ class TestAccessLogTokenRedaction:
             thread.join(timeout=15)
         assert "/hooks/" in emitted, "no access-log line observed"
         assert TOKEN not in emitted
-        assert f"/hooks/{TOKEN[:8]}*" in emitted
+        assert "/hooks/<redacted>" in emitted
 
 
 def _balanced_call(text: str, open_paren_index: int) -> str:

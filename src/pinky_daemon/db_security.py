@@ -22,6 +22,8 @@ aborting startup.
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 from pathlib import Path
 
 from pinky_identity.fs_security import (
@@ -46,6 +48,7 @@ __all__ = [
     "harden_secret_dir",
     "harden_secret_file",
     "sweep_db_permissions",
+    "sweep_db_permissions_in_child",
 ]
 
 
@@ -54,8 +57,8 @@ def sweep_db_permissions(data_dir: str | Path) -> int:
 
     Also tightens the ``identity/`` subdirectory (encrypted signing keys,
     bearer-token hashes) to ``0700`` when present. Idempotent and
-    best-effort; intended to run once on daemon startup, after the stores
-    have created their files. Returns the count of files/dirs chmod'd.
+    best-effort. Run in a child process after startup has opened stores;
+    a raw close in the store-owning process would release its SQLite locks. Returns the count of files/dirs chmod'd.
     """
     # Canonicalize the root so a non-resolved/symlinked root argument can't
     # steer the sweep; O_NOFOLLOW then guards each leaf below it.
@@ -74,3 +77,21 @@ def sweep_db_permissions(data_dir: str | Path) -> int:
         # keys on "secret" in the name and false-flags logging it.
         logger.info("db_security: tightened SQLite file permissions on startup")
     return changed
+
+
+def sweep_db_permissions_in_child(data_dir: str | Path, *, timeout: float = 30) -> bool:
+    """Harden startup files without releasing any parent-process SQLite locks."""
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pinky_daemon.db_security", str(data_dir)],
+            capture_output=True, text=True, check=True, timeout=timeout,
+        )
+    except Exception:
+        logger.exception("Startup SQLite permission sweep failed in child process")
+        return False
+    logger.info("SQLite permission sweep completed in child process")
+    return True
+
+
+if __name__ == "__main__":
+    sweep_db_permissions(sys.argv[1])

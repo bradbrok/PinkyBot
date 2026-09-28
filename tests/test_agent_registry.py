@@ -12,6 +12,7 @@ import time
 import urllib.request
 from io import StringIO
 from unittest.mock import MagicMock
+from urllib.error import URLError
 
 import pytest
 
@@ -24,6 +25,108 @@ from pinky_daemon.agent_registry import (
     SoulMutationRejectedError,
     resolve_agent_path,
 )
+
+
+@pytest.mark.parametrize("failures", [2, 3])
+@pytest.mark.parametrize("prior_size", [0, 64 * 1024])
+def test_session_start_t7_retries_and_redacts_failure(tmp_path, monkeypatch, failures, prior_size):
+    from datetime import datetime
+
+    from pinky_daemon.agent_registry import _tmux_session_start_hook_source
+
+    sentinel = "SECRET_SENTINEL_DO_NOT_LOG"
+    url = "http://secret-endpoint.invalid/" + sentinel
+    monkeypatch.setenv("PINKY_AGENT_KEY", sentinel)
+    monkeypatch.setenv("PINKY_DAEMON_URL", url)
+    monkeypatch.setenv("PINKY_TMUX_TRANSCRIPT_BIND", "1")
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        StringIO(
+            json.dumps(
+                {
+                    "transcript_path": "/private/" + sentinel,
+                    "session_id": sentinel,
+                }
+            )
+        ),
+    )
+    outcomes = [URLError(url)] * failures
+    if failures < 3:
+        outcomes.append(MagicMock())
+    post = MagicMock(side_effect=outcomes)
+    monkeypatch.setattr(urllib.request, "urlopen", post)
+    sleeps = MagicMock()
+    monkeypatch.setattr(time, "sleep", sleeps)
+    hook = tmp_path / ".claude" / "hook_tmux_session_start.py"
+    hook.parent.mkdir()
+    failure_log = hook.parent / "hook_failures.log"
+    if prior_size:
+        failure_log.write_text("x" * prior_size)
+    source = _tmux_session_start_hook_source("test-agent")
+    try:
+        exec(compile(source, str(hook), "exec"), {"__file__": str(hook)})
+    except SystemExit as exc:
+        assert exc.code == 0
+    assert post.call_count == 3
+    assert [call.kwargs["timeout"] for call in post.call_args_list] == [5, 5, 5]
+    assert [call.args[0] for call in sleeps.call_args_list] == [0.5, 1.5]
+    if failures < 3:
+        if prior_size:
+            assert failure_log.read_text() == "x" * prior_size
+        else:
+            assert not failure_log.exists()
+    else:
+        assert failure_log.stat().st_size <= 64 * 1024
+        lines = failure_log.read_text().splitlines()
+        assert len(lines) == 1
+        assert datetime.fromisoformat(lines[0].split()[0]).tzinfo is not None
+        assert "SessionStart" in lines[0]
+        assert "URLError" in lines[0]
+        assert "attempts=3" in lines[0]
+        assert sentinel not in lines[0]
+        assert url not in lines[0]
+        assert "http" not in lines[0]
+        assert "/private" not in lines[0]
+
+
+def test_session_start_failure_log_io_error_still_exits_zero(tmp_path, monkeypatch):
+    from pinky_daemon.agent_registry import _tmux_session_start_hook_source
+
+    monkeypatch.setenv("PINKY_AGENT_KEY", "test-key")
+    monkeypatch.setenv("PINKY_TMUX_TRANSCRIPT_BIND", "1")
+    monkeypatch.setattr(sys, "stdin", StringIO(json.dumps({"transcript_path": "/test.jsonl"})))
+    monkeypatch.setattr(urllib.request, "urlopen", MagicMock(side_effect=URLError("unavailable")))
+    monkeypatch.setattr(time, "sleep", MagicMock())
+    hook = tmp_path / "hook_tmux_session_start.py"
+    (tmp_path / "hook_failures.log").mkdir()
+    with pytest.raises(SystemExit) as result:
+        exec(_tmux_session_start_hook_source("test-agent"), {"__file__": str(hook)})
+    assert result.value.code == 0
+
+
+def test_workspace_hook_refresh_installs_session_start_retry(tmp_path):
+    from pinky_daemon.agent_registry import _tmux_session_start_hook_source
+
+    registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+    workspace = tmp_path / "agent"
+    try:
+        registry.register("test-agent", working_dir=str(workspace))
+        hook = workspace / ".claude" / "hook_tmux_session_start.py"
+        hook.write_text("# old hook\n")
+        registry.ensure_workspace_hooks("test-agent")
+        assert hook.read_text() == _tmux_session_start_hook_source("test-agent")
+        settings = json.loads((workspace / ".claude" / "settings.json").read_text())
+        hooks = [
+            hook
+            for group in settings["hooks"]["SessionStart"]
+            for hook in group["hooks"]
+            if "hook_tmux_session_start.py" in hook.get("command", "")
+        ]
+        assert len(hooks) == 1
+        assert "timeout" not in hooks[0]
+    finally:
+        registry.close()
 
 
 @pytest.fixture
@@ -1837,6 +1940,62 @@ class TestModelSeeds:
             assert cost == pytest.approx(16.20)
         # The 1M-tier suffix strips to the same rate row.
         assert lookup_rate("claude-fable-5-1[1m]") is _FABLE_51
+
+    def test_opus_5_5_seeded_at_current_opus_tier(self, registry):
+        """Claude Opus 5.5 (2026-09-22) is the current Opus at $4/$20 per MTok
+        with a 5% cache read ($0.20) — cheaper than Opus 5 on every field.
+        Pin the catalog + RATE_TABLE + 1M-set so a half-updated table fails
+        loud (four registration sites must agree)."""
+        models = {
+            m["model_id"]: m
+            for m in registry.list_models(provider="anthropic", active_only=False)
+        }
+        assert "claude-opus-5-5" in models
+        o55 = models["claude-opus-5-5"]
+        o5 = models["claude-opus-5"]
+        assert o55["input_price"] == 4.0
+        assert o55["output_price"] == 20.0
+        assert o55["cached_input_price"] == 0.2
+        # Deliberately cheaper than Opus 5's standard tier, not a copy of it.
+        assert o55["input_price"] < o5["input_price"]
+        assert o55["output_price"] < o5["output_price"]
+        assert o55["cached_input_price"] < o5["cached_input_price"]
+        assert o55["context_window"] == 1_000_000
+        assert o55["is_1m"] == 1
+        assert o55["supports_thinking"] == 1
+        assert o55["tier"] == "opus"
+        # 1M-context set (SDK 200k-report correction path).
+        assert "claude-opus-5-5" in registry.get_1m_models()
+        # The live cost path reads pricing.RATE_TABLE; the parity guards skip a
+        # catalog row absent from RATE_TABLE, so require the entry here at the
+        # right rates — that forces the analytics seed via
+        # test_seed_pricing_matches_rate_table, closing the three-table chain.
+        from pinky_daemon.pricing import _OPUS_55, _OPUS_STD, RATE_TABLE
+        assert RATE_TABLE.get("claude-opus-5-5") is _OPUS_55
+        assert _OPUS_55 is not _OPUS_STD
+        assert _OPUS_55["input"] == 4.0
+        assert _OPUS_55["output"] == 20.0
+        assert _OPUS_55["cache_read"] == 0.20
+        assert _OPUS_55["cache_write_5m"] == 5.00
+        assert _OPUS_55["cache_write_1h"] == 8.00
+
+    def test_opus_5_5_cost_path_prices_all_five_fields(self):
+        """A hand-computed mixed-token turn through the live cost engine —
+        every field contributes a distinct dollar amount, so a mutated
+        cache-write tariff cannot ride through on display-price asserts."""
+        from pinky_daemon.pricing import _OPUS_55, compute_turn_cost_usd, lookup_rate
+
+        cost = compute_turn_cost_usd(
+            "claude-opus-5-5",
+            input_tokens=1_000_000,  # 1.00M x $4.00 = $4.00
+            output_tokens=100_000,  # 0.10M x $20.00 = $2.00
+            cache_read_tokens=2_000_000,  # 2.00M x $0.20 = $0.40
+            cache_creation_5m_tokens=40_000,  # 0.04M x $5.00 = $0.20
+            cache_creation_1h_tokens=10_000,  # 0.01M x $8.00 = $0.08
+        )
+        assert cost == pytest.approx(6.68)
+        # The 1M-tier suffix strips to the same rate row.
+        assert lookup_rate("claude-opus-5-5[1m]") is _OPUS_55
 
     def test_openai_seed_prices_match_pricing_rate_table(self, registry):
         """#860 extends the #741 invariant to the OpenAI family: catalog

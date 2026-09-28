@@ -135,6 +135,15 @@ class TestCronDescription:
 
 
 @pytest.fixture
+def daily_replay_clock(monkeypatch):
+    """Keep backdated wakes away from the 08:00 and 09:00 cron boundaries."""
+    origin = 1790535600.0  # 2026-09-27 12:00:00 America/Los_Angeles.
+    start = time.monotonic()
+    # Advance normally so strict age comparisons still see elapsed test time.
+    monkeypatch.setattr(time, "time", lambda: origin + (time.monotonic() - start))
+
+
+@pytest.fixture
 def registry():
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
@@ -2392,7 +2401,7 @@ class TestScheduler:
 
     @pytest.mark.asyncio
     async def test_kill_after_durable_accept_before_future_resolve_never_replays(
-        self, capsys
+        self, capsys, monkeypatch
     ):
         """Exercise the exact #991 crash seam, not a nearby timeout.
 
@@ -2401,6 +2410,10 @@ class TestScheduler:
         before AgentScheduler can observe/confirm that Future. A reopened
         scheduler must read the retained receipt and perform zero replay.
         """
+        # Keep restart in the accepted fire's minute: a later cron occurrence
+        # would be a legitimate new delivery, outside this crash-replay seam.
+        fired_at = 1_790_133_530.0
+        monkeypatch.setattr("pinky_daemon.scheduler.time.time", lambda: fired_at)
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         first = AgentRegistry(db_path=path)
@@ -2408,7 +2421,6 @@ class TestScheduler:
         schedule = first.add_schedule(
             "oleg", "* * * * *", name="crash-seam", prompt="run once"
         )
-        fired_at = time.time()
         claimed, row = first.claim_schedule_fire(
             schedule.id,
             timestamp=fired_at,
@@ -4187,6 +4199,8 @@ class TestScheduler:
             pending_wake_max_age_sec=1_000,
             outbox_drain_extension_attempt_cap=1,
         )
+        # Exercise release/staleness independently of the new busy deadline.
+        monkeypatch.setattr(scheduler, "_busy_deliver_at", lambda row: base + 10_000)
         scheduler._check_pending_wake_liveness(base)
         clock[0] = base + 60
         scheduler._check_pending_wake_liveness(clock[0])
@@ -5186,6 +5200,8 @@ class TestScheduler:
             owner_notify_callback=owner_notify,
             pending_wake_max_age_sec=100_000,
             outbox_drain_extension_attempt_cap=1,
+            # Every target must independently qualify for this partial-write scenario.
+            outbox_drain_extension_max_age_sec=30,
         )
         real_park = registry.drain_park_pending_schedule_wake
         park_wedged = [True]
@@ -5365,6 +5381,8 @@ class TestScheduler:
             owner_notify_callback=owner_notify,
             pending_wake_max_age_sec=100_000,
             outbox_drain_extension_attempt_cap=1,
+            # Every target must independently qualify for this partial-write scenario.
+            outbox_drain_extension_max_age_sec=30,
         )
         real_park = registry.drain_park_pending_schedule_wake
         wedged = [True]
@@ -5886,6 +5904,7 @@ class TestScheduler:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", ["alive", "ok", "busy", "finishing"])
+    @pytest.mark.usefixtures("daily_replay_clock")
     async def test_fresh_heartbeat_drains_stranded_outbox(
         self, registry, status
     ):
@@ -6033,6 +6052,7 @@ class TestScheduler:
         ] == ["morning inbox"]
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("daily_replay_clock")
     async def test_persisted_fifo_replays_before_new_schedule_cohort(
         self, registry
     ):
@@ -6440,6 +6460,7 @@ class TestScheduler:
         ] == ["next session only"]
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("daily_replay_clock")
     async def test_canceled_cohort_waiting_for_boot_replay_is_persisted(
         self, registry
     ):
@@ -6874,6 +6895,8 @@ class TestDrainParkedWakeRegistry:
         assert registry.get_schedule(
             schedule.id
         ).last_accepted_fired_at == pytest.approx(pending.fired_at)
+        assert registry._fire_trace.flush()
+        registry._fire_trace.close()
 
         # Simulate a pre-upgrade database: drop the column, discarding the
         # authority, while the accepted wake row remains retained. Reopening
@@ -6890,6 +6913,7 @@ class TestDrainParkedWakeRegistry:
             assert migrated.last_accepted_fired_at == pytest.approx(
                 pending.fired_at
             )
+            assert reopened._fire_trace.status()["state"] == "healthy"
         finally:
             reopened.close()
 
@@ -6898,6 +6922,8 @@ class TestDrainParkedWakeRegistry:
         has not added yet — released upgrade sources have the wake table
         without accepted_at, and a boot abort there bricks the daemon."""
         schedule, pending = self._persist(registry)
+        assert registry._fire_trace.flush()
+        registry._fire_trace.close()
         registry._db.executescript(
             """
             DROP INDEX IF EXISTS idx_schedule_wake_ledger_state;
@@ -6915,6 +6941,7 @@ class TestDrainParkedWakeRegistry:
             # No accepted stamps existed pre-upgrade, so zero is correct —
             # the requirement is that the reopen does not abort.
             assert migrated.last_accepted_fired_at == 0.0
+            assert reopened._fire_trace.status()["state"] == "healthy"
         finally:
             reopened.close()
 

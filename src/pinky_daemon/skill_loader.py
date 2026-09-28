@@ -320,14 +320,15 @@ def register_discovered_skills(
     Args:
         skill_store: SkillStore instance
         skills: List of parsed skills to register
-        overwrite: If True, update existing skills. If False, skip existing.
+        overwrite: If True, update existing skills. If False, report existing drift.
 
     Returns:
-        {"registered": [...], "skipped": [...], "updated": [...]}
+        {"registered": [...], "skipped": [...], "updated": [...], "drifted": [...]}
     """
     registered = []
     skipped = []
     updated = []
+    drifted = []
 
     for skill in skills:
         existing = skill_store.get(skill.name)
@@ -337,6 +338,25 @@ def register_discovered_skills(
             if existing
             else agent_originated or bool(persisted_origin)
         )
+
+        if existing and not overwrite:
+            # Don't overwrite skills registered via API/UI
+            if existing.skill_type != "skill":
+                skipped.append(skill.name)
+                continue
+            fields = [
+                field for field, value in (
+                    ("description", skill.description), ("directive", skill.body),
+                    ("tool_patterns", skill.allowed_tools),
+                ) if getattr(existing, field) != value
+            ]
+            if fields:
+                drifted.append({"name": skill.name, "fields": fields})
+            else:
+                skipped.append(skill.name)
+            if enforce_agent_clamps:
+                skill_store.converge_agent_clamps(skill.name)
+            continue
 
         try:
             validate_tool_patterns(
@@ -349,29 +369,6 @@ def register_discovered_skills(
             _log(f"skill_loader: skipping '{skill.name}' — {exc}")
             skipped.append(skill.name)
             continue
-
-        if existing and not overwrite:
-            # Don't overwrite skills registered via API/UI
-            if existing.skill_type != "skill":
-                skipped.append(skill.name)
-                continue
-            # Update if it was previously discovered (same type)
-            # but check if content changed
-            content_unchanged = (
-                existing.directive == skill.body
-                and existing.description == skill.description
-                and existing.tool_patterns == skill.allowed_tools
-            )
-            clamps_converged = (
-                not existing.shared
-                and not existing.privileged_tool_opt_in
-                and (not skill.allowed_tools or not existing.self_assignable)
-            )
-            if content_unchanged and (
-                not enforce_agent_clamps or clamps_converged
-            ):
-                skipped.append(skill.name)
-                continue
 
         # Build tool_patterns from allowed-tools frontmatter
         tool_patterns = skill.allowed_tools if skill.allowed_tools else []
@@ -410,7 +407,7 @@ def register_discovered_skills(
         else:
             registered.append(skill.name)
 
-    result = {"registered": registered, "skipped": skipped, "updated": updated}
+    result = {"registered": registered, "skipped": skipped, "updated": updated, "drifted": drifted}
     total = len(registered) + len(updated)
     if total > 0:
         _log(f"skill_loader: registered {len(registered)}, updated {len(updated)}, skipped {len(skipped)} skills")

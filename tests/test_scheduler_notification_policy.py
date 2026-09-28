@@ -166,7 +166,12 @@ async def test_drain_extension_pages_only_receipt_capable_runtime(
         owner_notify_callback=notify,
         delivery_drain_busy_fn=lambda _: True,
         outbox_drain_extension_attempt_cap=1,
+        # Each row independently qualifies; this test isolates notification policy.
+        outbox_drain_extension_max_age_sec=30,
     )
+    # Keep the busy park/release path independent of bounded mid-turn delivery.
+    monkeypatch.setattr(scheduler, "_busy_deliver_at", lambda row: clock[0] + 10_000)
+
     try:
         await scheduler._replay_pending_locked("worker", drain_recheck=True)
         await flush_alerts(scheduler)
@@ -318,7 +323,12 @@ async def test_claude_drain_cohort_repark_does_not_page_again(
         delivery_drain_busy_fn=lambda _: busy[0],
         owner_notify_callback=notify,
         outbox_drain_extension_attempt_cap=1,
+        # Each row independently qualifies; this test isolates notification policy.
+        outbox_drain_extension_max_age_sec=10,
     )
+    # Keep the busy park/release path independent of bounded mid-turn delivery.
+    monkeypatch.setattr(scheduler, "_busy_deliver_at", lambda row: clock[0] + 10_000)
+
 
     def row_state(row):
         return registry.get_schedule_wake_by_fire(row.schedule_id, row.fired_at)

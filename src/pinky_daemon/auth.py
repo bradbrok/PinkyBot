@@ -9,10 +9,12 @@ import json
 import os
 import time
 from typing import Any
+from urllib.parse import unquote
 
 from pinky_daemon.agent_signing_key_store import AgentSigningKeyStore
 
 SESSION_COOKIE_NAME = "pinky_session"
+OWNER_SESSION_USER = "admin"
 INTERNAL_AGENT_HEADER = "x-pinky-agent"
 INTERNAL_TIMESTAMP_HEADER = "x-pinky-timestamp"
 INTERNAL_SIGNATURE_HEADER = "x-pinky-signature"
@@ -85,7 +87,7 @@ def _sign_bytes(secret: str, payload: bytes) -> str:
     return _b64encode(digest)
 
 
-def create_session_cookie(secret: str, *, user: str = "admin", now: int | None = None) -> str:
+def create_session_cookie(secret: str, *, user: str = OWNER_SESSION_USER, now: int | None = None) -> str:
     """Create a signed UI session cookie."""
     ts = int(now or time.time())
     payload = {
@@ -207,11 +209,18 @@ def make_db_signing_key_resolver(db_path: str):
 
 
 def build_internal_auth_headers(secret: str, *, agent_name: str, method: str, path: str, timestamp: int | None = None) -> dict[str, str]:
-    """Build signed headers for local MCP-to-daemon requests."""
+    """Build signed headers for local MCP-to-daemon requests.
+
+    ``path`` must be the exact on-the-wire request path the client puts in the
+    URL (including any percent escapes, and optionally a query string). The
+    server exposes that URL path percent-decoded in ASGI ``scope["path"]``;
+    unquoting this wire form once produces the path the verifier signs.
+    Callers must encode user-provided path components before building the URL.
+    """
     if not secret or not agent_name:
         return {}
     ts = int(timestamp or time.time())
-    normalized_path = path.split("?", 1)[0]
+    normalized_path = unquote(path.split("?", 1)[0])
     payload = f"{agent_name}\n{method.upper()}\n{normalized_path}\n{ts}".encode("utf-8")
     return {
         INTERNAL_AGENT_HEADER: agent_name,
@@ -260,8 +269,10 @@ def verify_internal_request(
         return False
     if abs(int(time.time()) - ts) > _INTERNAL_TTL_SECONDS:
         return False
-    normalized_path = path.split("?", 1)[0]
-    payload = f"{agent_name}\n{method.upper()}\n{normalized_path}\n{ts}".encode("utf-8")
+    # The verifier receives the decoded routed path, without a query string.
+    if "?" in path or "#" in path:
+        return False
+    payload = f"{agent_name}\n{method.upper()}\n{path}\n{ts}".encode("utf-8")
     # Accept a match against the per-agent key OR (when allowed) the global
     # secret. Each comparison is constant-time; we only short-circuit on a match.
     for candidate in (agent_key, usable_secret):

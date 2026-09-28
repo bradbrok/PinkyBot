@@ -49,6 +49,7 @@ _1M_MODELS = {
     "claude-opus-4-7",
     "claude-opus-4-8",
     "claude-opus-5",
+    "claude-opus-5-5",
 }
 
 

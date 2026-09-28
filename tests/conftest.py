@@ -25,12 +25,15 @@ opt out via the ``real_auth`` pytest marker (set as a module-level
 from __future__ import annotations
 
 import atexit
+import logging
 import os
 import shutil
 import tempfile
 
 import pytest
 from fastapi.testclient import TestClient
+
+from tests._tmp_hygiene import restore_tree_readability
 
 # Test session secret. Long-enough random-looking value; never used in
 # production. Tests that need to override (e.g. test_auth.py) do so via
@@ -74,6 +77,7 @@ _PINNED_TEST_ENV = {
     "CLAUDE_SECURESTORAGE_CONFIG_DIR": TEST_CLAUDE_SECURESTORAGE_DIR,
     "CODEX_HOME": TEST_CODEX_HOME,
     "HOME": TEST_HOME,
+    "PINKY_ACCESS_LOG": "off",
     "PINKY_AUTH_DENY_DEFAULT": "shadow",
     "PINKY_DREAM_TRANSPORT": "sdk",
     "PINKY_SESSION_SECRET": TEST_SESSION_SECRET,
@@ -124,6 +128,19 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
 
 
 @pytest.fixture(autouse=True, scope="session")
+def _restore_tmp_path_readability(tmp_path_factory):
+    """Leave inspectable artifacts even when a mode-freezing test fails."""
+    try:
+        yield
+    finally:
+        changed = restore_tree_readability(tmp_path_factory.getbasetemp())
+        if changed:
+            logging.getLogger(__name__).info(
+                "Restored owner readability on %d temporary test entries", changed
+            )
+
+
+@pytest.fixture(autouse=True, scope="session")
 def _ensure_test_session_secret():
     """Make sure PINKY_SESSION_SECRET is set for the whole test run.
 
@@ -141,6 +158,14 @@ def _ensure_test_session_secret():
             os.environ.pop("PINKY_SESSION_SECRET", None)
         else:
             os.environ["PINKY_SESSION_SECRET"] = prev
+
+
+@pytest.fixture(autouse=True)
+def _isolate_temporary_files(tmp_path, monkeypatch):
+    """Keep fixed-name companion databases private to each test's app instances."""
+    temporary_root = tmp_path / "tempfiles"
+    temporary_root.mkdir(mode=0o700)
+    monkeypatch.setattr(tempfile, "tempdir", str(temporary_root))
 
 
 @pytest.fixture(autouse=True)

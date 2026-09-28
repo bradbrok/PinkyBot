@@ -1,4 +1,4 @@
-"""Adversarial reviewer probes for the #1163 folded-acceptance change."""
+"""Regression coverage for folded-acceptance edge cases (#1163)."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def _ok() -> TmuxCommandResult:
 
 def _make_session(*, registry: object | None = None) -> TmuxSession:
     control = MagicMock(spec=_TmuxControl)
-    control.session_name = "pinky-review-probe"
+    control.session_name = "pinky-fold-regression"
     control.tmux_binary = "tmux"
     control.socket_name = ""
     control.socket_path = None
@@ -43,7 +43,7 @@ def _make_session(*, registry: object | None = None) -> TmuxSession:
     session = TmuxSession(
         StreamingSessionConfig(
             agent_name="dymok",
-            working_dir="/tmp/tmux-fold-review-probe",
+            working_dir="/tmp/tmux-fold-regression",
         ),
         registry=registry,
         tmux_control=control,

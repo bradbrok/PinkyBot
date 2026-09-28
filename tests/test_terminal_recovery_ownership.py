@@ -77,9 +77,9 @@ async def test_teardown_quiesces_recovery_before_replacing(
     )
     try:
         if entry == "skills":
-            endpoint = next(r.endpoint for r in h.app.routes if getattr(r, "path", "") == "/agents/{name}/skills/apply")
-            response = await endpoint(name="sample")
-            assert response["session_restarted"]
+            response = await h.client.post("/agents/sample/skills/apply")
+            assert response.status_code == 200, response.text
+            assert response.json()["session_restarted"]
         else:
             response = await h.client.post("/agents/sample/stop")
             assert response.status_code == 200, response.text

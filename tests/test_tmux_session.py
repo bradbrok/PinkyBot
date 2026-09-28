@@ -20,6 +20,8 @@ import json as _json
 import os
 import re
 import shlex
+import subprocess
+import sys
 import threading
 import time as _time
 from collections.abc import Iterator
@@ -32,7 +34,7 @@ import pytest
 
 from pinky_daemon import tmux_session
 from pinky_daemon.agent_registry import AgentRegistry
-from pinky_daemon.command_runner import LocalCommandRunner
+from pinky_daemon.command_runner import CommandResult, ContainerCommandRunner, LocalCommandRunner
 from pinky_daemon.scheduler import AgentScheduler, ScheduleWakeReceipt
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import (
@@ -46,6 +48,180 @@ from pinky_daemon.tmux_transcript import TmuxTranscriptTailer, TurnResponse
 from pinky_daemon.transport_state import SessionState, TransitionResult, Trigger
 
 _REAL_ASYNCIO_SLEEP = asyncio.sleep
+
+
+async def _start_retained_recovery(tmp_path, monkeypatch, *, continued=False):
+    """Arm a fresh spawn with a retained tailer and real transcript history."""
+    ss, _ = _make_session(agent_name="test-agent")
+    old = tmp_path / "old.jsonl"
+    old.write_text("historical transcript\n")
+    monkeypatch.setattr(ss, "_project_dir", lambda: tmp_path)
+    ss._tailer = TmuxTranscriptTailer(
+        transcript_path=old,
+        on_turn_complete=ss._handle_turn_complete,
+    )
+    ss._tailer.set_offset(old.stat().st_size)
+    monkeypatch.setattr(ss._tailer, "start", AsyncMock())
+    monkeypatch.setattr(ss._tailer, "stop", AsyncMock())
+    ss._last_launch_used_continue = continued
+    ss._prelaunch_transcripts = (
+        frozenset(path for path, _ in ss._transcript_candidates()) if not continued else frozenset()
+    )
+    await ss._start_tailer()
+    return ss, old
+
+
+def _recovery_clock(monkeypatch, on_sleep=None):
+    """Advance recovery time without replacing the shared asyncio module."""
+    clock = SimpleNamespace(now=0.0, sleeps=[])
+
+    async def sleep(delay):
+        clock.sleeps.append(delay)
+        clock.now += delay
+        assert len(clock.sleeps) <= 61, "recovery exceeded its polling cap"
+        if on_sleep:
+            on_sleep(len(clock.sleeps))
+
+    monkeypatch.setattr(
+        tmux_session,
+        "asyncio",
+        SimpleNamespace(
+            **{
+                **vars(asyncio),
+                "sleep": sleep,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        tmux_session,
+        "time",
+        SimpleNamespace(
+            **{
+                **vars(_time),
+                "monotonic": lambda: clock.now,
+            }
+        ),
+    )
+    return clock
+
+
+async def test_recovery_t1_late_transcript_after_retained_fresh_spawn(tmp_path, monkeypatch):
+    ss, old = await _start_retained_recovery(tmp_path, monkeypatch)
+    new = tmp_path / "fresh.jsonl"
+    bind = MagicMock(wraps=ss._set_transcript_path_internal)
+    monkeypatch.setattr(ss, "_set_transcript_path_internal", bind)
+
+    def tick(number):
+        if number == 2:
+            bind.assert_not_called()
+            assert ss._tailer.transcript_path == old
+            new.write_text("first turn\n")
+
+    clock = _recovery_clock(monkeypatch, tick)
+    await ss._first_bind_recovery_task
+    assert ss._tailer.transcript_path == new
+    assert ss._tailer.offset == 0
+    assert ss._tailer_first_bind_pending is False
+    assert clock.sleeps == [5.0, 5.0]
+    bind.assert_called_once_with(new)
+    assert not ss._session_ready_event.is_set(), "discovery cannot authorize prompt delivery"
+
+
+async def test_recovery_t2_old_shutdown_write_never_rebinds(tmp_path, monkeypatch):
+    other = tmp_path / "older.jsonl"
+    other.write_text("other old history\n")
+    ss, old = await _start_retained_recovery(tmp_path, monkeypatch)
+    bind = MagicMock(wraps=ss._set_transcript_path_internal)
+    monkeypatch.setattr(ss, "_set_transcript_path_internal", bind)
+
+    def tick(number):
+        os.utime(other, (old.stat().st_mtime + number, old.stat().st_mtime + number))
+
+    _recovery_clock(monkeypatch, tick)
+    await ss._first_bind_recovery_task
+    bind.assert_not_called()
+    assert ss._tailer.transcript_path == old
+    assert ss._tailer.offset == old.stat().st_size
+
+
+async def test_recovery_t3_hook_stops_polling(tmp_path, monkeypatch):
+    ss, _ = await _start_retained_recovery(tmp_path, monkeypatch)
+    new = tmp_path / "hook.jsonl"
+    bind = MagicMock(wraps=ss._set_transcript_path_internal)
+    monkeypatch.setattr(ss, "_set_transcript_path_internal", bind)
+
+    def tick(number):
+        if number == 2:
+            new.write_text("first turn\n")
+            assert ss.set_transcript_path(new, session_id="new-session")
+
+    clock = _recovery_clock(monkeypatch, tick)
+    await ss._first_bind_recovery_task
+    assert clock.sleeps == [5.0, 5.0]
+    bind.assert_called_once_with(new)
+    assert ss._session_ready_event.is_set()
+
+
+async def test_recovery_t4_cap_logs_exactly_once(tmp_path, monkeypatch):
+    ss, old = await _start_retained_recovery(tmp_path, monkeypatch)
+    logs = []
+    monkeypatch.setattr(tmux_session, "_log", logs.append)
+    clock = _recovery_clock(monkeypatch)
+    await ss._first_bind_recovery_task
+    missing = [line for line in logs if line.startswith("TRANSCRIPT_FIRST_BIND_MISSING ")]
+    assert len(missing) == 1
+    assert "agent=test-agent waited_s=300 prelaunch=1 current=old.jsonl" in missing[0]
+    assert sum("no post-launch transcript yet" in line for line in logs) == 1
+    assert clock.now == 300
+    assert clock.sleeps == [5.0] * 60
+    assert ss._tailer.transcript_path == old
+    assert ss._tailer_first_bind_pending
+
+
+async def test_recovery_t5_continue_does_not_poll(tmp_path, monkeypatch):
+    ss, old = await _start_retained_recovery(tmp_path, monkeypatch, continued=True)
+    attempt = MagicMock(wraps=ss._attempt_first_bind_recovery)
+    monkeypatch.setattr(ss, "_attempt_first_bind_recovery", attempt)
+    clock = _recovery_clock(monkeypatch)
+    await ss._first_bind_recovery_task
+    attempt.assert_not_called()
+    assert not clock.sleeps
+    assert ss._tailer.transcript_path == old
+    assert ss._tailer.offset == old.stat().st_size
+
+
+async def test_recovery_t6_stop_cancels_between_polls(tmp_path, monkeypatch):
+    ss, old = await _start_retained_recovery(tmp_path, monkeypatch)
+    task = ss._first_bind_recovery_task
+    sleeps = []
+    parked = asyncio.Event()
+
+    async def sleep(delay):
+        sleeps.append(delay)
+        if len(sleeps) == 2:
+            await parked.wait()
+
+    monkeypatch.setattr(
+        tmux_session,
+        "asyncio",
+        SimpleNamespace(
+            **{
+                **vars(asyncio),
+                "sleep": sleep,
+            }
+        ),
+    )
+    await _REAL_ASYNCIO_SLEEP(0)
+    try:
+        assert sleeps == [5.0, 5.0]
+    finally:
+        await ss._stop_tailer()
+        await asyncio.gather(task, return_exceptions=True)
+    assert task.cancelled()
+    (tmp_path / "too-late.jsonl").write_text("late turn\n")
+    await _REAL_ASYNCIO_SLEEP(0)
+    assert ss._tailer.transcript_path == old
+    assert ss._first_bind_recovery_task is None
 
 
 @pytest.fixture(autouse=True)
@@ -243,6 +419,15 @@ def _make_session(
     return ss, tmux
 
 
+def _bind_placeholder_tailer(ss: TmuxSession) -> None:
+    """Give directly connected receipt fixtures the post-spawn tailer state."""
+    assert ss._tailer is None
+    ss._tailer = TmuxTranscriptTailer(
+        transcript_path=tmux_session._PLACEHOLDER_TRANSCRIPT_PATH,
+        on_turn_complete=ss._handle_turn_complete,
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Construction + identity
 # ──────────────────────────────────────────────────────────────────────────
@@ -304,6 +489,50 @@ async def test_cold_start_caps_concurrent_subagents_in_spawn_env() -> None:
 
     env = tmux.new_session.await_args.kwargs["env"]
     assert env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] == "6"
+
+
+@pytest.mark.asyncio
+async def test_cold_start_disables_prompt_suggestions_in_spawn_env(monkeypatch) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "true")
+    ss, tmux = _make_session(agent_name="test")
+
+    await ss.connect()
+
+    env = tmux.new_session.await_args.kwargs["env"]
+    assert env["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] == "false"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing", [None, True], ids=["missing_file", "explicit_true"])
+async def test_container_settings_merge_prompt_suggestions(tmp_path, monkeypatch, existing) -> None:
+    ss, _ = _make_session(agent_name="test")
+    runner = MagicMock(spec=ContainerCommandRunner)
+    runner.run = AsyncMock(return_value=CommandResult(returncode=0, stdout=b"", stderr=b""))
+    monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
+    await ss._seed_container_trust(str(tmp_path / "project"))
+    runner.run.assert_awaited_once()
+    argv = runner.run.await_args.args[0]
+
+    config_dir = tmp_path / "config"
+    settings_path = config_dir / "settings.json"
+    if existing is not None:
+        config_dir.mkdir()
+        settings_path.write_text(_json.dumps({"promptSuggestionEnabled": existing, "theme": "dark"}))
+    else:
+        assert not settings_path.exists()
+
+    completed = subprocess.run(
+        [sys.executable, *argv[1:]],
+        env={"CLAUDE_CONFIG_DIR": str(config_dir), "HOME": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    settings = _json.loads(settings_path.read_text())
+    assert settings["promptSuggestionEnabled"] is (False if existing is None else existing)
+    if existing is not None:
+        assert settings["theme"] == "dark"
 
 
 @pytest.mark.asyncio
@@ -1014,7 +1243,7 @@ async def test_capture_pane_joined_hold_target_adds_j_and_uses_target() -> None:
         target_session="login-hold-test",
     )
     assert "-J" in calls[0]
-    assert calls[0][calls[0].index("-t") + 1] == "login-hold-test"
+    assert calls[0][calls[0].index("-t") + 1] == "=login-hold-test:"
 
 
 @pytest.mark.asyncio
@@ -1031,7 +1260,7 @@ async def test_rename_session_freezes_without_retargeting_control() -> None:
     await tmux.rename_session("login-hold-test")
 
     assert calls == [
-        ("rename-session", "-t", "pinky-test", "login-hold-test")
+        ("rename-session", "-t", "=pinky-test", "--", "login-hold-test")
     ]
     assert tmux.session_name == "pinky-test"
 
@@ -1131,7 +1360,7 @@ async def test_resize_window_invokes_tmux_with_xy_flags() -> None:
     assert len(calls) == 1
     args = calls[0]
     assert args[0] == "resize-window"
-    assert "-t" in args and "pinky-test" in args
+    assert "-t" in args and "=pinky-test:" in args
     assert "-x" in args and "180" in args
     assert "-y" in args and "48" in args
 
@@ -1235,7 +1464,7 @@ async def test_paste_text_loads_buffer_pastes_and_sends_enter() -> None:
     assert "paste-buffer" in calls[1][0]
     assert "-p" in calls[1]  # bracketed paste mode
     assert "-d" in calls[1]  # delete buffer after paste
-    assert calls[2] == ("send-keys", "-t", "pinky-test", "Enter")
+    assert calls[2] == ("send-keys", "-t", "=pinky-test:", "Enter")
     assert result.ok
 
 
@@ -1579,50 +1808,36 @@ def test_build_repl_env_provisions_per_agent_key(monkeypatch) -> None:
     ss._registry.get_signing_key.assert_called_once_with("dymok")
 
 
-def test_build_repl_env_isolated_withholds_global_secret(monkeypatch) -> None:
-    """#149 phase-3 gate: an isolated agent that carries its own per-agent key
-    must NOT receive the global PINKY_SESSION_SECRET (which the daemon accepts
-    for any name → a forgery vector). It gets PINKY_AGENT_KEY only."""
-    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret-xyz")
-    ss, _ = _make_session(agent_name="dymok")
-    ss._registry = MagicMock()
-    ss._registry.get_signing_key.return_value = "dymok-per-agent-key"
-    ss._registry.get.return_value.isolated = True
-    env = ss._build_repl_env()
-    assert env.get("PINKY_AGENT_KEY") == "dymok-per-agent-key"
-    assert "PINKY_SESSION_SECRET" not in env
+async def test_build_repl_env_isolated_withholds_global_secret(tmp_path, monkeypatch) -> None:
+    """The child, including inherited state, must only carry its scoped identity."""
+    from tests.tmux_isolated_env_support import Registry, launch_probe
+
+    async with launch_probe(tmp_path, monkeypatch, mode="enforce") as probe:
+        names = await probe.launch(registry=Registry())
+        assert "PINKY_AGENT_KEY" in names
+        assert "PINKY_SESSION_SECRET" not in names
 
 
-def test_build_repl_env_isolated_without_key_withholds_secret(monkeypatch) -> None:
-    """Fail CLOSED (Murzik #639 review): an isolated agent with NO per-agent
-    key is a provisioning failure, not an availability case — withhold the
-    global secret too (hooks/MCP no-op) rather than hand a sandbox the
-    forgeable fleet-wide signing secret for the very window this gate closes."""
-    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret-xyz")
-    ss, _ = _make_session(agent_name="dymok")
-    ss._registry = MagicMock()
-    ss._registry.get_signing_key.return_value = None
-    ss._registry.get.return_value.isolated = True
-    env = ss._build_repl_env()
-    assert "PINKY_AGENT_KEY" not in env
-    assert "PINKY_SESSION_SECRET" not in env
+async def test_build_repl_env_isolated_without_key_withholds_secret(tmp_path, monkeypatch) -> None:
+    """Missing scoped identity must not fall back to an inherited global key."""
+    from tests.tmux_isolated_env_support import Registry, launch_probe
+
+    async with launch_probe(tmp_path, monkeypatch, mode="enforce") as probe:
+        names = await probe.launch(registry=Registry(key=""))
+        assert "PINKY_AGENT_KEY" not in names
+        assert "PINKY_SESSION_SECRET" not in names
 
 
-def test_build_repl_env_withholds_secret_when_isolation_unknown_but_key_present(
-    monkeypatch,
+async def test_build_repl_env_withholds_secret_when_isolation_unknown_but_key_present(
+    tmp_path, monkeypatch,
 ) -> None:
-    """Fail-open guard (Murzik #639 review): if a per-agent key resolves but the
-    isolation lookup RAISES (status unknown), the global secret must still be
-    withheld — registry uncertainty must not expose the forgeable fleet secret
-    (same fail-open class as #635). The key already gives a working identity."""
-    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret-xyz")
-    ss, _ = _make_session(agent_name="dymok")
-    ss._registry = MagicMock()
-    ss._registry.get_signing_key.return_value = "dymok-per-agent-key"
-    ss._registry.get.side_effect = RuntimeError("db locked")
-    env = ss._build_repl_env()
-    assert env.get("PINKY_AGENT_KEY") == "dymok-per-agent-key"
-    assert "PINKY_SESSION_SECRET" not in env
+    """Unknown isolation plus a key protects the actual child environment."""
+    from tests.tmux_isolated_env_support import Registry, launch_probe
+
+    async with launch_probe(tmp_path, monkeypatch, mode="enforce") as probe:
+        names = await probe.launch(registry=Registry("unknown"))
+        assert "PINKY_AGENT_KEY" in names
+        assert "PINKY_SESSION_SECRET" not in names
 
 
 def test_build_repl_env_omits_agent_key_when_registry_absent() -> None:
@@ -3313,7 +3528,7 @@ async def test_first_bind_recovery_fresh_with_prior_history_rebinds_and_seeks_to
 
     # Stub discovery to return the new fresh path. Avoids needing a
     # full encoded-cwd project dir in the test fixture.
-    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: new_real)
+    monkeypatch.setattr(ss, "_discover_post_launch_transcript_path", lambda: new_real)
 
     # Drive the recovery directly — bypasses the ``asyncio.sleep`` in
     # ``_delayed_first_bind_recovery`` so the test stays fast and
@@ -3357,7 +3572,7 @@ async def test_late_hook_establishes_lineage_after_internal_recovery(
     ss._last_launch_used_continue = False
     monkeypatch.setattr(
         ss,
-        "_discover_transcript_path",
+        "_discover_post_launch_transcript_path",
         lambda: recovered_guess,
     )
 
@@ -3392,7 +3607,7 @@ async def test_late_hook_lineage_rejects_foreign_followup(
     ss._last_launch_used_continue = False
     monkeypatch.setattr(
         ss,
-        "_discover_transcript_path",
+        "_discover_post_launch_transcript_path",
         lambda: recovered_guess,
     )
 
@@ -3467,7 +3682,7 @@ async def test_first_bind_recovery_continue_launch_noops_and_preserves_eof(
         "type": "system", "subtype": "stop_hook_summary",
         "timestamp": "2026-05-20T16:00:00.000Z",
     }) + "\n")
-    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: other)
+    monkeypatch.setattr(ss, "_discover_post_launch_transcript_path", lambda: other)
 
     ss._attempt_first_bind_recovery()
 
@@ -3521,7 +3736,7 @@ async def test_first_bind_recovery_noops_when_flag_already_consumed(
     # it because the flag is already consumed.
     other = tmp_path / "newer.jsonl"
     other.write_text("")
-    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: other)
+    monkeypatch.setattr(ss, "_discover_post_launch_transcript_path", lambda: other)
 
     ss._attempt_first_bind_recovery()
 
@@ -3533,18 +3748,11 @@ async def test_first_bind_recovery_noops_when_flag_already_consumed(
 
 
 @pytest.mark.asyncio
-async def test_first_bind_recovery_noops_when_discovery_returns_same_path(
-    tmp_path, monkeypatch,
+async def test_first_bind_recovery_acknowledges_same_post_launch_path(
+    tmp_path,
+    monkeypatch,
 ) -> None:
-    """Issue #565 — recovery must no-op (no log spam, no seek reset)
-    when discovery returns the path the tailer is already bound to.
-
-    This is the common case when the SessionStart hook arrives at the
-    same time discovery would have found the right path (CC just
-    happens to have its newest JSONL be the one the tailer already
-    points at). The attempt should detect the same-path case and
-    return without going through ``set_transcript_path``.
-    """
+    """An eligible path already found by self-heal completes recovery without seeking."""
     ss, _ = _make_session_with_response_cb()
     await ss.connect()
 
@@ -3555,16 +3763,13 @@ async def test_first_bind_recovery_noops_when_discovery_returns_same_path(
     ss._tailer_first_bind_pending = True
     ss._last_launch_used_continue = False
 
-    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: current)
+    monkeypatch.setattr(ss, "_discover_post_launch_transcript_path", lambda: current)
 
     ss._attempt_first_bind_recovery()
 
     assert ss._tailer.transcript_path == current
     assert ss._tailer.offset == 1234, "same-path recovery must not reset offset"
-    assert ss._tailer_first_bind_pending is True, (
-        "same-path no-op must not consume the first-bind flag — "
-        "the real bind hasn't happened yet"
-    )
+    assert ss._tailer_first_bind_pending is False
 
     await ss.disconnect()
 
@@ -3588,7 +3793,7 @@ async def test_first_bind_recovery_noops_when_discovery_returns_none(
     ss._tailer_first_bind_pending = True
     ss._last_launch_used_continue = False
 
-    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: None)
+    monkeypatch.setattr(ss, "_discover_post_launch_transcript_path", lambda: None)
 
     ss._attempt_first_bind_recovery()
 
@@ -3808,7 +4013,7 @@ async def test_first_bind_recovery_after_retained_instance_respawn_rebinds_and_s
     ]
     second_real.write_text("\n".join(_json.dumps(e) for e in entries) + "\n")
 
-    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: second_real)
+    monkeypatch.setattr(ss, "_discover_post_launch_transcript_path", lambda: second_real)
 
     # Drive the recovery directly (the same trick the other #565
     # tests use to skip the timer).
@@ -4503,6 +4708,7 @@ async def test_scheduler_prompt_receipt_waits_for_live_working_status() -> None:
     """#931: pane status must gate prompts without local inflight metadata."""
     live = {"status": "working", "last_updated": _time.time()}
     ss, tmux = _make_session(state=SessionState.CONNECTED)
+    _bind_placeholder_tailer(ss)
     ss._config.live_status_fn = lambda: live
 
     receipt = await ss.send_scheduler_prompt("scheduled")
@@ -4626,6 +4832,7 @@ async def test_scheduler_wake_queued_tracks_943_requeued_head() -> None:
 async def test_scheduler_cancel_paste_race_reports_pasted() -> None:
     """The REPL lock adjudicates a paste that starts during queued recall."""
     ss, tmux = _make_session(state=SessionState.CONNECTED)
+    _bind_placeholder_tailer(ss)
     ss._config.live_status_fn = lambda: {
         "status": "idle",
         "last_updated": _time.time(),
@@ -4784,6 +4991,7 @@ async def test_second_scheduler_prompt_delivers_after_first_receipt_and_stop(
     """Midturn native-queue steering must not starve the next scheduler turn."""
     live = {"status": "idle", "last_updated": _time.time()}
     ss, tmux = _make_session(state=SessionState.CONNECTED)
+    _bind_placeholder_tailer(ss)
     ss._config.live_status_fn = lambda: live
     ss._worker_task = asyncio.create_task(ss._message_worker())
     second_receipt: asyncio.Future[bool] | None = None
@@ -11562,6 +11770,7 @@ class TestWakeSubmissionVerification:
         )
         tmux = _make_mock_tmux()
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        _bind_placeholder_tailer(ss)
         injector = AsyncMock(return_value=True)
         ss._config.wake_submission_recovery_injector = injector
         ss.force_restart = AsyncMock(return_value=True)
@@ -11620,6 +11829,7 @@ class TestWakeSubmissionVerification:
 
         tmux.capture_pane = AsyncMock(side_effect=final_probe)
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        _bind_placeholder_tailer(ss)
         injector = AsyncMock(return_value=True)
         ss._config.wake_submission_recovery_injector = injector
         ss.force_restart = AsyncMock(return_value=True)
@@ -12107,6 +12317,7 @@ class TestWakeSubmissionVerification:
             )
         )
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        _bind_placeholder_tailer(ss)
         ss._session_ready_event.set()
         receipt = asyncio.get_running_loop().create_future()
         fires: list[str] = []
@@ -12191,6 +12402,7 @@ class TestWakeSubmissionVerification:
         )
         tmux = _make_mock_tmux()
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        _bind_placeholder_tailer(ss)
         ss._session_ready_event.set()
         receipt = asyncio.get_running_loop().create_future()
         fires: list[str] = []
@@ -12287,6 +12499,7 @@ class TestWakeSubmissionVerification:
         )
         tmux = _make_mock_tmux()
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        _bind_placeholder_tailer(ss)
         ss._session_ready_event.set()
         receipt = asyncio.get_running_loop().create_future()
         fires: list[str] = []
@@ -12344,6 +12557,7 @@ class TestWakeSubmissionVerification:
             )
         )
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        _bind_placeholder_tailer(ss)
         ss._session_ready_event.set()
         receipt = asyncio.get_running_loop().create_future()
         fires: list[str] = []
@@ -12408,6 +12622,7 @@ class TestWakeSubmissionVerification:
 
         tmux.paste_text = AsyncMock(side_effect=timeout_after_receipt)
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        _bind_placeholder_tailer(ss)
         ss._session_ready_event.set()
         receipt = asyncio.get_running_loop().create_future()
         fires: list[str] = []
@@ -12493,6 +12708,7 @@ class TestWakeSubmissionVerification:
 
         tmux._run = AsyncMock(side_effect=run_command)
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        _bind_placeholder_tailer(ss)
         ss._session_ready_event.set()
         receipt = asyncio.get_running_loop().create_future()
         fires: list[str] = []

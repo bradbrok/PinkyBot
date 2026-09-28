@@ -58,6 +58,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 
 from pinky_daemon import runtime_model_catalog
+from pinky_daemon import schedule_fire_trace as _schedule_fire_trace
 from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import (
@@ -983,6 +984,7 @@ GATE_TOOL_NAMES: dict[str, list[str]] = {
         "set_wake_schedule",
         "update_wake_schedule",
         "list_my_schedules",
+        "get_schedule",
         "remove_wake_schedule",
         "discard_pending_schedule_wake",
     ],
@@ -1842,6 +1844,7 @@ def create_api(
     max_sessions: int = 50,
     default_working_dir: str = ".",
     db_path: str = "data/conversations.db",
+    access_log_path: str | Path | None = None,
 ) -> FastAPI:
     """Create the FastAPI application."""
     from pinky_daemon.tmux_session import _WakeLaunchHistory
@@ -1875,6 +1878,7 @@ def create_api(
         store_catalog.preflight_integrity(
             store_manifest.values(),
             on_outcome=storage_observability.record_preflight,
+            telemetry_busy_timeout=_schedule_fire_trace.SETUP_TIMEOUT_SECONDS,
         )
     except StoreCatalogError:
         store_catalog.close()
@@ -1960,23 +1964,6 @@ def create_api(
                            "X-Internal-Timestamp", "X-Internal-Signature"],
             max_age=3600,
         )
-
-    # ── Security Headers ──────────────────────────────────
-    @app.middleware("http")
-    async def security_headers_middleware(request: Request, call_next):
-        if request.headers.get("upgrade", "").lower() == "websocket":
-            return await call_next(request)
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-        # HSTS only when behind TLS (reverse proxy sets X-Forwarded-Proto)
-        proto = request.headers.get("x-forwarded-proto", "")
-        if proto == "https" or request.url.scheme == "https":
-            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        return response
 
     session_store = SessionStore(db_path=store_manifest["sessions"].path, catalog=store_catalog)
     session_event_store = SessionEventStore(
@@ -3436,6 +3423,21 @@ def create_api(
             if kg_insights:
                 wake_ctx = f"{wake_ctx}\n\n{kg_insights}" if wake_ctx else kg_insights
 
+        # Owed work is informational here; rendering never consumes a fire.
+        try:
+            owed = []
+            for row in agents.list_pending_schedule_wakes(agent_name, include_parked=True):
+                if row.pasted_at:
+                    owed.append(f"- {row.name} (fired_at={row.fired_at}): pasted before the restart, may not have run; check before redoing")
+                elif not (row.parked_at or row.abandoned_at):
+                    schedule = agents.get_schedule(row.schedule_id)
+                    if schedule is not None and not schedule.one_shot:
+                        owed.append(f"- {row.name} (fired_at={row.fired_at})")
+            if owed:
+                wake_ctx += "\n\nOwed scheduled wakes:\n" + "\n".join(owed)
+        except Exception as exc:
+            _log(f"scheduler: failed to list owed wake context: {type(exc).__name__}")
+
         # Inject open task summary
         try:
             open_tasks = tasks.list(assigned_agent=agent_name)
@@ -4220,7 +4222,10 @@ def create_api(
             mcp_servers=codex_mcp_servers,
             permission_mode=agent.permission_mode or "bypassPermissions",
             max_turns=agent.max_turns,
-            system_prompt=agents.build_system_prompt(agent_name, skill_store=skills),
+            # Claude tmux reads CLAUDE.md. Compile at the final spawn hook so
+            # a missing-file publication failure cannot abort preparation.
+            system_prompt=("" if is_tmux else
+                           agents.build_system_prompt(agent_name, skill_store=skills)),
             resume_handle=resume_id,
             # commit=False here: the connect-time rebuild via
             # ``wake_context_builder`` is the delivered (committed) build
@@ -4281,6 +4286,8 @@ def create_api(
             init_kwargs["auth_success_callback"] = _on_auth_success
         if is_codex or is_tmux:
             init_kwargs["stream_event_callback"] = await _make_streaming_event_callback(agent_name, label)
+        if is_tmux:
+            init_kwargs["prepare_spawn_callback"] = lambda cwd: _publish_missing_claude_prompt(agent_name, cwd)
 
         ss = SessionClass(config, **init_kwargs)
         ss._launch_runtime = runtime
@@ -4801,7 +4808,26 @@ def create_api(
                 agent_name, label=label, resume_id=resume_id
             )
 
-    async def _deliver_streaming(name, prompt, *, label="main", schedule_receipt=None, scheduler=False, **kwargs):
+    def _trace_sdk_submission(session, receipt):
+        if receipt is None:
+            return
+        # send() exposes no backend message id. This session-local sequence
+        # describes observed submissions without inventing backend identity.
+        try:
+            sequence = vars(session).get("_schedule_trace_submit_seq", 0) + 1
+            session._schedule_trace_submit_seq = sequence
+            receipt.trace("paste", transport_kind="sdk", pointer=json.dumps({
+                "resume_handle": getattr(session, "resume_handle", ""),
+                "message_id": None,
+                "submit_seq": sequence,
+            }, default=str))
+        except Exception as exc:
+            try:
+                receipt.trace_failure("paste", exc)
+            except Exception:
+                _log(f"schedule fire trace SDK callback failed ({type(exc).__name__})")
+
+    async def _deliver_streaming(name, prompt, *, label="main", schedule_receipt=None, scheduler=False, busy_deliver_at=None, **kwargs):
         for _ in range(3):
             ss = await _ensure_streaming_session(name, label=label)
             async with _session_scope(name, label):
@@ -4814,10 +4840,16 @@ def create_api(
                 if scheduler:
                     sender = getattr(ss, "send_scheduler_prompt", None)
                     if callable(sender):
+                        if "busy_deliver_at" in inspect.signature(sender).parameters:
+                            kwargs["busy_deliver_at"] = busy_deliver_at
                         if schedule_receipt is not None and "on_accept" in inspect.signature(sender).parameters:
+                            # Preserve the bound method: trace hooks recover its exact fire owner.
                             kwargs["on_accept"] = schedule_receipt.accept
                         return ss, await sender(prompt, **kwargs)
-                return ss, await ss.send(prompt, **kwargs)
+                result = await ss.send(prompt, **kwargs)
+                if scheduler and result and schedule_receipt is not None:
+                    _trace_sdk_submission(ss, schedule_receipt)
+                return ss, result
         raise HTTPException(409, "Session changed repeatedly before delivery")
 
     broker._compatible_delivery = _deliver_streaming
@@ -5320,8 +5352,6 @@ def create_api(
         "/a/",
         # Twilio voice callbacks — authenticated via X-Twilio-Signature, not session
         "/api/voice/twiml/", "/api/voice/status/", "/api/voice/amd/",
-        # ConversationRelay WebSocket — auth via session-ID-in-path (opaque UUID)
-        "/ws/voice/",
         # Google OAuth callback — Google's redirect arrives cross-site WITHOUT our
         # SameSite=strict cookie; the route self-authenticates via a one-time state
         # nonce. Must stay public even though the rest of /calendar is now protected.
@@ -5527,7 +5557,7 @@ def create_api(
             secret,
             agent_name=agent_name,
             method=request.method,
-            path=request.url.path,
+            path=request.scope["path"],
             timestamp=timestamp,
             signature=signature,
             agent_key=agent_key,
@@ -5752,9 +5782,10 @@ def create_api(
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
-        # Skip auth for WebSocket upgrades — WS handlers do their own auth
-        if request.headers.get("upgrade", "").lower() == "websocket":
-            return await call_next(request)
+        # No carve-out for an ``Upgrade`` header: real WebSocket handshakes
+        # never enter HTTP middleware (Starlette dispatches the ``websocket``
+        # scope around it), so an HTTP request carrying that header is just
+        # an HTTP request and is authenticated like any other.
 
         # NOTE on the unconfigured-secret case (PINKY_SESSION_SECRET unset):
         # we do NOT short-circuit to call_next here. Doing so would make
@@ -5776,9 +5807,10 @@ def create_api(
         path = request.url.path
 
         # 1. Public paths (login/setup/landing, /assets, /hooks, Twilio webhook
-        #    callbacks, ConversationRelay WS — these are authenticated by
+        #    callbacks — these are authenticated by
         #    other means or are intentionally open).
         if _is_public_path(path):
+            request.state.auth_gate = "public"
             return await call_next(request)
 
         # 2. HMAC-signed internal request (agent-to-daemon, hook scripts).
@@ -5788,6 +5820,7 @@ def create_api(
             caller = request.headers.get(INTERNAL_AGENT_HEADER, "")
             request.state.internal_caller = caller
             if _internal_isolation_denied(request, caller):
+                request.state.auth_gate = "deny_isolation"
                 error = "isolated agent may only access its own resources"
                 if _isolation_fleet_write(request.method, request.url.path):
                     error = (
@@ -5801,18 +5834,27 @@ def create_api(
                     status_code=403,
                     content=content,
                 )
+            request.state.auth_gate = "internal_hmac"
             return await call_next(request)
 
         # 3. Valid session cookie → through. Pulled up from the per-path
         #    branches below so a logged-in browser session passes the same
         #    way regardless of which protected surface is being hit.
-        if _has_valid_session(request):
+        session_secret = _session_secret()
+        session = (
+            verify_session_cookie(session_secret, request.cookies.get(SESSION_COOKIE_NAME, ""))
+            if session_secret else None
+        )
+        if session:
+            request.state.auth_gate = "session"
+            request.state.auth_user = session.get("user") or "-"
             return await call_next(request)
 
         # 4. Protected HTML pages: unauth → 307 redirect to /login (or
         #    /setup before first password is set). Different shape from
         #    the JSON 401 because this is hit by the browser navigating.
         if path in _protected_html_paths:
+            request.state.auth_gate = "redirect_login"
             next_target = _sanitize_next(str(request.url.path) + (f"?{request.url.query}" if request.url.query else ""))
             destination = "/setup" if _setup_required() else "/login"
             return RedirectResponse(url=f"{destination}?next={urllib.parse.quote(next_target, safe='/%#?=&')}", status_code=307)
@@ -5822,6 +5864,7 @@ def create_api(
         #    auth-status info for frontend UX. This is what the SPA reads
         #    to decide whether to show /login vs /setup.
         if _needs_browser_api_auth(request):
+            request.state.auth_gate = "deny_browser_api"
             return JSONResponse(
                 status_code=401,
                 content={
@@ -5858,6 +5901,7 @@ def create_api(
         #    leak, and 401-ing every unmapped path was a UX regression
         #    in v2 of this PR.
         if path.startswith(_protected_api_prefixes):
+            request.state.auth_gate = "deny_protected_prefix"
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
         # 7. Deny-by-default (#506). Anything still here is unauthenticated, not
@@ -5867,7 +5911,9 @@ def create_api(
         #    without auth. Genuinely-public routes are added to _public_* (e.g.
         #    the /a/ app viewer) so they pass at step 1 and never reach here.
         if _auth_deny_mode == "enforce":
+            request.state.auth_gate = "deny_default"
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+        request.state.auth_gate = "shadow_passthrough"
         if _auth_deny_mode == "shadow":
             _log(f"auth: would-deny (shadow) {request.method} {path}")
         return await call_next(request)
@@ -6049,10 +6095,23 @@ def create_api(
 
     _SLOW_REQUEST_MS = 500  # noqa: N806 — log requests slower than this
 
+    # ── Security Headers ──────────────────────────────────
+    @app.middleware("http")
+    async def security_headers_middleware(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        # HSTS only when behind TLS (reverse proxy sets X-Forwarded-Proto)
+        proto = request.headers.get("x-forwarded-proto", "")
+        if proto == "https" or request.url.scheme == "https":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+
     @app.middleware("http")
     async def timing_middleware(request: Request, call_next):
-        if request.headers.get("upgrade", "").lower() == "websocket":
-            return await call_next(request)
         start = time.time()
         response = await call_next(request)
         elapsed_ms = (time.time() - start) * 1000
@@ -7027,6 +7086,46 @@ npm run build</pre>
     from pinky_daemon.routes.skills import router as _skills_router
     from pinky_daemon.routes.skills import set_dependencies as _skills_set_deps
 
+    async def _send_skill_change_notices(changes: list[tuple[str, str, str]]) -> None:
+        """Tell each live agent session whose skills changed text, one message per agent.
+
+        An agent is told about a skill only when the skill is effectively on
+        for it (direct assignment or shared, minus opt outs and globally
+        disabled skills). A session that is not live gets nothing: it reads
+        the current catalog copy the next time it loads the skill. Each inject
+        is bounded by a timeout so one stalled session cannot hold the
+        notifier.
+        """
+        from pinky_daemon.skill_store import SKILL_NOTICE_INJECT_TIMEOUT, render_change_notice
+
+        for agent in agents.list(enabled_only=True):
+            try:
+                effective = {
+                    row["name"] for row in skills.get_agent_skills(agent.name, enabled_only=True)
+                }
+                mine = [c for c in changes if c[0] in effective]
+                if not mine:
+                    continue
+                text = render_change_notice(mine)
+                result = await asyncio.wait_for(
+                    broker.inject_agent_message("system", agent.name, text),
+                    timeout=SKILL_NOTICE_INJECT_TIMEOUT,
+                )
+                _log(
+                    f"skills: change notice {[c[0][:80] for c in mine[:10]]} -> {agent.name} "
+                    f"delivered={result.delivered}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                _log(
+                    f"skills: change notice -> {agent.name} failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    from pinky_daemon.skill_store import SkillChangeNotifier
+
+    _skill_notifier = SkillChangeNotifier(_send_skill_change_notices, log=_log)
+    app.state.skill_notifier = _skill_notifier
+
     _skills_set_deps(
         skills=skills,
         plugins=plugins,
@@ -7034,6 +7133,7 @@ npm run build</pre>
         manager=manager,
         pinky_root=_pinky_root,
         log=_log,
+        on_text_changed=_skill_notifier.submit,
     )
     app.include_router(_skills_router)
 
@@ -7062,6 +7162,64 @@ npm run build</pre>
             name, self_assignable_only=self_assignable, category=category,
         )
         return {"agent": name, "skills": [s.to_dict() for s in result], "count": len(result)}
+
+    @app.post("/agents/{name}/skills/apply")
+    @_locked_agent
+    async def apply_agent_skills(name: str):
+        """Re-materialize skills and restart the agent's streaming session.
+
+        This writes the updated .mcp.json, then restarts the current
+        streaming session only if the agent has a recent explicit
+        save_my_context() checkpoint from this session.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        work_dir = Path(agent.working_dir or default_working_dir).resolve()
+
+        # 1. Materialize skills
+        materialized = skills.materialize_for_agent(name)
+
+        # 2. Write file templates (don't overwrite existing files)
+        for rel_path, content in materialized.get("file_templates", {}).items():
+            file_path = (work_dir / rel_path).resolve()
+            # Security: prevent path traversal — file must stay within work_dir
+            if not file_path.is_relative_to(work_dir.resolve()):
+                _log(f"api: BLOCKED path traversal in skill template: {rel_path}")
+                continue
+            if not file_path.exists():
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(content)
+                _log(f"api: wrote skill template {rel_path} to {work_dir}")
+
+        # 3. Rewrite .mcp.json with skill servers
+        _write_mcp_json(work_dir, name, agent_registry=agents, skill_store=skills)
+
+        # 4. CLAUDE.md is agent-owned — don't overwrite on skill changes
+        # Dynamic parts (directives, skills, users) are injected at session start via system_prompt
+
+        # 5. Restart streaming session if one exists
+        restarted = False
+        streaming = broker._get_streaming_session(name)
+        if streaming:
+            guard = _get_streaming_restart_guard(name, streaming)
+            if not guard["restart_safe"]:
+                raise HTTPException(409, _guard_message("restart", guard))
+
+            # Close and restart
+            await _disconnect_streaming_sessions(name)
+            await _start_streaming_session(name)
+            restarted = True
+
+        return {
+            "applied": True,
+            "agent": name,
+            "mcp_servers": list(materialized.get("mcp_servers", {}).keys()),
+            "tool_patterns": materialized.get("tool_patterns", []),
+            "directives_count": len(materialized.get("directives", [])),
+            "session_restarted": restarted,
+        }
 
     @app.post("/agents/{name}/skills/{skill_name}")
     async def assign_agent_skill(
@@ -7161,65 +7319,15 @@ npm run build</pre>
             raise HTTPException(404, f"Skill '{skill_name}' not assigned to '{name}'")
         return {"disabled": True, "agent": name, "skill": skill_name}
 
-    @app.post("/agents/{name}/skills/apply")
-    @_locked_agent
-    async def apply_agent_skills(name: str):
-        """Re-materialize skills and restart the agent's streaming session.
-
-        This writes the updated .mcp.json, then restarts the current
-        streaming session only if the agent has a recent explicit
-        save_my_context() checkpoint from this session.
-        """
-        agent = agents.get(name)
-        if not agent:
-            raise HTTPException(404, f"Agent '{name}' not found")
-
-        work_dir = Path(agent.working_dir or default_working_dir).resolve()
-
-        # 1. Materialize skills
-        materialized = skills.materialize_for_agent(name)
-
-        # 2. Write file templates (don't overwrite existing files)
-        for rel_path, content in materialized.get("file_templates", {}).items():
-            file_path = (work_dir / rel_path).resolve()
-            # Security: prevent path traversal — file must stay within work_dir
-            if not file_path.is_relative_to(work_dir.resolve()):
-                _log(f"api: BLOCKED path traversal in skill template: {rel_path}")
-                continue
-            if not file_path.exists():
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-                file_path.write_text(content)
-                _log(f"api: wrote skill template {rel_path} to {work_dir}")
-
-        # 3. Rewrite .mcp.json with skill servers
-        _write_mcp_json(work_dir, name, agent_registry=agents, skill_store=skills)
-
-        # 4. CLAUDE.md is agent-owned — don't overwrite on skill changes
-        # Dynamic parts (directives, skills, users) are injected at session start via system_prompt
-
-        # 5. Restart streaming session if one exists
-        restarted = False
-        streaming = broker._get_streaming_session(name)
-        if streaming:
-            guard = _get_streaming_restart_guard(name, streaming)
-            if not guard["restart_safe"]:
-                raise HTTPException(409, _guard_message("restart", guard))
-
-            # Close and restart
-            await _disconnect_streaming_sessions(name)
-            await _start_streaming_session(name)
-            restarted = True
-
-        return {
-            "applied": True,
-            "agent": name,
-            "mcp_servers": list(materialized.get("mcp_servers", {}).keys()),
-            "tool_patterns": materialized.get("tool_patterns", []),
-            "directives_count": len(materialized.get("directives", [])),
-            "session_restarted": restarted,
-        }
-
     # ── System Settings ────────────────────────────────────
+
+    @app.get("/system/health")
+    async def system_health():
+        """Authenticated access-log availability and counted receipt gaps."""
+        return {
+            "access_log": app.state.access_log.status(),
+            "sqlite_locks": getattr(app.state, "sqlite_lock_health", {"healthy": None}),
+        }
 
     @app.get("/system/timezone")
     async def get_default_timezone():
@@ -7375,7 +7483,7 @@ npm run build</pre>
                 {"code": "agent_path_outside_workspace"},
             ) from exc
 
-    def _write_agent_text(agent, path: Path, content: str) -> Path:
+    def _write_agent_text(agent, path: Path, content: str, *, create_only: bool = False) -> Path:
         """Atomically replace an agent-owned text file without following links."""
         try:
             return replace_agent_text(
@@ -7383,12 +7491,56 @@ npm run build</pre>
                 agent.working_dir,
                 path,
                 content,
+                **({"create_only": True} if create_only else {}),
             )
+        except FileExistsError as exc:
+            if create_only:
+                raise
+            raise HTTPException(400, {"code": "agent_path_outside_workspace"}) from exc
         except (AgentPathContainmentError, OSError, RuntimeError, ValueError) as exc:
             raise HTTPException(
                 400,
                 {"code": "agent_path_outside_workspace"},
             ) from exc
+
+    def _publish_missing_claude_prompt(agent_name: str, launch_cwd: str) -> None:
+        logger = logging.getLogger(__name__)
+        try:
+            agent = agents.get(agent_name)
+            if agent is None:
+                raise ValueError("agent no longer registered")
+            owner_root = _agent_path_or_400(agent)
+            launch_root = Path(launch_cwd).resolve()
+            if launch_root != owner_root:
+                logger.warning(
+                    "skipped missing CLAUDE.md for %s: launch workspace %s differs from registered owner root %s",
+                    agent_name, launch_root, owner_root,
+                )
+                return
+            path = owner_root / "CLAUDE.md"
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                return
+            if agent.isolation_mode == "unix_user":
+                logger.warning(
+                    "skipped missing CLAUDE.md for %s: unix_user ownership is unsupported",
+                    agent_name,
+                )
+                return
+            prompt = agents.build_system_prompt(
+                agent_name, skill_store=skills, user_profile_store=user_profiles,
+            )
+            try:
+                _write_agent_text(agent, path, prompt, create_only=True)
+            except FileExistsError:
+                return  # Another publisher won; never modify its file or version it.
+            agents.save_soul_version(agent_name, prompt, source="spawn")
+            logger.info("published missing CLAUDE.md for %s (%d chars)", agent_name, len(prompt))
+        except Exception as exc:
+            logger.warning("could not publish missing CLAUDE.md for %s: %s", agent_name, exc)
 
     registration_managed_dirs = ("data", "output", "workspace", ".claude")
     registration_managed_files = (
@@ -8283,7 +8435,7 @@ npm run build</pre>
         # every tool call, so this is the freshest signal for what the
         # REPL is really running at (surfaced via GET /agents/{name}/effort
         # and the session meta endpoint).
-        if req.effort and hasattr(session, "last_reported_effort"):
+        if not req.agent_id and req.effort and hasattr(session, "last_reported_effort"):
             session.last_reported_effort = req.effort
 
         record = getattr(session, "record_tool_use_start", None)
@@ -8292,6 +8444,8 @@ npm run build</pre>
                 await record(
                     tool_use_id=req.tool_use_id,
                     tool_name=req.tool_name,
+                    agent_id=req.agent_id,
+                    agent_type=req.agent_type,
                     tool_input=req.tool_input or {},
                 )
             except Exception as e:
@@ -8322,6 +8476,8 @@ npm run build</pre>
                 await record(
                     tool_use_id=req.tool_use_id,
                     tool_name=req.tool_name,
+                    agent_id=req.agent_id,
+                    agent_type=req.agent_type,
                     is_error=req.is_error,
                     tool_response=req.tool_response,
                 )
@@ -8505,6 +8661,49 @@ npm run build</pre>
             "last_seen": p["last_seen"],
             "capabilities": [d.directive for d in directives],
             "groups": agent.groups,
+        }
+
+    @app.get("/agents/{name}/message-context/{platform}/{chat_id}/{message_id}")
+    async def get_agent_message_context(
+        name: str, platform: str, chat_id: str, message_id: str, request: Request
+    ):
+        """Confirm one inbound message the daemon routed to this agent.
+
+        Signed, self-scoped read: only the agent named in the path, proving its
+        own identity through the internal signature, can look up its contexts.
+        Answers with the message timestamp, when the context was stored and
+        whether the chat is a group, or 404 for anything else: an unknown
+        identity, a record not stamped ``direction == "inbound"`` by the
+        broker's routing path (outbound, legacy or unstamped rows alike), a
+        row past the retention window or beyond the per-agent cap. The body
+        never says which of those applied.
+        """
+        name = _agent_name_or_400(name)
+        if getattr(request.state, "internal_caller", None) != name:
+            raise HTTPException(403, "verified caller must match the target agent")
+        not_found = {
+            "code": "message_context_not_found",
+            "detail": (
+                "no inbound message context for that identity within the "
+                f"retention window ({message_context_store.retention_days} days, "
+                f"{message_context_store.max_per_agent} most recent per agent)"
+            ),
+        }
+        # Identity segments are plain platform ids; a decoded '?' or '#' in one
+        # is never legitimate and is refused before any lookup, with the same
+        # body as a miss so the caller sees one shape.
+        if any(ch in segment for segment in (platform, chat_id, message_id) for ch in "?#"):
+            raise HTTPException(404, not_found)
+        found = broker.get_message_context_by_identity(name, platform, chat_id, message_id)
+        if found is None:
+            raise HTTPException(404, not_found)
+        context, stored_at = found
+        if (context.metadata or {}).get("direction") != "inbound":
+            raise HTTPException(404, not_found)
+        return {
+            "message_ts": float(context.timestamp),
+            "stored_at": float(stored_at),
+            "is_group": bool(context.is_group),
         }
 
     # Action policy routes compose with the existing signed caller and owner gates.
@@ -10715,6 +10914,13 @@ npm run build</pre>
         if not agent_name or not chat_id or not file_path:
             raise HTTPException(400, "agent_name, chat_id, and file_path are required")
 
+        from pinky_identity.live_sqlite import LiveSQLiteFileError, refuse_sqlite_attachment
+
+        try:
+            refuse_sqlite_attachment(file_path)
+        except LiveSQLiteFileError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
         loop = asyncio.get_running_loop()
         try:
             msg = await loop.run_in_executor(
@@ -12575,6 +12781,7 @@ npm run build</pre>
         prompt: str,
         *,
         schedule_receipt=None,
+        busy_deliver_at=None,
     ):
         """Queue a wake and return its exact per-prompt delivery receipt."""
         del session_id  # Streaming is now the canonical main runtime.
@@ -12587,6 +12794,7 @@ npm run build</pre>
             try:
                 ss, receipt = await _deliver_streaming(
                     agent_name, prompt, scheduler=True, schedule_receipt=schedule_receipt,
+                    busy_deliver_at=busy_deliver_at,
                 )
             except HTTPException:
                 return False
@@ -12599,10 +12807,13 @@ npm run build</pre>
         scheduler_send = getattr(ss, "send_scheduler_prompt", None)
         if callable(scheduler_send):
             scheduler_kwargs = {}
+            if "busy_deliver_at" in inspect.signature(scheduler_send).parameters:
+                scheduler_kwargs["busy_deliver_at"] = busy_deliver_at
             if schedule_receipt is not None:
                 try:
                     signature = inspect.signature(scheduler_send)
                     if "on_accept" in signature.parameters:
+                        # Preserve the bound method: trace hooks recover its exact fire owner.
                         scheduler_kwargs["on_accept"] = (
                             schedule_receipt.accept
                         )
@@ -12616,6 +12827,8 @@ npm run build</pre>
             return receipt
 
         handed_off = await ss.send(prompt)
+        if handed_off and schedule_receipt is not None:
+            _trace_sdk_submission(ss, schedule_receipt)
         confirmed = bool(
             handed_off
             and getattr(ss, "injection_confirms_consumption", False)
@@ -12809,6 +13022,12 @@ npm run build</pre>
             return _scheduler_delivery_busy(agent_name)
         return probe() is True
 
+    def _scheduler_paste_session(agent_name: str) -> str:
+        ss = broker._streaming.get(agent_name, {}).get("main")
+        if ss is None or ss.state != TransportSessionState.CONNECTED:
+            return ""
+        return getattr(ss, "_scheduler_paste_session_id", "")
+
     def _scheduler_wake_inflight(agent_name: str, prompt: str) -> bool:
         """Per-turn execution state: is this wake pasted with an open receipt?
 
@@ -12904,7 +13123,18 @@ npm run build</pre>
                 if agents.get_raw_token_for_account(candidate, platform, account_id)
             ), "")
 
-            if not preferred_bound:
+            if not preferred_bound and sender_name:
+                # Another local sender holds a token for this account, so
+                # the route is still deliverable: one fallback line, not a
+                # failure, because a fallback that delivers is not a failure.
+                _log(
+                    "api: OWNER_NOTIFY_ROUTE_FALLBACK for scheduler alert "
+                    f"agent '{agent_name}' route "
+                    f"{platform}/{account_id}/{conversation_id}: preferred "
+                    "sender has no token for the destination account; using "
+                    f"local sender '{sender_name}'"
+                )
+            elif not preferred_bound:
                 error = (
                     f"no {platform} token bound to destination account "
                     f"{account_id} for preferred sender {agent_name}"
@@ -12915,10 +13145,8 @@ npm run build</pre>
                     f"agent '{agent_name}' via sender '{agent_name}' route "
                     f"{platform}/{account_id}/{conversation_id}: {error}"
                 )
-
-            if not sender_name:
                 continue
-            if index > 0 or sender_name != agent_name:
+            elif index > 0:
                 _log(
                     "api: OWNER_NOTIFY_ROUTE_FALLBACK for scheduler alert "
                     f"agent '{agent_name}': using canonical route "
@@ -12999,6 +13227,7 @@ npm run build</pre>
         delivery_busy_fn=_scheduler_delivery_busy,
         delivery_drain_busy_fn=_scheduler_drain_busy,
         delivery_inflight_fn=_scheduler_wake_inflight,
+        delivery_session_fn=_scheduler_paste_session,
         delivery_queued_fn=_scheduler_wake_queued,
         delivery_cancel_queued_fn=_cancel_scheduler_wake,
         owner_notify_callback=_notify_owner_alert,
@@ -13235,7 +13464,9 @@ npm run build</pre>
             raise RuntimeError(
                 f"active tmux transport {agent_name}/{label} lacks freeze plumbing"
             )
-        safe_agent = re.sub(r"[^A-Za-z0-9_.-]", "-", agent_name)
+        # Keep only characters the exact tmux targets accept; a valid agent
+        # name passes unchanged.
+        safe_agent = re.sub(r"[^a-z0-9_-]", "-", agent_name)
         hold_session_name = f"login-hold-{safe_agent}"
         rename_result = await rename_session(hold_session_name)
         if not rename_result.ok:
@@ -13442,10 +13673,10 @@ npm run build</pre>
 
         # Lock down SQLite file permissions to owner-only. Runs here (not in
         # create_api) so every store's __init__ has already created its DB
-        # file; the sweep is idempotent and best-effort.
+        # file. A child performs raw opens/closes to preserve our SQLite locks.
         try:
-            from pinky_daemon.db_security import sweep_db_permissions
-            sweep_db_permissions(Path(db_path).resolve().parent)
+            from pinky_daemon.db_security import sweep_db_permissions_in_child
+            await asyncio.to_thread(sweep_db_permissions_in_child, Path(db_path).resolve().parent)
         except Exception as exc:  # never let hardening abort startup
             _log(f"startup: db permission sweep skipped ({exc})")
 
@@ -13501,6 +13732,16 @@ npm run build</pre>
                     # mid-flight (asyncio.create_task only holds a weak ref).
                     app.state.log_rotation_task = asyncio.create_task(
                         run_rotation_loop(_api_log)
+                    )
+                if app.state.access_log.enabled:
+                    app.state.access_log_rotation_task = asyncio.create_task(
+                        run_rotation_loop(
+                            app.state.access_log.path,
+                            backup_days=access_log_retention_days,
+                            max_bytes=200 * 1024 * 1024,
+                            mode="rename",
+                            on_rotate=app.state.access_log.reopen,
+                        )
                     )
             except Exception as exc:  # never let log rotation abort startup
                 _log(f"startup: log rotation not started ({exc})")
@@ -13877,12 +14118,45 @@ npm run build</pre>
             f"{len(_broker_pollers)} broker poller(s), {streaming_count} streaming"
         )
 
+        from pinky_daemon.sqlite_lock_check import check_sqlite_locks, recheck_sqlite_locks
+
+        wal_stores = [
+            store for catalog in (store_catalog, *tenant_store_catalogs.values())
+            for store in catalog.live_wal_stores()
+        ]
+        app.state.sqlite_lock_health = await asyncio.to_thread(check_sqlite_locks, wal_stores)
+
+        def current_wal_stores():
+            return [
+                store for catalog in (store_catalog, *tenant_store_catalogs.values())
+                for store in catalog.live_wal_stores()
+            ]
+
+        if (app.state.sqlite_lock_health["healthy"] is None
+                and app.state.sqlite_lock_health.get("reason") != "device_mismatch"):
+            app.state.sqlite_lock_recheck_task = asyncio.create_task(recheck_sqlite_locks(
+                current_wal_stores,
+                lambda status: setattr(app.state, "sqlite_lock_health", status),
+                app.state.sqlite_lock_health,
+            ))
+
     @app.on_event("shutdown")
     async def on_shutdown():
         """Stop scheduler, autonomy, broker pollers, and streaming sessions on shutdown."""
         import json as _json
         from datetime import datetime, timezone
 
+        lock_recheck = getattr(app.state, "sqlite_lock_recheck_task", None)
+        if lock_recheck is not None:
+            lock_recheck.cancel()
+            await asyncio.gather(lock_recheck, return_exceptions=True)
+
+        rotation_task = getattr(app.state, "access_log_rotation_task", None)
+        if rotation_task is not None:
+            rotation_task.cancel()
+            await asyncio.gather(rotation_task, return_exceptions=True)
+        await app.state.skill_notifier.aclose()
+        app.state.access_log.close()
         await broker.stop_approval_notification_retries()
 
         # Write restart manifest before disconnecting — captures each agent's in-progress state
@@ -13973,6 +14247,9 @@ npm run build</pre>
         if shared_mcp_manager and shared_mcp_manager.is_running:
             await shared_mcp_manager.stop()
             _log("shutdown: shared MCP server stopped")
+        # The trace owns a retry timer and worker separate from catalog stores.
+        # Stop it before catalog shutdown closes its pinned descriptors.
+        agents._fire_trace.close()
         for tenant_catalog in tenant_store_catalogs.values():
             tenant_catalog.close()
         try:
@@ -14016,6 +14293,7 @@ npm run build</pre>
                 transport_status[et] = {"status": "unknown", "error": str(e)}
         out["transport_alert_status"] = transport_status
         out["storage"] = storage_observability.snapshot()
+        out["fire_trace"] = agents._fire_trace.status()
         return out
 
     # ── Admin: Shared MCP Status ─────────────────────────
@@ -14687,14 +14965,38 @@ npm run build</pre>
 
     # ── Scheduler Control ──────────────────────────────────
 
+    @app.get("/scheduler/fire-trace")
+    async def scheduler_fire_trace(
+        since: float | None = Query(None, allow_inf_nan=False), agent: str | None = None,
+        schedule_id: int | None = Query(None, ge=-(2**63), le=2**63 - 1),
+        outcome: str | None = None, limit: int = Query(200, ge=1, le=1000),
+        offset: int = Query(0, ge=0, le=2**63 - 1),
+    ):
+        """Read observed fire evidence through the existing admin/signed auth boundary."""
+        return await asyncio.to_thread(agents._fire_trace.report,
+                                       since=time.time() - 86400 if since is None else since,
+                                       agent=agent, schedule_id=schedule_id, outcome=outcome,
+                                       limit=limit, offset=offset)
+
     @app.get("/scheduler/status")
     async def scheduler_status():
-        """Get scheduler status."""
+        """Get scheduler status; trace failure integers are upper bounds.
+
+        Per-edge bounds describe rolling-window uncertainty, with display labels
+        such as '≤2 (approx.)' for a partially covered overflow bucket.
+        """
         all_schedules = agents.get_all_schedules(enabled_only=False)
         auto_start = agents.list_auto_start_agents()
         pending_health = agents.get_pending_schedule_wake_health()
+        failure_bounds = await asyncio.to_thread(
+            agents._fire_trace.failure_bounds, since=time.time() - 86400
+        )
         return {
             "running": scheduler.running,
+            "fire_trace_status": agents._fire_trace.status(),
+            "fire_trace_24h": (await asyncio.to_thread(agents._fire_trace.report, since=time.time() - 86400))["counts"],
+            "trace_write_failures_24h": {edge: value["upper"] for edge, value in failure_bounds.items()},
+            "trace_write_failure_bounds_24h": failure_bounds,
             "total_schedules": len(all_schedules),
             "enabled_schedules": sum(1 for s in all_schedules if s.enabled),
             "auto_start_agents": [a.name for a in auto_start],
@@ -15306,6 +15608,27 @@ npm run build</pre>
     except ImportError:
         pass
 
+    from pinky_daemon.access_log import AccessLogWriter, request_record
+
+    @app.middleware("http")
+    async def access_log_middleware(request: Request, call_next):
+        rid = uuid.uuid4().hex
+        request.state.request_id = rid
+        started = time.monotonic()
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            app.state.access_log.write(request_record(
+                request, rid=rid, status=500, duration=time.monotonic() - started,
+                error=type(exc).__name__,
+            ))
+            raise
+        response.headers["X-Request-ID"] = rid
+        app.state.access_log.write(request_record(
+            request, rid=rid, status=response.status_code, duration=time.monotonic() - started,
+        ))
+        return response
+
     # Installed last so this pure-ASGI layer wraps every BaseHTTPMiddleware
     # registered above.  Its final-body ``send`` return is the deterministic
     # response-delivery barrier used by context_restart.
@@ -15323,4 +15646,15 @@ npm run build</pre>
     storage_observability.record_boot_success(store_catalog.snapshot(), warnings)
     storage_observability.arm_runtime()
 
+    try:
+        access_log_retention_days = int(os.environ.get("PINKY_ACCESS_LOG_RETENTION_DAYS", "90"))
+        if access_log_retention_days < 1:
+            raise ValueError
+    except ValueError:
+        _log("ACCESS LOG: invalid retention days; using 90")
+        access_log_retention_days = 90
+    app.state.access_log = AccessLogWriter(
+        access_log_path if access_log_path is not None else os.environ.get("PINKY_ACCESS_LOG", "logs/access.log"),
+        log=_log,
+    )
     return app

@@ -166,7 +166,7 @@ PinkyBot/
 │   └── pinky_cli/          # CLI: init, serve, run
 ├── frontend-svelte/        # Svelte 5 SPA source
 ├── frontend-dist/          # Generated, gitignored frontend build (served by daemon)
-├── docs/                   # Architecture docs and specs
+├── docs/                   # Architecture docs and specs (HTTP access logging: docs/access-log.md)
 ├── tests/                  # pytest suite
 └── data/                   # Runtime data (SQLite, agent files) — gitignored
 ```
@@ -199,3 +199,5 @@ The durable dream-receipts migration is one-way. Rolling back below PinkyBot
 26.08.020 after this migration is unsupported: pre-gate builds may start with
 stale watermark semantics beside v1 receipt rows. Builds at or above 26.08.020
 fail closed if they encounter a future dream schema version.
+
+HTTP request receipts, authentication gates, and retention: [Access log](docs/access-log.md).

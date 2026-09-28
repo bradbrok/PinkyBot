@@ -19,6 +19,11 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl
 
 from pinky_daemon.store_shutdown import StoreShutdownCoordinator, StoreShutdownReport
+from pinky_identity.live_sqlite import (
+    LiveSQLiteConnection,
+    refuse_live_sqlite_file,
+    track_sqlite_connection,
+)
 
 if TYPE_CHECKING:
     from pinky_daemon.storage_observability import RuntimeOperation, StorageObservability
@@ -142,6 +147,7 @@ class BoundSQLiteFile:
 
     @classmethod
     def open(cls, path: str | os.PathLike[str]) -> "BoundSQLiteFile":
+        refuse_live_sqlite_file(path)
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(os.path.abspath(os.fspath(path)), flags)
         return cls(path, descriptor)
@@ -301,6 +307,8 @@ class StoreConnectionPolicy:
 
 def default_store_connection_policy(logical_name: str) -> StoreConnectionPolicy:
     """Return the behavior-preserving policy for a logical daemon store."""
+    if logical_name in {"schedule_fire_trace", "schedule_fire_trace_read"}:
+        return StoreConnectionPolicy(busy_timeout_ms=0 if logical_name == "schedule_fire_trace" else 1000)
     busy_timeout_ms = 30_000 if logical_name in _THIRTY_SECOND_BUSY_STORES else 5_000
     return StoreConnectionPolicy(busy_timeout_ms=busy_timeout_ms)
 
@@ -363,7 +371,7 @@ class StorePathAuthorityError(PermissionError):
         self.uid = uid
 
 
-class _ManagedSQLiteConnection(sqlite3.Connection):
+class _ManagedSQLiteConnection(LiveSQLiteConnection):
     """Catalog connection with optional synchronous runtime recording."""
 
     _store_authority: _StoreConnectionAuthority | None = None
@@ -707,6 +715,7 @@ class _StoreConnectionAuthority:
             connection._store_handle_id = handle_id
             connection._store_logical_name = logical_name
             connection._store_observability = self._catalog._observability
+            track_sqlite_connection(connection, path)
             self._handles[handle_id] = handle
             return connection
 
@@ -849,6 +858,7 @@ class StoreCatalog:
         self._observability = observability
         self._entries: list[_CatalogEntry] = []
         self._observations: list[StoreObservation] = []
+        self._preflight_outcome_callback: Callable[[str, str], None] | None = None
         self._lock = threading.RLock()
         self._connection_authority = _StoreConnectionAuthority(self)
 
@@ -915,6 +925,35 @@ class StoreCatalog:
                     cohort.append(entry.record.criticality)
         return max(cohort, key=lambda criticality: _CRITICALITY_RANK[criticality])
 
+    def verify_deferred_preflight(self, logical_name: str, *, timeout: float) -> bool:
+        """Complete a telemetry integrity check deferred only for SQLite contention."""
+        with self._lock:
+            observation = next(
+                (item for item in self._observations
+                 if logical_name in item.logical_names and item.outcome == "deferred-busy"),
+                None,
+            )
+        if observation is None:
+            return True
+        bound_file = observation._bound_file
+        if bound_file is None:
+            raise StoreCatalogError("deferred telemetry preflight lost its pinned file")
+        connection = bound_file.connect_read_only(timeout=max(0.0, timeout))
+        try:
+            rows = connection.execute("PRAGMA quick_check").fetchall()
+        finally:
+            connection.close()
+        bound_file.require_path_unchanged()
+        if rows != [("ok",)]:
+            raise StoreCatalogError(
+                f"deferred telemetry quick_check failed for {logical_name!r}: {rows!r}"
+            )
+        with self._lock:
+            observation.outcome = "deferred-busy-verified"
+        if self._preflight_outcome_callback is not None:
+            self._preflight_outcome_callback(logical_name, "deferred-busy-verified")
+        return True
+
     def open_connection(
         self,
         logical_name: str,
@@ -932,6 +971,13 @@ class StoreCatalog:
             owner=owner,
             **kwargs,
         )
+
+    def live_wal_stores(self) -> list[tuple[str, str]]:
+        """Return open WAL handles for a child-process lock probe."""
+        authority = self._connection_authority
+        with authority._lock:
+            return sorted({(h.logical_name, h.path) for h in authority._handles.values()
+                           if h.journal_mode == "wal" and not h.connection._store_closed})
 
     def shutdown(self, *, deadline_seconds: float) -> StoreShutdownReport:
         """Finalize every tracked connection, then release preflight descriptors."""
@@ -1300,6 +1346,7 @@ class StoreCatalog:
         targets: Iterable[StoreIntegrityTarget],
         *,
         on_outcome: Callable[[str, str], None] | None = None,
+        telemetry_busy_timeout: float = _SQLITE_DEFAULT_TIMEOUT_SECONDS,
     ) -> dict[str, StoreObservation]:
         """Fail closed when an existing API-owned SQLite file is corrupt.
 
@@ -1307,6 +1354,8 @@ class StoreCatalog:
         Missing and in-memory stores are left for their constructors to create.
         """
         targets_by_path: dict[str, list[StoreIntegrityTarget]] = {}
+        with self._lock:
+            self._preflight_outcome_callback = on_outcome
         outcomes: dict[str, str] = {}
         observations: dict[str, StoreObservation] = {}
         for target in targets:
@@ -1318,8 +1367,36 @@ class StoreCatalog:
 
         for absolute_path, matching_targets in targets_by_path.items():
             logical_names = tuple(target.logical_name for target in matching_targets)
+            telemetry_only = False
+            preflight_timeout = _SQLITE_DEFAULT_TIMEOUT_SECONDS
             try:
                 bound_file = BoundSQLiteFile.open(absolute_path)
+                physical_id = bound_file.dev_ino
+                cohort_targets = []
+                for candidate in self._manifest.values():
+                    same_path = os.path.realpath(os.fspath(candidate.path)) == os.path.realpath(
+                        absolute_path
+                    )
+                    try:
+                        candidate_stat = os.stat(candidate.path, follow_symlinks=False)
+                        same_inode = physical_id == (candidate_stat.st_dev, candidate_stat.st_ino)
+                    except OSError:
+                        same_inode = False
+                    if same_path or same_inode:
+                        cohort_targets.append(candidate)
+                cohort_targets.extend(matching_targets)
+                telemetry_only = (
+                    any(
+                        target.logical_name
+                        in {"schedule_fire_trace", "schedule_fire_trace_read"}
+                        for target in cohort_targets
+                    )
+                    and bool(cohort_targets)
+                    and all(target.criticality == "telemetry" for target in cohort_targets)
+                )
+                preflight_timeout = (
+                    telemetry_busy_timeout if telemetry_only else _SQLITE_DEFAULT_TIMEOUT_SECONDS
+                )
             except OSError as exc:
                 if self._is_missing_path_error(exc):
                     observation = StoreObservation.absent(logical_names, absolute_path)
@@ -1370,7 +1447,7 @@ class StoreCatalog:
                         absolute_path,
                     )
                 else:
-                    connection = bound_file.connect_read_only()
+                    connection = bound_file.connect_read_only(timeout=preflight_timeout)
                 try:
                     if any(target.journal_mode is not None for target in matching_targets):
                         journal_row = connection.execute("PRAGMA journal_mode").fetchone()
@@ -1440,6 +1517,26 @@ class StoreCatalog:
                         "skipped-absent",
                         outcomes,
                         on_outcome,
+                    )
+                    continue
+                error_code = getattr(exc, "sqlite_errorcode", None)
+                primary_code = error_code & 0xFF if error_code is not None else None
+                if telemetry_only and primary_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                    bound_file.require_path_unchanged()
+                    observation = StoreObservation(
+                        logical_names=logical_names,
+                        path=absolute_path,
+                        outcome="deferred-busy",
+                        journal_mode=header_journal_mode,
+                        _bound_file=bound_file,
+                    )
+                    retain_bound_file = True
+                    with self._lock:
+                        self._observations.append(observation)
+                    for target in matching_targets:
+                        observations[target.logical_name] = observation
+                    self._record_integrity_outcomes(
+                        matching_targets, "deferred-busy", outcomes, on_outcome
                     )
                     continue
                 self._record_integrity_outcomes(
@@ -1991,12 +2088,45 @@ class DaemonStoreCatalog(StoreCatalog):
                 ]
 
     def preflight_ancestor_chains(self) -> None:
-        """Verify the directory chains boot checks, skipping boot-absent targets."""
+        """Recheck directory authority without closing any live database fd."""
+        def verify_retained(bound_file, absolute_path):
+            try:
+                self._verify_bound_wal_target(bound_file, absolute_path)
+            except OSError:
+                if bound_file.path_state() != "absent":
+                    raise
+
+        with self._lock:
+            observations = {o.path: o for o in self._observations if o._bound_file is not None}
+            records = {entry.record.resolved_path: entry.record for entry in self._entries}
         for target in self.configured_integrity_targets():
             raw_path = os.fspath(target.path)
             if self._is_memory_path(raw_path):
                 continue
             absolute_path = os.path.abspath(raw_path)
+            observation = observations.get(absolute_path)
+            record = records.get(os.path.realpath(absolute_path))
+            bound_file = None if observation is None else observation._bound_file
+            if bound_file is not None:
+                if bound_file.header_journal_mode() == "wal":
+                    verify_retained(bound_file, absolute_path)
+                continue
+            if record is not None:
+                # Stores absent at boot have no retained inspection fd. Their
+                # registered inode and journal mode are already authoritative.
+                if record.journal_mode == "wal":
+                    try:
+                        current = os.stat(absolute_path, follow_symlinks=False)
+                        self._verified_daemon_owned_path(absolute_path)
+                    except OSError as exc:
+                        if self._is_missing_path_error(exc):
+                            continue
+                        raise
+                    if (current.st_dev, current.st_ino) != record.dev_ino:
+                        raise StoreCatalogError("store path changed since registration")
+                continue
+            # An unopened manifest target can still be inspected normally.
+            refuse_live_sqlite_file(absolute_path)
             try:
                 bound_file = BoundSQLiteFile.open(absolute_path)
             except OSError as exc:
@@ -2004,14 +2134,8 @@ class DaemonStoreCatalog(StoreCatalog):
                     continue
                 raise
             try:
-                if bound_file.header_journal_mode() != "wal":
-                    continue
-                try:
-                    self._verify_bound_wal_target(bound_file, absolute_path)
-                except OSError:
-                    if bound_file.path_state() == "absent":
-                        continue
-                    raise
+                if bound_file.header_journal_mode() == "wal":
+                    verify_retained(bound_file, absolute_path)
             finally:
                 bound_file.close()
 

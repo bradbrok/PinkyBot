@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import threading
@@ -14,12 +16,14 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
 
 import pinky_daemon.dream_runner as dream_runner_module
+from pinky_daemon.agent_registry import _validate_agent_name
 from pinky_daemon.api import create_api
 from pinky_daemon.dream_runner import DreamRunner
 
@@ -150,6 +154,9 @@ def test_skill_proposal_uses_signed_headers_against_auth_gate(
     catalog API can be called.
     """
     monkeypatch.setenv("PINKY_SESSION_SECRET", "dream-test-session-secret")
+    # This test covers the legacy install path; the default mode only records
+    # proposals (see TestDreamSkillProposals).
+    monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "install")
     app = create_api(
         max_sessions=10,
         default_working_dir=str(tmp_path),
@@ -1873,3 +1880,574 @@ class TestDreamReflectionLoudness:
 
         assert runner.get_state("pinky")["zero_reflection_streak"] == 3
         assert len(notices) == 2
+
+
+class _ProposalAgentConfig:
+    isolated = False
+
+
+_PROPOSAL_OUTPUT = """<proposed_skills>
+[{
+  "skill_name": "Test Dream Skill",
+  "description": "Use this skill for a repeated test workflow.",
+  "task_summary": "Run the workflow and verify its output.",
+  "source_pattern": "Repeated test workflow"
+}]
+</proposed_skills>"""
+
+_R2_AGENT = "review-agent"
+_R2_CFG = _ProposalAgentConfig()
+
+
+def _r2_output(name: str = "review-skill") -> str:
+    return "<proposed_skills>" + json.dumps([{
+        "skill_name": name,
+        "description": "Use this skill for a repeated review workflow.",
+        "task_summary": "Run the workflow and verify its output.",
+        "source_pattern": "Repeated review workflow",
+    }]) + "</proposed_skills>"
+
+
+def _r2_rows(path: Path) -> list[dict]:
+    """Index rows as a reader would see them; a torn line is skipped."""
+    rows = []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    return rows
+
+
+def _r2_is_index(fd: int, directory: Path) -> bool:
+    try:
+        a, b = os.fstat(fd), (directory / "index.jsonl").stat()
+        return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+    except FileNotFoundError:
+        return False
+
+
+@pytest.fixture
+def r2_fixture(tmp_path, monkeypatch):
+    """Runner in propose mode with the catalog API blocked; returns
+    (runner, agent_dir, root, logs) like the reviewer's repro harness."""
+    monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "propose")
+
+    def _no_api(*_a, **_k):
+        raise AssertionError("the skill catalog API must not be called")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _no_api)
+    logs: list[str] = []
+    monkeypatch.setattr(dream_runner_module, "_log", logs.append)
+    runner = DreamRunner(db_path=str(tmp_path / "data" / "dream.db"))
+    root = runner._skill_proposals_dir()
+    return runner, root / _R2_AGENT, root, logs
+
+
+class TestDreamSkillProposals:
+    """Dreams propose skills into a review folder; they never self-install."""
+
+    @staticmethod
+    def _runner(tmp_path, monkeypatch):
+        def _no_api(*_a, **_k):
+            raise AssertionError("the skill catalog API must not be called")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _no_api)
+        logs: list[str] = []
+        monkeypatch.setattr(dream_runner_module, "_log", logs.append)
+        return DreamRunner(db_path=str(tmp_path / "data" / "dream.db")), logs
+
+    def test_default_mode_records_proposal_without_touching_catalog(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("PINKY_DREAM_SKILL_MODE", raising=False)
+        runner, logs = self._runner(tmp_path, monkeypatch)
+
+        created = runner._extract_proposed_skills(
+            _PROPOSAL_OUTPUT, "test-agent", _ProposalAgentConfig()
+        )
+
+        assert created == 1
+        agent_dir = tmp_path / "data" / "dream_skill_proposals" / "test-agent"
+        files = sorted(agent_dir.glob("*_test-dream-skill.md"))
+        assert len(files) == 1
+        text = files[0].read_text(encoding="utf-8")
+        assert text.startswith("---\nname: test-dream-skill\n")
+        assert "Auto-generated during dream cycle" in text
+        rows = _r2_rows(agent_dir / "index.jsonl")
+        assert [r["status"] for r in rows] == ["proposed"]
+        assert rows[0]["name"] == "test-dream-skill"
+        assert rows[0]["agent"] == "test-agent"
+        assert rows[0]["source_pattern"] == "Repeated test workflow"
+        assert rows[0]["expires_at"] - rows[0]["ts"] == 14 * 86400
+        assert not (tmp_path / "skills").exists()
+        assert any("proposed skill 'test-dream-skill'" in line for line in logs)
+
+    def test_pending_proposal_is_not_written_twice(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "propose")
+        runner, logs = self._runner(tmp_path, monkeypatch)
+        cfg = _ProposalAgentConfig()
+
+        assert runner._extract_proposed_skills(_PROPOSAL_OUTPUT, "test-agent", cfg) == 1
+        assert runner._extract_proposed_skills(_PROPOSAL_OUTPUT, "test-agent", cfg) == 0
+
+        agent_dir = tmp_path / "data" / "dream_skill_proposals" / "test-agent"
+        assert len(list(agent_dir.glob("*.md"))) == 1
+        assert any("already pending (recorded" in line for line in logs)
+
+    def test_expiry_uses_recorded_deadline_not_file_mtime(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "propose")
+        runner, _logs = self._runner(tmp_path, monkeypatch)
+        cfg = _ProposalAgentConfig()
+        assert runner._extract_proposed_skills(_PROPOSAL_OUTPUT, "test-agent", cfg) == 1
+        agent_dir = tmp_path / "data" / "dream_skill_proposals" / "test-agent"
+        proposal = next(agent_dir.glob("*.md"))
+
+        # Touching the file does not extend the deadline: only the recorded
+        # expires_at counts.
+        fresh = time.time()
+        os.utime(proposal, (fresh, fresh))
+        index = agent_dir / "index.jsonl"
+        row = _r2_rows(index)[0]
+        row["expires_at"] = time.time() - 60
+        index.write_text(json.dumps(row, sort_keys=True) + "\n")
+
+        # The next dream re-proposes because the expired one was dropped first.
+        assert runner._extract_proposed_skills(_PROPOSAL_OUTPUT, "test-agent", cfg) == 1
+
+        assert len(list(agent_dir.glob("*.md"))) == 1
+        rows = _r2_rows(index)
+        assert [r["status"] for r in rows] == ["proposed", "expired", "proposed"]
+        assert rows[2]["expires_at"] > time.time() + 13 * 86400
+
+    def test_pending_proposal_survives_file_touch(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "propose")
+        runner, _logs = self._runner(tmp_path, monkeypatch)
+        cfg = _ProposalAgentConfig()
+        assert runner._extract_proposed_skills(_PROPOSAL_OUTPUT, "test-agent", cfg) == 1
+        agent_dir = tmp_path / "data" / "dream_skill_proposals" / "test-agent"
+        proposal = next(agent_dir.glob("*.md"))
+        stale = time.time() - 15 * 86400
+        os.utime(proposal, (stale, stale))
+
+        # An old mtime alone never expires an indexed proposal.
+        assert runner._extract_proposed_skills(_PROPOSAL_OUTPUT, "test-agent", cfg) == 0
+        assert proposal.exists()
+
+    def test_orphan_file_without_index_row_expires_by_mtime(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "propose")
+        runner, _logs = self._runner(tmp_path, monkeypatch)
+        agent_dir = tmp_path / "data" / "dream_skill_proposals" / "test-agent"
+        agent_dir.mkdir(parents=True)
+        orphan = agent_dir / "20200101_old-orphan.md"
+        orphan.write_text("---\nname: old-orphan\ndescription: x\n---\n")
+        stale = time.time() - 15 * 86400
+        os.utime(orphan, (stale, stale))
+
+        assert runner._prune_skill_proposals(agent_dir) == 1
+        assert not orphan.exists()
+        rows = _r2_rows(agent_dir / "index.jsonl")
+        assert rows == [
+            {**rows[0], "name": "old-orphan", "status": "expired", "agent": "test-agent"}
+        ]
+
+    def test_missing_file_behind_proposed_row_is_failed_and_reproposed(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "propose")
+        runner, _logs = self._runner(tmp_path, monkeypatch)
+        cfg = _ProposalAgentConfig()
+        assert runner._extract_proposed_skills(_PROPOSAL_OUTPUT, "test-agent", cfg) == 1
+        agent_dir = tmp_path / "data" / "dream_skill_proposals" / "test-agent"
+        next(agent_dir.glob("*.md")).unlink()  # an incomplete transaction
+
+        assert runner._extract_proposed_skills(_PROPOSAL_OUTPUT, "test-agent", cfg) == 1
+
+        rows = _r2_rows(agent_dir / "index.jsonl")
+        assert [r["status"] for r in rows] == ["proposed", "failed", "proposed"]
+        assert "file missing" in rows[1]["error"]
+        assert len(list(agent_dir.glob("*.md"))) == 1
+
+    def test_missing_file_past_deadline_expires_from_its_index_row(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "propose")
+        runner, _logs = self._runner(tmp_path, monkeypatch)
+        cfg = _ProposalAgentConfig()
+        assert runner._extract_proposed_skills(_PROPOSAL_OUTPUT, "test-agent", cfg) == 1
+        agent_dir = tmp_path / "data" / "dream_skill_proposals" / "test-agent"
+        next(agent_dir.glob("*.md")).unlink()
+        index = agent_dir / "index.jsonl"
+        row = _r2_rows(index)[0]
+        row["expires_at"] = time.time() - 1
+        index.write_text(json.dumps(row) + "\n")
+
+        assert runner._extract_proposed_skills(_PROPOSAL_OUTPUT, "test-agent", cfg) == 1
+        assert [r["status"] for r in _r2_rows(index)] == ["proposed", "expired", "proposed"]
+
+    def test_index_write_failure_leaves_no_file_and_retries_next_dream(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "propose")
+        runner, logs = self._runner(tmp_path, monkeypatch)
+        cfg = _ProposalAgentConfig()
+        real_append = runner._append_proposal_index
+        calls = {"n": 0}
+
+        def _flaky(agent_dir, row):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real_append(agent_dir, row)
+
+        monkeypatch.setattr(runner, "_append_proposal_index", _flaky)
+        agent_dir = tmp_path / "data" / "dream_skill_proposals" / "test-agent"
+
+        # First dream: the proposed row never lands, a failed row records it,
+        # and no proposal becomes visible.
+        assert runner._extract_proposed_skills(_PROPOSAL_OUTPUT, "test-agent", cfg) == 0
+        assert list(agent_dir.glob("*.md")) == []
+        assert list(agent_dir.glob(".*.tmp")) == []
+        assert [r["status"] for r in _r2_rows(agent_dir / "index.jsonl")] == ["failed"]
+        assert any("failed to record skill proposal" in line for line in logs)
+
+        # Next dream: nothing pending, so it is proposed with its audit row.
+        assert runner._extract_proposed_skills(_PROPOSAL_OUTPUT, "test-agent", cfg) == 1
+        assert len(list(agent_dir.glob("*.md"))) == 1
+        assert [r["status"] for r in _r2_rows(agent_dir / "index.jsonl")] == [
+            "failed",
+            "proposed",
+        ]
+
+    def test_torn_index_tail_does_not_swallow_next_event(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "propose")
+        runner, _logs = self._runner(tmp_path, monkeypatch)
+        agent_dir = tmp_path / "data" / "dream_skill_proposals" / "test-agent"
+        agent_dir.mkdir(parents=True)
+        # A crash mid-append leaves a partial last line with no newline.
+        (agent_dir / "index.jsonl").write_text('{"name": "half", "status": "propo')
+
+        assert (
+            runner._extract_proposed_skills(
+                _PROPOSAL_OUTPUT, "test-agent", _ProposalAgentConfig()
+            )
+            == 1
+        )
+        lines = (agent_dir / "index.jsonl").read_text().splitlines()
+        assert len(lines) == 2
+        assert json.loads(lines[1])["status"] == "proposed"
+        assert runner._read_proposal_index(agent_dir) == [json.loads(lines[1])]
+
+    def test_invalid_agent_name_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "propose")
+        runner, logs = self._runner(tmp_path, monkeypatch)
+
+        for bad in ("../../Escape Agent", "Review-Agent", "", "a" * 64, "-lead"):
+            assert (
+                runner._extract_proposed_skills(_PROPOSAL_OUTPUT, bad, _ProposalAgentConfig())
+                == 0
+            )
+        assert not (tmp_path / "data" / "dream_skill_proposals").exists()
+        assert not list(tmp_path.rglob("*.md"))
+        # Refused by both the housekeeping pass and the write path.
+        assert sum("invalid agent name" in line for line in logs) >= 5
+
+    def test_symlinked_agent_dir_or_index_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "propose")
+        runner, logs = self._runner(tmp_path, monkeypatch)
+        cfg = _ProposalAgentConfig()
+        root = tmp_path / "data" / "dream_skill_proposals"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        root.mkdir(parents=True)
+        (root / "test-agent").symlink_to(outside, target_is_directory=True)
+
+        assert runner._extract_proposed_skills(_PROPOSAL_OUTPUT, "test-agent", cfg) == 0
+        assert list(outside.iterdir()) == []
+        assert any("symlink in review folder" in line for line in logs)
+
+        (root / "test-agent").unlink()
+        (root / "test-agent").mkdir()
+        (root / "test-agent" / "index.jsonl").symlink_to(outside / "stolen.jsonl")
+
+        assert runner._extract_proposed_skills(_PROPOSAL_OUTPUT, "test-agent", cfg) == 0
+        assert not (outside / "stolen.jsonl").exists()
+        assert list((root / "test-agent").glob("*.md")) == []
+
+    def test_expiry_runs_on_a_dream_that_proposes_nothing(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "propose")
+        runner, _logs = self._runner(tmp_path, monkeypatch)
+        cfg = _ProposalAgentConfig()
+        assert runner._extract_proposed_skills(_PROPOSAL_OUTPUT, "test-agent", cfg) == 1
+        agent_dir = tmp_path / "data" / "dream_skill_proposals" / "test-agent"
+        proposal = next(agent_dir.glob("*.md"))
+        index = agent_dir / "index.jsonl"
+        row = _r2_rows(index)[0]
+        row["expires_at"] = time.time() - 1
+        index.write_text(json.dumps(row) + "\n")
+
+        # A quiet dream (no proposed_skills block) still runs the expiry.
+        assert runner._extract_proposed_skills("Quiet night, nothing new.", "test-agent", cfg) == 0
+
+        assert not proposal.exists()
+        assert [r["status"] for r in _r2_rows(index)] == ["proposed", "expired"]
+
+    @pytest.mark.parametrize("mode", ["install", "off"])
+    def test_other_modes_never_touch_the_review_folder(self, tmp_path, monkeypatch, mode):
+        monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "propose")
+        runner, _logs = self._runner(tmp_path, monkeypatch)
+        cfg = _ProposalAgentConfig()
+        assert runner._extract_proposed_skills(_PROPOSAL_OUTPUT, "test-agent", cfg) == 1
+        agent_dir = tmp_path / "data" / "dream_skill_proposals" / "test-agent"
+        proposal = next(agent_dir.glob("*.md"))
+        index = agent_dir / "index.jsonl"
+        row = _r2_rows(index)[0]
+        row["expires_at"] = time.time() - 1
+        index.write_text(json.dumps(row) + "\n")
+        before = index.read_bytes()
+
+        monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", mode)
+        assert runner._extract_proposed_skills("Quiet night, nothing new.", "test-agent", cfg) == 0
+
+        assert proposal.exists()
+        assert index.read_bytes() == before
+
+    def test_model_supplied_skill_names_are_confined_and_bounded(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "propose")
+        runner, _logs = self._runner(tmp_path, monkeypatch)
+        cfg = _ProposalAgentConfig()
+        names = [
+            "../../etc/passwd",
+            "/abs/name",
+            "a/b",
+            "a.b.c",
+            "x" * 200,
+            "!!!",  # sanitizes to empty: skipped
+        ]
+        proposals = [
+            {
+                "skill_name": name,
+                "description": "Use this skill for a repeated test workflow.",
+                "task_summary": "Run the workflow and verify its output.",
+                "source_pattern": "Repeated test workflow",
+            }
+            for name in names
+        ]
+        output = "<proposed_skills>" + json.dumps(proposals) + "</proposed_skills>"
+
+        assert runner._extract_proposed_skills(output, "test-agent", cfg) == 5
+
+        root = tmp_path / "data" / "dream_skill_proposals"
+        agent_dir = root / "test-agent"
+        written = sorted(p for p in tmp_path.rglob("*.md"))
+        assert all(p.parent == agent_dir for p in written)
+        assert len(written) == 5
+        pattern = re.compile(r"^\d{8}_[a-z0-9-]{1,30}\.md$")
+        assert all(pattern.match(p.name) for p in written), [p.name for p in written]
+        rows = _r2_rows(agent_dir / "index.jsonl")
+        assert sorted(r["name"] for r in rows) == sorted(p.name[9:-3] for p in written)
+        assert all(1 <= len(r["name"]) <= 30 and re.fullmatch(r"[a-z0-9-]+", r["name"]) for r in rows)
+        assert "x" * 30 in {r["name"] for r in rows}
+
+    def test_off_mode_discards_proposals(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "off")
+        runner, logs = self._runner(tmp_path, monkeypatch)
+
+        assert (
+            runner._extract_proposed_skills(
+                _PROPOSAL_OUTPUT, "test-agent", _ProposalAgentConfig()
+            )
+            == 0
+        )
+        assert not (tmp_path / "data" / "dream_skill_proposals").exists()
+        assert logs == [
+            "dream-runner: discarded 1 proposed skill(s) for 'test-agent' "
+            "(PINKY_DREAM_SKILL_MODE=off)"
+        ]
+
+    def test_unknown_mode_falls_back_to_propose(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("PINKY_DREAM_SKILL_MODE", "yolo")
+        runner, logs = self._runner(tmp_path, monkeypatch)
+
+        assert (
+            runner._extract_proposed_skills(
+                _PROPOSAL_OUTPUT, "test-agent", _ProposalAgentConfig()
+            )
+            == 1
+        )
+        assert any("unknown PINKY_DREAM_SKILL_MODE='yolo'" in line for line in logs)
+
+
+class TestDreamSkillProposalsReviewRepros:
+    """The reviewer's r2 logic probes, adapted onto the local fixture."""
+
+    @pytest.mark.parametrize("status", ["failed", "expired"])
+    def test_latest_closed_status_reproposes(self, r2_fixture, status):
+        runner, directory, _, _ = r2_fixture
+        assert runner._extract_proposed_skills(_r2_output(), _R2_AGENT, _R2_CFG) == 1
+        runner._append_proposal_index(
+            directory, {"name": "review-skill", "status": status, "ts": time.time()}
+        )
+        assert runner._extract_proposed_skills(_r2_output(), _R2_AGENT, _R2_CFG) == 1
+        assert _r2_rows(directory / "index.jsonl")[-1]["status"] == "proposed"
+        assert len(list(directory.glob("*.md"))) == 1
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            b'broken first\n{"name":"valid"}\n',
+            b'{"name":"valid"}\n{"torn":',
+            b'[]\nnull\n{"name":"valid"}\n',
+        ],
+    )
+    def test_reader_skips_foreign_and_torn_lines(self, r2_fixture, raw):
+        runner, directory, _, _ = r2_fixture
+        directory.mkdir(parents=True)
+        (directory / "index.jsonl").write_bytes(raw)
+        assert runner._read_proposal_index(directory) == [{"name": "valid"}]
+
+    def test_index_fsync_failure_retries_to_visible_proposal(self, r2_fixture):
+        runner, directory, _, _ = r2_fixture
+        real_fsync = os.fsync
+
+        def fail_index_sync(fd):
+            if _r2_is_index(fd, directory):
+                raise OSError(errno.EIO, "synthetic index fsync failure")
+            return real_fsync(fd)
+
+        with patch.object(dream_runner_module.os, "fsync", side_effect=fail_index_sync):
+            assert runner._extract_proposed_skills(_r2_output(), _R2_AGENT, _R2_CFG) == 0
+        assert list(directory.glob("*.md")) == []
+        assert list(directory.glob(".*.tmp")) == []
+        assert runner._extract_proposed_skills(_r2_output(), _R2_AGENT, _R2_CFG) == 1, (
+            "fsync error left a proposed row that permanently dedupes retry"
+        )
+        assert len(list(directory.glob("*.md"))) == 1
+
+    def test_index_short_write_never_publishes_unindexed_md(self, r2_fixture):
+        runner, directory, _, _ = r2_fixture
+        real_write = os.write
+
+        def short_index(fd, data):
+            return real_write(fd, data[:1] if _r2_is_index(fd, directory) else data)
+
+        with patch.object(dream_runner_module.os, "write", side_effect=short_index):
+            result = runner._extract_proposed_skills(_r2_output(), _R2_AGENT, _R2_CFG)
+        visible = list(directory.glob("*.md"))
+        events = [r for r in _r2_rows(directory / "index.jsonl") if r.get("status") == "proposed"]
+        assert not visible or len(events) == 1, (
+            "visible .md has no readable proposed row after short append"
+        )
+        assert result == 0
+
+    def test_short_index_write_just_before_newline_remains_retryable(self, r2_fixture):
+        runner, directory, _, _ = r2_fixture
+        real_write = os.write
+
+        def short_boundary(fd, data):
+            return real_write(fd, data[:-1] if _r2_is_index(fd, directory) else data)
+
+        with patch.object(dream_runner_module.os, "write", side_effect=short_boundary):
+            assert runner._extract_proposed_skills(_r2_output(), _R2_AGENT, _R2_CFG) == 0
+        assert list(directory.glob("*.md")) == []
+        assert runner._extract_proposed_skills(_r2_output(), _R2_AGENT, _R2_CFG) == 1
+        assert len(list(directory.glob("*.md"))) == 1
+
+    def test_temp_short_write_never_publishes_truncated_md(self, r2_fixture):
+        runner, directory, _, _ = r2_fixture
+        real_write = os.write
+
+        def short_temp(fd, data):
+            return real_write(fd, data if _r2_is_index(fd, directory) else data[:1])
+
+        with patch.object(dream_runner_module.os, "write", side_effect=short_temp):
+            result = runner._extract_proposed_skills(_r2_output(), _R2_AGENT, _R2_CFG)
+        visible = list(directory.glob("*.md"))
+        assert not visible, "short temp write was silently published as a complete proposal"
+        assert result == 0
+
+    def test_rename_happens_after_index_fsync(self, r2_fixture):
+        runner, directory, _, _ = r2_fixture
+        order: list[str] = []
+        real_sync, real_replace = os.fsync, os.replace
+
+        def sync(fd):
+            order.append("index-sync" if _r2_is_index(fd, directory) else "temp-sync")
+            return real_sync(fd)
+
+        def replace(src, dst):
+            assert order == ["temp-sync", "index-sync"]
+            assert not Path(dst).exists()
+            assert _r2_rows(directory / "index.jsonl")[-1]["status"] == "proposed"
+            order.append("rename")
+            return real_replace(src, dst)
+
+        with (
+            patch.object(dream_runner_module.os, "fsync", side_effect=sync),
+            patch.object(dream_runner_module.os, "replace", side_effect=replace),
+        ):
+            assert runner._extract_proposed_skills(_r2_output(), _R2_AGENT, _R2_CFG) == 1
+        assert order == ["temp-sync", "index-sync", "rename"]
+
+    def test_rename_failure_marks_failed_then_retries(self, r2_fixture):
+        runner, directory, _, _ = r2_fixture
+        with patch.object(
+            dream_runner_module.os,
+            "replace",
+            side_effect=OSError(errno.EIO, "synthetic rename failure"),
+        ):
+            assert runner._extract_proposed_skills(_r2_output(), _R2_AGENT, _R2_CFG) == 0
+        assert list(directory.glob("*.md")) == []
+        assert [r["status"] for r in _r2_rows(directory / "index.jsonl")] == [
+            "proposed",
+            "failed",
+        ]
+        assert runner._extract_proposed_skills(_r2_output(), _R2_AGENT, _R2_CFG) == 1
+
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [("review-agent", "review_agent"), ("a" * 60 + "1", "a" * 60 + "2")],
+    )
+    def test_registered_agents_keep_distinct_proposal_directories(
+        self, r2_fixture, first, second
+    ):
+        runner, _, _, _ = r2_fixture
+        assert _validate_agent_name(first) == first
+        assert _validate_agent_name(second) == second
+        assert runner._extract_proposed_skills(_r2_output(), first, _R2_CFG) == 1
+        assert runner._extract_proposed_skills(_r2_output(), second, _R2_CFG) == 1, (
+            "safe registered agents collide after component normalization"
+        )
+        root = runner._skill_proposals_dir()
+        for name in (first, second):
+            assert _r2_rows(root / name / "index.jsonl")[0]["agent"] == name
+
+    def test_containment_validation_precedes_directory_creation(self, r2_fixture):
+        runner, directory, _, _ = r2_fixture
+        events: list[str] = []
+        real_mkdir, real_resolve = Path.mkdir, Path.resolve
+
+        def mkdir(path, *a, **kw):
+            if path == directory:
+                events.append("mkdir")
+            return real_mkdir(path, *a, **kw)
+
+        def resolve(path, *a, **kw):
+            if path == directory:
+                events.append("resolve")
+            return real_resolve(path, *a, **kw)
+
+        with patch.object(Path, "mkdir", mkdir), patch.object(Path, "resolve", resolve):
+            assert runner._extract_proposed_skills(_r2_output(), _R2_AGENT, _R2_CFG) == 1
+        assert events.index("resolve") < events.index("mkdir"), events
+
+    def test_symlinked_root_never_creates_outside_agent_directory(self, r2_fixture, tmp_path):
+        runner, _directory, root, _ = r2_fixture
+        outside = tmp_path / "outside-root"
+        outside.mkdir()
+        root.parent.mkdir(parents=True, exist_ok=True)
+        root.symlink_to(outside, target_is_directory=True)
+        runner._extract_proposed_skills(_r2_output(), _R2_AGENT, _R2_CFG)
+        assert list(outside.iterdir()) == [], "root symlink followed before containment check"

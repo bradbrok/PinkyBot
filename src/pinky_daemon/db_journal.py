@@ -1,26 +1,18 @@
 """Rollback (TRUNCATE) journal-mode configuration for daemon SQLite stores.
 
-#889 — deleted-WAL corruption family. Root cause (proven 2026-08-16 via auditd
-syscall capture): an EXTERNAL process opening a live WAL-mode daemon DB read-write
-and closing it (e.g. an ad-hoc ``sqlite3 data/conversations.db "SELECT ..."`` CLI
-read, or any plain ``sqlite3.connect``) runs SQLite's checkpoint-on-last-close,
-which unlinks the ``-wal``/``-shm`` files. Because POSIX advisory file locks are
-held PER-PROCESS (not per-fd), the external process can become the effective
-"last connection" while the daemon's own long-lived connection is idle between
-transactions — so SQLite deletes the ``-wal``/``-shm`` out from under the daemon's
-open fd. The daemon then holds an fd to a DELETED inode; its data stays intact
-until the next process exit/restart, at which point the un-replayed WAL is gone
-and the main DB can be left header-corrupt (observed: a main file beginning with a
-b-tree leaf page instead of the SQLite header, a full outage on 2026-08-15).
+An idle WAL connection retains a SHARED lock on the main database and a DMS
+lock on shared memory. Ordinary external readers and writers cannot unlink
+its sidecars while those locks remain held. The deleted-WAL incidents required
+an earlier lock drop: a startup permission sweep opened and closed raw file
+descriptors in the daemon process, releasing all POSIX locks on those inodes.
+SQLite's own lock accounting then diverged from the kernel's state. An external
+read-write closer could checkpoint and unlink the WAL; subsequent daemon writes
+went to the orphaned inode and could be lost on a crash.
 
-The structural fix is the same one already applied to ``conversations_agents.db``
-(#797/#220): run these stores in rollback (TRUNCATE) journal mode. Rollback mode
-has no ``-wal``/``-shm`` at all, so there is nothing an external open can unlink —
-the corruption substrate simply does not exist. Trade-off: rollback mode serializes
-writers vs readers (no WAL concurrency), mitigated by a generous ``busy_timeout``.
-
-Behavioral half of the fix (see ``scripts/safe_db_read.py``): never open a live
-daemon DB with a plain/RW ``sqlite3`` client; use a copy or ``mode=ro&immutable=1``.
+Rollback mode removes the WAL/shared-memory failure surface, at the cost of
+reader/writer concurrency. It does not make raw in-process closes safe: they
+also release rollback-journal locks. Preserve SQLite's locks in either mode.
+Use the daemon snapshot interface for consistent external inspection.
 """
 
 from __future__ import annotations

@@ -45,12 +45,15 @@ resume-UUID-capture diagnostics.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shlex
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
+from pinky_daemon import isolated_launch_env, tmux_launch_env
 from pinky_daemon.codex_home import (
     MANAGED_CONFIG_SENTINEL,
     codex_home_for,
@@ -58,6 +61,7 @@ from pinky_daemon.codex_home import (
     prepare_agent_codex_home,
     validate_agent_codex_home,
 )
+from pinky_daemon.codex_mcp_env import mcp_cli_config, with_mcp_header_env
 from pinky_daemon.codex_tmux_transcript import (
     CodexTmuxTranscriptTailer,
     _discover_codex_rollout,
@@ -68,6 +72,7 @@ from pinky_daemon.tmux_session import (
     _PLACEHOLDER_TRANSCRIPT_PATH,
     TmuxSession,
     _log,
+    _regular_transcript_candidates,
     _SchedulerDeliveryCancelled,
     _TmuxControl,
 )
@@ -112,6 +117,8 @@ class CodexTmuxSession(TmuxSession):
     # path's default (CodexSession._analytics_log_turn_usage) and
     # analytics_store._provider_alias maps it onto the openai rate rows.
     _ANALYTICS_PROVIDER = "codex_cli"
+    _trace_transport_kind = "tmux_codex"
+    _scrub_codex_headers = True
 
     def _reported_context_window(self) -> int:
         """Return the latest positive window reported by the Codex rollout."""
@@ -212,6 +219,8 @@ class CodexTmuxSession(TmuxSession):
         self._reasoning_effort = config.thinking_effort or "medium"
         self._codex_mcp_servers = config.mcp_servers or {}
         self._codex_last_scheduler_gate_signature: tuple[bool, ...] | None = None
+        self._codex_user_content_warned = False
+        self._codex_user_no_text_warned = False
 
     # ── seam: session name ──────────────────────────────────────────────────
     def _build_session_name(self) -> str:
@@ -258,14 +267,8 @@ class CodexTmuxSession(TmuxSession):
                 effort = "high"  # codex has no "max"
             parts += ["-c", f'model_reasoning_effort="{effort}"']
         # MCP injection (same -c form as CodexSession; works on fresh + resume).
-        for name, cfg in (self._codex_mcp_servers or {}).items():
-            if not isinstance(cfg, dict):
-                continue
-            url = cfg.get("url", "")
-            if url:
-                parts += ["-c", f'mcp_servers.{name}.url="{url}"']
-                for hk, hv in (cfg.get("headers") or {}).items():
-                    parts += ["-c", f'mcp_servers.{name}.http_headers.{hk}="{hv}"']
+        mcp_args, _ = mcp_cli_config(self._codex_mcp_servers or {})
+        parts += mcp_args
 
         cmd = " ".join(shlex.quote(p) for p in parts)
         _log(
@@ -298,54 +301,37 @@ class CodexTmuxSession(TmuxSession):
         self._codex_model = model
         return "pending_restart"
 
-    # tmux-internal vars that must not leak into the nested REPL's children
-    # (mirrors ``CodexAppServerSupervisor._ENV_DROP``).
-    _ENV_DROP = frozenset({"TMUX", "TMUX_PANE"})
-
     # ── seam: env ───────────────────────────────────────────────────────────
-    def _build_repl_env(self) -> dict[str, str]:
-        """Full daemon-env parity for the codex tmux pane — NOT a small allowlist.
-
-        tmux ``new-session`` drops the parent process env entirely; only the
-        ``-e KEY=VAL`` pairs we pass survive into the pane (and its codex child).
-        Both other codex transports launch codex with the daemon's FULL env:
-        ``CodexSession._exec_codex`` uses ``env={**os.environ}`` (+ the configured
-        key), and #792's tmux app-server (``CodexAppServerSupervisor._build_env``)
-        does the same after CODEX_HOME / proxy / XDG / cert divergence proved a
-        real footgun. A 4-key allowlist silently boots codex under different auth
-        / network / session config: it drops ``HOME`` / ``XDG_*``, the proxy +
-        TLS bundle (``HTTPS_PROXY`` / ``SSL_CERT_FILE`` / ``NODE_EXTRA_CA_CERTS``),
-        ``OPENAI_BASE_URL`` / ``OPENAI_ORG`` / other ``OPENAI_*`` + ``CODEX_*``
-        knobs, and any future auth/config env (Murzik #795 P1; same class as the
-        #792 app-server env-parity fix).
-
-        So we propagate the entire daemon env — including ``CODEX_HOME`` (item G:
-        the child writes, and discovery scans, the SAME rollout store) and
-        ``PATH`` (so the ``codex`` / ``node`` binaries resolve) — minus
-        tmux-internal vars and any value tmux ``-e`` can't carry (newlines, which
-        are pathological for env anyway), then overlay the configured
-        ``OPENAI_API_KEY`` (item H) and this agent's ``PINKY_AGENT_NAME``. No
-        ANTHROPIC_* special-casing is needed: codex ignores them, exactly as the
-        subprocess transport already inherits them harmlessly.
-        """
-        env: dict[str, str] = {}
-        for key, value in os.environ.items():
-            if key in self._ENV_DROP:
-                continue
-            if "\n" in value or "\r" in value:
-                _log(
-                    f"tmux[{self.agent_name}]: dropping multiline env {key!r} "
-                    f"(cannot pass via tmux -e)"
+    def _build_repl_env(
+        self, *, launch_policy: isolated_launch_env.LaunchPolicy | None = None,
+    ) -> dict[str, str]:
+        """Build scoped inputs in clean mode and preserve ambient parity otherwise."""
+        launch_policy = launch_policy or self._launch_env_policy()
+        if launch_policy.clean:
+            env = isolated_launch_env.scoped_codex_env(launch_policy, self.agent_name)
+            if self._container_agent() is not None:
+                env["PINKY_DAEMON_URL"] = os.environ.get(
+                    "PINKY_CONTAINER_DAEMON_URL", "http://host.containers.internal:8888",
                 )
-                continue
-            env[key] = value
+            if self._config.provider_url:
+                env["OPENAI_BASE_URL"] = self._config.provider_url
+        else:
+            env = tmux_launch_env.ambient_env(
+                os.environ.items(), lambda message: _log(f"tmux[{self.agent_name}]: {message}"),
+            )
         if self._openai_api_key:
             env["OPENAI_API_KEY"] = self._openai_api_key
         if self.agent_name:
             env["PINKY_AGENT_NAME"] = self.agent_name
-        if per_agent_codex_home_enabled():
+        if launch_policy.clean or per_agent_codex_home_enabled():
             env["CODEX_HOME"] = str(codex_home_for(self._config))
-        return env
+        isolated_launch_env.report_codex_shadow(
+            agent_name=self.agent_name, registry=self._registry,
+            status_lookup=self._isolation_status, env=env, log=_log,
+        )
+        # Inject after scoping and explicit grants: ambient header vars are not authority.
+        env = isolated_launch_env.with_grants(launch_policy, env)
+        return with_mcp_header_env(env, self._codex_mcp_servers or {})
 
     # ── seam: transcript discovery (codex rollout store) ────────────────────
     def _project_dir(self) -> Path:
@@ -373,6 +359,22 @@ class CodexTmuxSession(TmuxSession):
             self._config.working_dir or ".",
             agent=self._config,
         )
+
+    def _transcript_candidates(self) -> Iterator[tuple[Path, float]]:
+        """Enumerate rollout paths without opening historical session content."""
+        yield from _regular_transcript_candidates(self._project_dir().glob("**/rollout-*.jsonl"))
+
+    def _is_own_transcript(self, path: Path) -> bool:
+        """Inspect ownership only for a bounded set of post-launch rollouts."""
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                metadata = json.loads(handle.readline())
+            if metadata.get("type") != "session_meta":
+                return False
+            cwd = metadata.get("payload", {}).get("cwd", "")
+            return os.path.realpath(cwd) == os.path.realpath(self._config.working_dir or ".")
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
 
     # ── seam: tailer class ──────────────────────────────────────────────────
     async def _start_tailer(self) -> None:
@@ -437,6 +439,8 @@ class CodexTmuxSession(TmuxSession):
         The inherited scheduler task, REPL lock, logs, exact receipt, and
         retirement paths remain unchanged.
         """
+        if self._scheduler_busy_deadline_reached(candidate):
+            return self._has_unresolved_pasted_acceptance()
         evidence = self._codex_scheduler_evidence(candidate)
         busy = any(evidence)
         signature = (*evidence, busy)
@@ -595,27 +599,103 @@ class CodexTmuxSession(TmuxSession):
 
     def _on_transcript_entry(self, entry: dict) -> None:
         """Map Codex rollout acceptance onto the shared exact-receipt path."""
-        if entry.get("type") == "event_msg":
-            payload = entry.get("payload") or {}
-            if payload.get("type") == "user_message":
-                prompt = payload.get("message")
-                if isinstance(prompt, str):
-                    turn = self._match_acceptance_turn(prompt)
-                    # The rollout tailer can observe user_message and a very
-                    # fast task_complete in one read while paste_text's final
-                    # tmux subprocess is still returning.  Reserve FIFO
-                    # metadata before resolving the exact scheduler receipt so
-                    # that same-read completion has a head to retire.  The
-                    # normal post-paste path is idempotent on this flag.
-                    if (
-                        turn is not None
-                        and turn.scheduler_delivery is not None
-                        and not turn.pane_delivery_recorded
-                    ):
-                        self._finish_turn_delivery(turn)
-                    self._mark_transport_accepted(turn)
+        payload = entry.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        current_user_row = (
+            entry.get("type") == "response_item"
+            and payload.get("type") == "message"
+            and payload.get("role") == "user"
+        )
+        legacy_user_row = (
+            entry.get("type") == "event_msg" and payload.get("type") == "user_message"
+        )
+        if current_user_row:
+            content = payload.get("content")
+            if not isinstance(content, list) or any(
+                not isinstance(item, dict)
+                or (item.get("type") == "input_text" and not isinstance(item.get("text"), str))
+                for item in content
+            ):
+                if not self._codex_user_content_warned:
+                    self._codex_user_content_warned = True
+                    _log("WARNING malformed Codex user-row content; receipt ignored")
                 return
-        super()._on_transcript_entry(entry)
+            prompt = "".join(
+                item["text"] for item in content if item.get("type") == "input_text"
+            )
+            if not prompt:
+                if content and not self._codex_user_no_text_warned:
+                    self._codex_user_no_text_warned = True
+                    item_types = sorted({str(item.get("type")) for item in content})
+                    _log(
+                        "WARNING Codex user-row content yielded no text; "
+                        f"item types={item_types}"
+                    )
+                return
+        elif legacy_user_row:
+            prompt = payload.get("message")
+        else:
+            super()._on_transcript_entry(entry)
+            return
+        if not isinstance(prompt, str):
+            return
+        pointer = getattr(self._tailer, "entry_pointer", None) or {
+            "path": getattr(self._tailer, "transcript_path", ""), "offset": None,
+        }
+        self._trace_observed_prompt(prompt, pointer=pointer)
+        turn = self._match_acceptance_turn(prompt)
+        if current_user_row and (
+            turn is None
+            or not self._transcript_entry_matches_ticket(
+                entry_offset=pointer.get("offset"),
+                source_identity=pointer.get("identity"),
+                ticket_offset=turn.transcript_offset_at_paste,
+                ticket_identity=turn.transcript_file_identity_at_paste,
+            )
+        ):
+            if turn is not None:
+                identity = turn.transcript_file_identity_at_paste
+                offset = turn.transcript_offset_at_paste
+                path = turn.transcript_path_at_paste
+                detail = ""
+                reason = "paste ticket mismatch"
+                if pointer.get("identity") is None or pointer.get("offset") is None:
+                    shape = "no_pointer"
+                elif path is not None and identity is None and offset == 0:
+                    shape = "cold-start"
+                    reason = "cold_start_ticket_unverified"
+                    cold_reason = (
+                        "placeholder" if path == _PLACEHOLDER_TRANSCRIPT_PATH else "file_missing"
+                    )
+                    detail = f" cold_start_reason={cold_reason!r}"
+                elif path is None:
+                    shape = "unbound"
+                    reason = "no paste ticket"
+                elif identity is None or offset is None:
+                    shape = "inaccessible"
+                    reason = "ticket identity/offset missing"
+                else:
+                    shape = "mismatch"
+                if shape not in turn.transcript_ticket_warned_shapes:
+                    turn.transcript_ticket_warned_shapes.add(shape)
+                    _log(
+                        f"WARNING codex user-row ticket turn_id={id(turn)} "
+                        f"entry_offset={pointer.get('offset')} "
+                        f"source_identity={pointer.get('identity')} "
+                        f"ticket_offset={offset} ticket_identity={identity} "
+                        f"shape={shape} reason={reason!r}{detail}"
+                    )
+            return
+        # A user row and task_complete can arrive in one read before paste_text
+        # returns. Reserve routing metadata before resolving the receipt so that
+        # completion has a head to retire; normal post-paste recording is idempotent.
+        if (
+            turn is not None
+            and turn.scheduler_delivery is not None
+            and not turn.pane_delivery_recorded
+        ):
+            self._finish_turn_delivery(turn)
+        self._mark_transport_accepted(turn)
 
     # ── seam: cold-start (codex trust pre-seed + NUX dismissal + readiness) ──
     def _preflight_transport_replacement(self) -> None:

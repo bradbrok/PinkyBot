@@ -70,8 +70,9 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
-from pinky_identity.fs_security import harden_secret_file
+from pinky_identity.fs_security import prepare_secret_database
 from pinky_identity.keys import SignatureError
+from pinky_identity.live_sqlite import LiveSQLiteConnection, track_sqlite_connection
 
 # -- Constants ---------------------------------------------------------------
 
@@ -286,14 +287,16 @@ class BearerTokenStore:
     ) -> None:
         self._db_path = Path(db_path)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        prepare_secret_database(self._db_path)
         self._db = sqlite3.connect(
-            str(self._db_path), isolation_level=None, check_same_thread=False
+            str(self._db_path), isolation_level=None, check_same_thread=False,
+            factory=LiveSQLiteConnection
         )
+        track_sqlite_connection(self._db, self._db_path)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._ensure_schema()
-        harden_secret_file(self._db_path)
 
     # -- schema --
 

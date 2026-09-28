@@ -160,12 +160,24 @@ _GPT_54_NANO = {
     "cache_write_1h": 0.0,
 }
 
+# Opus 5.5 (2026-09-22): the current Opus tier at $4/$20 per Mtok, cache
+# reads at 5% of input ($0.20), cache writes $5 (5m) / $8 (1h). 1M context,
+# 128K output. Cheaper than Opus 5's $5/$25 standard tier on every field.
+_OPUS_55 = {
+    "input": 4.00,
+    "output": 20.00,
+    "cache_read": 0.20,
+    "cache_write_5m": 5.00,
+    "cache_write_1h": 8.00,
+}
+
 # Bare-model-id → rate dict. Add new model ids here on each release.
 RATE_TABLE: dict[str, dict[str, float]] = {
     "claude-fable-5": _FABLE,
     "claude-mythos-5": _FABLE,
     "claude-fable-5-1": _FABLE_51,
     "claude-mythos-5-1": _FABLE_51,
+    "claude-opus-5-5": _OPUS_55,
     "claude-opus-5": _OPUS_STD,
     "claude-opus-4-8": _OPUS_STD,
     "claude-opus-4-7": _OPUS_STD,

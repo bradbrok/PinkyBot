@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re as _re2
 import time
 from datetime import datetime
@@ -20,6 +21,7 @@ from typing import Any, Awaitable, Callable
 
 from fastapi import APIRouter, HTTPException, Request
 
+from pinky_daemon.access_log import _redact_hook_path as _redact_hook_path
 from pinky_daemon.api_models import CreateTriggerRequest, UpdateTriggerRequest
 
 router = APIRouter(tags=["triggers"])
@@ -57,14 +59,8 @@ _hook_ip_buckets: dict[str, list[float]] = {}
 
 _HOOK_IP_RATE_LIMIT = 20
 _HOOK_IP_RATE_WINDOW = 60.0
-
-
-_HOOKS_PATH_RE = _re2.compile(r"(/hooks/)([^/\s\"?]+)")
-
-
-def _redact_hook_path(value: str) -> str:
-    """Replace the token segment of a /hooks/<token> path with its 8-char prefix."""
-    return _HOOKS_PATH_RE.sub(lambda m: f"{m.group(1)}{m.group(2)[:8]}*", value)
+_HOOK_TOKEN_RATE_LIMIT = 60
+_HOOK_TOKEN_RATE_WINDOW = 60.0
 
 
 class HookTokenRedactionFilter(logging.Filter):
@@ -81,7 +77,7 @@ class HookTokenRedactionFilter(logging.Filter):
                 _redact_hook_path(arg) if isinstance(arg, str) else arg
                 for arg in record.args
             )
-        if isinstance(record.msg, str) and "/hooks/" in record.msg:
+        if isinstance(record.msg, str):
             record.msg = _redact_hook_path(record.msg)
         return True
 
@@ -126,8 +122,13 @@ def _prune_bucket(timestamps: list[float], now: float, window: float) -> list[fl
     return [t for t in timestamps if 0 <= now - t < window]
 
 
-def _check_hook_ip_rate_limit(request: Request, now: float) -> bool:
-    """Return True if the client IP is within the webhook rate limit."""
+def _retry_after(timestamps: list[float], now: float, window: float) -> int:
+    """Seconds until the oldest counted request leaves the sliding window."""
+    return max(1, min(math.ceil(window), math.ceil(window - (now - timestamps[0]))))
+
+
+def _charge_hook_ip_miss(request: Request, now: float) -> int | None:
+    """Charge an unknown-token lookup, or return seconds until a retry."""
     ip = _client_ip(request)
     timestamps = _prune_bucket(
         _hook_ip_buckets.get(ip, []), now, _HOOK_IP_RATE_WINDOW
@@ -135,16 +136,16 @@ def _check_hook_ip_rate_limit(request: Request, now: float) -> bool:
     if len(timestamps) >= _HOOK_IP_RATE_LIMIT:
         _hook_ip_buckets[ip] = timestamps
         _log(f"hooks: IP rate limited {ip} ({len(timestamps)} reqs in {_HOOK_IP_RATE_WINDOW}s)")
-        return False
+        return _retry_after(timestamps, now, _HOOK_IP_RATE_WINDOW)
     timestamps.append(now)
     _hook_ip_buckets[ip] = timestamps
-    return True
+    return None
 
 
-def _check_hook_rate_limit(token: str, now: float) -> bool:
-    """Return True if the request is within the rate limit (60/min per token)."""
-    window = 60.0
-    limit = 60
+def _charge_hook_token(token: str, now: float) -> int | None:
+    """Charge a valid token delivery, or return seconds until a retry."""
+    window = _HOOK_TOKEN_RATE_WINDOW
+    limit = _HOOK_TOKEN_RATE_LIMIT
     timestamps = _prune_bucket(_hook_rate_buckets.get(token, []), now, window)
     if len(timestamps) >= limit:
         _hook_rate_buckets[token] = timestamps
@@ -155,10 +156,10 @@ def _check_hook_rate_limit(token: str, now: float) -> bool:
             f"hooks: token rate limited {token[:8]}* "
             f"({len(timestamps)} reqs in {window:.0f}s)"
         )
-        return False
+        return _retry_after(timestamps, now, window)
     timestamps.append(now)
     _hook_rate_buckets[token] = timestamps
-    return True
+    return None
 
 
 def _render_trigger_prompt(template: str, trigger_name: str, body: dict | None, body_raw: str) -> str:
@@ -335,28 +336,37 @@ async def receive_webhook(token: str, request: Request):
     # rate-limit 429, oversized 413). The token is a credential: prefix only.
     _log(
         f"hooks: receipt token={token[:8]}* ip={_client_ip(request)}"
+        f" rid={getattr(request.state, 'request_id', '-')}"
         f" len={request.headers.get('content-length', '?')}"
         f" type={request.headers.get('content-type', '-')}"
     )
     now = time.time()
 
-    # IP rate limit (anti-enumeration — runs before token lookup)
-    if not _check_hook_ip_rate_limit(request, now):
-        raise HTTPException(status_code=429, detail="rate limit exceeded")
+    # Resolve credentials first: misses must never starve valid deliveries.
+    trigger = _trigger_store.get_by_token(token)
+    if not trigger:
+        wait = _charge_hook_ip_miss(request, now)
+        if wait is not None:
+            raise HTTPException(
+                status_code=429,
+                detail="rate limit exceeded",
+                headers={"Retry-After": str(wait)},
+            )
+        raise HTTPException(status_code=404, detail="not found")
 
-    # Body size check
+    # Valid deliveries use only their independent per-token budget.
+    wait = _charge_hook_token(token, now)
+    if wait is not None:
+        raise HTTPException(
+            status_code=429,
+            detail="rate limit exceeded",
+            headers={"Retry-After": str(wait)},
+        )
+
+    # Read the body only after token lookup and rate limiting.
     body_bytes = await request.body()
     if len(body_bytes) > 1_048_576:
         raise HTTPException(status_code=413, detail="body too large")
-
-    # Token lookup
-    trigger = _trigger_store.get_by_token(token)
-    if not trigger:
-        raise HTTPException(status_code=404, detail="not found")
-
-    # Rate limit: 60 requests per minute per token
-    if not _check_hook_rate_limit(token, now):
-        raise HTTPException(status_code=429, detail="rate limit exceeded")
 
     # Parse body
     body_raw = body_bytes.decode(errors="replace")

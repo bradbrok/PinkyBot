@@ -61,22 +61,28 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
+import sys
 import threading
 import time
+import uuid
 from collections import OrderedDict, deque
 from collections.abc import Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from stat import S_ISREG
 from typing import Literal
 
+from pinky_daemon import isolated_launch_env, tmux_launch_env, tmux_launch_env_loader
 from pinky_daemon.agent_registry import (
     CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS,
     validate_restart_tokens_cap,
 )
 from pinky_daemon.auth_relay import coordinator as _auth_relay
 from pinky_daemon.auth_relay import extract_relay_oauth_url, looks_like_login_wall
+from pinky_daemon.codex_tmux_transcript import _DISCOVERY_SCAN_LIMIT
 from pinky_daemon.command_runner import (
     CommandRunner,
     ContainerCommandRunner,
@@ -86,12 +92,19 @@ from pinky_daemon.command_runner import (
 from pinky_daemon.effort import EFFORT_LEVELS, is_ultracode, resolve_cli_effort
 from pinky_daemon.pricing import compute_cost_from_usage
 from pinky_daemon.runtime_model_catalog import ModelCatalogError
+from pinky_daemon.scheduler_delivery import scheduler_busy_delay
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.streaming_session import (
     StreamingSessionConfig,
     _is_outreach_tool,
     _log,
     _notify_turn_idle,
+)
+from pinky_daemon.tmux_targets import (
+    _addressable,
+    exact_pane_target,
+    exact_session_target,
+    text_argument,
 )
 from pinky_daemon.tmux_transcript import (
     TmuxTranscriptTailer,
@@ -116,6 +129,18 @@ from pinky_daemon.watchdog_log import log_watchdog_decision
 # global sleep untouched so independent event loops cannot interfere.
 _async_sleep = asyncio.sleep
 
+
+def _regular_transcript_candidates(paths: Iterator[Path]) -> Iterator[tuple[Path, float]]:
+    """Yield regular files and their mtimes, isolating each filesystem failure."""
+    for path in paths:
+        try:
+            metadata = path.lstat()
+        except OSError:
+            continue
+        if S_ISREG(metadata.st_mode):
+            yield path, metadata.st_mtime
+
+
 # Soft context-watermark default (#614) — used when an agent's
 # ``context_nudge_threshold_pct`` is unset (0). Sits well below the
 # hard ``restart_threshold_pct`` (default 80) so the agent gets an
@@ -133,6 +158,22 @@ DEFAULT_MAX_CONCURRENT_SUBAGENTS = 6
 # otherwise it remains deliberately bounded so legitimate warm-wake-after-
 # crash returns to normal ``--continue`` behavior.
 FRESH_CONTEXT_RESPAWN_GRACE_SEC = 180.0
+
+# Allow namespace entry and interpreter startup the same budget as credential seeding.
+_NAMESPACE_SEED_TIMEOUT_SEC = 15.0
+# Cache both target programs once. Only the small loader crosses tmux's
+# command-size boundary; staging uses the runner directly.
+_LAUNCH_ENV_LOADER_SOURCE = Path(tmux_launch_env_loader.__file__).read_text()
+_LAUNCH_ENV_SOURCE = (
+    "import sys, types\n"
+    "_package = types.ModuleType('pinky_daemon')\n"
+    "_package.__path__ = []\n"
+    "sys.modules['pinky_daemon'] = _package\n"
+    "_loader = types.ModuleType('pinky_daemon.tmux_launch_env_loader')\n"
+    f"exec({_LAUNCH_ENV_LOADER_SOURCE!r}, _loader.__dict__)\n"
+    "sys.modules[_loader.__name__] = _loader\n"
+    f"exec({Path(tmux_launch_env.__file__).read_text()!r})\n"
+)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Tmux subprocess control
@@ -344,6 +385,8 @@ def _is_dead_runtime_stderr(stderr: str) -> bool:
         needle in low
         for needle in (
             "can't find pane",
+            # Exact ``=NAME:`` pane targets report a vanished session this way.
+            "can't find session",
             # podman exec into a stopped container
             "can only create exec sessions on running containers",
             # podman/docker: container was removed entirely
@@ -537,16 +580,10 @@ def _adaptive_paste_enter_delay_ms(text: str) -> int:
 # on subsequent real→real swaps (compact-resume protected by #496).
 _PLACEHOLDER_TRANSCRIPT_PATH = Path("/dev/null/no-transcript-yet")
 
-# Issue #565 — delayed first-bind recovery delay. After ``_start_tailer``
-# schedules a recovery task; if no explicit ``set_transcript_path`` bind
-# has consumed ``_tailer_first_bind_pending`` by this deadline AND the
-# launch is fresh, we re-run ``_discover_transcript_path()`` and rebind
-# even if the currently watched path exists. Covers the bind-never-arrives
-# case for fresh-launch-with-prior-history (the existing #515 self-heal
-# only fires when the current watched path is missing; a stale real path
-# blocks it forever). 5 seconds is generous slack vs. typical
-# SessionStart hook latency (sub-second to ~200ms).
+# Poll for a fresh transcript when the startup hook is lost. Transcripts
+# can appear lazily after the first prompt, well after the first attempt.
 _FIRST_BIND_RECOVERY_DELAY_SEC = 5.0
+_FIRST_BIND_RECOVERY_CAP_SEC = 300.0
 
 # #1148 — this per-session marker gates daemon-spawned headless sessions because
 # the daemon environment never carries it. Pane-descendant processes inherit
@@ -594,10 +631,47 @@ class TmuxCommandResult:
     returncode: int
     stdout: str
     stderr: str
+    launch_env: tuple[CommandRunner, str, str] | None = field(default=None, repr=False, compare=False)
 
     @property
     def ok(self) -> bool:
         return self.returncode == 0
+
+
+async def _cleanup_launch_env(receipt: tuple[CommandRunner, str, str] | None) -> None:
+    """Finish exact-nonce cleanup before allowing cancellation to unwind."""
+    if receipt is None:
+        return
+    runner, scope, nonce = receipt
+
+    async def cleanup() -> None:
+        if isinstance(runner, LocalCommandRunner):
+            await asyncio.to_thread(tmux_launch_env.cancel_env, scope, nonce)
+        else:
+            result = await runner.run(
+                ["python3", "-I", "-c", _LAUNCH_ENV_SOURCE],
+                stdin_data=json.dumps({"action": "cancel", "scope": scope, "nonce": nonce}).encode(),
+                timeout=tmux_launch_env.PUBLICATION_TIMEOUT + _NAMESPACE_SEED_TIMEOUT_SEC,
+            )
+            if not result.ok:
+                raise RuntimeError("launch environment cleanup failed")
+
+    task = asyncio.create_task(cleanup())
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    try:
+        task.result()
+    except (Exception, asyncio.CancelledError):
+        # Runner exceptions can contain command input; never interpolate them.
+        _log("WARNING launch environment cleanup failed")
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 class _TmuxControl:
@@ -705,7 +779,7 @@ class _TmuxControl:
         callers that merely observe liveness already treat probe exceptions as
         diagnostic uncertainty.
         """
-        result = await self._run("has-session", "-t", self.session_name)
+        result = await self._run("has-session", "-t", exact_session_target(self.session_name))
         if result.ok:
             return True
         if await self._session_absence_is_verified(result):
@@ -790,27 +864,90 @@ class _TmuxControl:
         cwd: str,
         command: str,
         env: dict[str, str] | None = None,
+        inherit: str = "all",
+        granted: tuple[str, ...] = (),
+        codex_headers: bool = False,
     ) -> TmuxCommandResult:
-        """Spawn a fresh detached tmux session running ``command``.
-
-        ``cwd`` becomes the session's working directory — critical for
-        ``claude --continue`` to find the right transcript.
-
-        ``env`` is added as ``-e KEY=VAL`` flags (tmux 3.2+).
-        """
-        args = ["new-session", "-d", "-s", self.session_name, "-c", cwd]
-        if env:
+        """Spawn using isolated Python to consume private JSON before shell exec."""
+        env = env or {}
+        tmux_launch_env.validate_env(env)
+        try:
+            tmux_launch_env.validate_inherit(env, inherit)
+        except PermissionError:
+            names = sorted(isolated_launch_env.DAEMON_ONLY.intersection(env))
+            _log("ERROR isolated launch daemon-only payload refused: " + json.dumps(names))
+            raise isolated_launch_env.LaunchEnvError("daemon-only payload refused") from None
+        policy_options = {"inherit": inherit, "granted": granted} if inherit == "none" else {}
+        if codex_headers:
+            policy_options["codex_headers"] = True
+        scope = hashlib.sha256(json.dumps(
+            [self._base_cmd(), self.session_name], separators=(",", ":"),
+        ).encode()).hexdigest()
+        nonce = secrets.token_hex(16)
+        runner = self._runner
+        has_values = codex_headers or inherit == "none" or any(v != "" for v in env.values())
+        receipt = (runner, scope, nonce) if has_values else None
+        deadline = time.time() + tmux_launch_env.PUBLICATION_TIMEOUT
+        try:
+            if isinstance(runner, LocalCommandRunner):
+                staged = await asyncio.to_thread(
+                    tmux_launch_env.stage_env, env, scope, nonce, deadline=deadline,
+                    **policy_options,
+                )
+            else:
+                result = await runner.run(
+                    ["python3", "-I", "-c", _LAUNCH_ENV_SOURCE],
+                    stdin_data=json.dumps({
+                        "action": "stage", "env": env, "scope": scope,
+                        "nonce": nonce, "deadline": deadline, **policy_options,
+                    }).encode(),
+                    timeout=_NAMESPACE_SEED_TIMEOUT_SEC,
+                )
+                if not result.ok:
+                    raise RuntimeError("launch environment staging failed")
+                try:
+                    staged = json.loads(result.stdout)
+                except (ValueError, UnicodeError):
+                    raise RuntimeError("invalid launch environment staging response") from None
+            if (staged is None) != (not has_values):
+                raise RuntimeError("incomplete launch environment staging response")
+            if staged is not None:
+                if not isinstance(staged, dict) or set(staged) != {"path"}:
+                    raise RuntimeError("invalid launch environment staging response")
+                path = staged["path"]
+                suffix = (".local", "state", "pinkybot", "tmux-launch-env", scope, f"env-{nonce}.json")
+                if (
+                    not isinstance(path, str) or "\x00" in path or "\n" in path or "\r" in path
+                    or not Path(path).is_absolute() or ".." in Path(path).parts
+                    or Path(path).parts[-len(suffix):] != suffix
+                ):
+                    raise RuntimeError("invalid launch environment staging response")
+                python = sys.executable if isinstance(runner, LocalCommandRunner) else "python3"
+                command = "exec " + shlex.join([
+                    python, "-I", "-c", _LAUNCH_ENV_LOADER_SOURCE, path, nonce, command,
+                ])
+            args = ["new-session", "-d", "-s", self.session_name, "-c", cwd]
             for key, value in env.items():
-                args.extend(["-e", f"{key}={value}"])
-        # The command is passed as a single string arg; tmux invokes
-        # it via the user's shell, so we shell-escape for safety.
-        args.append(command)
-        return await self._run(*args)
+                if value == "":
+                    args.extend(["-e", f"{key}="])
+            args.append(command)
+            if self._runner is not runner:
+                raise RuntimeError("launch execution namespace changed")
+            result = await self._run(*args)
+            if result.ok:
+                result.launch_env = receipt
+            else:
+                cleanup_receipt, receipt = receipt, None
+                await _cleanup_launch_env(cleanup_receipt)
+            return result
+        except BaseException:
+            await _cleanup_launch_env(receipt)
+            raise
 
     async def kill_session(self) -> TmuxCommandResult:
         """Kill the tmux session. Idempotent — succeeds whether or not the
         session exists (callers shouldn't pre-check)."""
-        result = await self._run("kill-session", "-t", self.session_name)
+        result = await self._run("kill-session", "-t", exact_session_target(self.session_name))
         if result.ok:
             return result
         # Positive absence is tmux's exact canonical no-server result, a missing
@@ -829,9 +966,17 @@ class _TmuxControl:
         look for ``pinky-<agent>`` while the preserved OAuth pane lives under
         ``login-hold-<agent>``. Keeping ``self.session_name`` unchanged is
         therefore intentional.
+
+        The renamed session is later addressed by exact name, so ``new_name``
+        must pass the same allowlist as targets; anything else raises
+        ``ValueError`` before tmux runs.
         """
         return await self._run(
-            "rename-session", "-t", self.session_name, new_name,
+            "rename-session",
+            "-t",
+            exact_session_target(self.session_name),
+            "--",
+            _addressable(new_name),
         )
 
     async def resize_window(
@@ -855,7 +1000,7 @@ class _TmuxControl:
         rows = max(10, min(200, int(rows)))
         return await self._run(
             "resize-window",
-            "-t", self.session_name,
+            "-t", exact_pane_target(self.session_name),
             "-x", str(cols),
             "-y", str(rows),
         )
@@ -868,15 +1013,17 @@ class _TmuxControl:
         receives the keystrokes and (for claude) processes them as a
         prompt.
 
-        ``text`` is passed as a single tmux argument; tmux interprets
-        no further shell metacharacters.
+        ``text`` is passed as a single tmux argument after ``--``, so text
+        starting with ``-`` is never parsed as tmux flags, and a trailing
+        ``;`` is escaped so tmux does not split it off as a command
+        separator; tmux interprets no further shell metacharacters.
 
         Use ``paste_text`` instead for prompts that need to survive the
         claude cold-start splash UI (issue #514) — bracketed-paste plus
         a short delay is more reliable than raw keystrokes during the
         splash-to-chat transition.
         """
-        args = ["send-keys", "-t", self.session_name, text]
+        args = ["send-keys", "-t", exact_pane_target(self.session_name), "--", text_argument(text)]
         if enter:
             args.append("Enter")
         return await self._run(*args)
@@ -887,9 +1034,20 @@ class _TmuxControl:
         Unlike ``send_keys``, tmux performs no keyname interpretation —
         "Enter" types the five letters, "C-c" types three characters.
         Used by the typeable pane view, where the operator's typed text
-        must never be accidentally promoted to a control key.
+        must never be accidentally promoted to a control key. ``--`` ends
+        tmux's flag parsing, so text starting with ``-`` is typed too rather
+        than read as flags (a later ``-t`` there would re-target the command),
+        and ``text_argument`` keeps a trailing ``;`` from being split off as a
+        command separator.
         """
-        return await self._run("send-keys", "-t", self.session_name, "-l", text)
+        return await self._run(
+            "send-keys",
+            "-t",
+            exact_pane_target(self.session_name),
+            "-l",
+            "--",
+            text_argument(text),
+        )
 
     async def paste_text(
         self,
@@ -953,7 +1111,7 @@ class _TmuxControl:
             buf_name,
             "-d",
             "-t",
-            self.session_name,
+            exact_pane_target(self.session_name),
             "-p",
         )
         if not paste_result.ok or not enter:
@@ -964,7 +1122,7 @@ class _TmuxControl:
         if enter_delay_ms > 0:
             await _async_sleep(enter_delay_ms / 1000.0)
 
-        return await self._run("send-keys", "-t", self.session_name, "Enter")
+        return await self._run("send-keys", "-t", exact_pane_target(self.session_name), "Enter")
 
     async def capture_pane(
         self,
@@ -993,7 +1151,7 @@ class _TmuxControl:
         """
         args = [
             "capture-pane",
-            "-t", target_session or self.session_name,
+            "-t", exact_pane_target(target_session or self.session_name),
             "-p",  # print to stdout instead of paste buffer
         ]
         if escapes:
@@ -1482,6 +1640,7 @@ class _QueuedTurn:
     # the only positive evidence and replay work that already entered the pane.
     scheduler_accept: object = None  # Callable() -> bool
     scheduler_serialized: bool = False
+    scheduler_busy_deliver_at: float | None = None
     pane_delivery_started: bool = False
     pane_queue_enqueued: bool = False
     transport_accepted: bool = False
@@ -1499,6 +1658,8 @@ class _QueuedTurn:
     transcript_anchor_start_at_paste: int | None = None
     transcript_anchor_at_paste: bytes | None = None
     transcript_ticket_captured_at_ns: int | None = None
+    # Bound warning deduplication to the turn's lifetime, including redelivery.
+    transcript_ticket_warned_shapes: set[str] = field(default_factory=set)
     # Wake-only exact submission receipt (#953). True requires a matching
     # transcript user row or queue enqueue→dequeue; successful tmux paste/Enter
     # commands alone are deliberately insufficient. Kept separate from the
@@ -2015,6 +2176,8 @@ class TmuxSession(TransportReplacementMixin):
     # CodexTmuxSession. See
     # MessageBroker.injection_confirms_consumption.
     injection_confirms_consumption: bool = False
+    _trace_transport_kind = "tmux_claude"
+    _scrub_codex_headers = False
 
     def __init__(
         self,
@@ -2027,8 +2190,10 @@ class TmuxSession(TransportReplacementMixin):
         analytics_store=None,
         registry=None,
         tmux_control: _TmuxControl | None = None,
+        prepare_spawn_callback=None,
     ) -> None:
         self._config = config
+        self._scheduler_paste_session_id = uuid.uuid4().hex
         self._wake_launch_history = config.wake_launch_history
         self._wake_owner_alerted = False
         self._response_callback = response_callback
@@ -2037,6 +2202,7 @@ class TmuxSession(TransportReplacementMixin):
         self._stream_event_callback = stream_event_callback
         self._analytics_store = analytics_store
         self._registry = registry
+        self._prepare_spawn_callback = prepare_spawn_callback
 
         self.agent_name = config.agent_name
 
@@ -2280,6 +2446,8 @@ class TmuxSession(TransportReplacementMixin):
         # ``stop_hook_summary``. Continue launches preserve the
         # seek-to-EOF default (#496 round-1 Case 3 reply-spam defense).
         self._tailer_first_bind_pending: bool = False
+        self._prelaunch_transcripts: frozenset[Path] = frozenset()
+        self._first_bind_wait_logged: bool = False
 
         # #1148 — lineage reported by the pane's SessionStart hook. A new
         # non-empty id may replace this only while the daemon's per-spawn
@@ -2580,7 +2748,7 @@ class TmuxSession(TransportReplacementMixin):
         if mode == _CLAUDE_AUTH_MODE_PER_AGENT_OAUTH:
             try:
                 res = await runner.run(
-                    ["python3", "-c", _CONTAINER_CREDS_STATE_PY], timeout=15
+                    ["python3", "-c", _CONTAINER_CREDS_STATE_PY], timeout=_NAMESPACE_SEED_TIMEOUT_SEC
                 )
                 if res.ok:
                     state = res.stdout.decode("utf-8", "replace").strip()
@@ -2612,7 +2780,9 @@ class TmuxSession(TransportReplacementMixin):
             'chmod 600 "$HOME/.claude/.credentials.json"; }'
         )
         try:
-            res = await runner.run(["sh", "-c", seed_sh], timeout=15)
+            res = await runner.run(
+                ["sh", "-c", seed_sh], timeout=_NAMESPACE_SEED_TIMEOUT_SEC,
+            )
             if res.ok:
                 _log(
                     f"tmux[{self.agent_name}]: ensured claude credentials in "
@@ -2692,6 +2862,9 @@ class TmuxSession(TransportReplacementMixin):
             "changed=False\n"
             "if not s.get('skipDangerousModePermissionPrompt'):\n"
             "    s['skipDangerousModePermissionPrompt']=True\n"
+            "    changed=True\n"
+            "if 'promptSuggestionEnabled' not in s:\n"
+            "    s['promptSuggestionEnabled']=False\n"
             "    changed=True\n"
             "permissions=s.get('permissions')\n"
             "if not isinstance(permissions,dict):\n"
@@ -2887,6 +3060,8 @@ class TmuxSession(TransportReplacementMixin):
         tool_use_id: str,
         tool_name: str,
         tool_input: dict,
+        agent_id: str = "",
+        agent_type: str = "",
     ) -> None:
         """Record a tool-call start (task #93).
 
@@ -2894,8 +3069,8 @@ class TmuxSession(TransportReplacementMixin):
         ``POST /agents/{name}/transport/tool-use``. Mirrors what
         ``StreamingSession`` does in-band for SDK agents:
 
-        - Update ``_current_activity`` so live status surfaces show
-          which tool the agent is running right now.
+        - Update main-thread inflight and current activity state only for
+          main-thread calls; subagent calls retain tagged telemetry.
         - Append a human-readable line to ``_activity_log``.
         - Open an analytics row via ``start_tool_call`` (PII-safe —
           only arg KEYS are recorded, not values).
@@ -2917,7 +3092,7 @@ class TmuxSession(TransportReplacementMixin):
         # for a wedged REPL. Cleared by record_tool_use_finish; bounded by
         # _FOREGROUND_TOOL_ACTIVE_CEILING_SEC in the verdict so a lost
         # finish-POST can't extend the window forever.
-        if tool_use_id:
+        if tool_use_id and not agent_id:
             self._inflight_tool_calls[tool_use_id] = time.time()
 
         # Human-readable activity line — mirror SDK by importing the
@@ -2929,7 +3104,10 @@ class TmuxSession(TransportReplacementMixin):
             # Defensive fallback — keeps record_tool_use_start working
             # if streaming_session ever moves or renames the helper.
             desc = tool_name.rsplit("__", 1)[-1] if "__" in tool_name else tool_name
-        self._current_activity = desc
+        if agent_id:
+            desc = f"[subagent {agent_id}] {desc}"
+        else:
+            self._current_activity = desc
         try:
             self._activity_log.append(desc)
         except Exception:
@@ -2955,7 +3133,8 @@ class TmuxSession(TransportReplacementMixin):
         # Persist description alongside arg_keys so the chat UI can
         # rebuild the chip strip after a page refresh (otherwise these
         # only live in the transient tool_use_start SSE payload).
-        start_meta: dict = {}
+        identity = {"agent_id": agent_id, "agent_type": agent_type} if agent_id else {}
+        start_meta: dict = dict(identity)
         if arg_keys:
             start_meta["arg_keys"] = arg_keys
         if desc:
@@ -2980,6 +3159,7 @@ class TmuxSession(TransportReplacementMixin):
 
         await self._emit_stream_event(
             {
+                **identity,
                 "type": "tool_use_start",
                 "agent_name": self.agent_name,
                 "tool_use_id": call_key,
@@ -2997,6 +3177,8 @@ class TmuxSession(TransportReplacementMixin):
         tool_name: str = "",
         is_error: bool = False,
         tool_response: object = None,
+        agent_id: str = "",
+        agent_type: str = "",
     ) -> None:
         """Record a tool-call result (task #93).
 
@@ -3016,7 +3198,7 @@ class TmuxSession(TransportReplacementMixin):
 
         # #731: this tool call is done — drop it from the in-flight set so the
         # watchdog stops extending the wedge window on its behalf.
-        if tool_use_id:
+        if tool_use_id and not agent_id:
             self._inflight_tool_calls.pop(tool_use_id, None)
 
         # Short result snippet for the stream event — same cap SDK
@@ -3039,7 +3221,8 @@ class TmuxSession(TransportReplacementMixin):
         # the truncated tool output after a page refresh. The same
         # 200-char snippet that the live tool_use_finish SSE event
         # carries — no new PII surface.
-        finish_meta: dict = {}
+        identity = {"agent_id": agent_id, "agent_type": agent_type} if agent_id else {}
+        finish_meta: dict = dict(identity)
         if result_preview:
             finish_meta["result_preview"] = result_preview
 
@@ -3061,6 +3244,7 @@ class TmuxSession(TransportReplacementMixin):
 
         await self._emit_stream_event(
             {
+                **identity,
                 "type": "tool_use_finish",
                 "agent_name": self.agent_name,
                 "tool_use_id": tool_use_id,
@@ -3618,6 +3802,8 @@ class TmuxSession(TransportReplacementMixin):
 
     def _prepare_tmux_spawn(self) -> None:
         """Publish transport-specific state at the final spawn boundary."""
+        if self._prepare_spawn_callback is not None:
+            self._prepare_spawn_callback(self._config.working_dir)
 
     def _spawn_cleanup_state_dir(self) -> Path:
         registry_path = getattr(self._registry, "_db_path", "")
@@ -3689,7 +3875,9 @@ class TmuxSession(TransportReplacementMixin):
             raise RuntimeError(f"{failure}; cleanup debt retained at {path}")
         _clear_tmux_spawn_cleanup_debt(path)
 
-    async def _rollback_spawned_session(self, *, site: str) -> str | None:
+    async def _rollback_spawned_session(
+        self, *, site: str, launch_env: tuple[CommandRunner, str, str] | None = None,
+    ) -> str | None:
         """Strictly and boundedly roll back a possibly-created tmux session.
 
         A returned non-ok kill enters the same verification path as a raise:
@@ -3720,11 +3908,16 @@ class TmuxSession(TransportReplacementMixin):
             )
 
         async def _cleanup() -> str | None:
-            failure = await _strict_owned_tmux_cleanup(
-                self._tmux,
-                agent_name=self.agent_name,
-                action=f"spawn rollback at {site}",
-            )
+            try:
+                failure = await _strict_owned_tmux_cleanup(
+                    self._tmux,
+                    agent_name=self.agent_name,
+                    action=f"spawn rollback at {site}",
+                )
+            finally:
+                # The pane may have died before its interpreter consumed JSON.
+                # Complete nonce cleanup after the kill attempt, even on failure.
+                await _cleanup_launch_env(launch_env)
             if failure is None:
                 if debt_path is not None:
                     try:
@@ -3801,6 +3994,8 @@ class TmuxSession(TransportReplacementMixin):
         than docstring-only.
         """
         self._check_startup_owner()
+        launch_policy = self._launch_env_policy()
+        policy_args = {"launch_policy": launch_policy} if launch_policy.mode == "enforce" else {}
         cwd = self._config.working_dir or "."
         # Ensure cwd exists — claude --continue needs it.
         Path(cwd).mkdir(parents=True, exist_ok=True)
@@ -3869,7 +4064,13 @@ class TmuxSession(TransportReplacementMixin):
         # ``_spawn()`` below (the container is running by now).
         if container_agent is None:
             try:
-                effective_env = {**os.environ, **self._build_repl_env()}
+                effective_env = dict(os.environ)
+                if launch_policy.clean:
+                    effective_env = {
+                        k: v for k, v in effective_env.items()
+                        if k in isolated_launch_env.BASE_ALLOWLIST or k.startswith(("LC_", "XDG_"))
+                    }
+                effective_env.update(self._build_repl_env(**policy_args))
                 cfg_path = _resolve_claude_config_path(effective_env)
                 if _seed_claude_trust_file(cfg_path, cwd):
                     _log(
@@ -3902,17 +4103,20 @@ class TmuxSession(TransportReplacementMixin):
 
         # Transport-specific state publication belongs after every teardown
         # precondition and immediately before command/env construction. The
-        # default is a no-op; Codex uses this exact boundary for AGENTS.md and
-        # soul-version publication.
+        # Claude publishes a missing prompt here; Codex overrides the hook
+        # with its own existing publication policy.
         self._prepare_tmux_spawn()
 
         # Build the in-pane command. ``claude --continue`` resumes the
         # most-recent transcript for ``cwd``; falls back to fresh session
         # if none exists.
         claude_cmd = self._build_claude_cmd()
-        env = self._build_repl_env()
+        env = self._build_repl_env(**policy_args)
+
+        launch_env = None
 
         async def _spawn():
+            nonlocal launch_env
             # Container is up (started above, outside this umbrella): seed its
             # trust file and home-volume credentials (via `podman exec`)
             # before the REPL launches. No-ops for local agents.
@@ -3921,6 +4125,13 @@ class TmuxSession(TransportReplacementMixin):
             self._check_startup_owner()
             await self._seed_container_home_creds()
             self._check_startup_owner()
+            # The new process can create its transcript before tailer startup.
+            # Snapshot only history that exists before process creation.
+            self._prelaunch_transcripts = (
+                frozenset(path for path, _ in self._transcript_candidates())
+                if not self._last_launch_used_continue
+                else frozenset()
+            )
             # Stamp before process creation so even an immediate current-
             # session hook POST is correctly considered fresh.
             session_started_at = time.time()
@@ -3928,13 +4139,17 @@ class TmuxSession(TransportReplacementMixin):
                 cwd=cwd,
                 command=claude_cmd,
                 env=env,
+                **launch_policy.spawn_options(env),
+                **({"codex_headers": True} if self._scrub_codex_headers else {}),
             )
+            launch_env = result.launch_env
             if not result.ok:
                 raise RuntimeError(
                     f"tmux new-session failed: rc={result.returncode} "
                     f"stderr={result.stderr.strip()!r}"
                 )
             self._current_session_started_at = session_started_at
+            self._scheduler_paste_session_id = uuid.uuid4().hex
             # The frozen-value tracker is scoped to the CURRENT tmux process.
             # Keep restart pacing on the retained TmuxSession instance, but
             # never compare the replacement process against the old process's
@@ -3964,7 +4179,7 @@ class TmuxSession(TransportReplacementMixin):
                 raise asyncio.CancelledError
         except asyncio.TimeoutError as exc:
             rollback_failure = await self._rollback_spawned_session(
-                site="cold-start timeout"
+                site="cold-start timeout", launch_env=launch_env,
             )
             message = (
                 f"tmux[{self.agent_name}]: cold-start timed out after "
@@ -3975,7 +4190,7 @@ class TmuxSession(TransportReplacementMixin):
             raise RuntimeError(message) from exc
         except asyncio.CancelledError as exc:
             rollback_failure = await self._rollback_spawned_session(
-                site="cold-start cancellation"
+                site="cold-start cancellation", launch_env=launch_env,
             )
             self._annotate_spawn_rollback_failure(exc, rollback_failure)
             raise
@@ -4000,7 +4215,7 @@ class TmuxSession(TransportReplacementMixin):
             # the Python state machine to DEAD. Strict rollback stays bounded
             # and preserves the original failure (including CancelledError).
             rollback_failure = await self._rollback_spawned_session(
-                site="post-spawn liveness"
+                site="post-spawn liveness", launch_env=launch_env,
             )
             self._annotate_spawn_rollback_failure(exc, rollback_failure)
             raise
@@ -4034,7 +4249,7 @@ class TmuxSession(TransportReplacementMixin):
                 pass
             self._tailer = None
             rollback_failure = await self._rollback_spawned_session(
-                site="tailer-start failure"
+                site="tailer-start failure", launch_env=launch_env,
             )
             self._annotate_spawn_rollback_failure(exc, rollback_failure)
             raise
@@ -4347,16 +4562,24 @@ class TmuxSession(TransportReplacementMixin):
 
         return local_config_dir(wd)
 
-    def _build_repl_env(self) -> dict[str, str]:
+    def _launch_env_policy(self) -> isolated_launch_env.LaunchPolicy:
+        return isolated_launch_env.capture_policy(
+            agent_name=self.agent_name, registry=self._registry,
+            status_lookup=self._isolation_status, log=_log,
+        )
+
+    def _build_repl_env(
+        self, *, launch_policy: isolated_launch_env.LaunchPolicy | None = None,
+    ) -> dict[str, str]:
         """Env vars injected into the tmux session.
 
         Mirrors StreamingSession's ``provider_env`` shape so hook scripts
         (e.g. ``hook_verify_effort.py``) see the same signals on both
         backends.
 
-        **#515 follow-up: PINKY_SESSION_SECRET propagation.** Tmux
-        ``new-session`` only propagates env vars listed via ``-e
-        KEY=VAL``; parent-process env is dropped except for the small
+        **#515 follow-up: PINKY_SESSION_SECRET propagation.**
+        The launch boundary explicitly delivers these env vars; the tmux
+        server drops the caller environment except for the small
         ``update-environment`` allowlist (DISPLAY, SSH_*, etc.). Without
         explicit propagation, every PinkyBot-managed hook
         (``hook_idle.py``, ``hook_working.py``, ``hook_verify_effort.py``,
@@ -4370,6 +4593,7 @@ class TmuxSession(TransportReplacementMixin):
         Propagating the secret here re-enables the entire hook fleet
         for tmux agents without touching any individual hook script.
         """
+        launch_policy = launch_policy or self._launch_env_policy()
         env: dict[str, str] = {}
         if self._config.provider_url:
             env["ANTHROPIC_BASE_URL"] = self._config.provider_url
@@ -4389,7 +4613,7 @@ class TmuxSession(TransportReplacementMixin):
         # instead of the single-use refresh token in .credentials.json (no
         # refresh ⇒ no shared-creds de-auth race). ESSENTIAL for container
         # agents — their isolated env does NOT inherit the daemon env, so
-        # without this -e the token never reaches them; local tmux agents get
+        # without explicit delivery the token never reaches them; local tmux agents get
         # it via tmux-server inheritance, but forwarding makes it explicit and
         # uniform. Flag-gated + provider-guarded inside _static_oauth_token.
         #
@@ -4410,12 +4634,19 @@ class TmuxSession(TransportReplacementMixin):
             env["CLAUDE_CODE_OAUTH_TOKEN"] = ""
         elif oauth_token:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+        if launch_policy.clean and not (self._config.provider_url or self._config.provider_key):
+            for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+                if key in os.environ:
+                    env.setdefault(key, os.environ[key])
+            if not dedicated_config_dir and "CLAUDE_CODE_OAUTH_TOKEN" in os.environ:
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
         if self.agent_name:
             env["PINKY_AGENT_NAME"] = self.agent_name
         env[_TMUX_TRANSCRIPT_BIND_MARKER_ENV] = _TMUX_TRANSCRIPT_BIND_MARKER_VALUE
         env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] = str(
             DEFAULT_MAX_CONCURRENT_SUBAGENTS
         )
+        env["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] = "false"
         # Surface the RESOLVED effort (#151): the drift hook compares this to
         # the runtime $CLAUDE_EFFORT, which reports xhigh under ultracode — so
         # expect xhigh, not the literal "ultracode", to avoid false drift.
@@ -4442,7 +4673,9 @@ class TmuxSession(TransportReplacementMixin):
         # internal requests with a non-forgeable identity. Lookup guarded like
         # _restart_threshold_pct — a registry hiccup must not break session env.
         agent_key = ""
-        if self._registry and self.agent_name:
+        if launch_policy.mode == "enforce":
+            agent_key = launch_policy.agent_key
+        elif self._registry and self.agent_name:
             try:
                 agent_key = (self._registry.get_signing_key(self.agent_name) or "").strip()
             except Exception:
@@ -4467,6 +4700,7 @@ class TmuxSession(TransportReplacementMixin):
         # FastAPI middleware read it from the same env var. Empty/missing is
         # tolerated: hooks already handle that gracefully (silent no-op).
         #
+        # Resolve the explicit identity independently of the inheritance mode.
         # #149 phase-3 security gate (fail CLOSED — Murzik #639 review): the
         # global secret is the fleet-wide signing key; the daemon dual-accepts
         # it for EVERY agent name, so any child that holds it can sign internal
@@ -4484,27 +4718,33 @@ class TmuxSession(TransportReplacementMixin):
         # non-isolated agents and the legacy/dev "unknown + no key" case (an
         # agent with no key genuinely needs the shared secret to sign at all).
         secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
-        status = self._isolation_status()
+        status = launch_policy.status if launch_policy.mode == "enforce" else self._isolation_status()
         if status == "isolated":
             if agent_key:
                 _log(
-                    f"tmux[{self.agent_name}]: isolated — per-agent key only, "
-                    f"global secret withheld"
+                    f"tmux[{self.agent_name}]: isolated launch identity configured"
                 )
             else:
                 _log(
                     f"tmux[{self.agent_name}]: ERROR isolated agent has no per-agent "
-                    f"signing key — withholding global secret too (hooks/MCP will "
-                    f"no-op); provision a key to restore signing"
+                    f"signing key; provision a key for scoped signing"
                 )
         elif status == "unknown" and agent_key and secret:
             _log(
                 f"tmux[{self.agent_name}]: isolation status unknown but per-agent "
-                f"key present — withholding global secret (fail closed)"
+                f"key present — scoped identity configured"
             )
         elif secret:
             env["PINKY_SESSION_SECRET"] = secret
 
+        isolated_launch_env.report_shadow(
+            agent_name=self.agent_name, status=status, has_agent_key=bool(agent_key),
+            explicit_names=env, log=_log,
+        )
+        env = isolated_launch_env.with_grants(launch_policy, env)
+        if launch_policy.clean and (self._config.provider_url or self._config.provider_key):
+            if not dedicated_config_dir:
+                env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
         return env
 
     async def disconnect(self) -> None:
@@ -4782,7 +5022,7 @@ class TmuxSession(TransportReplacementMixin):
         )
 
     async def send_scheduler_prompt(
-        self, prompt: str, *, on_accept=None
+        self, prompt: str, *, on_accept=None, busy_deliver_at: float | None = None
     ) -> asyncio.Future[bool]:
         """Start a scheduler turn and return its exact acceptance receipt.
 
@@ -4795,6 +5035,7 @@ class TmuxSession(TransportReplacementMixin):
             prompt,
             scheduler_delivery=receipt,
             scheduler_accept=on_accept,
+            scheduler_busy_deliver_at=busy_deliver_at,
             scheduler_serialized=True,
         )
         if not queued and not receipt.done():
@@ -4908,6 +5149,7 @@ class TmuxSession(TransportReplacementMixin):
         agent_hint: str = "",
         scheduler_delivery: asyncio.Future[bool] | None = None,
         scheduler_accept=None,
+        scheduler_busy_deliver_at: float | None = None,
         scheduler_serialized: bool = False,
     ) -> bool:
         """Apply external-send side effects and enqueue one pane turn."""
@@ -4969,11 +5211,13 @@ class TmuxSession(TransportReplacementMixin):
         queued_prompt = prompt + agent_hint if agent_hint else prompt
         turn = _QueuedTurn(
             prompt=queued_prompt,
+            queued_at=time.time(),
             platform=platform,
             chat_id=chat_id,
             message_id=message_id,
             scheduler_delivery=scheduler_delivery,
             scheduler_accept=scheduler_accept,
+            scheduler_busy_deliver_at=scheduler_busy_deliver_at,
             scheduler_serialized=scheduler_serialized,
         )
         if scheduler_serialized:
@@ -5393,6 +5637,9 @@ class TmuxSession(TransportReplacementMixin):
 
         self._bound_transcript_session_id = requested_session_id
         self._set_transcript_path_internal(path)
+        if not self._session_ready_event.is_set():
+            self._session_ready_event.set()
+            _log(f"tmux[{self.agent_name}]: session-ready gate opened (SessionStart hook)")
         return True
 
     def _set_transcript_path_internal(self, path: Path | str) -> None:
@@ -5418,19 +5665,6 @@ class TmuxSession(TransportReplacementMixin):
             f"tmux[{self.agent_name}]: transcript path updated to {path}"
             + (" (first-bind — seek_to_start)" if seek_to_start else "")
         )
-
-        # Issue #570: SessionStart hook firing is our "claude is past
-        # splash + MCP boot, input area is live" signal — open the
-        # readiness gate so any pending wake prompt's paste can land.
-        # Idempotent under .set() so a hook that re-fires later in the
-        # session is a harmless no-op (existing tests confirm hook can
-        # fire on every CC SessionStart event, not just first launch).
-        if not self._session_ready_event.is_set():
-            self._session_ready_event.set()
-            _log(
-                f"tmux[{self.agent_name}]: session-ready gate opened "
-                f"(SessionStart hook)"
-            )
 
     async def get_pane_snapshot(self, *, lines: int = 200) -> str:
         """Return the last ``lines`` lines of the tmux pane, with ANSI
@@ -5693,35 +5927,12 @@ class TmuxSession(TransportReplacementMixin):
         return max(1, raw - self._AUTOCOMPACT_BUFFER_TOKENS)
 
     def _isolation_status(self) -> str:
-        """Tri-state isolation lookup for the env secret gate (#149 phase-3).
+        """Shared tri-state lookup for explicit payload omission and shadowing.
 
-        Returns ``"isolated"``, ``"not_isolated"``, or ``"unknown"`` (registry
-        unwired, agent not found, or lookup raised). A bare bool would conflate
-        "proven non-isolated" (safe to inject the global secret) with "can't
-        tell" — and Murzik's #639 review caught that conflation as a fail-OPEN:
-        if ``get_signing_key`` returns a key but ``registry.get`` raises, a bool
-        helper falls to False and the env builder would inject BOTH the per-agent
-        key AND the forgeable global secret (the same fail-open class fixed in
-        #635). The caller withholds the global secret whenever isolation can't
-        be *proven* false and a per-agent key already provides a working
-        identity, so registry uncertainty never causes global-secret exposure.
+        Unknown isolation plus a signing key uses the isolated policy; a
+        non-local mode also implies isolation regardless of the isolated flag.
         """
-        if not self._registry or not self.agent_name:
-            return "unknown"
-        try:
-            agent = self._registry.get(self.agent_name)
-        except Exception:
-            return "unknown"
-        if agent is None:
-            return "unknown"
-        # A non-local isolation_mode IS isolation, regardless of the `isolated`
-        # bool: a container/unix_user tenant holding the fleet-wide forgeable
-        # PINKY_SESSION_SECRET would defeat the entire OS boundary (#638 gap —
-        # the register/update models coerce isolated=True for non-local modes,
-        # but legacy rows / direct DB writes must not bypass the secret gate).
-        if getattr(agent, "isolation_mode", "local") not in ("", "local"):
-            return "isolated"
-        return "isolated" if getattr(agent, "isolated", False) else "not_isolated"
+        return isolated_launch_env.isolation_status(self._registry, self.agent_name)
 
     def _restart_threshold_pct(self) -> float:
         """Pull the agent's restart threshold from the registry.
@@ -6773,6 +6984,8 @@ class TmuxSession(TransportReplacementMixin):
         # silently lost the #564 first-bind seek AND the #565
         # delayed recovery for the rest of its lifetime.
         self._tailer_first_bind_pending = True
+        # Preserve the candidate snapshot taken before process creation.
+        self._first_bind_wait_logged = False
 
         # Issue #570: reset the wake-prompt readiness gate to a fresh
         # unset Event on every spawn. The previous spawn's event may
@@ -6849,28 +7062,28 @@ class TmuxSession(TransportReplacementMixin):
         task.add_done_callback(_done)
 
     async def _delayed_first_bind_recovery(self) -> None:
-        """Issue #565 — wait, then attempt first-bind recovery.
-
-        Sleeps for ``_FIRST_BIND_RECOVERY_DELAY_SEC`` and then calls
-        ``_attempt_first_bind_recovery()``. Split from the sync
-        recovery method so tests can exercise the recovery logic
-        without dealing with timer-based scheduling.
-
-        Cancellation during the sleep is the expected unwind on
-        ``_stop_tailer``: ``asyncio.CancelledError`` propagates so the
-        task is marked cancelled (don't swallow it — that would mask
-        the intent and confuse anything inspecting the task state).
-        Any non-cancel exception from ``_attempt_first_bind_recovery``
-        is caught and logged; the task must not crash unhandled.
-        """
-        await asyncio.sleep(_FIRST_BIND_RECOVERY_DELAY_SEC)
-        try:
-            self._attempt_first_bind_recovery()
-        except Exception as e:  # defensive — must never crash a task
-            _log(
-                f"tmux[{self.agent_name}]: #565 first-bind recovery raised "
-                f"({type(e).__name__}: {e})"
-            )
+        """Poll for a late transcript; teardown cancellation propagates."""
+        if self._last_launch_used_continue:
+            return
+        deadline = time.monotonic() + _FIRST_BIND_RECOVERY_CAP_SEC
+        while self._tailer is not None and self._tailer_first_bind_pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _log(
+                    f"TRANSCRIPT_FIRST_BIND_MISSING agent={self.agent_name} "
+                    f"waited_s={_FIRST_BIND_RECOVERY_CAP_SEC:g} "
+                    f"prelaunch={len(self._prelaunch_transcripts)} "
+                    f"current={Path(self._tailer.transcript_path).name}"
+                )
+                return
+            await asyncio.sleep(min(_FIRST_BIND_RECOVERY_DELAY_SEC, remaining))
+            try:
+                self._attempt_first_bind_recovery()
+            except Exception as e:  # defensive — must never crash a task
+                _log(
+                    f"tmux[{self.agent_name}]: #565 first-bind recovery raised "
+                    f"({type(e).__name__}: {e})"
+                )
 
     def _attempt_first_bind_recovery(self) -> None:
         """Issue #565 — recover from the bind-never-arrives case on a
@@ -6900,7 +7113,9 @@ class TmuxSession(TransportReplacementMixin):
           - First-bind flag already consumed by the explicit hook.
           - Tailer has been torn down (``_stop_tailer`` ran).
           - Discovery returns None (no real transcript on disk yet).
-          - Discovery returns the same path we're already on.
+
+        An eligible path already found by the tailer's self-heal consumes
+        the pending flag without seeking or opening the readiness gate.
         """
         # Guard: only fresh launches need recovery — continue launches
         # already seek EOF for #496 reply-spam defense.
@@ -6917,18 +7132,27 @@ class TmuxSession(TransportReplacementMixin):
         if self._tailer is None:
             return
         try:
-            discovered = self._discover_transcript_path()
+            discovered = self._discover_post_launch_transcript_path()
         except Exception as e:
             _log(
-                f"tmux[{self.agent_name}]: #565 recovery discovery raised "
-                f"({type(e).__name__}: {e})"
+                f"tmux[{self.agent_name}]: #565 recovery discovery raised ({type(e).__name__}: {e})"
             )
             return
         if discovered is None:
+            if not self._first_bind_wait_logged:
+                self._first_bind_wait_logged = True
+                _log(
+                    f"tmux[{self.agent_name}]: #565 recovery: "
+                    "no post-launch transcript yet — polling"
+                )
             return
-        # No-change → no work. The tailer's own equality guard would
-        # handle this, but checking here keeps the log noise honest.
+        # Discovery can be satisfied by the tailer's independent self-heal.
+        # Acknowledge it without rewinding bytes already consumed.
         if Path(discovered) == Path(self._tailer.transcript_path):
+            self._tailer_first_bind_pending = False
+            _log(
+                f"tmux[{self.agent_name}]: #565 recovery: first bind already satisfied by self-heal"
+            )
             return
         _log(
             f"tmux[{self.agent_name}]: #565 first-bind recovery — no "
@@ -7106,6 +7330,30 @@ class TmuxSession(TransportReplacementMixin):
         except OSError:
             return None
         return jsonls[0] if jsonls else None
+
+    def _transcript_candidates(self) -> Iterator[tuple[Path, float]]:
+        """Enumerate eligible transcripts for snapshots and recovery discovery."""
+        yield from _regular_transcript_candidates(self._project_dir().glob("*.jsonl"))
+
+    def _is_own_transcript(self, path: Path) -> bool:
+        """The default runtime has a dedicated transcript directory per workspace."""
+        return True
+
+    def _discover_post_launch_transcript_path(self) -> Path | None:
+        """Find a new transcript path, excluding history modified at shutdown."""
+        candidates = sorted(
+            (
+                (path, mtime)
+                for path, mtime in self._transcript_candidates()
+                if path not in self._prelaunch_transcripts
+            ),
+            key=lambda candidate: candidate[1],
+            reverse=True,
+        )
+        for path, _ in candidates[:_DISCOVERY_SCAN_LIMIT]:
+            if self._is_own_transcript(path):
+                return path
+        return None
 
     def _prepend_message_queue(self, turns: list[_QueuedTurn]) -> None:
         """Put ``turns`` ahead of the existing backlog without changing FIFO."""
@@ -7578,6 +7826,13 @@ class TmuxSession(TransportReplacementMixin):
             path = Path(raw_path)
         except (TypeError, ValueError):
             return _TranscriptOccurrenceTicket(None, None, None)
+        if path == _PLACEHOLDER_TRANSCRIPT_PATH:
+            # Before first bind, a fresh launch materializes its file after
+            # paste. On --continue, first bind does not seek_to_start, so old
+            # identical rows are not emitted as new acceptance evidence.
+            return _TranscriptOccurrenceTicket(
+                path, None, 0, anchor_start=0, anchor=b"", captured_at_ns=time.time_ns(),
+            )
         try:
             # Preserve the fail-safe distinction between a missing path and an
             # inaccessible bound path. Identity never comes from this lookup;
@@ -7611,7 +7866,7 @@ class TmuxSession(TransportReplacementMixin):
     def _phantom_consumption_verdicts(
         self, candidates: list[_InflightMeta]
     ) -> list[bool | None]:
-        """Allocate complete post-paste user rows to candidates one-to-one.
+        """Certify paste-bound user rows, folded spans, and exact fold chains.
 
         ``True`` proves this exact occurrence was accepted, ``False`` means
         no paste-bound occurrence was proved (including allocation-only rows
@@ -7770,7 +8025,11 @@ class TmuxSession(TransportReplacementMixin):
                         if (
                             row_offset >= allocation_start
                             and row_offset not in reserved
-                            and prompt == entry.turn.prompt
+                            and (
+                                prompt == entry.turn.prompt
+                                or self._transcript_prompt_identity(prompt)
+                                == entry.turn.prompt
+                            )
                         ):
                             reserved.add(row_offset)
                             break
@@ -7828,8 +8087,8 @@ class TmuxSession(TransportReplacementMixin):
                     incomplete.add(key)
                 rows[key] = found
 
-            # Phase 1 is the pre-#1163 exact allocator byte-for-byte: each
-            # candidate claims its oldest distinct exact row, including an
+            # Phase 1 allocates exact prompt identities (bare or one strict
+            # TUI envelope): each candidate claims its oldest row, including an
             # already accepted candidate whose row must not be donated to a
             # later duplicate. Exact-reserved rows are wholly unavailable to
             # containment, even for a different nested prompt.
@@ -7846,7 +8105,11 @@ class TmuxSession(TransportReplacementMixin):
                     if (
                         row_offset >= allocation_start
                         and occurrence not in exact_rows
-                        and prompt == entry.turn.prompt
+                        and (
+                            prompt == entry.turn.prompt
+                            or self._transcript_prompt_identity(prompt)
+                            == entry.turn.prompt
+                        )
                     ):
                         exact_rows.add(occurrence)
                         claims[index] = _TranscriptProbeRow(
@@ -8110,7 +8373,11 @@ class TmuxSession(TransportReplacementMixin):
                     occurrence = (key, chain_index)
                     if (
                         occurrence in reserved_chains
-                        or chain.prompt != candidate_prompt
+                        or (
+                            chain.prompt != candidate_prompt
+                            and self._transcript_prompt_identity(chain.prompt)
+                            != candidate_prompt
+                        )
                     ):
                         continue
                     reserved_chains.add(occurrence)
@@ -8842,8 +9109,8 @@ class TmuxSession(TransportReplacementMixin):
                 if verdict == "idle":
                     # #1127/#1128: an idle REPL proves there is no work running,
                     # but not that every mechanically successful paste was ever
-                    # submitted. Allocate complete ``type=user`` rows from each
-                    # turn's post-paste transcript boundary, FIFO and one-to-one.
+                    # submitted. Probe complete user rows, folded spans, and
+                    # exact fold chains against each turn's paste boundary.
                     # Existing exact acceptance remains authoritative, while an
                     # older/equal prompt occurrence cannot certify a new paste.
                     candidates = list(self._inflight_metas)
@@ -9365,6 +9632,7 @@ class TmuxSession(TransportReplacementMixin):
                         if delivery is not None and not delivery.done():
                             delivery.set_result(False)
                         return False
+                    self._trace_scheduler_turn(t, "replay", reason="watchdog_replay")
                     # Its old FIFO metadata was removed above. Allow the
                     # replacement-pane delivery to record a fresh entry.
                     t.pane_delivery_recorded = False
@@ -9517,6 +9785,14 @@ class TmuxSession(TransportReplacementMixin):
         if self._scheduler_receipt_terminal(turn):
             raise _SchedulerDeliveryCancelled
 
+    def _scheduler_busy_deadline_reached(self, turn: _QueuedTurn | None) -> bool:
+        if turn is None or not turn.scheduler_serialized:
+            return False
+        deadline = turn.scheduler_busy_deliver_at
+        if deadline is None:
+            deadline = turn.queued_at + min(scheduler_busy_delay(), 1800.0)
+        return time.time() >= deadline
+
     def _scheduler_pane_busy(
         self, candidate: _QueuedTurn | None = None
     ) -> bool:
@@ -9529,6 +9805,8 @@ class TmuxSession(TransportReplacementMixin):
         identity (and queue items necessarily behind it) to avoid a self-wait;
         all earlier pane work and live-idle evidence still gate the paste.
         """
+        if self._scheduler_busy_deadline_reached(candidate):
+            return self._has_unresolved_pasted_acceptance()
         candidate_in_worker = (
             candidate is not None and self._inflight_turn is candidate
         )
@@ -9615,6 +9893,30 @@ class TmuxSession(TransportReplacementMixin):
         if self.state != SessionState.CONNECTED:
             return False
         return self._scheduler_pane_busy()
+
+    @staticmethod
+    def _transcript_prompt_identity(content: str | None) -> str | None:
+        """Unwrap exactly one Claude Code 2.1.278 pasted-content envelope.
+
+        The closing tag carries the same four-hex id as the opening tag.
+        Only the two framing newlines are removed; raw prompt whitespace is
+        significant. Malformed, nested, or multiple envelopes stay unchanged.
+        Callers compare the original bytes first to preserve literal markup.
+        """
+        if content is None:
+            return None
+        match = re.fullmatch(
+            r'<pasted_content id="([0-9a-fA-F]{4})">\n(.*)\n'
+            r'</pasted_content id="\1">',
+            content.strip(),
+            flags=re.DOTALL,
+        )
+        if match is None:
+            return content
+        inner = match.group(2)
+        if "<pasted_content" in inner or "</pasted_content" in inner:
+            return content
+        return inner
 
     @staticmethod
     def _transcript_user_text(entry: dict) -> str | None:
@@ -9711,7 +10013,10 @@ class TmuxSession(TransportReplacementMixin):
             if (
                 not turn.pane_delivery_started
                 or turn.transport_accepted
-                or turn.prompt != content
+                or (
+                    turn.prompt != content
+                    and turn.prompt != self._transcript_prompt_identity(content)
+                )
                 or (
                     turn.submission_receipt is not None
                     and turn.submission_receipt.done()
@@ -9741,6 +10046,50 @@ class TmuxSession(TransportReplacementMixin):
             and ticket_offset is not None
             and entry_offset >= ticket_offset
         )
+
+    def _live_user_row_matches_turn_ticket(
+        self,
+        turn: _QueuedTurn,
+        *,
+        entry_offset: int | None,
+        source_identity: tuple[int, int] | None,
+    ) -> bool:
+        """Check the pre-paste ticket even before routing metadata exists."""
+        identity = turn.transcript_file_identity_at_paste
+        offset = turn.transcript_offset_at_paste
+        if identity is not None and offset is not None:
+            return self._transcript_entry_matches_ticket(
+                entry_offset=entry_offset,
+                source_identity=source_identity,
+                ticket_offset=offset,
+                ticket_identity=identity,
+            )
+        cold_start = (
+            turn.transcript_path_at_paste is not None
+            and identity is None
+            and offset == 0
+        )
+        detail = ""
+        if cold_start:
+            # Preserve first-turn acceptance when the file did not exist at
+            # paste. Anchor/first-materialization certification is a follow-up.
+            shape = "cold-start"
+            reason = "cold_start_ticket_unverified"
+            cold_reason = (
+                "placeholder" if turn.transcript_path_at_paste == _PLACEHOLDER_TRANSCRIPT_PATH
+                else "file_missing"
+            )
+            detail = f" cold_start_reason={cold_reason!r}"
+        else:
+            shape = "unbound" if turn.transcript_path_at_paste is None else "inaccessible"
+            reason = "no paste ticket"
+        if shape not in turn.transcript_ticket_warned_shapes:
+            turn.transcript_ticket_warned_shapes.add(shape)
+            _log(
+                f"WARNING live user-row ticket turn_id={id(turn)} "
+                f"entry_offset={entry_offset} shape={shape} reason={reason!r}{detail}"
+            )
+        return cold_start
 
     @staticmethod
     def _fold_pair_rows_share_occurrence(
@@ -10309,7 +10658,11 @@ class TmuxSession(TransportReplacementMixin):
             if (
                 not evidence.retired
                 and evidence.turn is None
-                and evidence.content == turn.prompt
+                and (
+                    evidence.content == turn.prompt
+                    or self._transcript_prompt_identity(evidence.content)
+                    == turn.prompt
+                )
             ):
                 self._pane_queue_operations[index] = replace(
                     evidence,
@@ -10320,7 +10673,11 @@ class TmuxSession(TransportReplacementMixin):
             if (
                 not evidence.retired
                 and evidence.turn is None
-                and evidence.content == turn.prompt
+                and (
+                    evidence.content == turn.prompt
+                    or self._transcript_prompt_identity(evidence.content)
+                    == turn.prompt
+                )
             ):
                 self._pane_dequeued_turns[index] = _DequeuedPromptEvidence(
                     evidence.content,
@@ -10329,6 +10686,40 @@ class TmuxSession(TransportReplacementMixin):
                     retired=True,
                 )
                 return
+
+    @staticmethod
+    def _trace_scheduler_turn(turn, edge: str, **fields) -> None:
+        owner = getattr(getattr(turn, "scheduler_accept", None), "__self__", None)
+        trace = getattr(owner, "trace", None)
+        if callable(trace):
+            try:
+                if "pointer" in fields:
+                    fields["pointer"] = json.dumps(fields["pointer"], default=str)
+                trace(edge, **fields)
+            except Exception as exc:
+                try:
+                    owner.trace_failure(edge, exc)
+                except Exception:
+                    _log(f"schedule fire trace callback failed ({type(exc).__name__})")
+
+    def _trace_observed_prompt(self, prompt, *, pointer) -> None:
+        # Observe separately from the acceptance matcher: matching failure is
+        # itself a diagnostic class. Do not grant or change receipt authority.
+        occupied: list[tuple[int, int]] = []
+        for turn in self._acceptance_candidates():
+            if not turn.pane_delivery_started:
+                continue
+            if isinstance(pointer, dict) and not self._transcript_entry_matches_ticket(
+                entry_offset=pointer.get("offset"), source_identity=pointer.get("identity"),
+                ticket_offset=turn.transcript_offset_at_paste,
+                ticket_identity=turn.transcript_file_identity_at_paste,
+            ):
+                continue
+            span = self._first_unoccupied_prompt_span(prompt, turn.prompt, occupied)
+            if span is None:
+                continue
+            occupied.append(span)
+            self._trace_scheduler_turn(turn, "observed", pointer=pointer)
 
     def _mark_transport_accepted(self, turn: _QueuedTurn | None) -> bool:
         """Resolve exact receipts only on observed pane acceptance."""
@@ -10343,6 +10734,7 @@ class TmuxSession(TransportReplacementMixin):
         if self._wake_requires_submission_receipt(turn):
             self._finish_turn_delivery(turn, fire_on_delivered=False)
         if turn.scheduler_accept is not None:
+            self._trace_scheduler_turn(turn, "accept_source", matched_by="transcript_receipt")
             try:
                 persisted = turn.scheduler_accept()
             except Exception as exc:
@@ -10514,10 +10906,19 @@ class TmuxSession(TransportReplacementMixin):
         if entry_type == "user":
             prompt = self._transcript_user_text(entry)
             if prompt is not None:
+                self._trace_observed_prompt(prompt, pointer={
+                    "path": getattr(self._tailer, "transcript_path", ""),
+                    "offset": entry_offset,
+                    "identity": source_identity,
+                })
                 guard = self._wake_context_reload_guard
                 if (
                     guard is not None
-                    and prompt == guard.original_turn.prompt
+                    and (
+                        prompt == guard.original_turn.prompt
+                        or self._transcript_prompt_identity(prompt)
+                        == guard.original_turn.prompt
+                    )
                     and not guard.original_seen
                 ):
                     guard.original_seen = True
@@ -10545,7 +10946,12 @@ class TmuxSession(TransportReplacementMixin):
                     return
                 turn = self._match_acceptance_content(prompt)
                 if turn is not None:
-                    self._mark_transport_accepted(turn)
+                    if self._live_user_row_matches_turn_ticket(
+                        turn,
+                        entry_offset=entry_offset,
+                        source_identity=source_identity,
+                    ):
+                        self._mark_transport_accepted(turn)
                 else:
                     for folded_turn in self._folded_acceptance_turns(prompt):
                         folded_meta = next(
@@ -11334,6 +11740,12 @@ class TmuxSession(TransportReplacementMixin):
                     turn.transcript_ticket_captured_at_ns = (
                         transcript_ticket.captured_at_ns
                     )
+                    owner = getattr(turn.scheduler_accept, "__self__", None)
+                    mark_pasted = getattr(owner, "mark_pasted", None)
+                    if callable(mark_pasted) and not mark_pasted(
+                        self._scheduler_paste_session_id, turn.prompt
+                    ):
+                        raise RuntimeError("scheduler paste marker refused exact fire")
                     turn.pane_delivery_started = True
                     result = await self._tmux.paste_text(
                         turn.prompt, enter=True
@@ -11467,6 +11879,13 @@ class TmuxSession(TransportReplacementMixin):
             ),
             fresh_context_epoch=self._fresh_context_respawn_epoch,
         ))
+        self._trace_scheduler_turn(turn, "paste", at=_paste_succeeded_at,
+                                   transport_kind=self._trace_transport_kind,
+                                   pointer={
+                                       "path": turn.transcript_path_at_paste or _tpath or "",
+                                       "offset": turn.transcript_offset_at_paste,
+                                       "identity": turn.transcript_file_identity_at_paste,
+                                   })
         # Watchdog head-clock. If this entry just became the head (deque
         # was empty before append), start its timeout window NOW. If
         # other entries are ahead, the head's clock was set when IT

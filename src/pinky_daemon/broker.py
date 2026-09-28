@@ -637,6 +637,11 @@ class MessageBroker:
         """Store inbound routing context for later reply()/react() resolution."""
         if not message.message_id:
             return
+        # Stamp the direction LAST so nothing carried in the platform metadata
+        # can pose as the daemon's own verdict: an identity lookup treats only
+        # an explicit "inbound" as a message the daemon routed to the agent.
+        metadata = dict(message.metadata or {})
+        metadata["direction"] = "inbound"
         self._remember_context(MessageContext(
             agent_name=message.agent_name,
             message_id=message.message_id,
@@ -647,7 +652,7 @@ class MessageBroker:
             is_group=message.is_group,
             source_was_voice=source_was_voice,
             attachments=list(message.attachments or []),
-            metadata=dict(message.metadata or {}),
+            metadata=metadata,
         ))
 
     def remember_outbound_message_context(
@@ -704,6 +709,45 @@ class MessageBroker:
             context, stored_at = next(iter(matches.values()))
             self._cache_message_context(context, stored_at=stored_at)
             return context
+
+    def get_message_context_by_identity(
+        self,
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        message_id: str,
+    ) -> tuple[MessageContext, float] | None:
+        """Resolve one fully identified context and when it was stored.
+
+        Unlike ``get_message_context`` the caller names the platform and chat,
+        so the lookup never has to disambiguate a message ID reused across
+        chats. The persisted store is authoritative: its retention window and
+        per-agent cap decide existence, so a row that only the in-memory cache
+        holds (persistence failed, or the store has since pruned it while the
+        cache order kept it) is never served. Without a store the bounds
+        cannot be enforced, so nothing is served. The read has no side
+        effects: the cache is neither refreshed nor pruned here, because the
+        reply-routing paths still rely on it.
+        """
+        if not (agent_name and platform and chat_id and message_id):
+            return None
+        if self._message_context_store is None:
+            return None
+        try:
+            stored = self._message_context_store.get(
+                agent_name,
+                message_id,
+                platform=platform,
+                chat_id=chat_id,
+                include_stored_at=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — a store fault reads as "not found"
+            _log(f"message-context load failed: {type(exc).__name__}")
+            return None
+        if stored is None:
+            return None
+        stored_at = float(stored.pop("_stored_at"))
+        return MessageContext(**stored), stored_at
 
     async def _handle_stop_command(self, message: BrokerMessage) -> bool:
         """Intercept /stop commands from the owner. Returns True if handled."""
