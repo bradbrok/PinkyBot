@@ -129,3 +129,34 @@ def test_existing_registration_guard_control(daemon):
                                json={'name': 'fixture-new', 'working_dir': str(d.root/'fixture-new')})
     assert response.status_code == 403
     assert d.agents.get('fixture-new') is None
+
+
+@pytest.mark.parametrize('prefix', ['/proxy', '/administrator'])
+@pytest.mark.parametrize('principal', ['tenant', 'normal', 'owner'])
+def test_admin_root_path_matches_dispatch(daemon, no_restart, prefix, principal):
+    d = daemon('off')
+    path = prefix + '/admin/restart'
+    with scratch_client(d.app, root_path=prefix) as client:
+        if principal == 'owner':
+            client.cookies.set(SESSION_COOKIE_NAME, create_session_cookie(TEST_SESSION_SECRET))
+            headers = {}
+        else:
+            headers = signed(d, 'POST', path, principal)
+        response = client.post(path, headers=headers)
+    expected = (403, []) if principal == 'tenant' else (200, ['restart'])
+    assert (response.status_code, no_restart) == expected
+
+
+def test_misleading_root_prefix_does_not_change_route(daemon, no_restart):
+    d = daemon('off')
+    hits = []
+
+    @d.app.post('/proxyish/admin/restart')
+    async def unrelated():
+        hits.append(True)
+        return {'ok': True}
+
+    path = '/proxyish/admin/restart'
+    with scratch_client(d.app, root_path='/proxy') as client:
+        response = client.post(path, headers=signed(d, 'POST', path))
+    assert (response.status_code, hits, no_restart) == (200, [True], [])

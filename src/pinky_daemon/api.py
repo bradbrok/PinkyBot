@@ -56,6 +56,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
+from starlette._utils import get_route_path
 
 from pinky_daemon import runtime_model_catalog
 from pinky_daemon import schedule_fire_trace as _schedule_fire_trace
@@ -5551,9 +5552,10 @@ def create_api(
         """
         if not caller_name:
             return False
-        # Always-on admin boundary. ASGI already decoded the path; collapse
-        # repeated slashes for this deny check only, without changing routing.
-        path = re.sub(r"/+", "/", request.scope["path"])
+        # Always-on admin boundary. Use the same root_path handling as the
+        # dispatcher, then collapse repeated slashes for the deny check only.
+        # ASGI already decoded the path; do not decode or rewrite it again.
+        path = re.sub(r"/+", "/", get_route_path(request.scope))
         admin_action = path == "/admin" or path.startswith("/admin/")
         admin_action = admin_action or (request.method == "POST" and path.rstrip("/") == "/agents")
         if admin_action:
