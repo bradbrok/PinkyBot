@@ -4190,6 +4190,8 @@ class TestScheduler:
             pending_wake_max_age_sec=1_000,
             outbox_drain_extension_attempt_cap=1,
         )
+        # Exercise release/staleness independently of the new busy deadline.
+        monkeypatch.setattr(scheduler, "_busy_deliver_at", lambda row: base + 10_000)
         scheduler._check_pending_wake_liveness(base)
         clock[0] = base + 60
         scheduler._check_pending_wake_liveness(clock[0])
@@ -5189,6 +5191,8 @@ class TestScheduler:
             owner_notify_callback=owner_notify,
             pending_wake_max_age_sec=100_000,
             outbox_drain_extension_attempt_cap=1,
+            # Every target must independently qualify for this partial-write scenario.
+            outbox_drain_extension_max_age_sec=30,
         )
         real_park = registry.drain_park_pending_schedule_wake
         park_wedged = [True]
@@ -5368,6 +5372,8 @@ class TestScheduler:
             owner_notify_callback=owner_notify,
             pending_wake_max_age_sec=100_000,
             outbox_drain_extension_attempt_cap=1,
+            # Every target must independently qualify for this partial-write scenario.
+            outbox_drain_extension_max_age_sec=30,
         )
         real_park = registry.drain_park_pending_schedule_wake
         wedged = [True]

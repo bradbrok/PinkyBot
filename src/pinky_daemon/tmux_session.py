@@ -66,6 +66,7 @@ import shlex
 import sys
 import threading
 import time
+import uuid
 from collections import OrderedDict, deque
 from collections.abc import Iterator
 from contextlib import ExitStack
@@ -91,6 +92,7 @@ from pinky_daemon.command_runner import (
 from pinky_daemon.effort import EFFORT_LEVELS, is_ultracode, resolve_cli_effort
 from pinky_daemon.pricing import compute_cost_from_usage
 from pinky_daemon.runtime_model_catalog import ModelCatalogError
+from pinky_daemon.scheduler_delivery import scheduler_busy_delay
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.streaming_session import (
     StreamingSessionConfig,
@@ -1638,6 +1640,7 @@ class _QueuedTurn:
     # the only positive evidence and replay work that already entered the pane.
     scheduler_accept: object = None  # Callable() -> bool
     scheduler_serialized: bool = False
+    scheduler_busy_deliver_at: float | None = None
     pane_delivery_started: bool = False
     pane_queue_enqueued: bool = False
     transport_accepted: bool = False
@@ -2190,6 +2193,7 @@ class TmuxSession(TransportReplacementMixin):
         prepare_spawn_callback=None,
     ) -> None:
         self._config = config
+        self._scheduler_paste_session_id = uuid.uuid4().hex
         self._wake_launch_history = config.wake_launch_history
         self._wake_owner_alerted = False
         self._response_callback = response_callback
@@ -4134,6 +4138,7 @@ class TmuxSession(TransportReplacementMixin):
                     f"stderr={result.stderr.strip()!r}"
                 )
             self._current_session_started_at = session_started_at
+            self._scheduler_paste_session_id = uuid.uuid4().hex
             # The frozen-value tracker is scoped to the CURRENT tmux process.
             # Keep restart pacing on the retained TmuxSession instance, but
             # never compare the replacement process against the old process's
@@ -5006,7 +5011,7 @@ class TmuxSession(TransportReplacementMixin):
         )
 
     async def send_scheduler_prompt(
-        self, prompt: str, *, on_accept=None
+        self, prompt: str, *, on_accept=None, busy_deliver_at: float | None = None
     ) -> asyncio.Future[bool]:
         """Start a scheduler turn and return its exact acceptance receipt.
 
@@ -5019,6 +5024,7 @@ class TmuxSession(TransportReplacementMixin):
             prompt,
             scheduler_delivery=receipt,
             scheduler_accept=on_accept,
+            scheduler_busy_deliver_at=busy_deliver_at,
             scheduler_serialized=True,
         )
         if not queued and not receipt.done():
@@ -5132,6 +5138,7 @@ class TmuxSession(TransportReplacementMixin):
         agent_hint: str = "",
         scheduler_delivery: asyncio.Future[bool] | None = None,
         scheduler_accept=None,
+        scheduler_busy_deliver_at: float | None = None,
         scheduler_serialized: bool = False,
     ) -> bool:
         """Apply external-send side effects and enqueue one pane turn."""
@@ -5193,11 +5200,13 @@ class TmuxSession(TransportReplacementMixin):
         queued_prompt = prompt + agent_hint if agent_hint else prompt
         turn = _QueuedTurn(
             prompt=queued_prompt,
+            queued_at=time.time(),
             platform=platform,
             chat_id=chat_id,
             message_id=message_id,
             scheduler_delivery=scheduler_delivery,
             scheduler_accept=scheduler_accept,
+            scheduler_busy_deliver_at=scheduler_busy_deliver_at,
             scheduler_serialized=scheduler_serialized,
         )
         if scheduler_serialized:
@@ -9765,6 +9774,14 @@ class TmuxSession(TransportReplacementMixin):
         if self._scheduler_receipt_terminal(turn):
             raise _SchedulerDeliveryCancelled
 
+    def _scheduler_busy_deadline_reached(self, turn: _QueuedTurn | None) -> bool:
+        if turn is None or not turn.scheduler_serialized:
+            return False
+        deadline = turn.scheduler_busy_deliver_at
+        if deadline is None:
+            deadline = turn.queued_at + min(scheduler_busy_delay(), 1800.0)
+        return time.time() >= deadline
+
     def _scheduler_pane_busy(
         self, candidate: _QueuedTurn | None = None
     ) -> bool:
@@ -9777,6 +9794,8 @@ class TmuxSession(TransportReplacementMixin):
         identity (and queue items necessarily behind it) to avoid a self-wait;
         all earlier pane work and live-idle evidence still gate the paste.
         """
+        if self._scheduler_busy_deadline_reached(candidate):
+            return self._has_unresolved_pasted_acceptance()
         candidate_in_worker = (
             candidate is not None and self._inflight_turn is candidate
         )
@@ -11710,6 +11729,12 @@ class TmuxSession(TransportReplacementMixin):
                     turn.transcript_ticket_captured_at_ns = (
                         transcript_ticket.captured_at_ns
                     )
+                    owner = getattr(turn.scheduler_accept, "__self__", None)
+                    mark_pasted = getattr(owner, "mark_pasted", None)
+                    if callable(mark_pasted) and not mark_pasted(
+                        self._scheduler_paste_session_id, turn.prompt
+                    ):
+                        raise RuntimeError("scheduler paste marker refused exact fire")
                     turn.pane_delivery_started = True
                     result = await self._tmux.paste_text(
                         turn.prompt, enter=True
