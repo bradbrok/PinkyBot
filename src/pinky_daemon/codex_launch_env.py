@@ -7,10 +7,10 @@ import os
 import shlex
 from dataclasses import replace
 
-from pinky_daemon import isolated_launch_env, tmux_launch_env
+from pinky_daemon import isolated_launch_env, launch_env_authority, tmux_launch_env
 from pinky_daemon.codex_home import codex_home_for, per_agent_codex_home_enabled
 from pinky_daemon.codex_mcp_env import with_mcp_header_env
-from pinky_daemon.tmux_launch_env_loader import BASE_ALLOWLIST, DAEMON_ONLY
+from pinky_daemon.tmux_launch_env_loader import BASE_ALLOWLIST
 
 BUILDER_OWNED = frozenset(
     {
@@ -73,17 +73,14 @@ def build_env(
     if daemon_url is not None:
         explicit["PINKY_DAEMON_URL"] = daemon_url
 
-    def permitted(name):
-        return name not in DAEMON_ONLY | BUILDER_OWNED and not name.startswith("PINKY_MCP_HDR_")
-
-    inherited = {name: value for name, value in ambient.items() if permitted(name)}
+    inherited = launch_env_authority.filter_env(ambient, BUILDER_OWNED)
     baseline = {
         name: value
         for name, value in inherited.items()
         if name in BASE_ALLOWLIST or name.startswith(("LC_", "XDG_"))
     }
     grants = isolated_launch_env.with_grants(replace(policy, mode="enforce"), {})
-    grants = {name: value for name, value in grants.items() if permitted(name)}
+    grants = launch_env_authority.filter_env(grants, BUILDER_OWNED)
     scoped = with_mcp_header_env({**baseline, **grants, **explicit}, servers or {})
     env = scoped if policy.clean else with_mcp_header_env({**inherited, **explicit}, servers or {})
     if (
@@ -116,7 +113,7 @@ def build_env(
 
 def wrap_command(command: str, env: dict[str, str]) -> str:
     """Run after the pane shell starts; values stay in the private JSON payload."""
-    absent = DAEMON_ONLY | (BUILDER_OWNED - env.keys())
+    absent = launch_env_authority.absent_names(env, BUILDER_OWNED)
     args = ["env"]
     for name in sorted(absent):
         args.extend(["-u", name])
