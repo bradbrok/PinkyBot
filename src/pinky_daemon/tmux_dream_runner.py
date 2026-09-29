@@ -37,6 +37,7 @@ from pinky_daemon.tmux_session import (
     _claude_host_auth_env,
     _claude_host_command,
     _claude_host_payload,
+    _cleanup_launch_env,
     _resolve_claude_config_path,
     _seed_claude_trust_file,
     _TmuxControl,
@@ -212,32 +213,42 @@ class TmuxDreamRunner:
             cmd += ["--disallowedTools", ",".join(self._config.disallowed_tools)]
 
         env = _claude_host_payload(_claude_host_auth_env())
-        spawned = await self._control.new_session(
-            cwd=str(work_dir), command=_claude_host_command(shlex.join(cmd), env), env=env,
-        )
+        try:
+            spawned = await self._control.new_session(
+                cwd=str(work_dir), command=_claude_host_command(shlex.join(cmd), env), env=env,
+            )
+        except Exception as exc:
+            # Staging errors can carry private command inputs; report only the type.
+            return RunResult(
+                output="", exit_code=1,
+                error=f"tmux new-session failed: {type(exc).__name__}",
+                duration_ms=int((time.time() - start) * 1000),
+            )
+        launch_env = spawned.launch_env
         if not spawned.ok:
+            await _cleanup_launch_env(launch_env)
             return RunResult(
                 output="",
                 exit_code=1,
-                error=f"tmux new-session failed: {spawned.stderr.strip()}",
+                error=f"tmux new-session failed: rc={spawned.returncode}",
                 duration_ms=int((time.time() - start) * 1000),
             )
 
-        _log(
-            f"tmux-dream: spawned {self.session_name} "
-            f"(model={self._config.model or 'default'}, prompt={prompt_path.name})"
-        )
-
-        # Keep the pane around when the claude process exits (crash, bad
-        # --model, expired auth) - without this tmux reaps the session on
-        # command exit, so the post-mortem capture-pane below would lose
-        # the one clue about WHY it died. Best-effort.
-        await self._tmux(
-            "set-option", "-w", "-t", exact_pane_target(self.session_name), "remain-on-exit", "on"
-        )
-
         success = False
         try:
+            _log(
+                f"tmux-dream: spawned {self.session_name} "
+                f"(model={self._config.model or 'default'}, prompt={prompt_path.name})"
+            )
+
+            # Keep the pane around when the claude process exits (crash, bad
+            # --model, expired auth) - without this tmux reaps the session on
+            # command exit, so the post-mortem capture-pane below would lose
+            # the one clue about WHY it died. Best-effort.
+            await self._tmux(
+                "set-option", "-w", "-t", exact_pane_target(self.session_name), "remain-on-exit", "on"
+            )
+
             if not await self._wait_ready():
                 # Proceed anyway: the pty buffers typed input, and CC reads it
                 # once the REPL is up. Logged so a hung binary is diagnosable.
@@ -297,7 +308,11 @@ class TmuxDreamRunner:
                 duration_ms=int((time.time() - start) * 1000),
             )
         finally:
-            await self._tmux("kill-session", "-t", exact_session_target(self.session_name))
+            try:
+                await self._tmux("kill-session", "-t", exact_session_target(self.session_name))
+            finally:
+                # Also revoke an unconsumed payload when teardown fails or is cancelled.
+                await _cleanup_launch_env(launch_env)
             # The report is persisted to the dream DB by the caller; the
             # prompt file carries raw conversation history. Delete both on
             # success so nightly dreams don't grow dreams/ unbounded; keep
