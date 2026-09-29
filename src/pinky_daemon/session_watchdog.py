@@ -461,7 +461,7 @@ class SessionWatchdog:
 
     # ── Lifecycle ────────────────────────────────────────────
 
-    async def start(self, at: float | None = None) -> None:
+    async def start(self) -> None:
         if self._running:
             return
         self._running = True
