@@ -37,11 +37,8 @@ async def test_intentional_empty_override_stays_present(tmp_path, monkeypatch, k
 async def test_nonisolated_child_retains_parity(tmp_path, monkeypatch, kind):
     async with launch_probe(tmp_path, monkeypatch, mode="enforce") as probe:
         names = await probe.launch(kind, registry=Registry("not_isolated"))
-        if kind == "claude":
-            assert DAEMON_NAMES <= names
-        else:
-            assert DAEMON_NAMES - DAEMON_ONLY <= names
-            assert not DAEMON_ONLY & names
+        assert DAEMON_NAMES - DAEMON_ONLY <= names
+        assert not DAEMON_ONLY & names
         assert "EXPLICIT_ALLOWED_NAME" in names
 
 

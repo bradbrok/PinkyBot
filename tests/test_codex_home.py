@@ -2753,6 +2753,7 @@ async def test_tmux_repl_absent_server_cold_start_proceeds(
     session = TmuxSession(config, tmux_control=tmux)
     _mark_tmux_server_socket(tmp_path, monkeypatch)
     monkeypatch.setenv("PINKY_SESSION_SECRET", "daemon-env-marker")
+    monkeypatch.setenv("ORDINARY_TOOL_CONFIG", "daemon-env-marker")
     tmux_calls: list[tuple[str, ...]] = []
     has_session_calls = 0
 
@@ -2773,7 +2774,9 @@ async def test_tmux_repl_absent_server_cold_start_proceeds(
             paths = secret_files(home, "daemon-env-marker")
             assert len(paths) == 1
             child = child_payload(run_pane(args, home))
-            assert child["env"]["PINKY_SESSION_SECRET"] == "daemon-env-marker"
+            retained = child["env"].get("ORDINARY_TOOL_CONFIG") == "daemon-env-marker"
+            assert retained
+            assert "PINKY_SESSION_SECRET" not in child["env"]
             assert not paths[0].exists()
             return TmuxCommandResult(returncode=0, stdout="", stderr="")
         raise AssertionError(f"unexpected tmux call: {args}")

@@ -184,10 +184,11 @@ def scoped_codex_env(policy: LaunchPolicy, agent_name: str) -> dict[str, str]:
 
 def report_shadow(
     *, agent_name: str, status: str, has_agent_key: bool,
-    explicit_names: Iterable[str], log: Callable[[str], None],
+    explicit_names: Iterable[str], log: Callable[[str], None], mode: str | None = None,
 ) -> None:
     """Predict name changes from the current daemon environment."""
-    if not shadow_enabled():
+    enabled = shadow_enabled() if mode is None else mode == "shadow"
+    if not enabled:
         return
     if not is_isolated(status, has_agent_key):
         return

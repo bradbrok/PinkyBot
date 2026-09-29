@@ -216,6 +216,8 @@ class TmuxDreamRunner:
         try:
             spawned = await self._control.new_session(
                 cwd=str(work_dir), command=_claude_host_command(shlex.join(cmd), env), env=env,
+                # The legacy option name scrubs the shared MCP header namespace.
+                codex_headers=True,
             )
         except Exception as exc:
             # Staging errors can carry private command inputs; report only the type.

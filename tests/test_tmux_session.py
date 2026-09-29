@@ -1750,16 +1750,14 @@ async def test_deliver_turn_native_effort_send_failure_still_pastes(
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def test_build_repl_env_propagates_pinky_session_secret_when_set(
+def test_build_repl_env_removes_pinky_session_secret_when_set(
     monkeypatch,
 ) -> None:
-    """When the daemon env has ``PINKY_SESSION_SECRET``, it must be
-    included in the tmux env so the HMAC-signing hook scripts inside
-    the tmux session can authenticate to the daemon."""
+    """Local Claude hosts never receive daemon-wide signing authority."""
     monkeypatch.setenv("PINKY_SESSION_SECRET", "test-secret-32-bytes-min-xyz")
     ss, _ = _make_session()
     env = ss._build_repl_env()
-    assert env.get("PINKY_SESSION_SECRET") == "test-secret-32-bytes-min-xyz"
+    assert "PINKY_SESSION_SECRET" not in env
 
 
 def test_build_repl_env_omits_pinky_session_secret_when_unset(
@@ -1796,15 +1794,15 @@ def test_build_repl_env_provisions_per_agent_key(monkeypatch) -> None:
     ss, _ = _make_session(agent_name="dymok")
     ss._registry = MagicMock()
     ss._registry.get_signing_key.return_value = "dymok-per-agent-key"
-    # Non-isolated agent: dual-accept fallback retains the global secret.
+    # Non-isolated host still receives only its scoped identity.
     ss._registry.get.return_value.isolated = False
     # #638: a bare MagicMock auto-generates a truthy Mock for isolation_mode,
     # which the non-local coupling rightly treats as isolated — declare local.
     ss._registry.get.return_value.isolation_mode = "local"
     env = ss._build_repl_env()
-    assert env.get("PINKY_AGENT_KEY") == "dymok-per-agent-key"
-    # Global secret still propagated (dual-accept fallback for other paths).
-    assert env.get("PINKY_SESSION_SECRET") == "global-secret-xyz"
+    own_key = env.get("PINKY_AGENT_KEY") == "dymok-per-agent-key"
+    assert own_key
+    assert "PINKY_SESSION_SECRET" not in env
     ss._registry.get_signing_key.assert_called_once_with("dymok")
 
 
@@ -1889,7 +1887,8 @@ async def test_concurrent_cold_start_runs_one_tmux_spawn() -> None:
     spawn_started = asyncio.Event()
     spawn_count = 0
 
-    async def blocking_new_session(*, cwd, command, env=None):
+    async def blocking_new_session(*, cwd, command, env=None, codex_headers=False):
+        assert codex_headers is True
         nonlocal spawn_count
         spawn_count += 1
         spawn_started.set()
@@ -1933,7 +1932,8 @@ async def test_concurrent_cold_start_subscriber_raises_on_owner_dead() -> None:
     release_spawn = asyncio.Event()
     spawn_started = asyncio.Event()
 
-    async def failing_new_session(*, cwd, command, env=None):
+    async def failing_new_session(*, cwd, command, env=None, codex_headers=False):
+        assert codex_headers is True
         spawn_started.set()
         await release_spawn.wait()
         return _fail("rc=1")
@@ -2067,7 +2067,8 @@ async def test_concurrent_warm_wake_runs_one_spawn() -> None:
     spawn_started = asyncio.Event()
     spawn_count = 0
 
-    async def blocking_new_session(*, cwd, command, env=None):
+    async def blocking_new_session(*, cwd, command, env=None, codex_headers=False):
+        assert codex_headers is True
         nonlocal spawn_count
         spawn_count += 1
         spawn_started.set()

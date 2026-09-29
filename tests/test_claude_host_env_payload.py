@@ -128,7 +128,7 @@ def test_explicit_signing_identity_is_not_replaced(clean_daemon, monkeypatch, is
     session = host_session(clean_daemon, registry=Registry(isolated=isolated, key=key))
     env = session._build_repl_env()
     secret_present = "PINKY_SESSION_SECRET" in env
-    assert secret_present is (not isolated)
+    assert not secret_present
     matches = env.get("PINKY_AGENT_KEY", "") == key
     assert matches, "PINKY_AGENT_KEY"
 
@@ -440,7 +440,11 @@ def test_overlay_cannot_fill_an_omitted_builder_name(clean_daemon, monkeypatch, 
     monkeypatch.setenv(name, SENTINEL)
     env = tmux_session._claude_host_payload({})
     present = name in env
-    assert not present, name
+    if name in {"PINKY_DAEMON_URL", "PINKY_TOOL_POLICY"}:
+        daemon_owned = env.get(name) == SENTINEL
+        assert present and daemon_owned, name
+    else:
+        assert not present, name
 
 
 @pytest.mark.parametrize("kind", ["host", "dream"])
