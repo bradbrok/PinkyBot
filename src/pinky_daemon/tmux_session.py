@@ -2156,6 +2156,90 @@ _MODEL_DIALOG_NEEDLES = ("change model", "switch model?")
 _MODEL_ERROR_NEEDLES = ("unknown model", "invalid model", "not a valid model")
 
 
+# Shared by host Claude sessions and dreams. Only absent names are removed;
+# configured values (including empty strings) remain in the private payload.
+_CLAUDE_AUTH_ENV_NAMES = frozenset("""
+ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS
+CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN
+CLAUDE_CODE_OAUTH_SCOPES CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
+CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_ANTHROPIC_AWS
+CLAUDE_CODE_SKIP_BEDROCK_AUTH CLAUDE_CODE_SKIP_VERTEX_AUTH CLAUDE_CODE_SKIP_FOUNDRY_AUTH
+CLAUDE_CODE_SKIP_MANTLE_AUTH CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH
+CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST ANTHROPIC_BEDROCK_BASE_URL
+ANTHROPIC_BEDROCK_MANTLE_BASE_URL ANTHROPIC_FOUNDRY_API_KEY ANTHROPIC_FOUNDRY_AUTH_TOKEN
+ANTHROPIC_FOUNDRY_BASE_URL ANTHROPIC_FOUNDRY_RESOURCE ANTHROPIC_VERTEX_BASE_URL
+ANTHROPIC_VERTEX_PROJECT_ID ANTHROPIC_AWS_API_KEY ANTHROPIC_AWS_BASE_URL
+ANTHROPIC_AWS_WORKSPACE_ID ANTHROPIC_FEDERATION_RULE_ID ANTHROPIC_ORGANIZATION_ID
+ANTHROPIC_WORKSPACE_ID ANTHROPIC_PROFILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+AWS_SESSION_TOKEN AWS_BEARER_TOKEN_BEDROCK AWS_PROFILE AWS_REGION AWS_DEFAULT_REGION
+AWS_SHARED_CREDENTIALS_FILE AWS_CONFIG_FILE GOOGLE_APPLICATION_CREDENTIALS
+GCLOUD_PROJECT GOOGLE_CLOUD_PROJECT CLOUD_ML_REGION
+""".split())
+# Every key whose presence or value is decided by the explicit Claude builder,
+# including auth helpers and the retired autocompact override.
+_CLAUDE_BUILDER_ENV_NAMES = _CLAUDE_AUTH_ENV_NAMES | frozenset({
+    "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW", "PINKY_AGENT_NAME", "PINKY_AGENT_KEY",
+    "PINKY_DAEMON_URL", "PINKY_CONTAINER_DAEMON_URL", "PINKY_EXPECTED_EFFORT",
+    "PINKY_STRICT_EFFORT", "PINKY_TOOL_POLICY", "PINKY_SESSION_SECRET",
+    _TMUX_TRANSCRIPT_BIND_MARKER_ENV,
+})
+_CLAUDE_PANE_ENV_NAMES = frozenset({"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG"})
+
+
+def _claude_host_payload(explicit: dict[str, str]) -> dict[str, str]:
+    """Overlay daemon configuration while retaining pane shell/terminal state."""
+    ambient = tmux_launch_env.ambient_env(os.environ.items(), _log)
+    for name in list(ambient):
+        if (
+            name in _CLAUDE_PANE_ENV_NAMES
+            or name.startswith(("LC_", "TMUX"))
+            or name in _CLAUDE_BUILDER_ENV_NAMES | tmux_launch_env_loader.DAEMON_ONLY
+        ):
+            ambient.pop(name)
+    return {**ambient, **explicit}
+
+
+def _claude_forward_oauth_enabled() -> bool:
+    return os.environ.get("PINKY_FORWARD_OAUTH_TOKEN", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _claude_host_auth_env(
+    *, provider_url: str = "", provider_key: str = "", forward_oauth: bool | None = None,
+) -> dict[str, str]:
+    """Resolve auth without overriding subscription intent or provider authority."""
+    env = tmux_launch_env.ambient_env(
+        ((name, value) for name, value in os.environ.items() if name in _CLAUDE_AUTH_ENV_NAMES),
+        _log,
+    )
+    if forward_oauth is None:
+        forward_oauth = _claude_forward_oauth_enabled()
+    custom_provider = bool(provider_url or provider_key or env.get("ANTHROPIC_BASE_URL", "").strip())
+    custom_provider = custom_provider or any(
+        env.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+        for name in (
+            "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+        )
+    )
+    if forward_oauth and not custom_provider:
+        # Static subscription intent must not silently select API billing.
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    else:
+        # Never send a first-party subscription token to a custom endpoint.
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    return env
+
+
+def _claude_host_command(command: str, env: dict[str, str]) -> str:
+    """Remove server-only authentication without placing values in argv."""
+    unset = [arg for name in sorted(_CLAUDE_AUTH_ENV_NAMES - env.keys()) for arg in ("-u", name)]
+    return shlex.join(["/usr/bin/env", *unset, "/bin/sh", "-c", command])
+
+
 class TmuxSession(TransportReplacementMixin):
     """Agent session backed by an interactive ``claude`` REPL in tmux.
 
@@ -4112,6 +4196,8 @@ class TmuxSession(TransportReplacementMixin):
         # if none exists.
         claude_cmd = self._build_claude_cmd()
         env = self._build_repl_env(**policy_args)
+        if self._uses_claude_host_payload(launch_policy):
+            claude_cmd = _claude_host_command(claude_cmd, env)
 
         launch_env = None
 
@@ -4503,9 +4589,7 @@ class TmuxSession(TransportReplacementMixin):
         on, token missing) must fail CLOSED (a loud login wall) rather than
         silently fall back to the shared refresh-token file (Murzik #781 P2).
         """
-        return os.environ.get("PINKY_FORWARD_OAUTH_TOKEN", "0").strip().lower() in (
-            "1", "true", "yes", "on",
-        )
+        return _claude_forward_oauth_enabled()
 
     def _static_oauth_token(self) -> str:
         """The long-lived ``CLAUDE_CODE_OAUTH_TOKEN`` to inject into this
@@ -4568,6 +4652,13 @@ class TmuxSession(TransportReplacementMixin):
             status_lookup=self._isolation_status, log=_log,
         )
 
+    def _uses_claude_host_payload(self, policy: isolated_launch_env.LaunchPolicy) -> bool:
+        return (
+            self._trace_transport_kind == "tmux_claude"
+            and type(self._tmux._runner) is LocalCommandRunner
+            and not policy.clean
+        )
+
     def _build_repl_env(
         self, *, launch_policy: isolated_launch_env.LaunchPolicy | None = None,
     ) -> dict[str, str]:
@@ -4595,6 +4686,19 @@ class TmuxSession(TransportReplacementMixin):
         """
         launch_policy = launch_policy or self._launch_env_policy()
         env: dict[str, str] = {}
+        host_auth = None
+        if self._uses_claude_host_payload(launch_policy):
+            host_auth = _claude_host_auth_env(
+                provider_url=self._config.provider_url or "", provider_key=self._config.provider_key or "",
+                forward_oauth=self._forward_oauth_enabled(),
+            )
+            env = dict(host_auth)
+            # These remain controlled by the existing account/forwarding guards.
+            env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            env.pop("CLAUDE_CONFIG_DIR", None)
+            if self._config.provider_url or self._config.provider_key:
+                for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+                    env.pop(name, None)
         if self._config.provider_url:
             env["ANTHROPIC_BASE_URL"] = self._config.provider_url
         if self._config.provider_key:
@@ -4630,6 +4734,8 @@ class TmuxSession(TransportReplacementMixin):
         # this agent's CLAUDE_CONFIG_DIR (.claude-local, populated by a manual
         # `claude /login`). Verified end-to-end on CC 2.1.226 + real tmux.
         oauth_token = self._static_oauth_token()
+        if host_auth is not None and "CLAUDE_CODE_OAUTH_TOKEN" not in host_auth:
+            oauth_token = ""
         if dedicated_config_dir:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = ""
         elif oauth_token:
@@ -4742,6 +4848,8 @@ class TmuxSession(TransportReplacementMixin):
             explicit_names=env, log=_log,
         )
         env = isolated_launch_env.with_grants(launch_policy, env)
+        if self._uses_claude_host_payload(launch_policy):
+            env = _claude_host_payload(env)
         if launch_policy.clean and (self._config.provider_url or self._config.provider_key):
             if not dedicated_config_dir:
                 env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)

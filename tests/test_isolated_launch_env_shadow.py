@@ -115,11 +115,10 @@ def test_shadow_preserves_payload_bytes(tmp_path, monkeypatch, kind):
     off = build()
     monkeypatch.setenv("PINKY_ISOLATED_ENV", "shadow")
     on = build()
-    # Codex forwards the operator's flag as part of existing full-env parity.
+    # All host transports forward the operator's flag in the daemon payload.
     # That input difference is the only allowed difference in output bytes.
-    if kind != "claude":
-        assert off.pop("PINKY_ISOLATED_ENV") == "off"
-        assert on.pop("PINKY_ISOLATED_ENV") == "shadow"
+    assert off.pop("PINKY_ISOLATED_ENV") == "off"
+    assert on.pop("PINKY_ISOLATED_ENV") == "shadow"
     assert json.dumps(off, sort_keys=True).encode() == json.dumps(on, sort_keys=True).encode()
     assert len(reports(logs)) == 1
 

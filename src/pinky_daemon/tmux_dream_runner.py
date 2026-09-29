@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import shutil
 import sys
 import time
@@ -33,8 +34,13 @@ from pinky_daemon.claude_runner import RunResult
 # acceptance and the typed instruction is silently eaten (observed in the
 # #707 live smoke test). Same-package reuse of tested helpers, on purpose.
 from pinky_daemon.tmux_session import (
+    _claude_host_auth_env,
+    _claude_host_command,
+    _claude_host_payload,
+    _cleanup_launch_env,
     _resolve_claude_config_path,
     _seed_claude_trust_file,
+    _TmuxControl,
 )
 from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target, text_argument
 
@@ -117,6 +123,7 @@ class TmuxDreamRunner:
     def __init__(self, config: TmuxDreamConfig | None = None, *, agent_name: str = "") -> None:
         self._config = config or TmuxDreamConfig()
         self._agent_name = agent_name or "agent"
+        self._control = _TmuxControl(self.session_name)
 
     @property
     def session_name(self) -> str:
@@ -135,7 +142,7 @@ class TmuxDreamRunner:
         every subsequent nightly fire).
         """
         proc = await asyncio.create_subprocess_exec(
-            "tmux", *args,
+            *self._control._base_cmd(), *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -205,32 +212,43 @@ class TmuxDreamRunner:
         if self._config.disallowed_tools:
             cmd += ["--disallowedTools", ",".join(self._config.disallowed_tools)]
 
-        rc, out = await self._tmux(
-            "new-session", "-d", "-s", self.session_name, "-c", str(work_dir), *cmd
-        )
-        if rc != 0:
+        env = _claude_host_payload(_claude_host_auth_env())
+        try:
+            spawned = await self._control.new_session(
+                cwd=str(work_dir), command=_claude_host_command(shlex.join(cmd), env), env=env,
+            )
+        except Exception as exc:
+            # Staging errors can carry private command inputs; report only the type.
+            return RunResult(
+                output="", exit_code=1,
+                error=f"tmux new-session failed: {type(exc).__name__}",
+                duration_ms=int((time.time() - start) * 1000),
+            )
+        launch_env = spawned.launch_env
+        if not spawned.ok:
+            await _cleanup_launch_env(launch_env)
             return RunResult(
                 output="",
                 exit_code=1,
-                error=f"tmux new-session failed: {out.strip()}",
+                error=f"tmux new-session failed: rc={spawned.returncode}",
                 duration_ms=int((time.time() - start) * 1000),
             )
 
-        _log(
-            f"tmux-dream: spawned {self.session_name} "
-            f"(model={self._config.model or 'default'}, prompt={prompt_path.name})"
-        )
-
-        # Keep the pane around when the claude process exits (crash, bad
-        # --model, expired auth) - without this tmux reaps the session on
-        # command exit, so the post-mortem capture-pane below would lose
-        # the one clue about WHY it died. Best-effort.
-        await self._tmux(
-            "set-option", "-w", "-t", exact_pane_target(self.session_name), "remain-on-exit", "on"
-        )
-
         success = False
         try:
+            _log(
+                f"tmux-dream: spawned {self.session_name} "
+                f"(model={self._config.model or 'default'}, prompt={prompt_path.name})"
+            )
+
+            # Keep the pane around when the claude process exits (crash, bad
+            # --model, expired auth) - without this tmux reaps the session on
+            # command exit, so the post-mortem capture-pane below would lose
+            # the one clue about WHY it died. Best-effort.
+            await self._tmux(
+                "set-option", "-w", "-t", exact_pane_target(self.session_name), "remain-on-exit", "on"
+            )
+
             if not await self._wait_ready():
                 # Proceed anyway: the pty buffers typed input, and CC reads it
                 # once the REPL is up. Logged so a hung binary is diagnosable.
@@ -290,7 +308,11 @@ class TmuxDreamRunner:
                 duration_ms=int((time.time() - start) * 1000),
             )
         finally:
-            await self._tmux("kill-session", "-t", exact_session_target(self.session_name))
+            try:
+                await self._tmux("kill-session", "-t", exact_session_target(self.session_name))
+            finally:
+                # Also revoke an unconsumed payload when teardown fails or is cancelled.
+                await _cleanup_launch_env(launch_env)
             # The report is persisted to the dream DB by the caller; the
             # prompt file carries raw conversation history. Delete both on
             # success so nightly dreams don't grow dreams/ unbounded; keep
