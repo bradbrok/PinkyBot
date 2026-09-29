@@ -1294,7 +1294,7 @@ class TestMcpBindRecovery:
     """#663 — watchdog force-fresh recovery of an MCP-unbound session."""
 
     def _wd(self, make_watchdog, *, status, recovered):
-        async def rec(agent, label, reason):
+        async def rec(agent, label, reason, expected):
             recovered.append((agent, label, reason))
         return make_watchdog(
             mcp_bind_status_fn=lambda n: status,
@@ -1400,7 +1400,7 @@ class TestMcpBindRecovery:
         def boom(_n):
             raise RuntimeError("status backend down")
 
-        async def rec(a, _l, _r):
+        async def rec(a, _l, _r, expected):
             recovered.append(a)
 
         wd = make_watchdog(mcp_bind_status_fn=boom, mcp_recover_fn=rec)
@@ -1410,8 +1410,8 @@ class TestMcpBindRecovery:
         assert recovered == []
 
     @pytest.mark.asyncio
-    async def test_recover_failure_does_not_burn_ratelimit(self, make_watchdog):
-        async def rec(_a, _l, _r):
+    async def test_recover_failure_conservatively_spends_ratelimit(self, make_watchdog):
+        async def rec(_a, _l, _r, expected):
             raise RuntimeError("connect failed")
 
         wd = make_watchdog(
@@ -1423,14 +1423,14 @@ class TestMcpBindRecovery:
         st = _AgentState(mcp_unbound_since=now - 1000)
         assert await wd._evaluate_mcp_bind(
             _conn_snap(), st, WatchdogConfig(mcp_recover=True), now) is False
-        assert wd._last_mcp_recover_at == 0.0  # not burned → next sweep retries
-        assert st.mcp_recovered_at == 0.0  # not marked recovered
+        assert wd._last_mcp_recover_at > 0.0  # unknown destructive outcome is rate-limited
+        assert st.mcp_recovered_at > 0.0  # grant a fresh recovery grace
 
     @pytest.mark.asyncio
     async def test_evaluate_routes_to_mcp_branch(self, make_watchdog):
         recovered = []
 
-        async def rec(a, _l, _r):
+        async def rec(a, _l, _r, expected):
             recovered.append(a)
 
         wd = make_watchdog(
@@ -1456,7 +1456,7 @@ class TestMcpBindRecovery:
     async def test_recovery_reason_includes_missed_probe(self, make_watchdog):
         captured = []
 
-        async def rec(_a, _l, reason):
+        async def rec(_a, _l, reason, expected):
             captured.append(reason)
 
         wd = make_watchdog(
@@ -1478,7 +1478,7 @@ class TestMcpBindRecovery:
         # signal, but the reason must NOT claim a missed probe.
         captured = []
 
-        async def rec(_a, _l, reason):
+        async def rec(_a, _l, reason, expected):
             captured.append(reason)
 
         wd = make_watchdog(
@@ -1497,7 +1497,7 @@ class TestMcpBindRecovery:
     async def test_recovery_reason_omits_probe_when_not_yet_aged(self, make_watchdog):
         captured = []
 
-        async def rec(_a, _l, reason):
+        async def rec(_a, _l, reason, expected):
             captured.append(reason)
 
         wd = make_watchdog(
@@ -1518,7 +1518,7 @@ class TestMcpBindRecovery:
         # passive gates still own the trigger.
         recovered = []
 
-        async def rec(a, _l, _r):
+        async def rec(a, _l, _r, expected):
             recovered.append(a)
 
         wd = make_watchdog(
@@ -1538,7 +1538,7 @@ class TestMcpBindRecovery:
         # unanswered (a generic MCP success proved the transport).
         recovered = []
 
-        async def rec(a, _l, _r):
+        async def rec(a, _l, _r, expected):
             recovered.append(a)
 
         wd = make_watchdog(
@@ -1558,7 +1558,7 @@ class TestMcpBindRecovery:
         even when the master watchdog (cfg.enabled) is OFF."""
         recovered = []
 
-        async def rec(a, _l, _r):
+        async def rec(a, _l, _r, expected):
             recovered.append(a)
 
         wd = make_watchdog(
@@ -1597,7 +1597,7 @@ class TestMcpBindRecovery:
         the generic path; only the MCP-bind branch is live."""
         recovered, alerts = [], []
 
-        async def rec(a, _l, _r):
+        async def rec(a, _l, _r, expected):
             recovered.append(a)
 
         async def alert(a, _m):
@@ -1634,7 +1634,7 @@ class TestMcpBindRecovery:
         takes the wedge — proves the R1 reorder didn't steal transitions."""
         recovered = []
 
-        async def rec(a, _l, _r):
+        async def rec(a, _l, _r, expected):
             recovered.append(a)
 
         wd = make_watchdog(

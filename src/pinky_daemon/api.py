@@ -218,6 +218,7 @@ from pinky_daemon.session_watchdog import (
     MCP_ATTACH_FAILURE_PROTOCOL,
     FrozenLoginPane,
     LoginWallProbe,
+    McpRecoveryRequest,
     SessionWatchdog,
     WatchdogConfig,
     compute_mcp_checkable,
@@ -13476,6 +13477,7 @@ npm run build</pre>
                 now=time.time(),
             ),
             "bound": bool(st.get("bound")),
+            "gateway_epoch": epoch,
             "observed_at": st.get("observed_at"),
             "heartbeat_interval": hb,
             "probe_request": get_probe_request(agent_name),
@@ -13487,7 +13489,9 @@ npm run build</pre>
         return result.delivered
 
     @_locked_agent
-    async def _watchdog_mcp_recover(agent_name: str, label: str, reason: str) -> None:
+    async def _watchdog_mcp_recover(
+        agent_name: str, label: str, reason: str, expected: McpRecoveryRequest,
+    ) -> bool:
         """Force-fresh recover an MCP-unbound session (#663).
 
         Mirrors the validated force-restart core (``admin_force_restart_agent``):
@@ -13500,9 +13504,29 @@ npm run build</pre>
         """
         sessions = broker._streaming.get(agent_name, {})
         ss = sessions.get(label)
-        if not ss:
-            _log(f"watchdog: no session for {agent_name}/{label} to MCP-recover")
-            return
+        # This predicate runs INSIDE lifecycle serialization. The caller's
+        # earlier check can become stale while this callback waits for the lock.
+        if ss is None or ss is not expected.session:
+            return False
+        try:
+            status = _watchdog_mcp_bind_status(agent_name)
+        except Exception as exc:
+            _log(f"watchdog: MCP recovery recheck failed: {type(exc).__name__}")
+            return False
+        probe = status.get("probe_request") or {}
+        if (
+            status.get("bound")
+            or not status.get("gateway_epoch")
+            or status.get("gateway_epoch") != expected.gateway_epoch
+            or (probe.get("gateway_epoch", ""), probe.get("launch_id", "")) != expected.launch_key
+            or (expected.require_probe and (not probe.get("current") or probe.get("fulfilled")))
+            or (not expected.require_probe and not status.get("checkable"))
+            or not watchdog._take_snapshot(agent_name, label, ss).connected
+        ):
+            return False
+        # No awaited work separates validation from the attempt accounting.
+        # From here, errors are conservatively treated as a spent attempt.
+        expected.start()
         audit_meta = {
             "label": label,
             "reason": reason,
@@ -13554,6 +13578,7 @@ npm run build</pre>
                 metadata=audit_meta,
             )
             _log(f"watchdog: MCP-recovered {agent_name}/{label} (force-fresh)")
+            return True
         except Exception as exc:
             if not _startup_fencing_enabled() and broker._streaming.get(agent_name, {}).get(label) is ss:
                 broker.unregister_streaming(agent_name, label=label)

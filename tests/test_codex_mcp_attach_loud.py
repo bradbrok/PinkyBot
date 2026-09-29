@@ -17,15 +17,17 @@ from pinky_daemon.session_watchdog import (
     DEFAULT_MCP_PROBE_DEADLINE,
     DEFAULT_MCP_RECOVER_MIN_INTERVAL,
     DEFAULT_MCP_UNBOUND_FLOOR,
+    McpRecoveryRequest,
 )
 from pinky_daemon.shared_mcp import (
     bump_gateway_epoch,
+    get_gateway_epoch,
     get_probe_request,
     record_mcp_success,
     record_probe_request,
     record_probe_success,
 )
-from pinky_daemon.transport_state import SessionState
+from pinky_daemon.transport_state import SessionState, Trigger
 
 ORIGIN = 1_800_000_000.0
 SENTINEL = "test-mcp-secret-" + "q" * 48
@@ -86,7 +88,7 @@ def harness(tmp_path, monkeypatch, caplog, capsys):
         alerts.append((name, message))
         return True
 
-    async def recover(name, label, reason):
+    async def recover(name, label, reason, expected):
         recovered.append((name, label, reason))
 
     watchdog = app.state.watchdog
@@ -365,7 +367,7 @@ async def test_recovery_error_spends_attempt_and_never_logs_exception_value(harn
     h.launch(seed=True)
 
     async def fail(*args):
-        h.recovered.append(args)
+        h.recovered.append(args[:3])
         raise RuntimeError(SENTINEL)
 
     h.watchdog._mcp_recover_fn = fail
@@ -621,6 +623,21 @@ async def test_recovery_callback_clears_codex_resume_state(
         session.codex_session_id = "previous-thread"
     h.app.state.agents.set_streaming_session_id("test-agent", "previous-thread")
     h.app.state.broker._streaming["test-agent"] = {"main": session}
+    boot = await session._state_machine.request_transition(SessionState.BOOTING, Trigger.BOOT)
+    await session._state_machine.transition_complete(
+        boot.owner_token,
+        SessionState.CONNECTED,
+        trigger=Trigger.BOOT_COMPLETE,
+    )
+    h.launch()
+    probe = get_probe_request("test-agent")
+    expected = McpRecoveryRequest(
+        session,
+        get_gateway_epoch(),
+        (probe["gateway_epoch"], probe["launch_id"]),
+        True,
+        lambda at: None,
+    )
     configs = []
 
     async def replacement(*, configure, **kwargs):
@@ -638,9 +655,9 @@ async def test_recovery_callback_clears_codex_resume_state(
     monkeypatch.setattr(session, "restart_transport", replacement)
     if connect_fails:
         with pytest.raises(RuntimeError):
-            await h.real_recover("test-agent", "main", "test attach recovery")
+            await h.real_recover("test-agent", "main", "test attach recovery", expected)
     else:
-        await h.real_recover("test-agent", "main", "test attach recovery")
+        await h.real_recover("test-agent", "main", "test attach recovery", expected)
     assert configs == [True]
     assert session.resume_handle == config.resume_handle == ""
     assert config.force_fresh_context_once is True
@@ -734,7 +751,7 @@ async def test_loopback_refusal_smoke(harness, tmp_path):
         assert requests
 
         async def recover(*args):
-            h.recovered.append(args)
+            h.recovered.append(args[:3])
             h.launch()
             await failed_attach()
 
