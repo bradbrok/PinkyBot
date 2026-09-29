@@ -376,6 +376,25 @@ async def test_b_only_restart_failure_retains_registered_client(lifecycle_harnes
     retained = ss._client
     retained.disconnect.side_effect = RuntimeError("cleanup unconfirmed")
     retained.get_context_usage = AsyncMock(return_value={"maxTokens": 200000})
+    expected = None
+    if entry == "mcp":
+        from pinky_daemon.session_watchdog import McpRecoveryRequest
+        from pinky_daemon.shared_mcp import bump_gateway_epoch
+
+        h.app.state.agents.register("sample", heartbeat_interval=60)
+        bump_gateway_epoch()
+        watchdog = h.app.state.watchdog
+        status = watchdog._mcp_bind_status_fn("sample")
+        probe = status.get("probe_request") or {}
+        assert status["checkable"] and not status["bound"]
+        assert watchdog._take_snapshot("sample", "main", ss).connected
+        expected = McpRecoveryRequest(
+            session=ss,
+            gateway_epoch=status["gateway_epoch"],
+            launch_key=(probe.get("gateway_epoch", ""), probe.get("launch_id", "")),
+            require_probe=False,
+            on_start=lambda at: None,
+        )
     try:
         if entry == "force":
             await h.client.post("/admin/force-restart-agent/sample")
@@ -388,10 +407,12 @@ async def test_b_only_restart_failure_retains_registered_client(lifecycle_harnes
         elif entry == "archive":
             await h.client.post("/agents/sample/streaming/archive")
         else:
-            await h.app.state.watchdog._mcp_recover_fn("sample", "main", "test")
+            await h.app.state.watchdog._mcp_recover_fn("sample", "main", "test", expected)
     except RuntimeError:
         pass
     assert h.app.state.broker._streaming.get("sample", {}).get("main") is ss
+    if entry == "mcp":
+        assert expected.started is True
     assert retained.disconnect.await_count > 0, "Restart did not exercise cleanup"
     assert ss._client is retained
     assert len(h.clients) == 1

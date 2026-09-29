@@ -70,8 +70,15 @@ DEFAULT_MCP_RECOVER_MIN_INTERVAL = 120  # global min secs between any two MCP re
 # #663 phase-2: a launch-time mcp_probe directive unanswered for this long is a
 # *corroborating* wedge signal. Generous (LLM may take a few turns to act on the
 # first-action directive). Only enriches an already-decided passive recovery —
-# never triggers one, and never shortens the sustained-unbound deadline.
+# never triggers legacy recovery or shortens its sustained-unbound deadline.
+# Codex requires this missed probe AND zero epoch successes, then a second
+# full window after a delivered notice before its one automatic retry.
 DEFAULT_MCP_PROBE_DEADLINE = 120
+MCP_ATTACH_FAILURE_PROTOCOL = (
+    "If mcp_probe is unavailable or errors: do NOT call MCP endpoints by hand "
+    "(curl/SSE/HTTP), never copy any token into a command; "
+    "reply 'MCP attach failed' in one line and wait."
+)
 # checkable-via-history window (#663 / R2). An agent with heartbeat_interval==0
 # (no scheduler-driven cadence) is still "checkable" if it emitted an
 # AGENT-ORIGIN heartbeat within this window — i.e. it is an actively-heartbeating
@@ -228,6 +235,8 @@ class _SessionSnapshot:
     inflight_active: bool = False
     inflight_liveness_reason: str = ""
     inflight_liveness_age_s: float | None = None
+    runtime: str = ""
+    session: Any = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -254,6 +263,26 @@ class _AgentState:
     # being checkable), so the deadline always measures a *sustained* outage.
     mcp_unbound_since: float = 0.0
     mcp_recovered_at: float = 0.0  # grace period after an MCP-bind recovery
+    mcp_identity_known: bool = False
+    mcp_session: Any = field(default=None, repr=False, compare=False)
+    mcp_launch_id: str = ""
+
+
+@dataclass
+class McpRecoveryRequest:
+    """Expected identity plus an explicit destructive-start accounting boundary."""
+
+    session: Any = field(repr=False)
+    gateway_epoch: str
+    launch_key: tuple[str, str]
+    require_probe: bool
+    on_start: Callable[[float], None] = field(repr=False)
+    started: bool = False
+
+    def start(self, at: float | None = None) -> None:
+        if not self.started:
+            self.started = True
+            self.on_start(time.time() if at is None else at)
 
 
 @dataclass
@@ -330,6 +359,18 @@ class _LoginWallIncident:
     notification_attempts: int = 0
 
 
+@dataclass
+class _CodexMcpAttachState:
+    """One retry across failed launches, independent of broker registration."""
+
+    launch_key: tuple[str, str] = ("", "")
+    logged: bool = False
+    alerted: bool = False
+    noticed_at: float | None = None
+    notify_attempted_at: float | None = None
+    retry_used: bool = False
+
+
 class SessionWatchdog:
     """Background service that detects and recovers stuck streaming sessions."""
 
@@ -341,7 +382,8 @@ class SessionWatchdog:
         alert_fn: Callable[[str, str], Coroutine[Any, Any, bool | None]] | None = None,
         agent_config_fn: Callable[[str], WatchdogConfig] | None = None,
         mcp_bind_status_fn: Callable[[str], dict] | None = None,
-        mcp_recover_fn: Callable[[str, str, str], Coroutine] | None = None,
+        mcp_recover_fn: Callable[[str, str, str, McpRecoveryRequest], Coroutine] | None = None,
+        mcp_notice_fn: Callable[[str, str], Coroutine[Any, Any, bool]] | None = None,
         tmux_liveness_fn: Callable[
             [str, str, Any],
             Coroutine[Any, Any, bool | tuple[bool, str] | None],
@@ -400,6 +442,10 @@ class SessionWatchdog:
         # mcp_recover_fn force-fresh restarts a wedged-MCP session.
         self._mcp_bind_status_fn = mcp_bind_status_fn
         self._mcp_recover_fn = mcp_recover_fn
+        self._mcp_recovery_pending: McpRecoveryRequest | None = None
+        self._mcp_notice_fn = mcp_notice_fn
+        # Keep the retry budget when a replacement temporarily unregisters.
+        self._codex_mcp_states: dict[str, _CodexMcpAttachState] = {}
         self._tmux_liveness_fn = tmux_liveness_fn
         self._login_wall_probe_fn = login_wall_probe_fn
         self._login_wall_freeze_fn = login_wall_freeze_fn
@@ -926,6 +972,11 @@ class SessionWatchdog:
             pending=(stats.get("pending_responses", 0) or stats.get("pending_messages", 0)),
             current_activity=stats.get("current_activity", ""),
             sample_time=time.time(),
+            session=ss,
+            runtime=(
+                getattr(ss, "_launch_runtime", "")
+                or getattr(getattr(ss, "_config", None), "provider_url", "")
+            ),
             state=state,
             state_entered_at=stats.get("state_entered_at", 0.0) or 0.0,
             inflight_turns=stats.get("inflight_turns", 0) or 0,
@@ -940,8 +991,10 @@ class SessionWatchdog:
         # (cfg.mcp_recover), independent of the master cfg.enabled switch: an
         # agent can run with the progress/transition watchdog disabled yet still
         # opt into MCP-orphan auto-recovery. So return early only when BOTH are
-        # off; everything below the MCP-bind branch stays gated on cfg.enabled.
-        if not cfg.enabled and not cfg.mcp_recover:
+        # off for legacy transports. Codex launch checks are always on;
+        # everything below the MCP-bind branch stays gated on cfg.enabled.
+        is_codex = snap.runtime == "codex_cli"
+        if not cfg.enabled and not cfg.mcp_recover and not is_codex:
             return
 
         state_key = (snap.agent_name, snap.label)
@@ -960,6 +1013,10 @@ class SessionWatchdog:
         # recovery. During a BOOTING/RECONNECTING transition snap.connected is
         # False, so this is a cheap no-op (clears the unbound clock) and the
         # transition branch below still handles the wedge.
+        if is_codex:
+            if await self._evaluate_codex_mcp_attach(snap, state, now):
+                return
+        # A Codex launch check does not replace opted-in mid-life recovery.
         if await self._evaluate_mcp_bind(snap, state, cfg, now):
             return
 
@@ -1206,6 +1263,170 @@ class SessionWatchdog:
                         snap.agent_name, exc,
                     )
 
+    async def _evaluate_codex_mcp_attach(
+        self, snap: _SessionSnapshot, state: _AgentState, now: float,
+    ) -> bool:
+        """Announce an unanswered launch before spending one force-fresh retry.
+
+        Both a missed probe AND no current-epoch MCP success are required.
+        A successful tool call always cancels recovery, even if the model did
+        not follow the probe directive. Notice delivery starts a second full
+        probe window; no automatic retry can precede it.
+        """
+        if not snap.connected or self._mcp_bind_status_fn is None:
+            return False
+        try:
+            status = self._mcp_bind_status_fn(snap.agent_name) or {}
+        except Exception:
+            # Diagnostic exceptions may contain request headers.
+            _warn("watchdog MCP attach status unavailable for %s", snap.agent_name)
+            return False
+
+        probe = status.get("probe_request") or {}
+        if not probe.get("current"):
+            return False
+        key = (probe.get("gateway_epoch", ""), probe.get("launch_id", ""))
+        attach = self._codex_mcp_states.setdefault(snap.agent_name, _CodexMcpAttachState())
+        if attach.launch_key != key:
+            attach = _CodexMcpAttachState(launch_key=key, retry_used=attach.retry_used)
+            self._codex_mcp_states[snap.agent_name] = attach
+
+        age = max(float(probe.get("age_sec") or 0), 0.0)
+        missed = not probe.get("fulfilled") and age >= DEFAULT_MCP_PROBE_DEADLINE
+        failed = missed and not status.get("bound")
+        if not failed:
+            # An old epoch-level bind suppresses detection but cannot replenish
+            # the retry budget. Only health observed since this launch can.
+            if status.get("bound") and (
+                float(status.get("observed_at") or 0)
+                >= float(probe.get("requested_at") or now)
+            ):
+                attach.retry_used = False
+            return False
+
+        if not attach.logged:
+            attach.logged = True
+            _warn(
+                "MCP_ATTACH_FAILED agent=%s launch_id=%s age_s=%d",
+                snap.agent_name, key[1], int(age),
+            )
+
+        message = (
+            f"MCP attach failed for {snap.agent_name} (launch_id={key[1]}). "
+            "Please call mcp_probe now using the launch directive's nonce and launch_id. "
+            + MCP_ATTACH_FAILURE_PROTOCOL
+        )
+        if attach.retry_used:
+            message += " The automatic retry was already used; waiting for operator recovery."
+        else:
+            message += (
+                f" If no MCP call succeeds in the next {DEFAULT_MCP_PROBE_DEADLINE}s, "
+                "one force-fresh retry may follow."
+            )
+
+        if attach.notify_attempted_at is None or (
+            now - attach.notify_attempted_at >= self._interval
+        ):
+            attach.notify_attempted_at = now
+            if not attach.alerted and self._alert_fn is not None:
+                try:
+                    attach.alerted = await self._alert_fn(snap.agent_name, message) is True
+                except Exception:
+                    _warn("watchdog MCP attach owner alert failed for %s", snap.agent_name)
+            if attach.noticed_at is None and self._mcp_notice_fn is not None:
+                try:
+                    if await self._mcp_notice_fn(snap.agent_name, message):
+                        # Delivery itself can take time. Grant the full window.
+                        attach.noticed_at = time.time()
+                except Exception:
+                    _warn("watchdog MCP attach notice failed for %s", snap.agent_name)
+
+        # The agent must receive its notice and grace window. Owner delivery
+        # remains best-effort: a notification outage must not block self-heal.
+        if (
+            attach.retry_used
+            or attach.noticed_at is None
+            or now - attach.noticed_at < DEFAULT_MCP_PROBE_DEADLINE
+            or self._mcp_recover_fn is None
+        ):
+            return True
+        if (
+            self._last_mcp_recover_at
+            and now - self._last_mcp_recover_at < DEFAULT_MCP_RECOVER_MIN_INTERVAL
+        ):
+            return True
+
+        # Alert/notice callbacks can suspend: recheck health and launch identity
+        # before a destructive retry. Never let an older sweep restart a new launch.
+        try:
+            latest = self._mcp_bind_status_fn(snap.agent_name) or {}
+        except Exception:
+            return True
+        latest_probe = latest.get("probe_request") or {}
+        if (
+            latest.get("bound")
+            or latest_probe.get("fulfilled")
+            or not latest_probe.get("current")
+            or (latest_probe.get("gateway_epoch", ""), latest_probe.get("launch_id", "")) != key
+        ):
+            return True
+
+        def consume_attempt(at: float) -> None:
+            # A concurrent sweep may have observed a replacement while we waited.
+            attach.retry_used = True
+            current = self._codex_mcp_states.get(snap.agent_name)
+            if current is not None:
+                current.retry_used = True
+            self._record_mcp_attempt(state, at)
+
+        try:
+            await self._attempt_mcp_recovery(
+                snap, status, "MCP attach failed after notice grace; force-fresh retry",
+                consume_attempt, now=now, require_probe=True,
+            )
+        except Exception as exc:
+            _warn("watchdog MCP attach retry failed for %s: %s", snap.agent_name, type(exc).__name__)
+        return True
+
+    def _record_mcp_attempt(self, state: _AgentState, now: float) -> None:
+        self._last_mcp_recover_at = now
+        # A replacement can finish between sweeps without appearing disconnected.
+        state.mcp_recovered_at = now
+        state.mcp_unbound_since = 0.0
+
+    async def _attempt_mcp_recovery(
+        self, snap: _SessionSnapshot, status: dict, reason: str,
+        on_start: Callable[[float], None], *, now: float, require_probe: bool = False,
+    ) -> bool:
+        # The in-flight reservation is distinct from a destructive attempt.
+        # It serializes both recovery paths even while the API waits on its lock.
+        if self._mcp_recovery_pending is not None:
+            return False
+        probe = status.get("probe_request") or {}
+        request = McpRecoveryRequest(
+            session=snap.session,
+            gateway_epoch=status.get("gateway_epoch", ""),
+            launch_key=(probe.get("gateway_epoch", ""), probe.get("launch_id", "")),
+            require_probe=require_probe, on_start=on_start,
+        )
+        self._mcp_recovery_pending = request
+        try:
+            result = await self._mcp_recover_fn(snap.agent_name, snap.label, reason, request)
+            if result is False and not request.started:
+                # Explicit under-lock rejection: next sweep may retry the same
+                # failed launch. No attempt or rate-limit interval was spent.
+                return False
+            request.start(now)
+            return True
+        except BaseException:
+            # An exception is not proof that teardown never began. Fail closed,
+            # including cancellation or a callback that failed to report start.
+            request.start()
+            raise
+        finally:
+            if self._mcp_recovery_pending is request:
+                self._mcp_recovery_pending = None
+
     async def _evaluate_mcp_bind(
         self, snap: _SessionSnapshot, state: _AgentState,
         cfg: WatchdogConfig, now: float,
@@ -1251,7 +1472,7 @@ class SessionWatchdog:
         try:
             status = self._mcp_bind_status_fn(snap.agent_name) or {}
         except Exception as exc:
-            _warn("watchdog mcp-bind status failed for %s: %s", snap.agent_name, exc)
+            _warn("watchdog mcp-bind status failed for %s: %s", snap.agent_name, type(exc).__name__)
             return False
 
         # Not checkable this phase (heartbeat disabled / no gateway epoch yet) —
@@ -1263,6 +1484,21 @@ class SessionWatchdog:
         if status.get("bound"):
             state.mcp_unbound_since = 0.0
             return False
+
+        # An external replacement can complete between sweeps. A new session
+        # or launch cannot inherit its predecessor's outage deadline. An epoch
+        # bump without a new probe retains the last known launch identity.
+        probe = status.get("probe_request") or {}
+        launch_id = probe.get("launch_id", "")
+        if state.mcp_identity_known and (
+            state.mcp_session is not snap.session
+            or (launch_id and launch_id != state.mcp_launch_id)
+        ):
+            state.mcp_unbound_since = 0.0
+        state.mcp_identity_known = True
+        state.mcp_session = snap.session
+        if launch_id:
+            state.mcp_launch_id = launch_id
 
         # Unbound for the current epoch — track a *sustained* outage.
         if state.mcp_unbound_since == 0.0:
@@ -1319,16 +1555,17 @@ class SessionWatchdog:
             )
         _warn("watchdog MCP-recovering %s: %s", snap.agent_name, reason)
         try:
-            await self._mcp_recover_fn(snap.agent_name, snap.label, reason)
+            fired = await self._attempt_mcp_recovery(
+                snap, status, reason, lambda at: self._record_mcp_attempt(state, at), now=now,
+            )
         except Exception as exc:
-            _warn("watchdog MCP recovery failed for %s: %s", snap.agent_name, exc)
+            _warn("watchdog MCP recovery failed for %s: %s", snap.agent_name, type(exc).__name__)
+            return False
+        if not fired:
             return False
 
-        # Recovery fired — record rate-limit + grace, reset progress tracking
-        # (the fresh session restarts the progress clock).
-        self._last_mcp_recover_at = now
-        state.mcp_recovered_at = now
-        state.mcp_unbound_since = 0.0
+        # Successful recovery resets progress tracking; an under-lock skip
+        # neither reports success nor consumes the retry/rate-limit budget.
         state.last_progress_at = now
         state.warned = False
         state.last_progress_turns = 0
@@ -1344,7 +1581,7 @@ class SessionWatchdog:
             except Exception as exc:
                 _warn(
                     "watchdog mcp-recover alert failed for %s: %s",
-                    snap.agent_name, exc,
+                    snap.agent_name, type(exc).__name__,
                 )
         return True
 

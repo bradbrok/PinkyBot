@@ -215,8 +215,10 @@ from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.scheduler import AgentScheduler, read_rate_limit_status
 from pinky_daemon.session_store import SessionEventStore, SessionStore
 from pinky_daemon.session_watchdog import (
+    MCP_ATTACH_FAILURE_PROTOCOL,
     FrozenLoginPane,
     LoginWallProbe,
+    McpRecoveryRequest,
     SessionWatchdog,
     WatchdogConfig,
     compute_mcp_checkable,
@@ -3386,7 +3388,7 @@ def create_api(
                 _log(f"wake_context: failed to read restart manifest for {agent_name}: {e}")
 
         # ── MCP bind-probe directive (#663 phase-2) ──────────────────
-        # For agents enrolled in MCP-orphan auto-recovery (per-agent
+        # For Codex and agents enrolled in MCP-orphan auto-recovery (per-agent
         # mcp_recover flag), inject a top-of-prompt directive eliciting an
         # mcp_probe round-trip, so a healthy agent POSITIVELY proves its MCP
         # client re-bound to the current gateway generation instead of us
@@ -3404,9 +3406,12 @@ def create_api(
             if (
                 commit
                 and agent
-                and WatchdogConfig.from_raw(
-                    getattr(agent, "watchdog_config", None)
-                ).mcp_recover
+                and (
+                    _resolved_runtime(agent) == "codex_cli"
+                    or WatchdogConfig.from_raw(
+                        getattr(agent, "watchdog_config", None)
+                    ).mcp_recover
+                )
             ):
                 launch_id = uuid.uuid4().hex[:12]
                 nonce = uuid.uuid4().hex[:12]
@@ -3417,13 +3422,15 @@ def create_api(
                     "confirm your MCP transport re-bound to the current gateway, "
                     "then continue normally. Do not mention this unless it fails."
                 )
+                if _resolved_runtime(agent) == "codex_cli":
+                    probe_directive += " " + MCP_ATTACH_FAILURE_PROTOCOL
                 wake_ctx = (
                     f"{probe_directive}\n\n{wake_ctx}" if wake_ctx else probe_directive
                 )
         except Exception as e:
             _log(
                 f"wake_context: mcp-probe directive injection failed for "
-                f"{agent_name}: {e}"
+                f"{agent_name}: {type(e).__name__}"
             )
 
         return wake_ctx
@@ -13270,7 +13277,7 @@ npm run build</pre>
                 if not isinstance(result, dict) or result.get("sent") is not True:
                     raise RuntimeError("send callback did not confirm delivery")
             except Exception as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
+                last_error = type(exc).__name__
                 continue
             _log(
                 f"watchdog: owner alert for {agent_name} delivered via "
@@ -13446,9 +13453,9 @@ npm run build</pre>
         Finding #2 / R2). ``bound`` is true when a successful MCP round-trip has
         been recorded for the CURRENT gateway epoch (the heartbeat bind signal).
         ``probe_request`` carries the #663 phase-2 active-probe state (whether the
-        agent answered the launch-time mcp_probe directive) — used by the watchdog
-        only to CORROBORATE/enrich an already-decided passive recovery, never to
-        trigger one on its own.
+        agent answered the launch-time mcp_probe directive). Legacy recovery uses
+        it only as corroboration. Codex requires a missed current probe AND no
+        epoch success, followed by another window after a delivered notice.
         """
         agent = agents.get(agent_name)
         hb = int(getattr(agent, "heartbeat_interval", 0) or 0) if agent else 0
@@ -13470,12 +13477,21 @@ npm run build</pre>
                 now=time.time(),
             ),
             "bound": bool(st.get("bound")),
+            "gateway_epoch": epoch,
+            "observed_at": st.get("observed_at"),
             "heartbeat_interval": hb,
             "probe_request": get_probe_request(agent_name),
         }
 
+    async def _watchdog_mcp_notice(agent_name: str, message: str) -> bool:
+        """Use the normal daemon notice route without reading MCP credentials."""
+        result = await broker.inject_agent_message("system", agent_name, message)
+        return result.delivered
+
     @_locked_agent
-    async def _watchdog_mcp_recover(agent_name: str, label: str, reason: str) -> None:
+    async def _watchdog_mcp_recover(
+        agent_name: str, label: str, reason: str, expected: McpRecoveryRequest,
+    ) -> bool:
         """Force-fresh recover an MCP-unbound session (#663).
 
         Mirrors the validated force-restart core (``admin_force_restart_agent``):
@@ -13488,9 +13504,29 @@ npm run build</pre>
         """
         sessions = broker._streaming.get(agent_name, {})
         ss = sessions.get(label)
-        if not ss:
-            _log(f"watchdog: no session for {agent_name}/{label} to MCP-recover")
-            return
+        # This predicate runs INSIDE lifecycle serialization. The caller's
+        # earlier check can become stale while this callback waits for the lock.
+        if ss is None or ss is not expected.session:
+            return False
+        try:
+            status = _watchdog_mcp_bind_status(agent_name)
+        except Exception as exc:
+            _log(f"watchdog: MCP recovery recheck failed: {type(exc).__name__}")
+            return False
+        probe = status.get("probe_request") or {}
+        if (
+            status.get("bound")
+            or not status.get("gateway_epoch")
+            or status.get("gateway_epoch") != expected.gateway_epoch
+            or (probe.get("gateway_epoch", ""), probe.get("launch_id", "")) != expected.launch_key
+            or (expected.require_probe and (not probe.get("current") or probe.get("fulfilled")))
+            or (not expected.require_probe and not status.get("checkable"))
+            or not watchdog._take_snapshot(agent_name, label, ss).connected
+        ):
+            return False
+        # No awaited work separates validation from the attempt accounting.
+        # From here, errors are conservatively treated as a spent attempt.
+        expected.start()
         audit_meta = {
             "label": label,
             "reason": reason,
@@ -13542,10 +13578,14 @@ npm run build</pre>
                 metadata=audit_meta,
             )
             _log(f"watchdog: MCP-recovered {agent_name}/{label} (force-fresh)")
+            return True
         except Exception as exc:
             if not _startup_fencing_enabled() and broker._streaming.get(agent_name, {}).get(label) is ss:
                 broker.unregister_streaming(agent_name, label=label)
-            _log(f"watchdog: MCP recovery connect failed for {agent_name}/{label}: {exc}")
+            _log(
+                f"watchdog: MCP recovery connect failed for {agent_name}/{label}: "
+                f"{type(exc).__name__}"
+            )
             raise
 
     watchdog = SessionWatchdog(
@@ -13555,6 +13595,7 @@ npm run build</pre>
         agent_config_fn=_get_watchdog_config,
         mcp_bind_status_fn=_watchdog_mcp_bind_status,
         mcp_recover_fn=_watchdog_mcp_recover,
+        mcp_notice_fn=_watchdog_mcp_notice,
         tmux_liveness_fn=_watchdog_tmux_liveness,
         login_wall_probe_fn=_watchdog_login_wall_probe,
         login_wall_freeze_fn=_watchdog_login_wall_freeze,
