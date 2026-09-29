@@ -122,14 +122,13 @@ def test_creation_control_preserves_nonisolated_behavior(daemon):
 
 
 @pytest.mark.parametrize("actor", ["tenant", "normal"])
-def test_clone_worker_existing_failure_blocks_policy_evidence(daemon, monkeypatch, actor):
-    """Baseline defect, NOT a security RED: list() returns SessionInfo, not Session.
+def test_clone_worker_runs_after_fork(daemon, monkeypatch, actor):
+    """Resolve metadata through the manager before forking a live session."""
+    from types import SimpleNamespace
 
-    The real handler reads info.session_type.value (but that field is a str),
-    before any fork or common policy can be reached. Keep this explicit rather
-    than patching manager.list() to fabricate a functioning control.
-    """
     import claude_agent_sdk
+
+    from pinky_daemon.sessions import Session
 
     d = daemon("shadow")
     manager = d.app.state.manager
@@ -142,11 +141,23 @@ def test_clone_worker_existing_failure_blocks_policy_evidence(daemon, monkeypatc
     main._sdk_session_id = "fixture-main-sdk"
     assert isinstance(manager.list()[0].session_type, str)
     forked = []
-    monkeypatch.setattr(claude_agent_sdk, "fork_session", lambda *a, **kw: forked.append(a))
+    sent = []
+
+    def fork(sdk_id, **kwargs):
+        forked.append(sdk_id)
+        return SimpleNamespace(session_id="fixture-fork-sdk")
+
+    async def send(session, content):
+        sent.append((session.agent_name, content, session._sdk_session_id))
+
+    monkeypatch.setattr(claude_agent_sdk, "fork_session", fork)
+    monkeypatch.setattr(Session, "send", send)
     path = f"/agents/{actor}/clone-worker"
-    client = TestClient(d.app, raise_server_exceptions=False)
+    client = TestClient(d.app)
     response = client.post(
         path, headers=signed(d, "POST", path, actor), json={"task": "fixture task"}
     )
     client.close()
-    assert (response.status_code, forked, len(manager.list())) == (500, [], 1)
+    assert response.status_code == 200, response.text
+    assert (forked, len(manager.list())) == (["fixture-main-sdk"], 2)
+    assert sent == [(actor, "fixture task", "fixture-fork-sdk")]
