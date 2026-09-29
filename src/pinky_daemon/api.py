@@ -225,6 +225,7 @@ from pinky_daemon.session_watchdog import (
 from pinky_daemon.sessions import (
     SessionManager,
     SessionState,
+    SessionType,
     is_purgeable_legacy_session,
 )
 from pinky_daemon.shared_mcp import (
@@ -6470,12 +6471,14 @@ npm run build</pre>
 
         # Find the agent's main session
         main_sessions = [
-            s for s in manager.list()
-            if s.agent_name == name and s.session_type.value == "main"
+            s
+            for s in manager.list()
+            if s.agent_name == name and s.session_type == SessionType.main.value
         ]
-        if not main_sessions:
+        # list() exposes metadata; resolve the live session before reading its transcript.
+        main_session = manager.get(main_sessions[0].id) if main_sessions else None
+        if main_session is None:
             raise HTTPException(400, f"Agent '{name}' has no active main session to fork from")
-        main_session = main_sessions[0]
 
         sdk_id = main_session._sdk_session_id
         if not sdk_id:
