@@ -5,7 +5,6 @@ import time
 import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
-from twilio.request_validator import RequestValidator
 
 from pinky_daemon.auth import (
     INTERNAL_AGENT_HEADER,
@@ -35,6 +34,8 @@ def test_public_callback_auth_and_state_matrix(
     provider,
     actor,
 ):
+    # The provider leg needs the optional voice extra; CI installs only the dev extras.
+    validator = pytest.importorskip("twilio.request_validator")
     d = daemon(mode)
     d.agents.set_setting("TWILIO_AUTH_TOKEN", "fixture-provider-token")
     path = "/api/voice/status/fixture-call"
@@ -55,7 +56,7 @@ def test_public_callback_auth_and_state_matrix(
         elif signature == "wrong-agent":
             headers[INTERNAL_AGENT_HEADER] = "peer"
     headers["X-Twilio-Signature"] = (
-        RequestValidator("fixture-provider-token").compute_signature(
+        validator.RequestValidator("fixture-provider-token").compute_signature(
             "http://testserver" + path, body
         )
         if provider
