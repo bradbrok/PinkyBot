@@ -993,7 +993,8 @@ class SessionWatchdog:
         if is_codex:
             if await self._evaluate_codex_mcp_attach(snap, now):
                 return
-        elif await self._evaluate_mcp_bind(snap, state, cfg, now):
+        # A Codex launch check does not replace opted-in mid-life recovery.
+        if await self._evaluate_mcp_bind(snap, state, cfg, now):
             return
 
         # Everything below — the lifecycle-transition and progress/backlog
@@ -1315,9 +1316,10 @@ class SessionWatchdog:
                 except Exception:
                     _warn("watchdog MCP attach notice failed for %s", snap.agent_name)
 
+        # The agent must receive its notice and grace window. Owner delivery
+        # remains best-effort: a notification outage must not block self-heal.
         if (
             attach.retry_used
-            or not attach.alerted
             or attach.noticed_at is None
             or now - attach.noticed_at < DEFAULT_MCP_PROBE_DEADLINE
             or self._mcp_recover_fn is None

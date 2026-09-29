@@ -16,6 +16,7 @@ from pinky_daemon.api import create_api
 from pinky_daemon.session_watchdog import (
     DEFAULT_MCP_PROBE_DEADLINE,
     DEFAULT_MCP_RECOVER_MIN_INTERVAL,
+    DEFAULT_MCP_UNBOUND_FLOOR,
 )
 from pinky_daemon.shared_mcp import (
     bump_gateway_epoch,
@@ -277,9 +278,11 @@ async def test_success_after_notice_cancels_relaunch(harness, generic):
 
 
 @pytest.mark.asyncio
-async def test_second_failed_launch_never_restarts_even_after_unregister(harness):
+@pytest.mark.parametrize("opted_in", [False, True])
+async def test_second_failed_launch_never_restarts_even_after_unregister(harness, opted_in):
     h = harness
-    h.add()
+    h.add(mcp_recover=opted_in)
+    h.app.state.agents.register("test-agent", heartbeat_interval=60)
     h.launch(seed=True)
     h.clock.advance(DEFAULT_MCP_PROBE_DEADLINE)
     await h.watchdog._sweep()
@@ -288,7 +291,8 @@ async def test_second_failed_launch_never_restarts_even_after_unregister(harness
     assert len(h.recovered) == 1
     h.app.state.broker._streaming.clear()
     await h.watchdog._sweep()
-    h.add()
+    h.add(mcp_recover=opted_in)
+    h.app.state.agents.register("test-agent", heartbeat_interval=60)
     h.launch(seed=True)
     h.clock.advance(DEFAULT_MCP_PROBE_DEADLINE)
     await h.watchdog._sweep()
@@ -477,6 +481,65 @@ async def test_notice_must_arrive_before_second_window_starts(harness, failure):
     h.clock.advance(1)
     await h.watchdog._sweep()
     assert len(h.recovered) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["false", "exception", "no_callback"])
+async def test_owner_alert_failure_does_not_block_retry_after_notice(harness, failure):
+    h = harness
+    h.add()
+    h.launch(seed=True)
+
+    async def unavailable(name, message):
+        h.alerts.append((name, message))
+        if failure == "exception":
+            raise RuntimeError(SENTINEL)
+        return False
+
+    h.watchdog._alert_fn = None if failure == "no_callback" else unavailable
+    h.clock.advance(DEFAULT_MCP_PROBE_DEADLINE)
+    await h.watchdog._sweep()
+    assert len(h.notices) == 1
+    assert h.recovered == []
+    h.clock.advance(DEFAULT_MCP_PROBE_DEADLINE - 1)
+    await h.watchdog._sweep()
+    assert h.recovered == []
+    h.clock.advance(1)
+    await h.watchdog._sweep()
+    assert len(h.recovered) == 1
+    h.clock.advance(DEFAULT_MCP_RECOVER_MIN_INTERVAL)
+    await h.watchdog._sweep()
+    assert len(h.recovered) == len(h.notices) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("opted_in", [True, False])
+async def test_codex_legacy_recovery_after_fulfilled_launch_probe(harness, opted_in):
+    h = harness
+    h.add(mcp_recover=opted_in)
+    h.app.state.agents.register("test-agent", heartbeat_interval=60)
+    h.launch()
+    h.prove()
+    assert get_probe_request("test-agent")["fulfilled"] is True
+    await h.watchdog._sweep()
+    assert h.alerts == h.notices == h.recovered == []
+
+    # The previously bound client loses its gateway epoch without a new wake.
+    # Legacy opt-in recovery must still observe this sustained outage.
+    h.clock.advance(10)
+    bump_gateway_epoch()
+    assert get_probe_request("test-agent") == {}
+    await h.watchdog._sweep()
+    h.clock.advance(DEFAULT_MCP_UNBOUND_FLOOR - 1)
+    await h.watchdog._sweep()
+    assert h.recovered == []
+    h.clock.advance(1)
+    await h.watchdog._sweep()
+    assert len(h.recovered) == int(opted_in)
+    assert h.notices == []  # this is not a failed launch probe
+    if opted_in:
+        assert "MCP transport unbound" in h.recovered[0][2]
+        assert "MCP_ATTACH_FAILED" not in h.caplog.text
 
 
 @pytest.mark.asyncio
