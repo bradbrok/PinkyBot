@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import atexit
 import errno
 import os
+import shutil
 import sqlite3
 import subprocess as sp
 import sys
@@ -24,6 +26,12 @@ from pinky_daemon.store_catalog import (
 
 _REAL_PATH_EXISTS = Path.exists
 
+# The storage ancestor preflight rejects world-writable directories (e.g. /tmp
+# at mode 1777). Keep all test database files under a private directory that
+# passes the check so the tests that are NOT about preflight can run freely.
+_SAFE_TMPDIR = tempfile.mkdtemp(dir="/root", prefix="pinky-admin-test-")
+atexit.register(shutil.rmtree, _SAFE_TMPDIR, ignore_errors=True)
+
 
 @pytest.fixture(autouse=True)
 def _stub_resolve_and_verify():
@@ -42,9 +50,10 @@ def _stub_resolve_and_verify():
 
 def _make_client():
     from pinky_daemon.api import create_api
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
+    data_dir = Path(tempfile.mkdtemp(prefix="pinky-client-", dir=_SAFE_TMPDIR))
+    data_dir.chmod(0o700)
+    path = str(data_dir / "conversations.db")
+    app = create_api(max_sessions=10, default_working_dir=str(data_dir), db_path=path)
     return TestClient(app)
 
 
