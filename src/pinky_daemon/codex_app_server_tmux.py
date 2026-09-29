@@ -40,7 +40,7 @@ import sys
 import tempfile
 from collections.abc import Callable
 
-from pinky_daemon import isolated_launch_env, tmux_launch_env
+from pinky_daemon import codex_launch_env, isolated_launch_env
 from pinky_daemon.codex_app_server import (
     _STREAM_LIMIT,
     CodexAppServerClient,
@@ -48,7 +48,6 @@ from pinky_daemon.codex_app_server import (
     ServerRequestHandler,
 )
 from pinky_daemon.codex_home import (
-    codex_home_for,
     per_agent_codex_home_enabled,
     prepare_agent_codex_home,
     validate_agent_codex_home,
@@ -186,15 +185,15 @@ class CodexAppServerSupervisor:
         self._unlink_sock()
 
         self._ensure_sock_dir_secure()
-        policy_args = {"launch_policy": launch_policy} if launch_policy.mode == "enforce" else {}
-        env = self._build_env(**policy_args)
+        env = self._build_env(launch_policy=launch_policy)
 
         command = " ".join(
             shlex.quote(p)
             for p in [sys.executable, "-m", "pinky_daemon.codex_app_server_shim", self.sock_path]
         )
         result = await self._tmux.new_session(
-            cwd=self._sock_dir, command=command, env=env, **launch_policy.spawn_options(env),
+            cwd=self._sock_dir, command=codex_launch_env.wrap_command(command, env),
+            env=env, **launch_policy.spawn_options(env), codex_headers=True,
         )
         if not result.ok:
             raise RuntimeError(
@@ -224,45 +223,25 @@ class CodexAppServerSupervisor:
         return client, _TmuxAppServerProc(self, pid=0)
 
     def _launch_env_policy(self) -> isolated_launch_env.LaunchPolicy:
-        return isolated_launch_env.capture_policy(
-            agent_name=self.agent_name, registry=self._registry,
-            status_lookup=self._isolation_status, log=self._log,
+        return codex_launch_env.capture_policy(
+            agent_name=self.agent_name, registry=self._registry, log=self._log,
         )
 
     def _build_env(
         self, *, launch_policy: isolated_launch_env.LaunchPolicy | None = None,
     ) -> dict[str, str]:
-        """Build scoped app-server inputs or the unchanged ambient payload."""
-        launch_policy = launch_policy or self._launch_env_policy()
-        if launch_policy.clean:
-            env = isolated_launch_env.scoped_codex_env(launch_policy, self.agent_name)
-            env["CODEX_HOME"] = str(codex_home_for(self._agent_config))
-            provider_url = getattr(self._agent_config, "provider_url", "")
-            if provider_url:
-                env["OPENAI_BASE_URL"] = provider_url
-        else:
-            env = tmux_launch_env.ambient_env(
-                os.environ.items(), lambda message: self._log(f"codex[{self.agent_name}]: {message}"),
-            )
-        if self._openai_api_key:
-            env["OPENAI_API_KEY"] = self._openai_api_key
+        policy = launch_policy or self._launch_env_policy()
+        prepared_home = None
         if per_agent_codex_home_enabled():
             if self._agent_config is None:
-                raise RuntimeError(
-                    "per-agent Codex home requires app-server agent config"
-                )
-            env["CODEX_HOME"] = str(
-                prepare_agent_codex_home(
-                    self._agent_config,
-                    log=self._log,
-                    soul_version_store=self._soul_version_store,
-                )
+                raise RuntimeError("per-agent Codex home requires app-server agent config")
+            prepared_home = prepare_agent_codex_home(
+                self._agent_config, log=self._log, soul_version_store=self._soul_version_store,
             )
-        isolated_launch_env.report_codex_shadow(
-            agent_name=self.agent_name, registry=self._registry,
-            status_lookup=self._isolation_status, env=env, log=self._log,
+        return codex_launch_env.build_env(
+            agent_name=self.agent_name, config=self._agent_config, api_key=self._openai_api_key,
+            policy=policy, log=self._log, prepared_home=prepared_home,
         )
-        return isolated_launch_env.with_grants(launch_policy, env)
 
     def _isolation_status(self) -> str:
         return isolated_launch_env.isolation_status(self._registry, self.agent_name)

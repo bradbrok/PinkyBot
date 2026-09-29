@@ -25,7 +25,7 @@ import shlex
 import time
 from dataclasses import dataclass, field
 
-from pinky_daemon import resume_recovery
+from pinky_daemon import codex_launch_env, resume_recovery
 from pinky_daemon.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
@@ -37,7 +37,7 @@ from pinky_daemon.codex_home import (
     prepare_agent_codex_home,
     validate_agent_codex_home,
 )
-from pinky_daemon.codex_mcp_env import mcp_cli_config, with_mcp_header_env
+from pinky_daemon.codex_mcp_env import mcp_cli_config
 from pinky_daemon.context_estimator import ContextTextEstimator
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.streaming_session import (
@@ -1011,16 +1011,16 @@ class CodexSession(TransportReplacementMixin):
         return cmd
 
     def _build_codex_env(self) -> dict[str, str]:
-        """Build the full process environment with the agent-home overlay."""
-        env = {**os.environ}
-        if self._openai_api_key:
-            env["OPENAI_API_KEY"] = self._openai_api_key
+        """Build one explicit launch identity over the permitted ambient inputs."""
+        policy = codex_launch_env.capture_policy(
+            agent_name=self.agent_name, registry=self._registry, log=_log,
+        )
         prepared_home = self._prepare_agent_codex_home()
-        if prepared_home is not None:
-            env["CODEX_HOME"] = prepared_home
-        if not self._use_app_server:
-            env = with_mcp_header_env(env, self._mcp_servers)
-        return env
+        return codex_launch_env.build_env(
+            agent_name=self.agent_name, config=self._config, api_key=self._openai_api_key,
+            policy=policy, log=_log, prepared_home=prepared_home,
+            servers={} if self._use_app_server else self._mcp_servers,
+        )
 
     def _prepare_agent_codex_home(self) -> str | None:
         """Snapshot and publish isolated-home state for an actual spawn."""

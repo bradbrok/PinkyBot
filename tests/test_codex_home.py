@@ -420,7 +420,7 @@ def test_shared_home_equality_refuses_before_every_writer_and_preserves_bytes(
     assert after == before
 
 
-def test_subprocess_transport_flag_off_has_zero_env_delta_and_zero_soul_writes(
+def test_subprocess_transport_flag_off_preserves_home_and_does_not_write_soul(
     tmp_path,
     monkeypatch,
 ):
@@ -439,7 +439,12 @@ def test_subprocess_transport_flag_off_has_zero_env_delta_and_zero_soul_writes(
 
     env = CodexSession(config, registry=soul_store)._build_codex_env()
 
-    assert env == before
+    same_home = env.get("CODEX_HOME") == before["CODEX_HOME"]
+    same_path = env.get("PATH") == before.get("PATH")
+    assert same_home and same_path
+    assert env.get("PINKY_AGENT_NAME") == "test-agent"
+    assert "PINKY_SESSION_SECRET" not in env
+    assert "PINKYBOT_FERRY_SHARED_SECRET" not in env
     assert soul_store.calls == []
     assert not (shared_home / "AGENTS.md").exists()
     assert not (working_dir / ".codex" / "AGENTS.md").exists()
@@ -2594,10 +2599,10 @@ async def test_tmux_app_server_first_start_with_absent_server_proceeds(
     async def _await_accept():
         return object(), object()
 
-    def _tracked_build_env():
+    def _tracked_build_env(**kwargs):
         nonlocal build_env_calls
         build_env_calls += 1
-        return real_build_env()
+        return real_build_env(**kwargs)
 
     class _Client:
         def __init__(self, *_args, **_kwargs):
@@ -2942,10 +2947,10 @@ async def test_tmux_app_server_stale_kill_failure_refuses_before_publication(
     async def _unexpected_new_session(**_kwargs):
         raise AssertionError("new_session reached after failed stale kill")
 
-    def _tracked_build_env():
+    def _tracked_build_env(**kwargs):
         nonlocal build_env_calls
         build_env_calls += 1
-        return real_build_env()
+        return real_build_env(**kwargs)
 
     monkeypatch.setattr(supervisor._tmux, "_run", _tmux_run)
     monkeypatch.setattr(supervisor._tmux, "new_session", _unexpected_new_session)
@@ -3012,10 +3017,10 @@ async def test_tmux_app_server_permission_probe_refuses_before_publication(
     async def _unexpected_new_session(**_kwargs):
         raise AssertionError("new_session reached after verifier error")
 
-    def _tracked_build_env():
+    def _tracked_build_env(**kwargs):
         nonlocal build_env_calls
         build_env_calls += 1
-        return real_build_env()
+        return real_build_env(**kwargs)
 
     monkeypatch.setattr(supervisor._tmux, "_run", _tmux_run)
     monkeypatch.setattr(supervisor._tmux, "new_session", _unexpected_new_session)
@@ -3419,10 +3424,10 @@ async def test_tmux_repl_returned_has_session_error_refuses_before_spawn_side_ef
             stderr="new-session reached after ambiguous has-session probe",
         )
 
-    def _tracked_build_env():
+    def _tracked_build_env(**kwargs):
         nonlocal env_build_count
         env_build_count += 1
-        return real_build_env()
+        return real_build_env(**kwargs)
 
     def _tracked_prepare_spawn():
         nonlocal publication_count

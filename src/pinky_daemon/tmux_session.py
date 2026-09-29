@@ -4079,7 +4079,10 @@ class TmuxSession(TransportReplacementMixin):
         """
         self._check_startup_owner()
         launch_policy = self._launch_env_policy()
-        policy_args = {"launch_policy": launch_policy} if launch_policy.mode == "enforce" else {}
+        policy_args = (
+            {"launch_policy": launch_policy}
+            if launch_policy.mode == "enforce" or self._scrub_codex_headers else {}
+        )
         cwd = self._config.working_dir or "."
         # Ensure cwd exists — claude --continue needs it.
         Path(cwd).mkdir(parents=True, exist_ok=True)
@@ -4154,7 +4157,10 @@ class TmuxSession(TransportReplacementMixin):
                         k: v for k, v in effective_env.items()
                         if k in isolated_launch_env.BASE_ALLOWLIST or k.startswith(("LC_", "XDG_"))
                     }
-                effective_env.update(self._build_repl_env(**policy_args))
+                effective_env.update(self._build_repl_env(
+                    **policy_args,
+                    **({"report_shadow": False} if self._scrub_codex_headers else {}),
+                ))
                 cfg_path = _resolve_claude_config_path(effective_env)
                 if _seed_claude_trust_file(cfg_path, cwd):
                     _log(
@@ -4196,8 +4202,7 @@ class TmuxSession(TransportReplacementMixin):
         # if none exists.
         claude_cmd = self._build_claude_cmd()
         env = self._build_repl_env(**policy_args)
-        if self._uses_claude_host_payload(launch_policy):
-            claude_cmd = _claude_host_command(claude_cmd, env)
+        claude_cmd = self._wrap_launch_command(claude_cmd, env, launch_policy)
 
         launch_env = None
 
@@ -4651,6 +4656,14 @@ class TmuxSession(TransportReplacementMixin):
             agent_name=self.agent_name, registry=self._registry,
             status_lookup=self._isolation_status, log=_log,
         )
+
+    def _wrap_launch_command(
+        self, command: str, env: dict[str, str], policy: isolated_launch_env.LaunchPolicy,
+    ) -> str:
+        # Only the Claude host payload uses the inherited-auth removal here.
+        if self._uses_claude_host_payload(policy):
+            return _claude_host_command(command, env)
+        return command
 
     def _uses_claude_host_payload(self, policy: isolated_launch_env.LaunchPolicy) -> bool:
         return (

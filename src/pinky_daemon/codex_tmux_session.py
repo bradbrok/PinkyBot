@@ -53,7 +53,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-from pinky_daemon import isolated_launch_env, tmux_launch_env
+from pinky_daemon import codex_launch_env, isolated_launch_env
 from pinky_daemon.codex_home import (
     MANAGED_CONFIG_SENTINEL,
     codex_home_for,
@@ -61,7 +61,7 @@ from pinky_daemon.codex_home import (
     prepare_agent_codex_home,
     validate_agent_codex_home,
 )
-from pinky_daemon.codex_mcp_env import mcp_cli_config, with_mcp_header_env
+from pinky_daemon.codex_mcp_env import mcp_cli_config
 from pinky_daemon.codex_tmux_transcript import (
     CodexTmuxTranscriptTailer,
     _discover_codex_rollout,
@@ -302,36 +302,31 @@ class CodexTmuxSession(TmuxSession):
         return "pending_restart"
 
     # ── seam: env ───────────────────────────────────────────────────────────
+    def _launch_env_policy(self) -> isolated_launch_env.LaunchPolicy:
+        return codex_launch_env.capture_policy(
+            agent_name=self.agent_name, registry=self._registry, log=_log,
+        )
+
+    def _wrap_launch_command(
+        self, command: str, env: dict[str, str], policy: isolated_launch_env.LaunchPolicy,
+    ) -> str:
+        return codex_launch_env.wrap_command(command, env)
+
     def _build_repl_env(
         self, *, launch_policy: isolated_launch_env.LaunchPolicy | None = None,
+        report_shadow: bool = True,
     ) -> dict[str, str]:
-        """Build scoped inputs in clean mode and preserve ambient parity otherwise."""
-        launch_policy = launch_policy or self._launch_env_policy()
-        if launch_policy.clean:
-            env = isolated_launch_env.scoped_codex_env(launch_policy, self.agent_name)
-            if self._container_agent() is not None:
-                env["PINKY_DAEMON_URL"] = os.environ.get(
-                    "PINKY_CONTAINER_DAEMON_URL", "http://host.containers.internal:8888",
-                )
-            if self._config.provider_url:
-                env["OPENAI_BASE_URL"] = self._config.provider_url
-        else:
-            env = tmux_launch_env.ambient_env(
-                os.environ.items(), lambda message: _log(f"tmux[{self.agent_name}]: {message}"),
+        policy = launch_policy or self._launch_env_policy()
+        daemon_url = None
+        if self._container_agent() is not None:
+            daemon_url = os.environ.get(
+                "PINKY_CONTAINER_DAEMON_URL", "http://host.containers.internal:8888",
             )
-        if self._openai_api_key:
-            env["OPENAI_API_KEY"] = self._openai_api_key
-        if self.agent_name:
-            env["PINKY_AGENT_NAME"] = self.agent_name
-        if launch_policy.clean or per_agent_codex_home_enabled():
-            env["CODEX_HOME"] = str(codex_home_for(self._config))
-        isolated_launch_env.report_codex_shadow(
-            agent_name=self.agent_name, registry=self._registry,
-            status_lookup=self._isolation_status, env=env, log=_log,
+        return codex_launch_env.build_env(
+            agent_name=self.agent_name, config=self._config, api_key=self._openai_api_key,
+            policy=policy, log=_log, servers=self._codex_mcp_servers,
+            daemon_url=daemon_url, report=report_shadow,
         )
-        # Inject after scoping and explicit grants: ambient header vars are not authority.
-        env = isolated_launch_env.with_grants(launch_policy, env)
-        return with_mcp_header_env(env, self._codex_mcp_servers or {})
 
     # ── seam: transcript discovery (codex rollout store) ────────────────────
     def _project_dir(self) -> Path:

@@ -35,7 +35,11 @@ async def test_observation_modes_preserve_real_inheritance(tmp_path, monkeypatch
     async with launch_probe(tmp_path, monkeypatch, mode=mode) as probe:
         monkeypatch.setenv("PINKY_ISOLATED_ENV_GRANTS_FILE", "/does/not/exist")
         names = await probe.launch(kind)
-        assert DAEMON_NAMES <= names
+        if kind == "claude":
+            assert DAEMON_NAMES <= names
+        else:
+            assert "HRPOS_PASSWORD" in names
+            assert not isolated_launch_env.DAEMON_ONLY.intersection(names)
 
 
 @pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])
@@ -173,7 +177,13 @@ def test_nonisolated_unaffected_by_bad_mode_or_grants(grants, tmp_path, monkeypa
     monkeypatch.setenv("PINKY_ISOLATED_ENV", "invalid-mode")
     monkeypatch.setenv("PINKY_SESSION_SECRET", "synthetic-global")
     build, _ = builder(kind, Registry("not_isolated"), tmp_path, monkeypatch)
-    assert build()["PINKY_SESSION_SECRET"] == "synthetic-global"
+    monkeypatch.setenv("ORDINARY_TOOL_CONFIG", "synthetic-config")
+    env = build()
+    assert env["ORDINARY_TOOL_CONFIG"] == "synthetic-config"
+    if kind == "claude":
+        assert env["PINKY_SESSION_SECRET"] == "synthetic-global"
+    else:
+        assert "PINKY_SESSION_SECRET" not in env
 
 
 @pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])

@@ -139,13 +139,18 @@ def _load_grants(registry, agent_name: str, log: Callable[[str], None]) -> tuple
 
 def capture_policy(
     *, agent_name: str, registry, status_lookup: Callable[[], str], log: Callable[[str], None],
+    minimum_shadow: bool = False,
 ) -> LaunchPolicy:
     mode = os.environ.get(MODE_ENV, "off")
-    if mode in ("off", "shadow"):
+    if mode in ("off", "shadow") and not minimum_shadow:
         return LaunchPolicy(mode=mode)
     status = status_lookup()
     key = signing_key(registry, agent_name)
     isolated = is_isolated(status, bool(key))
+    if mode in ("off", "shadow"):
+        return LaunchPolicy(
+            mode="shadow" if isolated else mode, status=status, agent_key=key,
+        )
     if mode != "enforce":
         if isolated:
             log("ERROR isolated launch mode configuration refused")

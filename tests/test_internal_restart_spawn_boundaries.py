@@ -32,7 +32,7 @@ async def test_real_spawn_stops_after_revoked_external_await(
     ss._seed_container_trust = AsyncMock()
     ss._seed_container_home_creds = AsyncMock()
     ss._start_tailer = AsyncMock()
-    ss._build_repl_env = lambda: {"HOME": ss._config.working_dir}
+    ss._build_repl_env = lambda **kwargs: {"HOME": ss._config.working_dir}
     ss._build_claude_cmd = lambda: "disposable-command"
     ss._prepare_tmux_spawn = lambda: None
     ss._tmux.has_session = AsyncMock(return_value=False)
