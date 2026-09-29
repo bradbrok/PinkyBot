@@ -42,7 +42,7 @@ def session_for(home, control, monkeypatch, kind="claude"):
         monkeypatch.setattr(session, name, AsyncMock())
     monkeypatch.setattr(session, "_container_agent", Mock(return_value=None))
     monkeypatch.setattr(session, "_select_command_runner", Mock(return_value=control._runner))
-    monkeypatch.setattr(session, "_build_repl_env", lambda: {"SECRET": SECRET})
+    monkeypatch.setattr(session, "_build_repl_env", lambda **kwargs: {"SECRET": SECRET})
     monkeypatch.setattr(session, "_build_claude_cmd", lambda: "true")
     monkeypatch.setattr(session, "_prepare_tmux_spawn", lambda: None)
     monkeypatch.setattr(session, "_spawn_cleanup_state_dir", lambda: home)

@@ -34,6 +34,7 @@ import tempfile
 import pytest
 from fastapi.testclient import TestClient
 
+from pinky_daemon.tmux_launch_env_loader import DAEMON_ONLY
 from tests._tmp_hygiene import restore_tree_readability
 
 # Test session secret. Long-enough random-looking value; never used in
@@ -93,7 +94,7 @@ _REAL_TRANSPORT_OPTED_IN = os.environ.get(
 def _scrub_test_env() -> None:
     """Replace ambient runtime configuration with deterministic test values."""
     for key in tuple(os.environ):
-        if key.startswith("PINKY_"):
+        if key.startswith(("PINKY_", "PINKYBOT_")) or key in DAEMON_ONLY:
             os.environ.pop(key, None)
     os.environ.update(_PINNED_TEST_ENV)
 
@@ -190,7 +191,7 @@ def _isolate_test_env(request, monkeypatch):
     environment leakage from a prior test that mutated ``os.environ`` directly.
     """
     for key in tuple(os.environ):
-        if key.startswith("PINKY_"):
+        if key.startswith(("PINKY_", "PINKYBOT_")) or key in DAEMON_ONLY:
             monkeypatch.delenv(key, raising=False)
     for key, value in _PINNED_TEST_ENV.items():
         monkeypatch.setenv(key, value)
