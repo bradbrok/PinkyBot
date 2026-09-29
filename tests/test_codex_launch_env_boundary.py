@@ -664,6 +664,27 @@ def test_explicit_shared_home_keeps_empty_and_nonempty_values(harness, kind, val
     assert matches, "explicit shared home override changed"
 
 
+@pytest.mark.parametrize("mode", ("off", "shadow"))
+@pytest.mark.parametrize("configured", (False, True))
+def test_container_shadow_resolves_target_daemon_url(harness, mode, configured):
+    h = harness
+    owner, build = h.make("repl")
+    h.registry.mode = "container"
+    h.patch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+    h.patch.setenv("PINKY_ISOLATED_ENV", mode)
+    h.patch.setenv("PINKY_DAEMON_URL", "http://127.0.0.1:8888")
+    expected = "http://container-gateway.invalid:8888"
+    if configured:
+        h.patch.setenv("PINKY_CONTAINER_DAEMON_URL", expected)
+    else:
+        expected = "http://host.containers.internal:8888"
+    assert owner._container_agent() is not None
+    matches = build().get("PINKY_DAEMON_URL") == expected
+    assert matches, "shadow container payload retained host-loopback daemon routing"
+    reports = [line for line in h.logs if line.startswith("isolated_launch_env_shadow ")]
+    assert len(reports) == 1
+
+
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("credential", ("current", "rotated", "wrong-agent"))
 async def test_launch_identity_authenticates_without_global_authority(harness, kind, credential):
