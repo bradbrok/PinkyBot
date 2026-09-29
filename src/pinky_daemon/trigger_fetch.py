@@ -1,4 +1,4 @@
-"""HTTP-only URL watcher transport with public destinations on every hop.
+"""HTTP-only URL watcher transport with operator-scoped exceptions on every hop.
 
 A private opener avoids ambient proxies/handlers. Connections use the validated
 DNS sockaddr directly, preserving the URL hostname for Host and TLS verification.
@@ -7,9 +7,64 @@ from __future__ import annotations
 
 import http.client
 import ipaddress
+import logging
+import os
 import socket
 import urllib.parse
 import urllib.request
+from functools import lru_cache
+
+_logger = logging.getLogger(__name__)
+
+
+class InternalDestinationRefusedError(ValueError):
+    """A nonpublic sockaddr was refused; expose only its URL host and port."""
+
+    def __init__(self, host: str, port: int):
+        self.destination = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+        super().__init__("URL trigger internal destination refused: " + self.destination)
+
+
+@lru_cache(maxsize=1)
+def _operator_allowlist(raw: str):
+    """Parse literal IP/CIDR:port entries; IPv6 uses [IP/CIDR]:port.
+
+    DNS names are intentionally not policy identities. Match the resolved socket
+    addresses against operator-controlled numeric entries, without policy DNS.
+    Invalid entries warn once per configuration and never broaden access.
+    """
+    entries = []
+    for index, entry in enumerate(raw.split(","), start=1):
+        entry = entry.strip()
+        if not entry and not raw.strip():
+            continue
+        try:
+            host, separator, port_text = entry.rpartition(":")
+            if host.startswith("[") and host.endswith("]"):
+                host = host[1:-1]
+            elif ":" in host:
+                raise ValueError("IPv6 requires brackets")
+            if (not separator or not port_text.isascii() or not port_text.isdecimal()
+                    or not 1 <= int(port_text) <= 65535 or "%" in host):
+                raise ValueError("explicit numeric port required")
+            network = ipaddress.ip_network(host)
+            entries.append((network, int(port_text)))
+        except ValueError:
+            # Do not echo config text: malformed entries could contain credentials.
+            _logger.warning("Ignoring invalid PINKY_URL_TRIGGER_ALLOW entry %d; "
+                            "expected IP-or-CIDR with required port", index)
+    return tuple(entries)
+
+
+def _operator_allows(address, port, entries):
+    for network, allowed_port in entries:
+        if port != allowed_port or address not in network:
+            continue
+        # Broad ranges must never implicitly authorize local service endpoints.
+        if (address.is_loopback or address.is_link_local) and network.num_addresses != 1:
+            continue
+        return True
+    return False
 
 
 def validate_trigger_url(url: str) -> urllib.parse.SplitResult:
@@ -18,7 +73,7 @@ def validate_trigger_url(url: str) -> urllib.parse.SplitResult:
         parsed = urllib.parse.urlsplit(url)
         if (parsed.scheme not in {"http", "https"} or not parsed.hostname
                 or parsed.username is not None or parsed.password is not None
-                or any(ord(c) < 33 for c in url)):
+                or any(ord(c) < 33 or ord(c) == 127 for c in url)):
             raise ValueError
         _ = parsed.port
     except (ValueError, TypeError):
@@ -27,6 +82,7 @@ def validate_trigger_url(url: str) -> urllib.parse.SplitResult:
 
 
 def _public_addresses(host: str, port: int):
+    entries = _operator_allowlist(os.environ.get("PINKY_URL_TRIGGER_ALLOW", ""))
     addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     if not addresses:
         raise ValueError("URL trigger destination has no addresses")
@@ -34,8 +90,9 @@ def _public_addresses(host: str, port: int):
         address = ipaddress.ip_address(sockaddr[0])
         if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
             address = address.ipv4_mapped
-        if not address.is_global or address.is_multicast:
-            raise ValueError("URL trigger destination must be a public address")
+        if (address.is_multicast or address.is_unspecified
+                or (not address.is_global and not _operator_allows(address, sockaddr[1], entries))):
+            raise InternalDestinationRefusedError(host, port)
     return addresses
 
 
@@ -106,7 +163,7 @@ class _PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def open_trigger_url(url: str, *, method: str = "GET", timeout: float = 5):
-    """Open a public HTTP(S) URL; reject unsafe persisted rows and redirects."""
+    """Open an approved HTTP(S) URL; validate persisted rows and every redirect."""
     _validate_destination(url)
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}), _PublicHTTPHandler(), _PublicHTTPSHandler(),
