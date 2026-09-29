@@ -114,10 +114,6 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 timeout = 300
 timeout_method = "thread"
-# /tmp has mode 1777 (world-writable) in this container, which trips the
-# storage ancestor preflight in tests that create SQLite databases. Keep all
-# pytest-managed temp dirs under /root (mode 700) so they pass the check.
-addopts = "--basetemp=/root/pinky-test-tmp"
 
 [dependency-groups]
 dev = [

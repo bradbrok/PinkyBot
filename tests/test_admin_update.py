@@ -29,7 +29,20 @@ _REAL_PATH_EXISTS = Path.exists
 # The storage ancestor preflight rejects world-writable directories (e.g. /tmp
 # at mode 1777). Keep all test database files under a private directory that
 # passes the check so the tests that are NOT about preflight can run freely.
-_SAFE_TMPDIR = tempfile.mkdtemp(dir="/root", prefix="pinky-admin-test-")
+def _safe_tmpdir_base() -> str:
+    import stat
+
+    candidate = os.environ.get("TMPDIR") or tempfile.gettempdir()
+    if not (stat.S_IMODE(os.stat(candidate).st_mode) & 0o022):
+        return candidate
+    # candidate is world-writable (e.g. /tmp at 1777); if running as root in a
+    # container, /root (mode 700) is always safe.
+    if hasattr(os, "getuid") and os.getuid() == 0 and os.access("/root", os.W_OK):
+        return "/root"
+    return candidate
+
+
+_SAFE_TMPDIR = tempfile.mkdtemp(prefix="pinky-admin-test-", dir=_safe_tmpdir_base())
 atexit.register(shutil.rmtree, _SAFE_TMPDIR, ignore_errors=True)
 
 
