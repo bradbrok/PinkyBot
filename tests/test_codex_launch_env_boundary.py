@@ -181,6 +181,114 @@ def test_nonisolated_off_retains_ordinary_config_without_report(harness, kind):
 
 
 @pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("mode", ("off", "shadow", "enforce", "invalid-mode"))
+def test_nonisolated_launch_keeps_current_env_signing_identity(harness, kind, mode):
+    from pinky_daemon.auth import build_internal_auth_headers, verify_internal_request
+
+    h = harness
+    h.registry.isolated = False
+    h.patch.setenv("PINKY_ISOLATED_ENV", mode)
+    h.patch.setenv("PINKY_AGENT_KEY", SENTINEL + "foreign")
+    for name in DAEMON_ONLY:
+        h.patch.setenv(name, SENTINEL)
+    _, build = h.make(kind)
+    env = build()
+    current_identity = env.get("PINKY_AGENT_KEY") == h.registry.key
+    authority_absent = not DAEMON_ONLY.intersection(env)
+    signed = build_internal_auth_headers(
+        env.get("PINKY_AGENT_KEY", ""),
+        agent_name="test-agent",
+        method="GET",
+        path="/agents/me",
+    )
+    verified = verify_internal_request(
+        "",
+        agent_name="test-agent",
+        method="GET",
+        path="/agents/me",
+        timestamp=signed.get("x-pinky-timestamp", ""),
+        signature=signed.get("x-pinky-signature", ""),
+        agent_key=h.registry.key,
+        allow_global_secret=False,
+    )
+    assert current_identity and verified, "launch lost its available scoped signing identity"
+    assert authority_absent, "signing compatibility restored global authority"
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_invalid_mode_still_refuses_isolated_launch(harness, kind):
+    from pinky_daemon.isolated_launch_env import LaunchConfigError
+
+    harness.patch.setenv("PINKY_ISOLATED_ENV", "invalid-mode")
+    _, build = harness.make(kind)
+    with pytest.raises(LaunchConfigError, match="mode configuration refused"):
+        build()
+
+
+@pytest.mark.parametrize("mode", ("off", "shadow", "invalid-mode"))
+async def test_repl_captures_one_policy_per_launch_despite_key_rotation(harness, mode):
+    from unittest.mock import AsyncMock
+
+    from pinky_daemon import isolated_launch_env
+    from pinky_daemon.tmux_session import TmuxCommandResult
+
+    h = harness
+    h.patch.setenv("PINKY_ISOLATED_ENV", mode)
+    h.registry.isolated = mode != "invalid-mode"
+    owner, _ = h.make("repl")
+    snapshots, wrapped_policies, delivered = [], [], []
+    real_capture = isolated_launch_env.capture_policy
+    real_wrap = owner._wrap_launch_command
+
+    def capture_then_rotate(**kwargs):
+        policy = real_capture(**kwargs)
+        snapshots.append(policy)
+        h.registry.key = SENTINEL + "rotated-" + str(len(snapshots))
+        return policy
+
+    def record_wrap(command, env, policy):
+        wrapped_policies.append(policy)
+        return real_wrap(command, env, policy)
+
+    async def record_spawn(**kwargs):
+        delivered.append(kwargs["env"])
+        return TmuxCommandResult(returncode=0, stdout="", stderr="")
+
+    h.patch.setattr(isolated_launch_env, "capture_policy", capture_then_rotate)
+    h.patch.setattr(owner, "_wrap_launch_command", record_wrap)
+    h.patch.setattr(owner._tmux, "new_session", record_spawn)
+    h.patch.setattr(owner._tmux, "has_session", AsyncMock(side_effect=[False, True] * 2))
+    for name in (
+        "_ensure_container_started",
+        "_reap_retained_spawn_cleanup_debt",
+        "_seed_container_trust",
+        "_seed_container_home_creds",
+        "_start_tailer",
+        "_stop_tailer",
+        "_codex_dismiss_nux_and_ready",
+    ):
+        h.patch.setattr(owner, name, AsyncMock())
+    h.patch.setattr(owner, "_container_agent", lambda **kwargs: None)
+    h.patch.setattr(owner, "_select_command_runner", lambda *args: owner._tmux._runner)
+    h.patch.setattr(owner, "_prepare_tmux_spawn", lambda: None)
+    h.patch.setattr(owner, "_has_prior_transcript", lambda: False)
+    h.patch.setattr(owner, "_spawn_cleanup_state_dir", lambda: h.root / "home")
+    h.patch.setattr(tmux_session, "_POST_SPAWN_LIVENESS_DELAY_SEC", 0)
+    h.patch.setattr(tmux_session, "_seed_claude_trust_file", lambda *args: False)
+
+    for index in range(2):
+        expected_key = h.registry.key
+        await owner._spawn_tmux_repl()
+        assert len(snapshots) == index + 1, "REPL recaptured policy during the same launch"
+        same_snapshot = wrapped_policies[index] is snapshots[index]
+        same_identity = delivered[index].get("PINKY_AGENT_KEY") == expected_key
+        assert same_snapshot and same_identity, "launch environment diverged from captured policy"
+    if mode != "invalid-mode":
+        reports = [line for line in h.logs if line.startswith("isolated_launch_env_shadow ")]
+        assert len(reports) == 2, "preflight duplicated or lost the final launch report"
+
+
+@pytest.mark.parametrize("kind", KINDS)
 def test_current_scoped_identity_replaces_foreign_ambient_key(harness, kind):
     h = harness
     h.patch.setenv("PINKY_AGENT_KEY", SENTINEL + "foreign")

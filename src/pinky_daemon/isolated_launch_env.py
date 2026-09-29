@@ -155,7 +155,8 @@ def capture_policy(
         if isolated:
             log("ERROR isolated launch mode configuration refused")
             raise LaunchConfigError("isolated launch mode configuration refused")
-        return LaunchPolicy()
+        # Compatibility fallback changes the mode, not the resolved identity.
+        return LaunchPolicy(status=status, agent_key=key)
     grants = _load_grants(registry, agent_name, log) if isolated else ()
     return LaunchPolicy(mode=mode, status=status, agent_key=key, grants=grants)
 
