@@ -28,6 +28,7 @@ import atexit
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
 
 import pytest
@@ -206,6 +207,43 @@ def _isolate_test_env(request, monkeypatch):
     finally:
         # Also contain direct os.environ writes that bypassed monkeypatch.
         _scrub_test_env()
+
+
+@pytest.fixture(autouse=True)
+def _guard_default_tmux_socket(monkeypatch):
+    """Never let an unpatched test spawn reach the operator's default server."""
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    original = subprocess.Popen
+
+    class PrivatePopen(original):
+        def __init__(self, args, *positional, **kwargs):
+            if (
+                isinstance(args, (list, tuple)) and args
+                and os.path.basename(os.fsdecode(args[0])) == "tmux"
+            ):
+                argv = [os.fsdecode(arg) for arg in args[1:]]
+                if argv != ["-V"]:
+                    selected = None
+                    index = 0
+                    while index < len(argv) and argv[index].startswith("-"):
+                        flag = argv[index]
+                        if flag in {"-L", "-S", "-f"}:
+                            if index + 1 >= len(argv):
+                                break
+                            if flag in {"-L", "-S"}:
+                                selected = argv[index + 1]
+                            index += 2
+                        elif flag.startswith(("-L", "-S")):
+                            selected = flag[2:]
+                            index += 1
+                        else:
+                            index += 1
+                    if not selected or os.path.basename(selected) == "default":
+                        raise RuntimeError("test tmux command requires an explicit private socket")
+            super().__init__(args, *positional, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", PrivatePopen)
 
 
 @pytest.fixture(autouse=True)

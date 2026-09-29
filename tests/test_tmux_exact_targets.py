@@ -377,7 +377,11 @@ class _PrivateAsyncio:
 
 @pytest.fixture
 def dream_tmux(private_tmux, monkeypatch):
-    monkeypatch.setattr(tmux_dream_runner, "asyncio", _PrivateAsyncio(private_tmux.socket_name))
+    # Bind both the common loader spawn and follow-up commands to this server.
+    monkeypatch.setattr(
+        tmux_dream_runner, "_TmuxControl",
+        lambda session_name: private_tmux.control(session_name),
+    )
     return private_tmux
 
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import shutil
 import sys
 import time
@@ -33,8 +34,12 @@ from pinky_daemon.claude_runner import RunResult
 # acceptance and the typed instruction is silently eaten (observed in the
 # #707 live smoke test). Same-package reuse of tested helpers, on purpose.
 from pinky_daemon.tmux_session import (
+    _claude_host_auth_env,
+    _claude_host_command,
+    _claude_host_payload,
     _resolve_claude_config_path,
     _seed_claude_trust_file,
+    _TmuxControl,
 )
 from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target, text_argument
 
@@ -117,6 +122,7 @@ class TmuxDreamRunner:
     def __init__(self, config: TmuxDreamConfig | None = None, *, agent_name: str = "") -> None:
         self._config = config or TmuxDreamConfig()
         self._agent_name = agent_name or "agent"
+        self._control = _TmuxControl(self.session_name)
 
     @property
     def session_name(self) -> str:
@@ -135,7 +141,7 @@ class TmuxDreamRunner:
         every subsequent nightly fire).
         """
         proc = await asyncio.create_subprocess_exec(
-            "tmux", *args,
+            *self._control._base_cmd(), *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -205,14 +211,15 @@ class TmuxDreamRunner:
         if self._config.disallowed_tools:
             cmd += ["--disallowedTools", ",".join(self._config.disallowed_tools)]
 
-        rc, out = await self._tmux(
-            "new-session", "-d", "-s", self.session_name, "-c", str(work_dir), *cmd
+        env = _claude_host_payload(_claude_host_auth_env())
+        spawned = await self._control.new_session(
+            cwd=str(work_dir), command=_claude_host_command(shlex.join(cmd), env), env=env,
         )
-        if rc != 0:
+        if not spawned.ok:
             return RunResult(
                 output="",
                 exit_code=1,
-                error=f"tmux new-session failed: {out.strip()}",
+                error=f"tmux new-session failed: {spawned.stderr.strip()}",
                 duration_ms=int((time.time() - start) * 1000),
             )
 
