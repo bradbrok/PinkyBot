@@ -7,7 +7,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import uuid
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -165,8 +164,8 @@ async def private_server(root, monkeypatch):
     binary = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
     if not binary:
         pytest.skip("tmux unavailable")
-    label = "k809-" + uuid.uuid4().hex[:12]
-    base = [binary, "-L", label, "-f", "/dev/null"]
+    socket = str(root / "tmux.sock")
+    base = [binary, "-S", socket, "-f", "/dev/null"]
     pane_home = root / "pane-home"
     pane_home.mkdir(mode=0o700)
     pane_bin = root / "pane-bin"
@@ -194,7 +193,7 @@ async def private_server(root, monkeypatch):
         "result['TERM']={'pane':os.environ.get('TERM')!='dumb'}\n"
         "result['LANG']={'pane':os.environ.get('LANG')=='C'}\n"
         "result['LC_TIME']={'pane':os.environ.get('LC_TIME')=='C'}\n"
-        f"result['TMUX']={{'pane':{label!r} in os.environ.get('TMUX','')}}\n"
+        f"result['TMUX']={{'pane':{socket!r} in os.environ.get('TMUX','')}}\n"
         "result['TMUX_CUSTOM_MARKER']={'pane':os.environ.get('TMUX_CUSTOM_MARKER')=='server-marker'}\n"
         "result['TMUX_PANE']={'pane':os.environ.get('TMUX_PANE','').startswith('%')}\n"
         "result['PINKYBOT_FERRY_SHARED_SECRET']={'present':'PINKYBOT_FERRY_SHARED_SECRET' in os.environ}\n"
@@ -214,7 +213,7 @@ async def private_server(root, monkeypatch):
         "TMUX_CUSTOM_MARKER": "server-marker",
         **{name: SENTINEL + "server" for name in AUTH_NAMES},
     }
-    control = _TmuxControl("probe", tmux_binary=binary, socket_name=label)
+    control = _TmuxControl("probe", tmux_binary=binary, socket_path=socket)
     monkeypatch.setattr(control, "_base_cmd", lambda: base)
     commands = []
     outputs = []

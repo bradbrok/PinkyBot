@@ -384,7 +384,6 @@ async def test_real_private_child_cannot_inherit_daemon_authority(
     import shutil
     import subprocess
     import sys
-    import uuid
     from unittest.mock import AsyncMock
 
     from pinky_daemon.tmux_session import _TmuxControl
@@ -393,8 +392,8 @@ async def test_real_private_child_cannot_inherit_daemon_authority(
     binary = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
     if not binary:
         pytest.skip("tmux unavailable")
-    label = "k806-" + uuid.uuid4().hex[:12]
-    base = [binary, "-L", label, "-f", "/dev/null"]
+    socket = str(h.root / "tmux.sock")
+    base = [binary, "-S", socket, "-f", "/dev/null"]
     bindir = h.root / "bin"
     bindir.mkdir()
     report = h.root / "child-names.json"
@@ -437,7 +436,7 @@ async def test_real_private_child_cannot_inherit_daemon_authority(
             h.patch.delenv(name, raising=False)
         else:
             h.patch.setenv(name, SENTINEL)
-    control = _TmuxControl("probe", tmux_binary=binary, socket_name=label)
+    control = _TmuxControl("probe", tmux_binary=binary, socket_path=socket)
     h.patch.setattr(control, "_base_cmd", lambda: base)
     commands, outputs = [], []
     real_run = control._run
