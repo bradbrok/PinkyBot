@@ -7,7 +7,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import uuid
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -21,6 +20,7 @@ from pinky_daemon.isolated_launch_env import LaunchPolicy
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_dream_runner import TmuxDreamConfig, TmuxDreamRunner
 from pinky_daemon.tmux_session import TmuxSession, _TmuxControl
+from tests.tmux_socket_support import private_socket
 
 SENTINEL = "private-launch-" + "q" * 48
 # Independent contract inventory: do not import the implementation's unset list.
@@ -129,7 +129,7 @@ def test_explicit_signing_identity_is_not_replaced(clean_daemon, monkeypatch, is
     session = host_session(clean_daemon, registry=Registry(isolated=isolated, key=key))
     env = session._build_repl_env()
     secret_present = "PINKY_SESSION_SECRET" in env
-    assert secret_present is (not isolated)
+    assert not secret_present
     matches = env.get("PINKY_AGENT_KEY", "") == key
     assert matches, "PINKY_AGENT_KEY"
 
@@ -165,92 +165,92 @@ async def private_server(root, monkeypatch):
     binary = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
     if not binary:
         pytest.skip("tmux unavailable")
-    label = "k809-" + uuid.uuid4().hex[:12]
-    base = [binary, "-L", label, "-f", "/dev/null"]
-    pane_home = root / "pane-home"
-    pane_home.mkdir(mode=0o700)
-    pane_bin = root / "pane-bin"
-    pane_bin.mkdir()
-    # Model the shell startup PATH additions used by host panes.
-    shell = root / "pane-shell"
-    shell.write_text(
-        "#!/bin/sh\n"
-        + "export PATH="
-        + shlex.quote(str(pane_bin))
-        + ':"$PATH"\n'
-        + 'exec /bin/sh "$@"\n'
-    )
-    shell.chmod(0o700)
-    report = root / "child-names.json"
-    script = pane_bin / "claude"
-    code = (
-        "import json,os,pathlib,time\n"
-        f"names={AUTH_NAMES!r}\n"
-        f"marker={SENTINEL!r}\n"
-        "result={name:{'present':name in os.environ,'daemon':os.environ.get(name)==marker+'daemon',"
-        "'server':os.environ.get(name)==marker+'server','empty':os.environ.get(name)==''} for name in names}\n"
-        f"result['PATH']={{'pane':{str(pane_bin)!r} in os.environ.get('PATH','').split(os.pathsep)}}\n"
-        f"result['HOME']={{'pane':os.environ.get('HOME')=={str(pane_home)!r}}}\n"
-        "result['TERM']={'pane':os.environ.get('TERM')!='dumb'}\n"
-        "result['LANG']={'pane':os.environ.get('LANG')=='C'}\n"
-        "result['LC_TIME']={'pane':os.environ.get('LC_TIME')=='C'}\n"
-        f"result['TMUX']={{'pane':{label!r} in os.environ.get('TMUX','')}}\n"
-        "result['TMUX_CUSTOM_MARKER']={'pane':os.environ.get('TMUX_CUSTOM_MARKER')=='server-marker'}\n"
-        "result['TMUX_PANE']={'pane':os.environ.get('TMUX_PANE','').startswith('%')}\n"
-        "result['PINKYBOT_FERRY_SHARED_SECRET']={'present':'PINKYBOT_FERRY_SHARED_SECRET' in os.environ}\n"
-        "result['CUSTOM_TOOL_TOKEN']={'daemon':os.environ.get('CUSTOM_TOOL_TOKEN')==marker+'daemon'}\n"
-        f"pathlib.Path({str(report)!r}).write_text(json.dumps(result))\n"
-        "time.sleep(60)\n"
-    )
-    script.write_text(f"#!{sys.executable}\n" + code)
-    script.chmod(0o700)
-    seed = {
-        "HOME": str(pane_home),
-        "PATH": str(pane_bin) + os.pathsep + os.defpath,
-        "SHELL": str(shell),
-        "LANG": "C",
-        "LC_TIME": "C",
-        "TERM": "xterm",
-        "TMUX_CUSTOM_MARKER": "server-marker",
-        **{name: SENTINEL + "server" for name in AUTH_NAMES},
-    }
-    control = _TmuxControl("probe", tmux_binary=binary, socket_name=label)
-    monkeypatch.setattr(control, "_base_cmd", lambda: base)
-    commands = []
-    outputs = []
-    real_run = control._run
+    with private_socket() as socket:
+        base = [binary, "-S", socket, "-f", "/dev/null"]
+        pane_home = root / "pane-home"
+        pane_home.mkdir(mode=0o700)
+        pane_bin = root / "pane-bin"
+        pane_bin.mkdir()
+        # Model the shell startup PATH additions used by host panes.
+        shell = root / "pane-shell"
+        shell.write_text(
+            "#!/bin/sh\n"
+            + "export PATH="
+            + shlex.quote(str(pane_bin))
+            + ':"$PATH"\n'
+            + 'exec /bin/sh "$@"\n'
+        )
+        shell.chmod(0o700)
+        report = root / "child-names.json"
+        script = pane_bin / "claude"
+        code = (
+            "import json,os,pathlib,time\n"
+            f"names={AUTH_NAMES!r}\n"
+            f"marker={SENTINEL!r}\n"
+            "result={name:{'present':name in os.environ,'daemon':os.environ.get(name)==marker+'daemon',"
+            "'server':os.environ.get(name)==marker+'server','empty':os.environ.get(name)==''} for name in names}\n"
+            f"result['PATH']={{'pane':{str(pane_bin)!r} in os.environ.get('PATH','').split(os.pathsep)}}\n"
+            f"result['HOME']={{'pane':os.environ.get('HOME')=={str(pane_home)!r}}}\n"
+            "result['TERM']={'pane':os.environ.get('TERM')!='dumb'}\n"
+            "result['LANG']={'pane':os.environ.get('LANG')=='C'}\n"
+            "result['LC_TIME']={'pane':os.environ.get('LC_TIME')=='C'}\n"
+            f"result['TMUX']={{'pane':{socket!r} in os.environ.get('TMUX','')}}\n"
+            "result['TMUX_CUSTOM_MARKER']={'pane':os.environ.get('TMUX_CUSTOM_MARKER')=='server-marker'}\n"
+            "result['TMUX_PANE']={'pane':os.environ.get('TMUX_PANE','').startswith('%')}\n"
+            "result['PINKYBOT_FERRY_SHARED_SECRET']={'present':'PINKYBOT_FERRY_SHARED_SECRET' in os.environ}\n"
+            "result['CUSTOM_TOOL_TOKEN']={'daemon':os.environ.get('CUSTOM_TOOL_TOKEN')==marker+'daemon'}\n"
+            f"pathlib.Path({str(report)!r}).write_text(json.dumps(result))\n"
+            "time.sleep(60)\n"
+        )
+        script.write_text(f"#!{sys.executable}\n" + code)
+        script.chmod(0o700)
+        seed = {
+            "HOME": str(pane_home),
+            "PATH": str(pane_bin) + os.pathsep + os.defpath,
+            "SHELL": str(shell),
+            "LANG": "C",
+            "LC_TIME": "C",
+            "TERM": "xterm",
+            "TMUX_CUSTOM_MARKER": "server-marker",
+            **{name: SENTINEL + "server" for name in AUTH_NAMES},
+        }
+        control = _TmuxControl("probe", tmux_binary=binary, socket_path=socket)
+        monkeypatch.setattr(control, "_base_cmd", lambda: base)
+        commands = []
+        outputs = []
+        real_run = control._run
 
-    async def record(*args, **kwargs):
-        commands.append(shlex.join(args))
-        result = await real_run(*args, **kwargs)
-        outputs.extend((result.stdout, result.stderr))
-        return result
+        async def record(*args, **kwargs):
+            commands.append(shlex.join(args))
+            result = await real_run(*args, **kwargs)
+            outputs.extend((result.stdout, result.stderr))
+            return result
 
-    monkeypatch.setattr(control, "_run", record)
-    try:
-        start = subprocess.run(
-            [*base, "new-session", "-d", "-s", "seed", "sleep 120"],
-            env=seed,
-            capture_output=True,
-            timeout=5,
-        )
-        assert start.returncode == 0, "private tmux seed failed"
-        yield SimpleNamespace(control=control, script=script, report=report, commands=commands)
-    finally:
-        end = subprocess.run(
-            [*base, "kill-server"],
-            capture_output=True,
-            timeout=5,
-            env={"HOME": str(pane_home), "PATH": os.defpath},
-        )
-        scan_outputs(
-            *commands,
-            *outputs,
-            start.stdout.decode(errors="replace"),
-            start.stderr.decode(errors="replace"),
-            end.stdout.decode(errors="replace"),
-            end.stderr.decode(errors="replace"),
-        )
+        monkeypatch.setattr(control, "_run", record)
+        try:
+            start = subprocess.run(
+                [*base, "new-session", "-d", "-s", "seed", "sleep 120"],
+                env=seed,
+                capture_output=True,
+                timeout=5,
+            )
+            assert start.returncode == 0, "private tmux seed failed"
+            yield SimpleNamespace(control=control, script=script, report=report, commands=commands)
+        finally:
+            end = subprocess.run(
+                [*base, "kill-server"],
+                capture_output=True,
+                timeout=5,
+                env={"HOME": str(pane_home), "PATH": os.defpath},
+            )
+            scan_outputs(
+                *commands,
+                *outputs,
+                start.stdout.decode(errors="replace"),
+                start.stderr.decode(errors="replace"),
+                end.stdout.decode(errors="replace"),
+                end.stderr.decode(errors="replace"),
+            )
 
 
 async def launch_host(root, probe, monkeypatch, *, cls=TmuxSession, provider_url=""):
@@ -441,7 +441,11 @@ def test_overlay_cannot_fill_an_omitted_builder_name(clean_daemon, monkeypatch, 
     monkeypatch.setenv(name, SENTINEL)
     env = tmux_session._claude_host_payload({})
     present = name in env
-    assert not present, name
+    if name in {"PINKY_DAEMON_URL", "PINKY_TOOL_POLICY"}:
+        daemon_owned = env.get(name) == SENTINEL
+        assert present and daemon_owned, name
+    else:
+        assert not present, name
 
 
 @pytest.mark.parametrize("kind", ["host", "dream"])

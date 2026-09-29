@@ -75,7 +75,12 @@ from pathlib import Path
 from stat import S_ISREG
 from typing import Literal
 
-from pinky_daemon import isolated_launch_env, tmux_launch_env, tmux_launch_env_loader
+from pinky_daemon import (
+    isolated_launch_env,
+    launch_env_authority,
+    tmux_launch_env,
+    tmux_launch_env_loader,
+)
 from pinky_daemon.agent_registry import (
     CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS,
     validate_restart_tokens_cap,
@@ -2156,7 +2161,7 @@ _MODEL_DIALOG_NEEDLES = ("change model", "switch model?")
 _MODEL_ERROR_NEEDLES = ("unknown model", "invalid model", "not a valid model")
 
 
-# Shared by host Claude sessions and dreams. Only absent names are removed;
+# Auth names shared by host Claude sessions and dreams are builder-owned;
 # configured values (including empty strings) remain in the private payload.
 _CLAUDE_AUTH_ENV_NAMES = frozenset("""
 ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS
@@ -2190,14 +2195,22 @@ _CLAUDE_PANE_ENV_NAMES = frozenset({"PATH", "HOME", "USER", "LOGNAME", "SHELL", 
 def _claude_host_payload(explicit: dict[str, str]) -> dict[str, str]:
     """Overlay daemon configuration while retaining pane shell/terminal state."""
     ambient = tmux_launch_env.ambient_env(os.environ.items(), _log)
-    for name in list(ambient):
-        if (
-            name in _CLAUDE_PANE_ENV_NAMES
-            or name.startswith(("LC_", "TMUX"))
-            or name in _CLAUDE_BUILDER_ENV_NAMES | tmux_launch_env_loader.DAEMON_ONLY
-        ):
-            ambient.pop(name)
-    return {**ambient, **explicit}
+    resolved = _claude_daemon_controls(ambient)
+    resolved.update(launch_env_authority.filter_env(explicit))
+    inherited = launch_env_authority.filter_env(ambient, _CLAUDE_BUILDER_ENV_NAMES)
+    inherited = {
+        name: value for name, value in inherited.items()
+        if name not in _CLAUDE_PANE_ENV_NAMES and not name.startswith(("LC_", "TMUX"))
+    }
+    return {**inherited, **resolved}
+
+
+def _claude_daemon_controls(ambient: dict[str, str]) -> dict[str, str]:
+    """A daemon-held route/policy is an explicit input, never server inheritance."""
+    return {
+        name: ambient[name] for name in ("PINKY_DAEMON_URL", "PINKY_TOOL_POLICY")
+        if name in ambient
+    }
 
 
 def _claude_forward_oauth_enabled() -> bool:
@@ -2235,8 +2248,9 @@ def _claude_host_auth_env(
 
 
 def _claude_host_command(command: str, env: dict[str, str]) -> str:
-    """Remove server-only authentication without placing values in argv."""
-    unset = [arg for name in sorted(_CLAUDE_AUTH_ENV_NAMES - env.keys()) for arg in ("-u", name)]
+    """Remove unowned server authority without placing values in argv."""
+    absent = launch_env_authority.absent_names(env, _CLAUDE_BUILDER_ENV_NAMES)
+    unset = [arg for name in sorted(absent) for arg in ("-u", name)]
     return shlex.join(["/usr/bin/env", *unset, "/bin/sh", "-c", command])
 
 
@@ -4078,11 +4092,6 @@ class TmuxSession(TransportReplacementMixin):
         than docstring-only.
         """
         self._check_startup_owner()
-        launch_policy = self._launch_env_policy()
-        policy_args = (
-            {"launch_policy": launch_policy}
-            if launch_policy.mode == "enforce" or self._scrub_codex_headers else {}
-        )
         cwd = self._config.working_dir or "."
         # Ensure cwd exists — claude --continue needs it.
         Path(cwd).mkdir(parents=True, exist_ok=True)
@@ -4097,6 +4106,12 @@ class TmuxSession(TransportReplacementMixin):
         # raises → BOOT_FAILED, never a quiet local fallback.
         container_agent = self._container_agent(strict=True)
         self._tmux.set_command_runner(self._select_command_runner(container_agent))
+        launch_policy = self._launch_env_policy()
+        policy_args = (
+            {"launch_policy": launch_policy}
+            if (launch_policy.mode == "enforce" or self._scrub_codex_headers
+                or self._uses_claude_host_payload(launch_policy)) else {}
+        )
         _log(
             f"tmux[{self.agent_name}]: claude_auth_mode={_claude_auth_mode(self.agent_name)} "
             f"container_agent={str(container_agent is not None).lower()}"
@@ -4159,7 +4174,9 @@ class TmuxSession(TransportReplacementMixin):
                     }
                 effective_env.update(self._build_repl_env(
                     **policy_args,
-                    **({"report_shadow": False} if self._scrub_codex_headers else {}),
+                    **({"report_shadow": False} if (
+                        self._scrub_codex_headers or self._uses_claude_host_payload(launch_policy)
+                    ) else {}),
                 ))
                 cfg_path = _resolve_claude_config_path(effective_env)
                 if _seed_claude_trust_file(cfg_path, cwd):
@@ -4231,7 +4248,9 @@ class TmuxSession(TransportReplacementMixin):
                 command=claude_cmd,
                 env=env,
                 **launch_policy.spawn_options(env),
-                **({"codex_headers": True} if self._scrub_codex_headers else {}),
+                **({"codex_headers": True} if (
+                    self._scrub_codex_headers or self._uses_claude_host_payload(launch_policy)
+                ) else {}),
             )
             launch_env = result.launch_env
             if not result.ok:
@@ -4655,12 +4674,16 @@ class TmuxSession(TransportReplacementMixin):
         return isolated_launch_env.capture_policy(
             agent_name=self.agent_name, registry=self._registry,
             status_lookup=self._isolation_status, log=_log,
+            minimum_shadow=(
+                self._trace_transport_kind == "tmux_claude"
+                and type(self._tmux._runner) is LocalCommandRunner
+            ),
         )
 
     def _wrap_launch_command(
         self, command: str, env: dict[str, str], policy: isolated_launch_env.LaunchPolicy,
     ) -> str:
-        # Only the Claude host payload uses the inherited-auth removal here.
+        # Only the Claude host payload uses inherited-authority removal here.
         if self._uses_claude_host_payload(policy):
             return _claude_host_command(command, env)
         return command
@@ -4674,6 +4697,7 @@ class TmuxSession(TransportReplacementMixin):
 
     def _build_repl_env(
         self, *, launch_policy: isolated_launch_env.LaunchPolicy | None = None,
+        report_shadow: bool = True,
     ) -> dict[str, str]:
         """Env vars injected into the tmux session.
 
@@ -4681,23 +4705,13 @@ class TmuxSession(TransportReplacementMixin):
         (e.g. ``hook_verify_effort.py``) see the same signals on both
         backends.
 
-        **#515 follow-up: PINKY_SESSION_SECRET propagation.**
-        The launch boundary explicitly delivers these env vars; the tmux
-        server drops the caller environment except for the small
-        ``update-environment`` allowlist (DISPLAY, SSH_*, etc.). Without
-        explicit propagation, every PinkyBot-managed hook
-        (``hook_idle.py``, ``hook_working.py``, ``hook_verify_effort.py``,
-        ``hook_tmux_wake.py``, ``hook_tmux_session_start.py``) hits the
-        guard ``if not secret: sys.exit(0)`` and silently no-ops. That
-        broke #515 (tailer never repoints from placeholder), and also
-        breaks tmux-agent presence updates, effort-drift logging, and
-        Stop-hook wakeups across the whole hook fleet. SDK agents are
-        unaffected because claude inherits daemon env via subprocess.
-
-        Propagating the secret here re-enables the entire hook fleet
-        for tmux agents without touching any individual hook script.
+        Local non-clean hosts receive only their resolved signing identity.
+        Hooks without a provisioned per-agent key can no-op; global authority
+        is never a fallback on that path. Other runners retain their existing
+        identity contract.
         """
         launch_policy = launch_policy or self._launch_env_policy()
+        host_payload = self._uses_claude_host_payload(launch_policy)
         env: dict[str, str] = {}
         host_auth = None
         if self._uses_claude_host_payload(launch_policy):
@@ -4792,7 +4806,7 @@ class TmuxSession(TransportReplacementMixin):
         # internal requests with a non-forgeable identity. Lookup guarded like
         # _restart_threshold_pct — a registry hiccup must not break session env.
         agent_key = ""
-        if launch_policy.mode == "enforce":
+        if launch_policy.mode == "enforce" or host_payload:
             agent_key = launch_policy.agent_key
         elif self._registry and self.agent_name:
             try:
@@ -4814,30 +4828,15 @@ class TmuxSession(TransportReplacementMixin):
                 "PINKY_CONTAINER_DAEMON_URL", "http://host.containers.internal:8888"
             )
 
-        # PINKY_SESSION_SECRET — the daemon-wide secret. Read from os.environ
-        # rather than a config field because the daemon's own SDK clients and
-        # FastAPI middleware read it from the same env var. Empty/missing is
-        # tolerated: hooks already handle that gracefully (silent no-op).
-        #
-        # Resolve the explicit identity independently of the inheritance mode.
-        # #149 phase-3 security gate (fail CLOSED — Murzik #639 review): the
-        # global secret is the fleet-wide signing key; the daemon dual-accepts
-        # it for EVERY agent name, so any child that holds it can sign internal
-        # requests AS ANY OTHER AGENT. Inject it ONLY when the agent is *proven*
-        # non-isolated. Withhold it whenever:
-        #   - the agent is isolated — with a per-agent key it signs as itself;
-        #     WITHOUT one it is a provisioning failure, so omit BOTH and let
-        #     hooks/MCP no-op rather than hand a sandbox the forgeable secret
-        #     (fail closed, not degraded-available); or
-        #   - isolation can't be proven (registry unwired/errored) AND a
-        #     per-agent key is present — the key already gives a working
-        #     identity, and registry uncertainty must not cause secret exposure
-        #     (same fail-open class as #635).
-        # The only paths that still receive the global secret are proven
-        # non-isolated agents and the legacy/dev "unknown + no key" case (an
-        # agent with no key genuinely needs the shared secret to sign at all).
+        # Local non-clean Claude hosts never receive daemon-wide authority.
+        # Other runners retain the legacy isolation-sensitive contract here:
+        # proven non-isolated, or unknown without a scoped key, may use the
+        # global fallback. Their policy rollout is separate from host cleanup.
         secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
-        status = launch_policy.status if launch_policy.mode == "enforce" else self._isolation_status()
+        status = (
+            launch_policy.status if launch_policy.mode == "enforce" or host_payload
+            else self._isolation_status()
+        )
         if status == "isolated":
             if agent_key:
                 _log(
@@ -4853,13 +4852,20 @@ class TmuxSession(TransportReplacementMixin):
                 f"tmux[{self.agent_name}]: isolation status unknown but per-agent "
                 f"key present — scoped identity configured"
             )
-        elif secret:
+        elif secret and not host_payload:
             env["PINKY_SESSION_SECRET"] = secret
 
-        isolated_launch_env.report_shadow(
-            agent_name=self.agent_name, status=status, has_agent_key=bool(agent_key),
-            explicit_names=env, log=_log,
-        )
+        if host_payload:
+            controls = _claude_daemon_controls(tmux_launch_env.ambient_env(os.environ.items(), _log))
+            env = {**controls, **launch_env_authority.filter_env(env)}
+            if not agent_key:
+                _log(f"tmux[{self.agent_name}]: launch signing key unavailable; status={status}")
+        if report_shadow:
+            isolated_launch_env.report_shadow(
+                agent_name=self.agent_name, status=status, has_agent_key=bool(agent_key),
+                explicit_names=env, log=_log,
+                mode=launch_policy.mode if host_payload else None,
+            )
         env = isolated_launch_env.with_grants(launch_policy, env)
         if self._uses_claude_host_payload(launch_policy):
             env = _claude_host_payload(env)

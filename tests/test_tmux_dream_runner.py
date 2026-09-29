@@ -29,7 +29,8 @@ class _FakeTmux:
             return 0, "❯ try 'help'  ? for shortcuts"
         return 0, ""
 
-    async def new_session(self, *, cwd, command, env):
+    async def new_session(self, *, cwd, command, env, codex_headers=False):
+        assert codex_headers is True
         # Preserve the existing CLI assertions at the common loader seam.
         wrapper = shlex.split(command)
         assert wrapper[0] == "/usr/bin/env"

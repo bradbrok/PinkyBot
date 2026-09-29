@@ -15,6 +15,7 @@ from pinky_daemon.codex_tmux_session import CodexTmuxSession
 from pinky_daemon.shared_mcp import derive_mcp_bearer
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_launch_env_loader import BASE_ALLOWLIST, DAEMON_ONLY
+from tests.tmux_socket_support import private_socket
 
 KINDS = ("repl", "exec", "app_server", "tmux_app_server")
 SENTINEL = "codex-env-private-" + "q" * 48
@@ -384,7 +385,6 @@ async def test_real_private_child_cannot_inherit_daemon_authority(
     import shutil
     import subprocess
     import sys
-    import uuid
     from unittest.mock import AsyncMock
 
     from pinky_daemon.tmux_session import _TmuxControl
@@ -393,137 +393,139 @@ async def test_real_private_child_cannot_inherit_daemon_authority(
     binary = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
     if not binary:
         pytest.skip("tmux unavailable")
-    label = "k806-" + uuid.uuid4().hex[:12]
-    base = [binary, "-L", label, "-f", "/dev/null"]
-    bindir = h.root / "bin"
-    bindir.mkdir()
-    report = h.root / "child-names.json"
-    script = bindir / "codex"
-    script.write_text(
-        f"#!{sys.executable}\n"
-        "import json,os,pathlib,sys,time\n"
-        f"pathlib.Path({str(report)!r}).write_text(json.dumps(sorted(os.environ)))\n"
-        "if 'app-server' in sys.argv:\n"
-        " for line in sys.stdin:\n"
-        "  frame=json.loads(line)\n"
-        "  if 'id' in frame: print(json.dumps({'id':frame['id'],'result':{}}),flush=True)\n"
-        "else: time.sleep(60)\n"
-    )
-    script.chmod(0o700)
-    h.patch.setenv("PATH", str(bindir) + os.pathsep + os.defpath)
-    h.patch.setenv("PYTHONPATH", str(Path(tmux_session.__file__).resolve().parents[1]))
-    seed = {
-        "HOME": os.environ["HOME"],
-        "PATH": os.environ["PATH"],
-        "SHELL": "/bin/sh",
-        "TERM": "xterm",
-        "PYTHONPATH": os.environ["PYTHONPATH"],
-        **{name: SENTINEL for name in DAEMON_ONLY},
-        "PINKY_MCP_HDR_FOREIGN_AUTHORIZATION": SENTINEL,
-    }
-    withheld_names = {
-        "PINKY_AGENT_KEY",
-        "OPENAI_API_KEY",
-        "OPENAI_BASE_URL",
-        "CODEX_HOME",
-        "PINKY_DAEMON_URL",
-        "PINKY_TOOL_POLICY",
-    }
-    if withheld:
-        h.registry.key = ""
-        seed.update({name: SENTINEL for name in withheld_names})
-    for name in DAEMON_ONLY:
-        if server_only:
-            h.patch.delenv(name, raising=False)
-        else:
-            h.patch.setenv(name, SENTINEL)
-    control = _TmuxControl("probe", tmux_binary=binary, socket_name=label)
-    h.patch.setattr(control, "_base_cmd", lambda: base)
-    commands, outputs = [], []
-    real_run = control._run
-
-    async def recorded(*args, **kwargs):
-        commands.append(shlex.join(args))
-        result = await real_run(*args, **kwargs)
-        outputs.extend((result.stdout, result.stderr))
-        return result
-
-    h.patch.setattr(control, "_run", recorded)
-    client = None
-    started = False
-    try:
-        result = subprocess.run(
-            [*base, "new-session", "-d", "-s", "seed", "/bin/sleep 60"],
-            env=seed,
-            capture_output=True,
-            timeout=5,
+    with private_socket() as socket:
+        base = [binary, "-S", socket, "-f", "/dev/null"]
+        bindir = h.root / "bin"
+        bindir.mkdir()
+        report = h.root / "child-names.json"
+        script = bindir / "codex"
+        script.write_text(
+            f"#!{sys.executable}\n"
+            "import json,os,pathlib,sys,time\n"
+            f"pathlib.Path({str(report)!r}).write_text(json.dumps(sorted(os.environ)))\n"
+            "if 'app-server' in sys.argv:\n"
+            " for line in sys.stdin:\n"
+            "  frame=json.loads(line)\n"
+            "  if 'id' in frame: print(json.dumps({'id':frame['id'],'result':{}}),flush=True)\n"
+            "else: time.sleep(60)\n"
         )
-        assert result.returncode == 0, "private server setup failed"
-        started = True
-        # A direct inert pane proves server globals exist without ever printing values.
-        positive = h.root / "positive-names.json"
-        positive_command = shlex.join(
-            [
-                sys.executable,
-                "-c",
-                "import json,os,pathlib;pathlib.Path("
-                + repr(str(positive))
-                + ").write_text(json.dumps(sorted(os.environ)))",
-            ]
-        )
-        planted = await control._run("new-window", "-t", "=seed", positive_command)
-        assert planted.ok
-        for _ in range(200):
-            if positive.exists():
-                break
-            await asyncio.sleep(0.01)
-        assert positive.exists(), "server-global positive control did not report"
-        present = DAEMON_ONLY.issubset(json.loads(positive.read_text()))
-        assert present, "private server did not carry planted authority names"
-        owner, _ = h.make(kind, provider_key="" if withheld else SENTINEL + "provider")
-        owner._tmux = control
-        if kind == "repl":
-            for name in (
-                "_ensure_container_started",
-                "_reap_retained_spawn_cleanup_debt",
-                "_seed_container_trust",
-                "_seed_container_home_creds",
-                "_stop_tailer",
-                "_start_tailer",
-            ):
-                h.patch.setattr(owner, name, AsyncMock())
-            h.patch.setattr(owner, "_container_agent", lambda **kwargs: None)
-            h.patch.setattr(owner, "_select_command_runner", lambda *args: control._runner)
-            h.patch.setattr(owner, "_prepare_tmux_spawn", lambda: None)
-            h.patch.setattr(owner, "_has_prior_transcript", lambda: False)
-            h.patch.setattr(owner, "_spawn_cleanup_state_dir", lambda: h.root / "home")
-            h.patch.setattr(owner, "_codex_dismiss_nux_and_ready", AsyncMock())
-            h.patch.setattr(tmux_session, "_POST_SPAWN_LIVENESS_DELAY_SEC", 0.01)
-            await owner._spawn_tmux_repl()
-        else:
-            client, _ = await owner.start()
-        for _ in range(200):
-            if report.exists():
-                break
-            await asyncio.sleep(0.01)
-        assert report.exists(), "inert child did not report its environment names"
-        names = set(json.loads(report.read_text()))
-        absent = not DAEMON_ONLY.intersection(names)
-        assert absent, "real child inherited daemon authority"
-        foreign_header_absent = "PINKY_MCP_HDR_FOREIGN_AUTHORIZATION" not in names
-        assert foreign_header_absent, "real child inherited a foreign MCP header"
+        script.chmod(0o700)
+        h.patch.setenv("PATH", str(bindir) + os.pathsep + os.defpath)
+        h.patch.setenv("PYTHONPATH", str(Path(tmux_session.__file__).resolve().parents[1]))
+        seed = {
+            "HOME": os.environ["HOME"],
+            "PATH": os.environ["PATH"],
+            "SHELL": "/bin/sh",
+            "TERM": "xterm",
+            "PYTHONPATH": os.environ["PYTHONPATH"],
+            **{name: SENTINEL for name in DAEMON_ONLY},
+            "PINKY_MCP_HDR_FOREIGN_AUTHORIZATION": SENTINEL,
+        }
+        withheld_names = {
+            "PINKY_AGENT_KEY",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "CODEX_HOME",
+            "PINKY_DAEMON_URL",
+            "PINKY_TOOL_POLICY",
+        }
         if withheld:
-            absent_owned = not withheld_names.intersection(names)
-            assert absent_owned, "server filled a withheld builder-owned name"
-    finally:
-        if client is not None:
-            await client.close()
-        if started:
-            end = subprocess.run([*base, "kill-server"], env=seed, capture_output=True, timeout=5)
-            outputs.extend(
-                (end.stdout.decode(errors="replace"), end.stderr.decode(errors="replace"))
+            h.registry.key = ""
+            seed.update({name: SENTINEL for name in withheld_names})
+        for name in DAEMON_ONLY:
+            if server_only:
+                h.patch.delenv(name, raising=False)
+            else:
+                h.patch.setenv(name, SENTINEL)
+        control = _TmuxControl("probe", tmux_binary=binary, socket_path=socket)
+        h.patch.setattr(control, "_base_cmd", lambda: base)
+        commands, outputs = [], []
+        real_run = control._run
+
+        async def recorded(*args, **kwargs):
+            commands.append(shlex.join(args))
+            result = await real_run(*args, **kwargs)
+            outputs.extend((result.stdout, result.stderr))
+            return result
+
+        h.patch.setattr(control, "_run", recorded)
+        client = None
+        started = False
+        try:
+            result = subprocess.run(
+                [*base, "new-session", "-d", "-s", "seed", "/bin/sleep 60"],
+                env=seed,
+                capture_output=True,
+                timeout=5,
             )
-        scan_outputs(*commands, *outputs)
+            assert result.returncode == 0, "private server setup failed"
+            started = True
+            # A direct inert pane proves server globals exist without ever printing values.
+            positive = h.root / "positive-names.json"
+            positive_command = shlex.join(
+                [
+                    sys.executable,
+                    "-c",
+                    "import json,os,pathlib;pathlib.Path("
+                    + repr(str(positive))
+                    + ").write_text(json.dumps(sorted(os.environ)))",
+                ]
+            )
+            planted = await control._run("new-window", "-t", "=seed", positive_command)
+            assert planted.ok
+            for _ in range(200):
+                if positive.exists():
+                    break
+                await asyncio.sleep(0.01)
+            assert positive.exists(), "server-global positive control did not report"
+            present = DAEMON_ONLY.issubset(json.loads(positive.read_text()))
+            assert present, "private server did not carry planted authority names"
+            owner, _ = h.make(kind, provider_key="" if withheld else SENTINEL + "provider")
+            owner._tmux = control
+            if kind == "repl":
+                for name in (
+                    "_ensure_container_started",
+                    "_reap_retained_spawn_cleanup_debt",
+                    "_seed_container_trust",
+                    "_seed_container_home_creds",
+                    "_stop_tailer",
+                    "_start_tailer",
+                ):
+                    h.patch.setattr(owner, name, AsyncMock())
+                h.patch.setattr(owner, "_container_agent", lambda **kwargs: None)
+                h.patch.setattr(owner, "_select_command_runner", lambda *args: control._runner)
+                h.patch.setattr(owner, "_prepare_tmux_spawn", lambda: None)
+                h.patch.setattr(owner, "_has_prior_transcript", lambda: False)
+                h.patch.setattr(owner, "_spawn_cleanup_state_dir", lambda: h.root / "home")
+                h.patch.setattr(owner, "_codex_dismiss_nux_and_ready", AsyncMock())
+                h.patch.setattr(tmux_session, "_POST_SPAWN_LIVENESS_DELAY_SEC", 0.01)
+                await owner._spawn_tmux_repl()
+            else:
+                client, _ = await owner.start()
+            for _ in range(200):
+                if report.exists():
+                    break
+                await asyncio.sleep(0.01)
+            assert report.exists(), "inert child did not report its environment names"
+            names = set(json.loads(report.read_text()))
+            absent = not DAEMON_ONLY.intersection(names)
+            assert absent, "real child inherited daemon authority"
+            foreign_header_absent = "PINKY_MCP_HDR_FOREIGN_AUTHORIZATION" not in names
+            assert foreign_header_absent, "real child inherited a foreign MCP header"
+            if withheld:
+                absent_owned = not withheld_names.intersection(names)
+                assert absent_owned, "server filled a withheld builder-owned name"
+        finally:
+            if client is not None:
+                await client.close()
+            if started:
+                end = subprocess.run(
+                    [*base, "kill-server"], env=seed, capture_output=True, timeout=5
+                )
+                outputs.extend(
+                    (end.stdout.decode(errors="replace"), end.stderr.decode(errors="replace"))
+                )
+            scan_outputs(*commands, *outputs)
 
 
 @pytest.mark.parametrize("kind", KINDS)
