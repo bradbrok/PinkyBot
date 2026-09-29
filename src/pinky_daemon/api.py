@@ -6477,7 +6477,7 @@ npm run build</pre>
         ]
         # list() exposes metadata; resolve the live session before reading its transcript.
         main_session = manager.get(main_sessions[0].id) if main_sessions else None
-        if main_session is None or main_session.state == SessionState.closed:
+        if main_session is None:
             raise HTTPException(400, f"Agent '{name}' has no active main session to fork from")
 
         sdk_id = main_session._sdk_session_id
