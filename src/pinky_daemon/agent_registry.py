@@ -5360,36 +5360,36 @@ except Exception as exc:
             ).fetchone()
             return self._row_to_schedule(row) if row else None
 
-    def remove_schedule(self, schedule_id: int) -> bool:
-        """Remove a schedule."""
-        cursor = self._db.execute("DELETE FROM agent_schedules WHERE id=?", (schedule_id,))
+    def remove_schedule(self, schedule_id: int, *, agent_name: str | None = None) -> bool:
+        """Remove an ID, optionally constrained to its path owner atomically."""
+        cursor = self._db.execute(
+            "DELETE FROM agent_schedules WHERE id=? AND (? IS NULL OR agent_name=?)",
+            (schedule_id, agent_name, agent_name),
+        )
         self._db.commit()
         return cursor.rowcount > 0
 
-    def toggle_schedule(self, schedule_id: int, enabled: bool) -> bool:
-        """Enable/disable a schedule."""
-        if not enabled:
-            cursor = self._db.execute(
-                "UPDATE agent_schedules SET enabled=0 WHERE id=?",
-                (schedule_id,),
-            )
-            self._db.commit()
-            return cursor.rowcount > 0
+    def toggle_schedule(
+        self, schedule_id: int, enabled: bool, *, agent_name: str | None = None
+    ) -> bool:
+        """Enable/disable only the requested owner's schedule when scoped."""
         with self._rmw_lock:
             current = self._db.execute(
-                "SELECT agent_name, name FROM agent_schedules WHERE id=?",
-                (schedule_id,),
+                "SELECT agent_name, name FROM agent_schedules "
+                "WHERE id=? AND (? IS NULL OR agent_name=?)",
+                (schedule_id, agent_name, agent_name),
             ).fetchone()
             if current is None:
                 return False
-            self._ensure_schedule_name_available(
-                current[0],
-                current[1],
-                exclude_schedule_id=schedule_id,
-            )
+            if enabled:
+                self._ensure_schedule_name_available(
+                    current[0],
+                    current[1],
+                    exclude_schedule_id=schedule_id,
+                )
             cursor = self._db.execute(
-                "UPDATE agent_schedules SET enabled=1 WHERE id=?",
-                (schedule_id,),
+                "UPDATE agent_schedules SET enabled=? WHERE id=? AND (? IS NULL OR agent_name=?)",
+                (int(enabled), schedule_id, agent_name, agent_name),
             )
             self._db.commit()
             return cursor.rowcount > 0

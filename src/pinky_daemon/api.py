@@ -177,6 +177,32 @@ from pinky_daemon.hooks import (
     create_heartbeat_hook,
     create_typing_indicator_hook,
 )
+from pinky_daemon.isolated_policy import (
+    ALL_GATED_TOOL_NAMES as ALL_GATED_TOOL_NAMES,
+)
+from pinky_daemon.isolated_policy import (
+    ALL_TOOL_GATES as ALL_TOOL_GATES,
+)
+from pinky_daemon.isolated_policy import (
+    GATE_TOOL_NAMES as GATE_TOOL_NAMES,
+)
+from pinky_daemon.isolated_policy import (
+    ISOLATED_MUTATION_ALLOW,
+    isolation_flag,
+    resolve_mutation_route,
+)
+from pinky_daemon.isolated_policy import (
+    SKILL_TO_GATES as SKILL_TO_GATES,
+)
+from pinky_daemon.isolated_policy import (
+    agent_tool_gates as _get_agent_tool_gates,
+)
+from pinky_daemon.isolated_policy import (
+    launch_denies as _get_shared_mode_disallowed_tools,
+)
+from pinky_daemon.isolated_policy import (
+    policy_mode as _isolation_policy_mode,
+)
 from pinky_daemon.kb_store import KBStore
 from pinky_daemon.librarian_runner import LibrarianRunner
 from pinky_daemon.mesh_store import MeshStore
@@ -961,123 +987,6 @@ def _seed_core_skills(skill_store) -> None:
 #
 # "pinky-self" covers general agent management gates.
 # Specialized features (research, presentations) need their own skills.
-SKILL_TO_GATES: dict[str, list[str]] = {
-    "pinky-self": ["schedule", "admin", "skill-admin", "triggers", "extras", "tasks-admin", "voice", "apps"],
-    "pinky-memory": ["kb"],
-    "research": ["research"],
-    "presentations": ["presentations"],
-}
-
-# All valid gate names for reference
-ALL_TOOL_GATES = [
-    "extras", "kb", "research", "presentations", "triggers",
-    "schedule", "skill-admin", "admin", "tasks-admin", "voice", "apps",
-]
-
-# Gate → pinky-self tool names registered under that gate.
-# Used to compute disallowed_tools for SDK-side gating in shared MCP mode
-# (where the shared server runs ALL gates and filtering happens client-side).
-GATE_TOOL_NAMES: dict[str, list[str]] = {
-    "extras": [
-        "get_attribution", "render_pdf", "spawn_clone", "get_agent_card",
-    ],
-    "schedule": [
-        "set_wake_schedule",
-        "update_wake_schedule",
-        "list_my_schedules",
-        "get_schedule",
-        "remove_wake_schedule",
-        "discard_pending_schedule_wake",
-    ],
-    "tasks-admin": [
-        "decompose_project", "bulk_create_tasks",
-    ],
-    "presentations": [
-        "get_presentation_template", "create_presentation",
-        "update_presentation", "list_presentations",
-    ],
-    "research": [
-        "submit_research_brief", "submit_research_review",
-        "get_my_research_assignments", "claim_research_topic",
-        "create_research_topic", "publish_research",
-        "list_research_topics", "get_research_detail",
-        "export_research_pdf",
-    ],
-    "skill-admin": [
-        "list_available_skills", "add_skill", "remove_skill",
-        "discover_skills", "install_skill", "create_skill", "propose_skill",
-    ],
-    "admin": [
-        "check_for_updates", "update_and_restart", "restart_daemon",
-        "register_agent",
-    ],
-    "triggers": [
-        "create_trigger", "list_triggers", "delete_trigger", "test_trigger",
-    ],
-    "kb": [
-        "kb_ingest", "kb_search", "kb_get_wiki", "kb_stats",
-        "kb_run_librarian", "kb_save_wiki", "kb_delete_wiki",
-        "kb_delete_raw", "kb_update_raw",
-    ],
-    "voice": [
-        "propose_call", "list_voice_calls", "list_call_requests",
-    ],
-    "apps": [
-        "create_app", "deploy_app", "update_app", "get_app_source",
-        "list_apps", "delete_app", "app_url",
-    ],
-}
-
-# Pre-compute the full set of all gated tool names (MCP-prefixed)
-ALL_GATED_TOOL_NAMES: set[str] = set()
-for _gate_tools in GATE_TOOL_NAMES.values():
-    for _tool in _gate_tools:
-        ALL_GATED_TOOL_NAMES.add(f"mcp__pinky-self__{_tool}")
-
-
-def _get_shared_mode_disallowed_tools(agent_name: str, skill_store=None) -> list[str]:
-    """Compute disallowed pinky-self tools for SDK-side gating in shared MCP mode.
-
-    In shared mode the server runs ALL gates. We filter client-side by telling
-    the SDK which tools the agent should NOT see. Returns MCP-prefixed tool names
-    like 'mcp__pinky-self__kb_ingest'.
-    """
-    agent_gates = set(_get_agent_tool_gates(agent_name, skill_store))
-    disallowed: list[str] = []
-    for gate, tools in GATE_TOOL_NAMES.items():
-        if gate not in agent_gates:
-            for tool in tools:
-                disallowed.append(f"mcp__pinky-self__{tool}")
-    return sorted(disallowed)
-
-def _get_agent_tool_gates(agent_name: str, skill_store=None) -> list[str]:
-    """Determine which pinky-self tool gates should be active for an agent.
-
-    Returns a list of gate names that will be passed as --tool-gates to pinky-self.
-    Maps agent skills → gates via SKILL_TO_GATES. Agents with no skills get
-    core tools only (no gates). They can always load_skill() to get more.
-    """
-    if not skill_store:
-        # No skill store available: fail closed (core tools only)
-        return []
-
-    try:
-        agent_skills = skill_store.get_agent_skills(agent_name, enabled_only=True)
-    except Exception:
-        # Skill lookup failed: fail closed rather than granting every gate
-        return []
-
-    if not agent_skills:
-        return []  # No skills → core tools only
-
-    # Collect gates from all assigned skills
-    gates: set[str] = set()
-    for skill in agent_skills:
-        skill_name = skill.get("name", "")
-        if skill_name in SKILL_TO_GATES:
-            gates.update(SKILL_TO_GATES[skill_name])
-
-    return sorted(gates)
 
 
 # #623: env var names whose VALUES must never be returned over the API. The
@@ -1303,6 +1212,7 @@ def _write_mcp_json(
     When PINKY_SHARED_MCP=1, all three core servers use SSE transport pointing
     at the shared MCP server. Memory uses a per-agent store pool for DB isolation.
     """
+    tool_gates = _get_agent_tool_gates(agent_name, skill_store, agent_registry)
     work_dir = resolve_agent_path(agent_name, work_dir)
     pinky_src = str(Path(__file__).resolve().parent.parent)
     mcp_config: dict = {"mcpServers": {}}
@@ -1438,7 +1348,6 @@ def _write_mcp_json(
                 stdio_env["PINKY_AGENTS_DB"] = db_path
 
         # Pinky-self: heartbeat_ack, schedules, self-management
-        tool_gates = _get_agent_tool_gates(agent_name, skill_store)
         self_args = [
             "-m", "pinky_self", "--agent", agent_name,
             "--api-url", "http://localhost:8888",
@@ -4060,6 +3969,11 @@ def create_api(
         if not agent or not agent.enabled:
             return None
 
+        # Authoritative filtering is server-side; all runtimes also receive denies.
+        effective_disallowed = _get_shared_mode_disallowed_tools(
+            agent_name, skills, agent_registry=agents, stored=agent.disallowed_tools
+        )
+
         work_dir = str(Path(agent.working_dir).resolve()) if agent.working_dir else "."
         restart_pct = int(agent.restart_threshold_pct) if agent.restart_threshold_pct else 80
         warn_pct = max(restart_pct // 2, 20)
@@ -4099,15 +4013,6 @@ def create_api(
                 )
         except Exception as e:
             _log(f"api: could not build subagent definitions: {e}")
-
-        # In shared MCP mode, compute SDK-side disallowed tools for this agent
-        # (shared server runs ALL gates; filtering is client-side)
-        effective_disallowed = list(agent.disallowed_tools or [])
-        if SHARED_MCP_ENABLED:
-            shared_disallowed = _get_shared_mode_disallowed_tools(agent_name, skills)
-            effective_disallowed.extend(shared_disallowed)
-            # Deduplicate
-            effective_disallowed = sorted(set(effective_disallowed))
 
         runtime, transport = _runtime_transport(agent)
         # All four runtime×transport combos are now valid — (claude_sdk, sdk),
@@ -5565,8 +5470,13 @@ def create_api(
                 return True
             return caller is None or bool(getattr(caller, "isolated", True))
 
-        fleet_write = _isolation_fleet_write(request.method, request.url.path)
-        target = _isolation_path_target(request.url.path)
+        legacy_path = (
+            get_route_path(request.scope)
+            if _isolation_policy_mode() == "enforce"
+            else request.url.path
+        )
+        fleet_write = _isolation_fleet_write(request.method, legacy_path)
+        target = _isolation_path_target(legacy_path)
         if not fleet_write and target is None:
             return False  # path does not name a specific agent
         if not fleet_write and target == caller_name:
@@ -5602,10 +5512,7 @@ def create_api(
             # target pays the extra peer lookup; every other cross-agent
             # attempt short-circuits to the deny below. Fail CLOSED if the peer
             # can't be resolved.
-            if (
-                request.method == "POST"
-                and request.url.path == f"/agents/{target}/message"
-            ):
+            if request.method == "POST" and legacy_path == f"/agents/{target}/message":
                 try:
                     peer = agents.get(target)
                 except Exception as e:
@@ -5616,7 +5523,7 @@ def create_api(
                     return True
                 if _isolated_peer_message_allowed(
                     request.method,
-                    request.url.path,
+                    legacy_path,
                     target,
                     getattr(caller, "groups", None),
                     getattr(peer, "groups", None) if peer else None,
@@ -5632,6 +5539,42 @@ def create_api(
             )
             return True
         return False
+
+    def _isolated_mutation_denied(request: Request, caller_name: str, mode: str) -> bool:
+        if mode == "off" or request.method in _ISOLATION_SAFE_METHODS:
+            return False
+        flag = isolation_flag(agents, caller_name)
+        if flag is False:
+            return False
+        template, params = resolve_mutation_route(app, request.scope)
+        reason = "registry unavailable" if flag is None else "unlisted"
+        permitted = flag is True and (request.method, template) in ISOLATED_MUTATION_ALLOW
+        target = params.get("agent_name", params.get("name"))
+        if permitted and target is not None and target != caller_name:
+            permitted = False
+            if template == "/agents/{name}/message":
+                try:
+                    caller = agents.get(caller_name)
+                    peer = agents.get(target)
+                    permitted = _isolated_peer_message_allowed(
+                        request.method,
+                        f"/agents/{target}/message",
+                        target,
+                        getattr(caller, "groups", None),
+                        getattr(peer, "groups", None),
+                    )
+                except Exception:
+                    pass
+            reason = "cross-agent"
+        if permitted:
+            return False
+        safe_caller = re.sub(r"[^a-zA-Z0-9_-]", "_", caller_name)[:120]
+        action = "WOULD DENY" if mode == "shadow" else "DENY"
+        _log(
+            f"isolation: {action} {request.method} {template or '<unknown>'} "
+            f"for {safe_caller} mode={mode} reason={reason}"
+        )
+        return mode == "enforce"
 
     def _is_isolated_agent(name: str) -> bool:
         """True iff ``name`` resolves to an agent with the #149 isolated flag.
@@ -5786,7 +5729,18 @@ def create_api(
         # 1. Public paths (login/setup/landing, /assets, /hooks, Twilio webhook
         #    callbacks — these are authenticated by
         #    other means or are intentionally open).
+        mode = _isolation_policy_mode(_log)
         if _is_public_path(path):
+            # Preserve public/provider auth and state in off/shadow. A presented
+            # signature is verified once before the public shortcut when enabled.
+            if mode != "off" and INTERNAL_SIGNATURE_HEADER in request.headers:
+                if _has_valid_internal_auth(request):
+                    caller = request.headers.get(INTERNAL_AGENT_HEADER, "")
+                    if _isolated_mutation_denied(request, caller, mode):
+                        request.state.auth_gate = "deny_isolation"
+                        return JSONResponse(
+                            status_code=403, content={"error": "isolated mutation denied"}
+                        )
             request.state.auth_gate = "public"
             return await call_next(request)
 
@@ -5796,7 +5750,9 @@ def create_api(
             # cross-agent /agents/{other}/* access even with a valid signature.
             caller = request.headers.get(INTERNAL_AGENT_HEADER, "")
             request.state.internal_caller = caller
-            if _internal_isolation_denied(request, caller):
+            if _isolated_mutation_denied(request, caller, mode) or _internal_isolation_denied(
+                request, caller
+            ):
                 request.state.auth_gate = "deny_isolation"
                 error = "isolated agent may only access its own resources"
                 if _isolation_fleet_write(request.method, request.url.path):
@@ -12267,6 +12223,10 @@ npm run build</pre>
         if not agent.enabled:
             raise HTTPException(400, f"Agent '{name}' is disabled")
 
+        effective_disallowed = _get_shared_mode_disallowed_tools(
+            name, skills, agent_registry=agents, stored=agent.disallowed_tools
+        )
+
         # Build system prompt from agent config + directives
         system_prompt = agents.build_system_prompt(name, skill_store=skills)
 
@@ -12305,7 +12265,7 @@ npm run build</pre>
             soul=agent.soul,
             working_dir=str(work_dir),
             allowed_tools=agent.allowed_tools or None,
-            disallowed_tools=agent.disallowed_tools or None,
+            disallowed_tools=effective_disallowed or None,
             max_turns=agent.max_turns,
             timeout=agent.timeout,
             system_prompt=system_prompt,
@@ -12415,7 +12375,7 @@ npm run build</pre>
     @app.delete("/agents/{agent_name}/schedules/{schedule_id}")
     async def remove_schedule(agent_name: str, schedule_id: int):
         """Remove a schedule."""
-        if not agents.remove_schedule(schedule_id):
+        if not agents.remove_schedule(schedule_id, agent_name=agent_name):
             raise HTTPException(404, f"Schedule {schedule_id} not found")
         return {"deleted": True}
 
@@ -12465,7 +12425,7 @@ npm run build</pre>
     async def toggle_schedule(agent_name: str, schedule_id: int, enabled: bool = True):
         """Enable/disable a schedule."""
         try:
-            toggled = agents.toggle_schedule(schedule_id, enabled)
+            toggled = agents.toggle_schedule(schedule_id, enabled, agent_name=agent_name)
         except ScheduleNameConflictError as exc:
             raise HTTPException(409, str(exc)) from exc
         if not toggled:
@@ -13640,6 +13600,69 @@ npm run build</pre>
 
     app.state._restart_manifest_sessions = _restart_manifest_sessions
 
+    def _create_shared_mcp_manager():
+        """Wire request-time policy dependencies before the gateway starts."""
+
+        def _resolve_memory_db(agent_name: str) -> str:
+            """Resolve agent_name -> memory DB path for the shared store pool."""
+            agent = agents.get(agent_name)
+            if not agent:
+                raise ValueError(f"Unknown agent: {agent_name}")
+            db_path = str(Path(agent.working_dir) / "data" / "memory.db")
+            # Ensure data dir exists (agent may not have used memory yet)
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+            return db_path
+
+        def _is_cross_agent_memory_authorized(caller_name: str) -> bool:
+            """May ``caller_name`` access other agents' memory? (#145)
+
+            Authorized iff the caller is a registered agent holding the
+            ``dreamer`` role — the Dreamer (Mora) that consolidates each
+            agent's history into that agent's own memory. Role-only (see
+            ``_agent_is_dreamer``). Default-deny: unknown agents and any
+            lookup failure → False.
+            """
+            try:
+                return _agent_is_dreamer(agents.get(caller_name))
+            except Exception:
+                return False
+
+        def _resolve_signing_key(agent_name: str) -> str | None:
+            """Resolve agent_name -> per-agent signing key (#623).
+
+            Lets the shared self/messaging MCP servers sign each request
+            with the resolved agent's own key instead of the global secret.
+            Guarded: unknown agent / lookup failure -> None -> the signer
+            falls back to the global secret (dual-accept still works).
+            """
+            try:
+                return agents.get_signing_key(agent_name)
+            except Exception:
+                return None
+
+        # Resolve the OpenAI key for the shared pinky-memory embedder.
+        # It lives in system_settings (where TTS/broker read it via
+        # get_setting), NOT the daemon process env — so the embedder, which
+        # only consulted os.environ, silently ran NoOp and disabled semantic
+        # recall fleet-wide until 2026-06-05. Prefer settings, fall back to
+        # env. Empty -> NoOp embedder (logged at WARNING).
+        try:
+            _memory_openai_key = agents.get_setting("OPENAI_API_KEY") or os.environ.get(
+                "OPENAI_API_KEY", ""
+            )
+        except Exception:
+            _memory_openai_key = os.environ.get("OPENAI_API_KEY", "")
+
+        return SharedMcpManager(
+            api_url="http://localhost:8888",
+            memory_db_resolver=_resolve_memory_db,
+            cross_agent_authorizer=_is_cross_agent_memory_authorized,
+            signing_key_resolver=_resolve_signing_key,
+            openai_api_key=_memory_openai_key,
+            agent_registry=agents,
+            skill_store=skills,
+        )
+
     @app.on_event("startup")
     async def on_startup():
         """Start broker pollers, streaming sessions, scheduler, and autonomy."""
@@ -13743,65 +13766,9 @@ npm run build</pre>
                 "inbound delivery claim(s)"
             )
 
-        # Start shared MCP server BEFORE agent sessions so SSE URLs are ready
+        # Start shared MCP before sessions consume their generated credentials.
         if SHARED_MCP_ENABLED:
-            def _resolve_memory_db(agent_name: str) -> str:
-                """Resolve agent_name -> memory DB path for the shared store pool."""
-                agent = agents.get(agent_name)
-                if not agent:
-                    raise ValueError(f"Unknown agent: {agent_name}")
-                db_path = str(Path(agent.working_dir) / "data" / "memory.db")
-                # Ensure data dir exists (agent may not have used memory yet)
-                Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-                return db_path
-
-            def _is_cross_agent_memory_authorized(caller_name: str) -> bool:
-                """May ``caller_name`` access other agents' memory? (#145)
-
-                Authorized iff the caller is a registered agent holding the
-                ``dreamer`` role — the Dreamer (Mora) that consolidates each
-                agent's history into that agent's own memory. Role-only (see
-                ``_agent_is_dreamer``). Default-deny: unknown agents and any
-                lookup failure → False.
-                """
-                try:
-                    return _agent_is_dreamer(agents.get(caller_name))
-                except Exception:
-                    return False
-
-            def _resolve_signing_key(agent_name: str) -> str | None:
-                """Resolve agent_name -> per-agent signing key (#623).
-
-                Lets the shared self/messaging MCP servers sign each request
-                with the resolved agent's own key instead of the global secret.
-                Guarded: unknown agent / lookup failure -> None -> the signer
-                falls back to the global secret (dual-accept still works).
-                """
-                try:
-                    return agents.get_signing_key(agent_name)
-                except Exception:
-                    return None
-
-            # Resolve the OpenAI key for the shared pinky-memory embedder.
-            # It lives in system_settings (where TTS/broker read it via
-            # get_setting), NOT the daemon process env — so the embedder, which
-            # only consulted os.environ, silently ran NoOp and disabled semantic
-            # recall fleet-wide until 2026-06-05. Prefer settings, fall back to
-            # env. Empty -> NoOp embedder (logged at WARNING).
-            try:
-                _memory_openai_key = agents.get_setting("OPENAI_API_KEY") or os.environ.get(
-                    "OPENAI_API_KEY", ""
-                )
-            except Exception:
-                _memory_openai_key = os.environ.get("OPENAI_API_KEY", "")
-
-            shared_mcp_manager = SharedMcpManager(
-                api_url="http://localhost:8888",
-                memory_db_resolver=_resolve_memory_db,
-                cross_agent_authorizer=_is_cross_agent_memory_authorized,
-                signing_key_resolver=_resolve_signing_key,
-                openai_api_key=_memory_openai_key,
-            )
+            shared_mcp_manager = _create_shared_mcp_manager()
             await shared_mcp_manager.start()
             _log(f"startup: shared MCP server started on {shared_mcp_manager.url}")
 

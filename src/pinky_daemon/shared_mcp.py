@@ -23,6 +23,10 @@ import time
 import uuid
 from collections.abc import Callable
 from contextvars import ContextVar
+from urllib.parse import parse_qs, urlsplit
+
+from pinky_daemon.isolated_policy import policy_mode
+from pinky_daemon.shared_mcp_policy import Principal, credential_digest, install_tool_policy
 
 # Valid agent name pattern — lowercase alphanumeric, hyphens, underscores
 _AGENT_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
@@ -434,6 +438,7 @@ class AgentNameMiddleware:
         self.app = app
         self._signing_key_resolver = signing_key_resolver
         self._require_auth = require_auth
+        self._session_principals: dict[tuple[str, str, str], Principal] = {}
 
     def _resolve_bearer(self, agent_name: str) -> str:
         if not self._signing_key_resolver:
@@ -448,12 +453,28 @@ class AgentNameMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        headers = dict(scope.get("headers", []))
-        agent_name = headers.get(b"x-agent-name", b"").decode()
-        dream_correlation = headers.get(b"x-dream-correlation", b"").decode()
-        valid_name = bool(agent_name and _AGENT_NAME_RE.match(agent_name))
-        auth = headers.get(b"authorization", b"").decode()
-        bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        raw_headers = scope.get("headers", [])
+        for name in (b"authorization", b"x-agent-name", b"mcp-session-id"):
+            if sum(k.lower() == name for k, _ in raw_headers) > 1:
+                await _send_401(send, "ambiguous agent credentials or session")
+                return
+        headers = dict(raw_headers)
+        agent_name = headers.get(b"x-agent-name", b"").decode("utf-8", errors="replace")
+        dream_correlation = headers.get(b"x-dream-correlation", b"").decode(
+            "utf-8", errors="replace"
+        )
+        valid_name = bool(agent_name and _AGENT_NAME_RE.fullmatch(agent_name))
+        auth_values = [v for k, v in scope.get("headers", []) if k.lower() == b"authorization"]
+        auth = headers.get(b"authorization", b"").decode("ascii", errors="replace")
+        bearer = auth[7:] if auth.lower().startswith("bearer ") else ""
+        if auth_values and (
+            len(auth_values) != 1
+            or not bearer
+            or not bearer.isascii()
+            or any(c.isspace() for c in bearer)
+        ):
+            await _send_401(send, "invalid agent credentials")
+            return
         auth_required = (
             self._require_auth
             or _require_auth_env()
@@ -462,7 +483,7 @@ class AgentNameMiddleware:
 
         if bearer:
             expected = self._resolve_bearer(agent_name) if valid_name else ""
-            if not expected or not hmac.compare_digest(bearer, expected):
+            if not expected or not hmac.compare_digest(bearer.encode(), expected.encode()):
                 await _send_401(send, "invalid agent credentials")
                 return
             # Bearer-authenticated request: normalize the Host header to
@@ -486,16 +507,94 @@ class AgentNameMiddleware:
             await _send_401(send, "agent bearer token required")
             return
 
-        if valid_name:
-            agent_token = _current_agent.set(agent_name)
-            correlation_token = _current_dream_correlation.set(dream_correlation)
-            try:
-                await self.app(scope, receive, send)
-            finally:
-                _current_dream_correlation.reset(correlation_token)
-                _current_agent.reset(agent_token)
+        # The middleware is the only authority that can mint this scope value.
+        principal = Principal(
+            agent_name if valid_name else "",
+            bool(bearer),
+            credential_digest(bearer) if bearer else "",
+        )
+        scope = dict(scope)
+        scope["pinky.principal"] = principal
+        scope["pinky.dream_correlation"] = dream_correlation
+        mode = policy_mode(_log)
+        path_parts = scope.get("path", "").split("/")
+        mount = path_parts[2] if len(path_parts) > 2 else ""
+        transport = "http" if len(path_parts) > 3 and path_parts[3] == "http" else "sse"
+        query = parse_qs(scope.get("query_string", b"").decode("ascii", errors="replace"))
+        if len(query.get("session_id", [])) > 1:
+            await _send_401(send, "ambiguous session")
             return
-        await self.app(scope, receive, send)
+        session_id = (
+            headers.get(b"mcp-session-id", b"").decode("ascii", errors="replace")
+            if transport == "http"
+            else query.get("session_id", [""])[0]
+        )
+        if session_id:
+            try:
+                session_id = uuid.UUID(session_id).hex
+            except ValueError:
+                session_id = "<invalid>"
+        key = (mount, transport, session_id)
+        if session_id and self._session_principals.get(key) != principal:
+            if mode != "off":
+                _log(
+                    f"isolation: {'WOULD DENY' if mode == 'shadow' else 'DENY'} "
+                    f"mcp session principal mismatch mode={mode}"
+                )
+                if mode == "enforce":
+                    from starlette.responses import JSONResponse
+
+                    await JSONResponse({"detail": "session principal mismatch"}, status_code=403)(
+                        scope, receive, send
+                    )
+                    return
+
+        opened_sse = []
+        endpoint_bytes = bytearray()
+        status = 0
+
+        async def bound_send(message):
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+                response_headers = dict(message.get("headers", []))
+                returned = response_headers.get(b"mcp-session-id")
+                if returned and status == 200 and not session_id:
+                    created = uuid.UUID(returned.decode()).hex
+                    self._session_principals[(mount, "http", created)] = principal
+                if transport == "http" and scope.get("method") == "DELETE" and status == 200:
+                    self._session_principals.pop(key, None)
+            elif (
+                message["type"] == "http.response.body"
+                and transport == "sse"
+                and not session_id
+                and not opened_sse
+                and len(endpoint_bytes) < 4096
+            ):
+                endpoint_bytes.extend(message.get("body", b""))
+                # The SSE SDK publishes the id in its first endpoint event.
+                text = endpoint_bytes.decode("utf-8", errors="replace").replace("\r\n", "\n")
+                if "\n\n" in text and "event: endpoint" in text:
+                    for line in text.split("\n"):
+                        if line.startswith("data: "):
+                            values = parse_qs(urlsplit(line[6:]).query)
+                            if values.get("session_id"):
+                                created = uuid.UUID(values["session_id"][0]).hex
+                                sse_key = (mount, "sse", created)
+                                self._session_principals[sse_key] = principal
+                                opened_sse.append(sse_key)
+                                break
+            await send(message)
+
+        agent_token = _current_agent.set(principal.name)
+        correlation_token = _current_dream_correlation.set(dream_correlation)
+        try:
+            await self.app(scope, receive, bound_send)
+        finally:
+            for opened in opened_sse:
+                self._session_principals.pop(opened, None)
+            _current_dream_correlation.reset(correlation_token)
+            _current_agent.reset(agent_token)
 
 
 # ── Combined App Factory ─────────────────────────────────────
@@ -581,9 +680,8 @@ SHARED_MCP_PORT = 8890
 # Bind address for the shared MCP server. Default loopback (host-only). Set
 # PINKY_SHARED_MCP_HOST (e.g. "0.0.0.0") to expose it to container-isolated
 # agents that reach it via host.containers.internal. NOTE: the shared MCP
-# authenticates callers by the X-Agent-Name header alone, so binding beyond
-# loopback widens the trust surface — only do so on a trusted network / behind
-# a firewall until that path carries a signature.
+# requires bearer authentication on every request when bound beyond loopback.
+# Isolated caller policy adds per-message tool and session authorization.
 SHARED_MCP_HOST = os.environ.get("PINKY_SHARED_MCP_HOST", "127.0.0.1")
 
 
@@ -667,7 +765,11 @@ class SharedMcpManager:
         cross_agent_authorizer: "Callable[[str], bool] | None" = None,
         signing_key_resolver: "Callable[[str], str | None] | None" = None,
         openai_api_key: str = "",
+        agent_registry=None,
+        skill_store=None,
     ):
+        self._agent_registry = agent_registry
+        self._skill_store = skill_store
         self._host = host
         self._port = port
         self._api_url = api_url
@@ -746,6 +848,15 @@ class SharedMcpManager:
             )
             mcp_servers["memory"] = memory_mcp
             _log("[shared-mcp] pinky-memory included (per-agent store pool)")
+
+        for mount, server in mcp_servers.items():
+            install_tool_policy(
+                server,
+                mount,
+                self._agent_registry,
+                self._skill_store,
+                self._signing_key_resolver,
+            )
 
         # A non-loopback BIND forces bearer-only auth for all requests: with
         # rootless Podman the container->host source address can appear as

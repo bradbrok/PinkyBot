@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 import pytest
+from mcp.server.fastmcp import FastMCP
 
 from pinky_daemon.shared_mcp import (
     SHARED_MCP_HOST,
@@ -747,11 +748,11 @@ class TestSharedMcpManager:
 
         def fake_self_server(**kwargs):
             captured["self"] = kwargs.get("signing_key_resolver")
-            return object()
+            return _FakeMcpServer()
 
         def fake_messaging_server(**kwargs):
             captured["messaging"] = kwargs.get("signing_key_resolver")
-            return object()
+            return _FakeMcpServer()
 
         # _create_app imports create_server lazily from these modules.
         monkeypatch.setattr("pinky_self.server.create_server", fake_self_server)
@@ -779,8 +780,8 @@ class TestSharedMcpManager:
 
         captured = {}
 
-        monkeypatch.setattr("pinky_self.server.create_server", lambda **kw: object())
-        monkeypatch.setattr("pinky_messaging.server.create_server", lambda **kw: object())
+        monkeypatch.setattr("pinky_self.server.create_server", lambda **kw: _FakeMcpServer())
+        monkeypatch.setattr("pinky_messaging.server.create_server", lambda **kw: _FakeMcpServer())
 
         def fake_build_embedder(api_key=""):
             captured["api_key"] = api_key
@@ -789,7 +790,7 @@ class TestSharedMcpManager:
         monkeypatch.setattr(
             "pinky_memory.embeddings.build_embedding_client", fake_build_embedder
         )
-        monkeypatch.setattr("pinky_memory.server.create_server", lambda **kw: object())
+        monkeypatch.setattr("pinky_memory.server.create_server", lambda **kw: _FakeMcpServer())
         monkeypatch.setattr(sm, "create_shared_app", lambda servers, **kw: servers)
 
         mgr = SharedMcpManager(
@@ -800,9 +801,12 @@ class TestSharedMcpManager:
         assert captured["api_key"] == "sk-from-settings"
 
 
-class _FakeMcpServer:
-    """Minimal FastMCP double: just enough surface for the REAL
-    create_shared_app to mount routes over it (streamable HTTP + SSE)."""
+class _FakeMcpServer(FastMCP):
+    """Real SDK dispatch registration with inert transport apps.
+
+    The policy installer requires list/call registration even when a test
+    exercises only dependency or bind-address wiring.
+    """
 
     _session_manager = None
 
