@@ -748,3 +748,90 @@ async def test_loopback_refusal_smoke(harness, tmp_path):
         h.check_outputs()
     finally:
         await runner.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("relaunch_at", [250, 275])
+async def test_codex_retry_then_connected_relaunch_no_legacy_double(harness, relaunch_at):
+    h = harness
+    t0 = h.clock.now
+    h.add(mcp_recover=True)
+    h.app.state.agents.register("test-agent", heartbeat_interval=60)
+    h.launch(seed=True)
+    await h.watchdog._sweep()  # t=0, probe pending: legacy clock starts
+    h.clock.advance(DEFAULT_MCP_PROBE_DEADLINE)
+    await h.watchdog._sweep()  # t=120 failure + notice
+    h.clock.advance(DEFAULT_MCP_PROBE_DEADLINE)
+    await h.watchdog._sweep()  # t=240 codex retry
+    assert len(h.recovered) == 1
+    # Force-fresh relaunch completes between sweeps: still connected, new pending probe.
+    h.clock.advance(relaunch_at - 240)
+    h.launch(seed=True)
+    for t in (relaunch_at + 20, 361, relaunch_at + DEFAULT_MCP_PROBE_DEADLINE - 1):
+        h.clock.now = t0 + t
+        await h.watchdog._sweep()
+    assert len(h.recovered) == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_retry_resets_legacy_outage_window(harness):
+    h = harness
+    h.add(mcp_recover=True)
+    h.app.state.agents.register("test-agent", heartbeat_interval=60)
+    h.launch()
+    await h.watchdog._sweep()
+    h.clock.advance(DEFAULT_MCP_PROBE_DEADLINE)
+    await h.watchdog._sweep()
+    h.clock.advance(DEFAULT_MCP_PROBE_DEADLINE)
+    await h.watchdog._sweep()
+    assert len(h.recovered) == 1
+
+    # A later gateway epoch has no current launch probe. Legacy recovery must
+    # measure this outage from its first observation, not the failed launch.
+    h.clock.advance(110)
+    bump_gateway_epoch()
+    await h.watchdog._sweep()
+    h.clock.advance(130)  # prior recovery's grace expires at t=480
+    await h.watchdog._sweep()
+    assert len(h.recovered) == 1
+    h.clock.advance(109)  # current outage is still one second short
+    await h.watchdog._sweep()
+    assert len(h.recovered) == 1
+    h.clock.advance(1)
+    await h.watchdog._sweep()
+    assert len(h.recovered) == 2
+    assert "MCP transport unbound" in h.recovered[1][2]
+
+
+@pytest.mark.asyncio
+async def test_legacy_recovery_then_new_launch_failure_gets_codex_retry(harness):
+    h = harness
+    h.add(mcp_recover=True)
+    h.app.state.agents.register("test-agent", heartbeat_interval=60)
+    h.launch()
+    h.prove()
+    await h.watchdog._sweep()
+    h.clock.advance(10)
+    bump_gateway_epoch()
+    await h.watchdog._sweep()
+    h.clock.advance(DEFAULT_MCP_UNBOUND_FLOOR)
+    await h.watchdog._sweep()
+    assert len(h.recovered) == 1
+    assert "MCP transport unbound" in h.recovered[0][2]
+
+    # The replacement has its own failed attach: two failures may lead to two
+    # recoveries, while each new launch still receives both complete windows.
+    h.launch()
+    h.clock.advance(DEFAULT_MCP_PROBE_DEADLINE)
+    await h.watchdog._sweep()
+    assert len(h.recovered) == len(h.notices) == 1
+    h.clock.advance(DEFAULT_MCP_PROBE_DEADLINE - 1)
+    await h.watchdog._sweep()
+    assert len(h.recovered) == 1
+    h.clock.advance(1)
+    await h.watchdog._sweep()
+    assert len(h.recovered) == 2
+    assert "MCP attach failed after notice grace" in h.recovered[1][2]
+    h.clock.advance(DEFAULT_MCP_UNBOUND_FLOOR)
+    await h.watchdog._sweep()
+    assert len(h.recovered) == 2

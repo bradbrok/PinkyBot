@@ -991,7 +991,7 @@ class SessionWatchdog:
         # False, so this is a cheap no-op (clears the unbound clock) and the
         # transition branch below still handles the wedge.
         if is_codex:
-            if await self._evaluate_codex_mcp_attach(snap, now):
+            if await self._evaluate_codex_mcp_attach(snap, state, now):
                 return
         # A Codex launch check does not replace opted-in mid-life recovery.
         if await self._evaluate_mcp_bind(snap, state, cfg, now):
@@ -1240,7 +1240,9 @@ class SessionWatchdog:
                         snap.agent_name, exc,
                     )
 
-    async def _evaluate_codex_mcp_attach(self, snap: _SessionSnapshot, now: float) -> bool:
+    async def _evaluate_codex_mcp_attach(
+        self, snap: _SessionSnapshot, state: _AgentState, now: float,
+    ) -> bool:
         """Announce an unanswered launch before spending one force-fresh retry.
 
         Both a missed probe AND no current-epoch MCP success are required.
@@ -1350,6 +1352,10 @@ class SessionWatchdog:
         # transient unregister must not buy another automatic restart.
         attach.retry_used = True
         self._last_mcp_recover_at = now
+        # A replacement can finish between sweeps without appearing disconnected.
+        # Give legacy recovery a fresh outage window and post-recovery grace.
+        state.mcp_recovered_at = now
+        state.mcp_unbound_since = 0.0
         try:
             await self._mcp_recover_fn(
                 snap.agent_name, snap.label, "MCP attach failed after notice grace; force-fresh retry"
