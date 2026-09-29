@@ -128,7 +128,8 @@ def test_explicit_signing_identity_is_not_replaced(clean_daemon, monkeypatch, is
     monkeypatch.setenv("PINKY_AGENT_KEY", SENTINEL + "foreign")
     session = host_session(clean_daemon, registry=Registry(isolated=isolated, key=key))
     env = session._build_repl_env()
-    assert ("PINKY_SESSION_SECRET" in env) is (not isolated)
+    secret_present = "PINKY_SESSION_SECRET" in env
+    assert secret_present is (not isolated)
     matches = env.get("PINKY_AGENT_KEY", "") == key
     assert matches, "PINKY_AGENT_KEY"
 
@@ -147,7 +148,8 @@ def test_host_overlay_excludes_clean_and_other_runners(clean_daemon, monkeypatch
 
         session._tmux._runner = OtherRunner()
     env = session._build_repl_env(launch_policy=policy)
-    assert "CUSTOM_TOOL_TOKEN" not in env
+    present = "CUSTOM_TOOL_TOKEN" in env
+    assert not present
 
 
 async def wait_report(path):
