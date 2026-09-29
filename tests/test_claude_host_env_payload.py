@@ -330,7 +330,9 @@ async def test_child_auth_is_daemon_owned(clean_daemon, tmp_path, monkeypatch, k
         launch = launch_host if kind == "host" else launch_dream
         report = await launch(tmp_path, probe, monkeypatch)
         for name in AUTH_NAMES:
-            withheld = kind == "host" and name in {"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR"}
+            withheld = name == "CLAUDE_CODE_OAUTH_TOKEN" or (
+                kind == "host" and name == "CLAUDE_CONFIG_DIR"
+            )
             assert report[name]["present"] is (auth != "absent" and not withheld), name
             if withheld:
                 continue
@@ -495,3 +497,79 @@ def test_explicit_tool_configuration_wins_over_ambient(clean_daemon, monkeypatch
     env = tmux_session._claude_host_payload({"CUSTOM_TOOL_TOKEN": SENTINEL + "explicit"})
     matches = env.get("CUSTOM_TOOL_TOKEN") == SENTINEL + "explicit"
     assert matches, "CUSTOM_TOOL_TOKEN"
+
+
+@pytest.mark.parametrize("kind", ["host", "dream"])
+@pytest.mark.parametrize("forward", [False, True])
+async def test_static_oauth_intent_controls_api_billing(
+    clean_daemon, tmp_path, monkeypatch, kind, forward
+):
+    async with private_server(tmp_path, monkeypatch) as probe:
+        monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1" if forward else "0")
+        for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+            monkeypatch.setenv(name, SENTINEL + "daemon")
+        launch = launch_host if kind == "host" else launch_dream
+        report = await launch(tmp_path, probe, monkeypatch)
+        for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+            assert report[name]["present"] is (not forward), name
+            if not forward:
+                assert report[name]["daemon"], name
+        assert report["CLAUDE_CODE_OAUTH_TOKEN"]["present"] is forward
+        if forward:
+            assert report["CLAUDE_CODE_OAUTH_TOKEN"]["daemon"]
+
+
+@pytest.mark.parametrize("kind", ["host", "dream"])
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_USE_MANTLE",
+        "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    ],
+)
+async def test_daemon_provider_route_withholds_subscription_token(
+    clean_daemon, tmp_path, monkeypatch, kind, selector
+):
+    async with private_server(tmp_path, monkeypatch) as probe:
+        monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
+        monkeypatch.setenv(
+            selector, "https://provider.example" if selector == "ANTHROPIC_BASE_URL" else "1"
+        )
+        for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+            monkeypatch.setenv(name, SENTINEL + "daemon")
+        launch = launch_host if kind == "host" else launch_dream
+        report = await launch(tmp_path, probe, monkeypatch)
+        assert not report["CLAUDE_CODE_OAUTH_TOKEN"]["present"]
+        for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+            assert report[name]["daemon"], name
+
+
+def test_false_provider_switches_keep_subscription_intent(clean_daemon, monkeypatch):
+    monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", SENTINEL)
+    for name in (
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_USE_MANTLE",
+        "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    ):
+        monkeypatch.setenv(name, "0")
+    env = tmux_session._claude_host_auth_env()
+    key_present = "ANTHROPIC_API_KEY" in env
+    token_matches = env.get("CLAUDE_CODE_OAUTH_TOKEN") == SENTINEL
+    assert not key_present
+    assert token_matches
+
+
+async def test_empty_static_token_is_withheld_by_host_builder(clean_daemon, tmp_path, monkeypatch):
+    async with private_server(tmp_path, monkeypatch) as probe:
+        monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+        report = await launch_host(tmp_path, probe, monkeypatch)
+        assert not report["CLAUDE_CODE_OAUTH_TOKEN"]["present"]

@@ -2200,12 +2200,38 @@ def _claude_host_payload(explicit: dict[str, str]) -> dict[str, str]:
     return {**ambient, **explicit}
 
 
-def _claude_host_auth_env() -> dict[str, str]:
-    """Resolve only documented daemon auth inputs before builder decisions."""
-    return tmux_launch_env.ambient_env(
+def _claude_forward_oauth_enabled() -> bool:
+    return os.environ.get("PINKY_FORWARD_OAUTH_TOKEN", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _claude_host_auth_env(
+    *, provider_url: str = "", provider_key: str = "", forward_oauth: bool | None = None,
+) -> dict[str, str]:
+    """Resolve auth without overriding subscription intent or provider authority."""
+    env = tmux_launch_env.ambient_env(
         ((name, value) for name, value in os.environ.items() if name in _CLAUDE_AUTH_ENV_NAMES),
         _log,
     )
+    if forward_oauth is None:
+        forward_oauth = _claude_forward_oauth_enabled()
+    custom_provider = bool(provider_url or provider_key or env.get("ANTHROPIC_BASE_URL", "").strip())
+    custom_provider = custom_provider or any(
+        env.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+        for name in (
+            "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+        )
+    )
+    if forward_oauth and not custom_provider:
+        # Static subscription intent must not silently select API billing.
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    else:
+        # Never send a first-party subscription token to a custom endpoint.
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    return env
 
 
 def _claude_host_command(command: str, env: dict[str, str]) -> str:
@@ -4563,9 +4589,7 @@ class TmuxSession(TransportReplacementMixin):
         on, token missing) must fail CLOSED (a loud login wall) rather than
         silently fall back to the shared refresh-token file (Murzik #781 P2).
         """
-        return os.environ.get("PINKY_FORWARD_OAUTH_TOKEN", "0").strip().lower() in (
-            "1", "true", "yes", "on",
-        )
+        return _claude_forward_oauth_enabled()
 
     def _static_oauth_token(self) -> str:
         """The long-lived ``CLAUDE_CODE_OAUTH_TOKEN`` to inject into this
@@ -4662,8 +4686,13 @@ class TmuxSession(TransportReplacementMixin):
         """
         launch_policy = launch_policy or self._launch_env_policy()
         env: dict[str, str] = {}
+        host_auth = None
         if self._uses_claude_host_payload(launch_policy):
-            env = _claude_host_auth_env()
+            host_auth = _claude_host_auth_env(
+                provider_url=self._config.provider_url or "", provider_key=self._config.provider_key or "",
+                forward_oauth=self._forward_oauth_enabled(),
+            )
+            env = dict(host_auth)
             # These remain controlled by the existing account/forwarding guards.
             env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
             env.pop("CLAUDE_CONFIG_DIR", None)
@@ -4705,6 +4734,8 @@ class TmuxSession(TransportReplacementMixin):
         # this agent's CLAUDE_CONFIG_DIR (.claude-local, populated by a manual
         # `claude /login`). Verified end-to-end on CC 2.1.226 + real tmux.
         oauth_token = self._static_oauth_token()
+        if host_auth is not None and "CLAUDE_CODE_OAUTH_TOKEN" not in host_auth:
+            oauth_token = ""
         if dedicated_config_dir:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = ""
         elif oauth_token:
