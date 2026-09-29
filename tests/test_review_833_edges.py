@@ -60,7 +60,9 @@ async def prepare_recovery(h, monkeypatch, tmp_path, mode, restart):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["launch", "legacy"])
-@pytest.mark.parametrize("change", ["bound", "new_launch", "replacement", "epoch", "unchanged"])
+@pytest.mark.parametrize(
+    "change", ["bound", "new_launch", "replacement", "epoch", "disconnected", "unchanged"]
+)
 @pytest.mark.parametrize("guard", ["PINKY_MODEL_RUNTIME_GUARD", "PINKY_RESUME_FAILSAFE"])
 async def test_recovery_rechecks_after_lifecycle_lock(
     harness, monkeypatch, tmp_path, change, guard, mode
@@ -68,6 +70,14 @@ async def test_recovery_rechecks_after_lifecycle_lock(
     h = harness
     restart = AsyncMock()
     original = await prepare_recovery(h, monkeypatch, tmp_path, mode, restart)
+    results = []
+
+    async def recover(*args):
+        result = await h.real_recover(*args)
+        results.append(result)
+        return result
+
+    h.watchdog._mcp_recover_fn = recover
     lock = lifecycle_lock(h)
     monkeypatch.setenv(guard, "1")
     await lock.acquire()
@@ -84,9 +94,21 @@ async def test_recovery_rechecks_after_lifecycle_lock(
             h.launch()
         elif change == "epoch":
             bump_gateway_epoch()
+        elif change == "disconnected":
+            from pinky_daemon.transport_state import SessionState, Trigger
+
+            transition = await original._state_machine.request_transition(
+                SessionState.DEAD, Trigger.INTERNAL
+            )
+            await original._state_machine.transition_complete(
+                transition.owner_token, SessionState.DEAD, trigger=Trigger.INTERNAL
+            )
+            assert h.app.state.broker._streaming["test-agent"]["main"] is original
+            assert not h.watchdog._take_snapshot("test-agent", "main", original).connected
     finally:
         lock.release()
         await sweep
+    assert results == [change == "unchanged"]
     assert restart.await_count == int(change == "unchanged")
     if change != "unchanged":
         assert h.watchdog._last_mcp_recover_at == 0
@@ -174,7 +196,28 @@ async def test_pending_reservation_blocks_concurrent_sweep(harness, monkeypatch,
     try:
         await asyncio.sleep(0)
         assert lock._waiters and len(lock._waiters) == 1
-        await h.watchdog._sweep()
+        pending = h.watchdog._mcp_recovery_pending
+        session = h.app.state.broker._streaming["test-agent"]["main"]
+        snap = h.watchdog._take_snapshot("test-agent", "main", session)
+        status = h.watchdog._mcp_bind_status_fn("test-agent")
+        started = []
+        try:
+            deferred = await asyncio.wait_for(
+                h.watchdog._attempt_mcp_recovery(
+                    snap,
+                    status,
+                    "concurrent recovery",
+                    started.append,
+                    now=h.clock.now,
+                    require_probe=True,
+                ),
+                timeout=0.25,
+            )
+        except TimeoutError:
+            deferred = "blocked on lifecycle lock"
+        assert deferred is False, "a concurrent attempt must defer without waiting for the lock"
+        assert h.watchdog._mcp_recovery_pending is pending
+        assert started == []
         assert len(lock._waiters) == 1
         assert restart.await_count == 0
     finally:
