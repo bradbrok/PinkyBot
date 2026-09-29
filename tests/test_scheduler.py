@@ -7662,7 +7662,8 @@ class TestUrlWatcherOffLoop:
         """The urlopen+read must run in a worker thread, not block the shared
         event loop (which also serves the API, pollers, and broker)."""
         import threading
-        import urllib.request
+
+        from pinky_daemon import trigger_fetch
 
         loop_thread = threading.current_thread()
         seen = {}
@@ -7679,11 +7680,11 @@ class TestUrlWatcherOffLoop:
             def read(self, n=-1):
                 return b"ok"
 
-        def _fake_urlopen(req, timeout=None):
+        def _fake_urlopen(url, *, method, timeout=None):
             seen["thread"] = threading.current_thread()
             return _Resp()
 
-        monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+        monkeypatch.setattr(trigger_fetch, "open_trigger_url", _fake_urlopen)
 
         store = _StubTriggerStore()
         fired = []

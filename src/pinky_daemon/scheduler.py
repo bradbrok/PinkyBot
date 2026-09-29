@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import math
 import os
 import sys
@@ -476,6 +477,7 @@ class AgentScheduler:
         # only, NOT owner-notified (#1043).
         self._owner_notify_callback = owner_notify_callback
         self._trigger_store = trigger_store  # TriggerStore | None
+        self._url_refusal_warned_at: dict[int, float] = {}
         self._activity = activity  # ActivityStore | None
         self._tick_interval = tick_interval
         self._schedule_delivery_timeout = schedule_delivery_timeout
@@ -3866,13 +3868,11 @@ class AgentScheduler:
     async def _poll_url_trigger(self, trigger, now: float) -> None:
         """Poll a single url trigger and fire if its condition is met."""
         import urllib.error
-        import urllib.request
+
+        from pinky_daemon.trigger_fetch import InternalDestinationRefusedError, open_trigger_url
 
         def _fetch() -> tuple[int, str]:
-            req = urllib.request.Request(
-                trigger.url, method=trigger.method or "GET",
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with open_trigger_url(trigger.url, method=trigger.method or "GET", timeout=5) as resp:
                 body_bytes = resp.read(65536)  # cap at 64KB
                 return resp.status, body_bytes.decode(errors="replace")
 
@@ -3880,6 +3880,20 @@ class AgentScheduler:
             # Off-loop: a slow watched URL must not stall the shared event loop
             # (cf. the run_in_executor pattern in pollers.py).
             status_code, body_text = await asyncio.to_thread(_fetch)
+        except InternalDestinationRefusedError as e:
+            # Deduplicate by trigger, including redirect/connection-time refusals.
+            # Expire idle IDs so deleted triggers do not accumulate indefinitely.
+            self._url_refusal_warned_at = {
+                key: stamp for key, stamp in self._url_refusal_warned_at.items()
+                if 0 <= now - stamp < 3600
+            }
+            if trigger.id not in self._url_refusal_warned_at:
+                logging.getLogger(__name__).warning(
+                    "URL trigger %s refused internal destination %s", trigger.id, e.destination,
+                )
+                self._url_refusal_warned_at[trigger.id] = now
+            self._trigger_store.record_check(trigger.id, trigger.last_value)
+            return
         except urllib.error.HTTPError as e:
             status_code = e.code
             body_text = ""
