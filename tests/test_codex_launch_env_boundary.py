@@ -704,7 +704,8 @@ async def test_launch_identity_authenticates_without_global_authority(harness, k
         h.patch.setenv(name, SENTINEL)
     owner, build = h.make(kind)
     env = build()
-    assert not DAEMON_ONLY.intersection(env)
+    authority_absent = not DAEMON_ONLY.intersection(env)
+    assert authority_absent, "daemon authority reached the authentication control"
     signed = build_internal_auth_headers(
         env.get("PINKY_AGENT_KEY", ""),
         agent_name="test-agent",
