@@ -71,7 +71,7 @@ def prepared(d, monkeypatch, method, template):
             text="fixture",
             query="fixture",
         )
-        if template.endswith("thread"):
+        if template.endswith(("thread", "send-voice", "send-gif")):
             d.app.state.broker.remember_message_context(
                 BrokerMessage(
                     platform="telegram",
