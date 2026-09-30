@@ -240,3 +240,90 @@ async def test_gap_uses_existing_monotonic_start_even_when_wall_clock_rewinds(en
     scheduler._running = True
     await scheduler._loop()
     assert "TICK_GAP gap_s=100 last_phase=" in capsys.readouterr().err, "existing monotonic progress was not used"
+
+
+async def test_current_minute_startup_and_next_minute_keep_existing_behavior(env, capsys):
+    add(env, "* * * * *", "current")
+    scheduler = env.scheduler()
+    await check(scheduler, env.clock)
+    await check(scheduler, env.clock)
+    assert env.fired == ["current"]
+    assert "LATE_FIRE" not in capsys.readouterr().err
+    env.clock.advance(30)
+    await check(scheduler, env.clock)
+    assert env.fired == ["current", "current"]
+    assert all(row["late_fire"] == 0 for row in trace_rows(env))
+
+
+async def test_empty_pass_and_new_schedule_do_not_replay_old_slots(env):
+    scheduler = env.scheduler()
+    env.clock.set("2026-09-30T04:31:00+00:00")
+    await check(scheduler, env.clock)
+    add(env, "30 4 * * *", "new")
+    env.clock.set("2026-09-30T05:01:00+00:00")
+    await check(scheduler, env.clock)
+    assert env.fired == [], "new schedule replayed a pre-creation slot"
+    assert scheduler._last_cron_evaluated_at == env.clock.wall
+
+
+async def test_failed_evaluation_retries_unclaimed_missed_slots(env, monkeypatch):
+    add(env, "30 4 * * *", "retry")
+    scheduler = env.scheduler()
+    env.clock.set("2026-09-30T05:01:00+00:00")
+    with monkeypatch.context() as patch:
+        patch.setattr(env.registry, "get_all_schedules", lambda **kw: (_ for _ in ()).throw(OSError("unavailable")))
+        with pytest.raises(OSError, match="unavailable"):
+            await check(scheduler, env.clock)
+    env.clock.advance(60)
+    await check(scheduler, env.clock)
+    assert env.fired == ["retry"], "failed scan consumed its catch-up window"
+
+
+async def test_direct_send_catchup_keeps_actual_claim_time(env):
+    row = add(env, "30 4 * * *", "direct", direct_send=True, target_channel="test")
+    scheduler = env.scheduler()
+    sent = AsyncMock(return_value=True)
+    scheduler._direct_send_callback = sent
+    env.clock.set("2026-09-30T05:01:00+00:00")
+    await check(scheduler, env.clock)
+    assert sent.await_count == 1, "direct-send missed slot was dropped"
+    assert env.registry.get_schedule(row.id).last_run == env.clock.wall
+    traced, = trace_rows(env)
+    assert traced["late_fire"] == 1
+    assert traced["scheduled_minute"] == "2026-09-30T04:30:00+00:00"
+
+
+@pytest.mark.parametrize("duration,logged", [(30, False), (30.01, True)])
+async def test_phase_timing_threshold_and_exception_propagation(env, monkeypatch, capsys, duration, logged):
+    scheduler = env.scheduler()
+    for name in PHASES:
+        monkeypatch.setattr(scheduler, name, lambda *args: None)
+
+    async def failure(now):
+        env.clock.advance(duration)
+        raise RuntimeError("phase failed")
+
+    monkeypatch.setattr(scheduler, "_check_heartbeats", failure)
+    with pytest.raises(RuntimeError, match="phase failed"):
+        await scheduler._tick()
+    assert ("SLOW_TICK_PHASE phase=_check_heartbeats" in capsys.readouterr().err) is logged
+    assert scheduler._last_tick_phase == "_check_heartbeats"
+
+
+async def test_trace_upgrade_preserves_existing_rows_and_adds_late_fields(env):
+    add(env, "* * * * *", "existing")
+    scheduler = env.scheduler()
+    await check(scheduler, env.clock)
+    original, = trace_rows(env)
+    # Simulate an older trace schema before reopening the same observational store.
+    writer = env.registry._fire_trace
+    writer.close()
+    with sqlite3.connect(writer.path) as db:
+        for column in ("scheduled_minute", "late_fire", "lateness_s"):
+            db.execute(f"ALTER TABLE schedule_fire_trace DROP COLUMN {column}")
+    from pinky_daemon.schedule_fire_trace import ScheduleFireTrace
+
+    env.registry._fire_trace = ScheduleFireTrace(env.registry._db_path)
+    upgraded, = trace_rows(env)
+    assert upgraded["fired_at"] == original["fired_at"]
+    assert upgraded["scheduled_minute"] == "" and upgraded["late_fire"] == 0

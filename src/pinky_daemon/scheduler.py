@@ -59,6 +59,8 @@ _RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"
 _RATE_LIMIT_THRESHOLD = 80  # percent — skip heartbeats above this
 _rate_limit_last_warned_at: float | None = None
 _CLOCK_WAKE_MAX_ATTEMPTS = 3
+_CRON_CATCHUP_MAX_SECONDS = 6 * 60 * 60
+_SLOW_TICK_PHASE_SECONDS = 30
 
 # #1029 transport-health guard. tmux builds can reject command argvs around
 # 8–16 KiB; prompts now travel over stdin, but surfacing large enabled rows
@@ -613,6 +615,8 @@ class AgentScheduler:
         self.last_tick_started_monotonic: float | None = None
         self.last_tick_completed_monotonic: float | None = None
         self._started_monotonic: float | None = None
+        self._last_cron_evaluated_at = time.time()
+        self._last_tick_phase = "none"
         self._last_clock_slot: dict[str, int] = {}  # agent_name -> last fired clock slot (minutes since midnight)
         self._clock_wake_attempts: dict[str, tuple[int, int]] = {}
         self._last_dream_check: dict[str, tuple] = {}  # agent_name -> (date_str, cron-minute) dedup key
@@ -670,6 +674,7 @@ class AgentScheduler:
         self._restart_attempt = self._clean_ticks = 0
         self.consecutive_tick_errors = 0
         now = time.time()
+        self._last_cron_evaluated_at = now
         self._run_outbox_reaper_if_due(now)
         self._warn_oversized_schedule_prompts(now, force=True)
         for pending in self._registry.list_pending_schedule_wakes():
@@ -783,9 +788,17 @@ class AgentScheduler:
     async def _loop(self) -> None:
         """Keep ticking through failures, including failures while reporting errors."""
         while self._running:
+            previous_start = self.last_tick_started_monotonic
             self.last_tick_started_monotonic = time.monotonic()
             self.last_tick_started_at = time.time()
             try:
+                if previous_start is not None:
+                    gap = self.last_tick_started_monotonic - previous_start
+                    if gap > 3 * self._tick_interval:
+                        _log(
+                            f"scheduler: TICK_GAP gap_s={gap:g} "
+                            f"last_phase={self._last_tick_phase}"
+                        )
                 await self._tick()
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
@@ -812,41 +825,26 @@ class AgentScheduler:
     async def _tick(self) -> None:
         """Single scheduler tick — check schedules, heartbeats, clock-aligned wakes, auto-sleep, idle sessions, expired messages, dreams, and url watchers."""
         now = time.time()
-
-        self._run_outbox_reaper_if_due(now)
-        self._warn_oversized_schedule_prompts(now)
-
-        # Check cron schedules
-        await self._check_schedules(now)
-
-        # Check clock-aligned wakes
-        await self._check_clock_aligned_wakes(now)
-
-        # Idle notifications are the primary low-latency outbox drain.  This
-        # bounded fallback prevents a lost edge from stranding a busy-deferred
-        # fire forever, including agents that keep the default heartbeat=0.
-        self._check_pending_wake_liveness(now)
-
-        # Check heartbeat health
-        await self._check_heartbeats(now)
-
-        # Check auto-sleep (idle too long)
-        await self._check_auto_sleep(now)
-
-        # Check for idle streaming sessions
-        await self._check_idle_sessions(now)
-
-        # Cleanup expired inbox messages
-        self._cleanup_expired_messages()
-
-        # Check dream schedules
-        await self._check_dreams(now)
-
-        # Check librarian schedule
-        await self._check_librarian(now)
-
-        # Check URL watcher triggers
-        await self._check_url_watchers(now)
+        # Preserve inline execution and ordering; timing must not detach work.
+        phases = (
+            "_run_outbox_reaper_if_due", "_warn_oversized_schedule_prompts",
+            "_check_schedules", "_check_clock_aligned_wakes",
+            "_check_pending_wake_liveness", "_check_heartbeats",
+            "_check_auto_sleep", "_check_idle_sessions", "_cleanup_expired_messages",
+            "_check_dreams", "_check_librarian", "_check_url_watchers",
+        )
+        for name in phases:
+            self._last_tick_phase = name
+            started = time.monotonic()
+            try:
+                phase = getattr(self, name)
+                result = phase() if name == "_cleanup_expired_messages" else phase(now)
+                if inspect.isawaitable(result):
+                    await result
+            finally:
+                elapsed = time.monotonic() - started
+                if elapsed > _SLOW_TICK_PHASE_SECONDS:
+                    _log(f"scheduler: SLOW_TICK_PHASE phase={name} elapsed_s={elapsed:g}")
 
     def _run_outbox_reaper_if_due(self, now: float) -> bool:
         """Run host-owned outbox maintenance once per local calendar day."""
@@ -938,10 +936,15 @@ class AgentScheduler:
 
     async def _check_schedules(self, now: float) -> None:
         """Stamp due schedules fired, then deliver each agent's cohort in order."""
+        window_start = max(self._last_cron_evaluated_at, now - _CRON_CATCHUP_MAX_SECONDS)
+        if self._last_cron_evaluated_at < now - _CRON_CATCHUP_MAX_SECONDS:
+            _log(
+                "scheduler: SCHEDULER_CATCHUP_TRUNCATED "
+                f"gap_s={now - self._last_cron_evaluated_at:g} "
+                f"bound_s={_CRON_CATCHUP_MAX_SECONDS}"
+            )
         schedules = self._registry.get_all_schedules(enabled_only=True)
-        if not schedules:
-            return
-
+        current_minute = math.floor(now / 60) * 60
         due_by_agent: dict[str, list] = {}
         for schedule in schedules:
             try:
@@ -949,16 +952,24 @@ class AgentScheduler:
             except (KeyError, ValueError):
                 tz = ZoneInfo("America/Los_Angeles")
 
-            dt = datetime.fromtimestamp(now, tz=tz)
-            current_minute = dt.hour * 60 + dt.minute
-
-            # Skip if we already checked this minute for this schedule
-            if schedule.last_run > 0:
-                last_dt = datetime.fromtimestamp(schedule.last_run, tz=tz)
-                last_minute = last_dt.hour * 60 + last_dt.minute
-                last_day = last_dt.date()
-                if last_minute == current_minute and last_day == dt.date():
-                    continue
+            # Walk absolute instants, not local wall minutes: folds have two
+            # instants and spring-forward gaps have none. Coalesce to latest.
+            scheduled_at = current_minute
+            while scheduled_at == current_minute or scheduled_at > window_start:
+                if schedule.last_run >= scheduled_at:
+                    break
+                if scheduled_at < current_minute and scheduled_at < schedule.created_at:
+                    break
+                dt = datetime.fromtimestamp(scheduled_at, tz=tz)
+                if cron_matches(schedule.cron, dt):
+                    break
+                scheduled_at -= 60
+            else:
+                continue
+            if schedule.last_run >= scheduled_at or (
+                scheduled_at < current_minute and scheduled_at < schedule.created_at
+            ):
+                continue
 
             if cron_matches(schedule.cron, dt):
                 if schedule.direct_send:
@@ -987,6 +998,19 @@ class AgentScheduler:
                         f"#{schedule.id} — skipping fire"
                     )
                     continue
+                late = scheduled_at < current_minute
+                lateness = max(0.0, now - scheduled_at)
+                if late:
+                    _log(
+                        f"scheduler: LATE_FIRE schedule={schedule.id} "
+                        f"scheduled_minute={dt.isoformat()} lateness_s={lateness:g}"
+                    )
+                trace_event(
+                    self._registry, "enqueue", schedule_id=schedule.id, fired_at=now,
+                    agent_name=schedule.agent_name, schedule_name=schedule.name,
+                    prompt=schedule.prompt or f"Scheduled wake: {schedule.name}",
+                    scheduled_minute=dt.isoformat(), late_fire=int(late), lateness_s=lateness,
+                )
                 _log(f"scheduler: firing schedule '{schedule.name}' for agent '{schedule.agent_name}' (direct_send={schedule.direct_send}, one_shot={schedule.one_shot})")
                 if self._activity:
                     try:
@@ -1006,6 +1030,9 @@ class AgentScheduler:
 
                 due_by_agent.setdefault(schedule.agent_name, []).append(schedule)
 
+        # Commit evaluation progress only after every schedule was checked.
+        # A failed pass can retry unclaimed slots; last_run fences prior claims.
+        self._last_cron_evaluated_at = max(self._last_cron_evaluated_at, now)
         cohort_started: list[asyncio.Event] = []
         for agent_name, due_schedules in due_by_agent.items():
             attempt_started = asyncio.Event()
