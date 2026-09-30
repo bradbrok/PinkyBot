@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine
 
 from pinky_daemon.auth_relay import extract_oauth_url
+from pinky_daemon.scheduler import _log as _safe_log
 from pinky_daemon.transport_state import SessionState
 from pinky_daemon.watchdog_log import log_watchdog_decision
 
@@ -398,6 +400,7 @@ class SessionWatchdog:
         ] | None = None,
         scheduler_health_fn: Callable[[], dict] | None = None,
         scheduler_notify_fn: Callable[[str], Coroutine[Any, Any, bool]] | None = None,
+        scheduler_notify_timeout_s: float = 30.0,
         check_interval: int = DEFAULT_CHECK_INTERVAL,
     ) -> None:
         """
@@ -437,9 +440,15 @@ class SessionWatchdog:
                 Scheduler progress snapshot, sampled independently of its loop.
             scheduler_notify_fn:
                 Direct owner notification; True confirms delivery for this episode.
+            scheduler_notify_timeout_s:
+                Maximum time spent awaiting one scheduler notification attempt.
             check_interval:
                 Seconds between sweeps.
         """
+        if not math.isfinite(scheduler_notify_timeout_s) or scheduler_notify_timeout_s <= 0:
+            raise ValueError("scheduler notification timeout must be finite and positive")
+        self._scheduler_notify_timeout_s = scheduler_notify_timeout_s
+        self.scheduler_check_failures = 0
         self._scheduler_health_fn = scheduler_health_fn
         self._scheduler_notify_fn = scheduler_notify_fn
         self._scheduler_stale_notified = False
@@ -516,24 +525,30 @@ class SessionWatchdog:
             return
         health = self._scheduler_health_fn()
         age = health["last_tick_age_s"]
-        if not health["enabled"] or age is None or age <= 4 * health["tick_interval_s"]:
+        errors = health.get("consecutive_tick_errors", 0)
+        if not health["enabled"] or age is None or (errors == 0 and age <= 4 * health["tick_interval_s"]):
             self._scheduler_stale_notified = False
             self._scheduler_notify_attempts = 0
             self._scheduler_notify_after = 0.0
             return
-        if age <= max(300, 10 * health["tick_interval_s"]):
+        failing = errors >= max(10, 300 / health["tick_interval_s"])
+        if not failing and age <= max(300, 10 * health["tick_interval_s"]):
             return
         if self._scheduler_stale_notified or self._scheduler_notify_fn is None:
             return
         if self._scheduler_notify_attempts >= 3 or time.monotonic() < self._scheduler_notify_after:
             return
         self._scheduler_notify_attempts += 1
+        reason = "ticks failing" if failing else "has not ticked"
         message = (
-            f"scheduler has not ticked for {int(age // 60)} min; "
+            f"scheduler {reason} for {int(age // 60)} min; "
             f"restarts={health['loop_restarts']}"
         )
         try:
-            delivered = await self._scheduler_notify_fn(message)
+            delivered = await asyncio.wait_for(
+                self._scheduler_notify_fn(message),
+                timeout=self._scheduler_notify_timeout_s,
+            )
         except Exception:
             # Delivery may have succeeded before acknowledgement failed.
             delivered = False
@@ -548,7 +563,11 @@ class SessionWatchdog:
 
     async def _sweep(self) -> None:
         """Sample all streaming sessions and check for stuck ones."""
-        await self._check_scheduler_liveness()
+        try:
+            await self._check_scheduler_liveness()
+        except Exception as exc:
+            self.scheduler_check_failures += 1
+            _safe_log(f"watchdog: scheduler health check failed ({type(exc).__name__})")
         streaming = self._streaming_fn()
         now = time.time()
         seen_keys: set[tuple[str, str]] = set()
@@ -1694,6 +1713,7 @@ class SessionWatchdog:
             "running": self._running,
             "check_interval": self._interval,
             "scheduler_alert": {
+                "check_failures": self.scheduler_check_failures,
                 "notification_attempts": self._scheduler_notify_attempts,
                 "notification_latched": self._scheduler_stale_notified or self._scheduler_notify_attempts >= 3,
                 "stale_alert_undelivered": self.stale_alert_undelivered,

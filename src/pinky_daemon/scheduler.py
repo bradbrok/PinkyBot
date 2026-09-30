@@ -605,6 +605,7 @@ class AgentScheduler:
         self._restart_handle: asyncio.TimerHandle | None = None
         self._restart_attempt = 0
         self._clean_ticks = 0
+        self.consecutive_tick_errors = 0
         self.loop_restarts = 0
         self.last_loop_exit: str | None = None
         self.last_tick_started_at: float | None = None
@@ -667,6 +668,7 @@ class AgentScheduler:
         self.last_tick_started_at = self.last_tick_completed_at = None
         self.last_tick_started_monotonic = self.last_tick_completed_monotonic = None
         self._restart_attempt = self._clean_ticks = 0
+        self.consecutive_tick_errors = 0
         now = time.time()
         self._run_outbox_reaper_if_due(now)
         self._warn_oversized_schedule_prompts(now, force=True)
@@ -764,12 +766,14 @@ class AgentScheduler:
         age = max(0.0, time.monotonic() - last) if last is not None else None
         running = self._running and self._task is not None and not self._task.done()
         degraded = self._running and (
-            not running or (age is not None and age > 4 * self._tick_interval)
+            not running or self.consecutive_tick_errors >= 3
+            or (age is not None and age > 4 * self._tick_interval)
         )
         return {
             "running": running,
             "last_tick_age_s": age,
             "loop_restarts": self.loop_restarts,
+            "consecutive_tick_errors": self.consecutive_tick_errors,
             "log_write_failures": log_write_failures,
             "tick_interval_s": self._tick_interval,
             "enabled": self._running,
@@ -786,6 +790,7 @@ class AgentScheduler:
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
             except BaseException as error:
+                self.consecutive_tick_errors += 1
                 self._clean_ticks = 0
                 try:
                     _log(f"scheduler: error in tick: {error}")
@@ -795,12 +800,13 @@ class AgentScheduler:
                     # Error formatting and logging must not kill this control loop.
                     pass
             else:
+                self.consecutive_tick_errors = 0
                 self._clean_ticks += 1
                 if self._clean_ticks >= 10:
                     self._restart_attempt = 0
                     self._clean_ticks = 0
-            self.last_tick_completed_monotonic = time.monotonic()
-            self.last_tick_completed_at = time.time()
+                self.last_tick_completed_monotonic = time.monotonic()
+                self.last_tick_completed_at = time.time()
             await asyncio.sleep(self._tick_interval)
 
     async def _tick(self) -> None:
