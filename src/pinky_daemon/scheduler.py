@@ -36,9 +36,16 @@ from pinky_daemon.scheduler_delivery import scheduler_busy_delay
 from pinky_daemon.transport_state import SessionState
 from pinky_daemon.watchdog_log import log_watchdog_decision
 
+log_write_failures = 0
+
 
 def _log(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
+    """Best-effort control-loop logging, including closed or full streams."""
+    global log_write_failures
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        log_write_failures += 1
 
 
 _PROVEN_LIVE_HEARTBEAT_STATUSES = frozenset(
@@ -595,6 +602,17 @@ class AgentScheduler:
         )
         self._running = False
         self._task: asyncio.Task | None = None
+        self._restart_handle: asyncio.TimerHandle | None = None
+        self._restart_attempt = 0
+        self._clean_ticks = 0
+        self.consecutive_tick_errors = 0
+        self.loop_restarts = 0
+        self.last_loop_exit: str | None = None
+        self.last_tick_started_at: float | None = None
+        self.last_tick_completed_at: float | None = None
+        self.last_tick_started_monotonic: float | None = None
+        self.last_tick_completed_monotonic: float | None = None
+        self._started_monotonic: float | None = None
         self._last_clock_slot: dict[str, int] = {}  # agent_name -> last fired clock slot (minutes since midnight)
         self._clock_wake_attempts: dict[str, tuple[int, int]] = {}
         self._last_dream_check: dict[str, tuple] = {}  # agent_name -> (date_str, cron-minute) dedup key
@@ -646,6 +664,11 @@ class AgentScheduler:
         if self._running:
             return
         self._running = True
+        self._started_monotonic = time.monotonic()
+        self.last_tick_started_at = self.last_tick_completed_at = None
+        self.last_tick_started_monotonic = self.last_tick_completed_monotonic = None
+        self._restart_attempt = self._clean_ticks = 0
+        self.consecutive_tick_errors = 0
         now = time.time()
         self._run_outbox_reaper_if_due(now)
         self._warn_oversized_schedule_prompts(now, force=True)
@@ -653,18 +676,18 @@ class AgentScheduler:
             self.replay_pending_for_agent(pending.agent_name)
         # Queue startup catch-up before the first live tick can enqueue newer
         # cron fires. Per-agent delivery locks preserve that ordering.
-        self._task = asyncio.create_task(self._loop())
+        self._spawn_loop()
         _log(f"scheduler: started (tick every {self._tick_interval}s)")
 
     async def stop(self) -> None:
         """Stop the scheduler."""
         self._running = False
+        if self._restart_handle is not None:
+            self._restart_handle.cancel()
+            self._restart_handle = None
         if self._task:
             self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+            await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
         # Cancel in-flight dream/librarian/sleep runs. Before #702 these ran
         # inside the loop task, so stop() cancelled them implicitly — keep
@@ -708,13 +731,82 @@ class AgentScheduler:
         self._owner_alert_tasks.clear()
         _log("scheduler: stopped")
 
+    def _spawn_loop(self) -> None:
+        self._task = asyncio.create_task(self._loop(), name="agent-scheduler")
+        self._task.add_done_callback(self._loop_done)
+
+    def _loop_done(self, task: asyncio.Task) -> None:
+        # Always retrieve the outcome, even if stop() or a later start won a race.
+        error = None if task.cancelled() else task.exception()
+        if not self._running or task is not self._task:
+            return
+        self.loop_restarts += 1
+        self.last_loop_exit = (
+            "CancelledError" if task.cancelled() else
+            type(error).__name__ if error is not None else "None"
+        )
+        self._clean_ticks = 0
+        delay = (1, 5, 30, 60)[min(self._restart_attempt, 3)]
+        self._restart_attempt = min(self._restart_attempt + 1, 3)
+        self._restart_handle = asyncio.get_running_loop().call_later(
+            delay, self._restart_loop,
+        )
+
+    def _restart_loop(self) -> None:
+        self._restart_handle = None
+        if self._running:
+            # Startup replay belongs to start(), never to loop supervision.
+            self._spawn_loop()
+
+    def health_snapshot(self) -> dict:
+        """Use monotonic progress so wall-clock corrections cannot hide a stall."""
+        last = self.last_tick_completed_monotonic
+        if last is None:
+            last = self._started_monotonic
+        age = max(0.0, time.monotonic() - last) if last is not None else None
+        running = self._running and self._task is not None and not self._task.done()
+        degraded = self._running and (
+            not running or self.consecutive_tick_errors >= 3
+            or (age is not None and age > 4 * self._tick_interval)
+        )
+        return {
+            "running": running,
+            "last_tick_age_s": age,
+            "loop_restarts": self.loop_restarts,
+            "consecutive_tick_errors": self.consecutive_tick_errors,
+            "log_write_failures": log_write_failures,
+            "tick_interval_s": self._tick_interval,
+            "enabled": self._running,
+            "status": "degraded" if degraded else "ok" if self._running else "stopped",
+        }
+
     async def _loop(self) -> None:
-        """Main scheduler loop."""
+        """Keep ticking through failures, including failures while reporting errors."""
         while self._running:
+            self.last_tick_started_monotonic = time.monotonic()
+            self.last_tick_started_at = time.time()
             try:
                 await self._tick()
-            except Exception as e:
-                _log(f"scheduler: error in tick: {e}")
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as error:
+                self.consecutive_tick_errors += 1
+                self._clean_ticks = 0
+                try:
+                    _log(f"scheduler: error in tick: {error}")
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException:
+                    # Error formatting and logging must not kill this control loop.
+                    pass
+            else:
+                self.consecutive_tick_errors = 0
+                self._clean_ticks += 1
+                if self._clean_ticks >= 10:
+                    self._restart_attempt = 0
+                    self._clean_ticks = 0
+                self.last_tick_completed_monotonic = time.monotonic()
+                self.last_tick_completed_at = time.time()
             await asyncio.sleep(self._tick_interval)
 
     async def _tick(self) -> None:
