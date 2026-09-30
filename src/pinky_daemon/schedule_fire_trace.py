@@ -41,6 +41,9 @@ _COLUMNS = {
     "prompt_hash": "TEXT NOT NULL DEFAULT ''",
     "cadence_seconds": "REAL NOT NULL DEFAULT 0",
     "enqueued_at": "REAL NOT NULL DEFAULT 0",
+    "scheduled_minute": "TEXT NOT NULL DEFAULT ''",
+    "late_fire": "INTEGER NOT NULL DEFAULT 0",
+    "lateness_s": "REAL NOT NULL DEFAULT 0",
     "paste_at": "REAL NOT NULL DEFAULT 0",
     "paste_pointer": "TEXT NOT NULL DEFAULT ''",
     "paste_attempts": "INTEGER NOT NULL DEFAULT 0",
@@ -665,6 +668,10 @@ class ScheduleFireTrace:
                 row["cadence_seconds"] = self._cadence(schedule, key[1])
         if edge == "enqueue":
             row["enqueued_at"] = row["enqueued_at"] or event.get("enqueued_at", at)
+            if event.get("scheduled_minute"):
+                row["scheduled_minute"] = event["scheduled_minute"]
+                row["late_fire"] = int(bool(event.get("late_fire")))
+                row["lateness_s"] = event.get("lateness_s", 0)
         elif edge == "paste":
             row["paste_at"] = row["paste_at"] or at
             row["paste_pointer"] = row["paste_pointer"] or event.get("pointer", "")
