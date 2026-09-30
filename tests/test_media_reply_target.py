@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from pinky_daemon.api import create_api
 from pinky_daemon.broker import BrokerMessage
 from pinky_outreach.slack import SlackAdapter
+from pinky_outreach.telegram import TelegramAdapter
 from tests.isolated_policy_support import closure, replace_cell
 
 ROUTES = ("photo", "document", "video", "animation", "gif", "voice")
@@ -61,12 +62,13 @@ def media(tmp_path, monkeypatch):
         )
 
 
-def remember(media, *, platform="telegram", chat=CHAT, message=MESSAGE):
+def remember(media, *, platform="telegram", chat=CHAT, message=MESSAGE, reply_to=""):
     media.app.state.broker.remember_message_context(
         BrokerMessage(
             platform=platform,
             chat_id=chat,
             message_id=message,
+            reply_to=reply_to,
             agent_name="sender",
             sender_name="fixture",
             sender_id="fixture-user",
@@ -139,9 +141,21 @@ def test_media_unknown_message_with_chat_is_refused_before_delivery(media, kind)
     media.network.assert_not_called()
 
 
-def test_matching_chat_and_message_reach_slack_file_upload_thread(media, monkeypatch):
+@pytest.mark.parametrize("kind", ("photo", "document", "video", "animation"))
+@pytest.mark.parametrize("include_chat", (False, True), ids=("message_only", "matching_chat"))
+@pytest.mark.parametrize("source", ("root", "child", "outbound_file"))
+def test_slack_file_upload_uses_thread_root(media, monkeypatch, kind, include_chat, source):
     thread_ts = "1700000000.000100"
-    remember(media, platform="slack", chat="C123", message=thread_ts)
+    message_id = {"root": thread_ts, "child": "1700000001.000200", "outbound_file": "F456"}[source]
+    if source == "outbound_file":
+        media.app.state.broker.remember_outbound_message_context(
+            "sender", message_id, platform="slack", chat_id="C123", reply_to=thread_ts,
+        )
+    else:
+        remember(
+            media, platform="slack", chat="C123", message=message_id,
+            reply_to=thread_ts if source == "child" else "",
+        )
     adapter = SlackAdapter("xoxb-fixture-token")
     media.select_adapter.return_value = adapter
     upload_url = "https://files.slack.com/upload/fixture"
@@ -155,15 +169,10 @@ def test_matching_chat_and_message_reach_slack_file_upload_thread(media, monkeyp
     upload = Mock(return_value=SimpleNamespace(status_code=200))
     monkeypatch.setattr("pinky_outreach.slack.httpx.post", upload)
     try:
-        response = media.client.post(
-            "/broker/send-document",
-            json={
-                **payload(media, "document"),
-                "chat_id": "C123",
-                "message_id": thread_ts,
-                "platform": "slack",
-            },
-        )
+        body = {**payload(media, kind), "message_id": message_id, "platform": "slack"}
+        if include_chat:
+            body["chat_id"] = "C123"
+        response = media.client.post(f"/broker/send-{kind}", json=body)
 
         assert response.status_code == 200, response.text
         upload.assert_called_once()
@@ -175,5 +184,39 @@ def test_matching_chat_and_message_reach_slack_file_upload_thread(media, monkeyp
         assert complete.kwargs["data"]["thread_ts"] == thread_ts
         assert "json" not in complete.kwargs
         assert response.json()["message_id"] == "F123"
+        context = media.app.state.broker.get_message_context("sender", "F123")
+        assert context is not None
+        assert context.reply_to == thread_ts
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize("kind", ("photo", "document", "video", "animation"))
+@pytest.mark.parametrize("include_chat", (False, True), ids=("message_only", "matching_chat"))
+def test_telegram_file_upload_replies_to_selected_child(media, monkeypatch, kind, include_chat):
+    remember(media, reply_to="100")
+    adapter = TelegramAdapter("fixture-token")
+    media.select_adapter.return_value = adapter
+    post = Mock(return_value=SimpleNamespace(json=lambda: {
+        "ok": True,
+        "result": {"message_id": 201, "chat": {"id": int(CHAT)}, "date": 1700000000},
+    }))
+    monkeypatch.setattr(adapter._client, "post", post)
+    try:
+        body = {**payload(media, kind), "message_id": MESSAGE}
+        if include_chat:
+            body["chat_id"] = CHAT
+        response = media.client.post(f"/broker/send-{kind}", json=body)
+
+        assert response.status_code == 200, response.text
+        post.assert_called_once()
+        assert post.call_args.args == (f"{adapter._base}/send{kind.title()}",)
+        assert post.call_args.kwargs["data"]["chat_id"] == CHAT
+        assert post.call_args.kwargs["data"]["reply_to_message_id"] == int(MESSAGE)
+        assert kind in post.call_args.kwargs["files"]
+        assert "json" not in post.call_args.kwargs
+        context = media.app.state.broker.get_message_context("sender", "201")
+        assert context is not None
+        assert context.reply_to == MESSAGE
     finally:
         adapter.close()

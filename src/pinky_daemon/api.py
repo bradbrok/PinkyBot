@@ -2095,7 +2095,8 @@ def create_api(
                 f"chat_id '{chat_id}' does not match resolved chat_id '{ctx.chat_id}' "
                 f"for message_id '{message_id}'",
             )
-        return ctx.platform, ctx.chat_id, ctx.message_id
+        reply_to = (ctx.reply_to or ctx.message_id) if ctx.platform == "slack" else ctx.message_id
+        return ctx.platform, ctx.chat_id, reply_to
 
     def _buzz_reply_metadata(ctx) -> dict | None:
         """Copy only verified public routing fields from durable context."""
