@@ -465,3 +465,126 @@ async def test_watchdog_unconfirmed_alerts_back_off_and_cap_per_episode(monkeypa
     await watchdog._sweep()
     assert notify.await_count == 4
     assert watchdog.status()["scheduler_alert"]["stale_alert_undelivered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduler_health_exception_does_not_skip_session_sweep(monkeypatch):
+    session = object()
+    watchdog = SessionWatchdog(
+        streaming_sessions_fn=lambda: {"worker": {"main": session}},
+        scheduler_health_fn=lambda: (_ for _ in ()).throw(OSError(5, "unreadable")),
+    )
+    snapshot = SimpleNamespace(agent_name="worker", label="main", connected=False)
+    monkeypatch.setattr(watchdog, "_take_snapshot", lambda *args: snapshot)
+    monkeypatch.setattr(watchdog, "_reconcile_tmux_liveness", AsyncMock(return_value=False))
+    evaluate = AsyncMock()
+    monkeypatch.setattr(watchdog, "_evaluate", evaluate)
+    with monkeypatch.context() as patch:
+        patch.setattr(module.sys, "stderr", FailingWriter(last=100))
+        await watchdog._sweep()
+    evaluate.assert_awaited_once()
+    assert watchdog.scheduler_check_failures == 1
+    assert watchdog.status()["scheduler_alert"]["check_failures"] == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduler_hung_notify_is_bounded_and_session_sweep_continues(monkeypatch):
+    cancelled = asyncio.Event()
+    evaluated = asyncio.Event()
+
+    async def notify(message):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    health = {"enabled": True, "running": False, "last_tick_age_s": 601,
+              "tick_interval_s": 30, "loop_restarts": 2}
+    watchdog = SessionWatchdog(
+        streaming_sessions_fn=lambda: {"worker": {"main": object()}},
+        scheduler_health_fn=lambda: health,
+        scheduler_notify_fn=notify,
+        scheduler_notify_timeout_s=0.01,
+    )
+    snapshot = SimpleNamespace(agent_name="worker", label="main", connected=False)
+    monkeypatch.setattr(watchdog, "_take_snapshot", lambda *args: snapshot)
+    monkeypatch.setattr(watchdog, "_reconcile_tmux_liveness", AsyncMock(return_value=False))
+
+    async def evaluate(*args):
+        evaluated.set()
+
+    monkeypatch.setattr(watchdog, "_evaluate", evaluate)
+    await asyncio.wait_for(watchdog._sweep(), 0.3)
+    assert evaluated.is_set()
+    assert cancelled.is_set()
+    assert watchdog.status()["scheduler_alert"]["notification_attempts"] == 1
+    assert watchdog.status()["scheduler_alert"]["notification_latched"] is False
+
+
+@pytest.mark.asyncio
+async def test_errored_ticks_degrade_alert_and_recover(registry, monkeypatch):
+    scheduler = AgentScheduler(registry, tick_interval=30)
+    clock = [100.0]
+    monkeypatch.setattr(module, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], time=lambda: 1_800_000_000 + clock[0],
+    ))
+    advance = asyncio.Queue()
+    completed_sleep = asyncio.Event()
+
+    async def sleep(delay):
+        completed_sleep.set()
+        await advance.get()
+        clock[0] += delay
+
+    monkeypatch.setattr(module, "asyncio", SimpleNamespace(**{
+        **vars(asyncio), "sleep": sleep,
+    }))
+    fail = [False]
+
+    async def tick():
+        if fail[0]:
+            raise OSError(5, "unreadable store")
+
+    scheduler._tick = tick
+    notify = AsyncMock(return_value=True)
+    watchdog = SessionWatchdog(
+        streaming_sessions_fn=lambda: {}, scheduler_health_fn=scheduler.health_snapshot,
+        scheduler_notify_fn=notify,
+    )
+
+    async def next_tick():
+        completed_sleep.clear()
+        advance.put_nowait(None)
+        await asyncio.wait_for(completed_sleep.wait(), 0.3)
+
+    try:
+        await scheduler.start()
+        await asyncio.wait_for(completed_sleep.wait(), 0.3)
+        clean_completed = scheduler.last_tick_completed_at
+        fail[0] = True
+        for errors in range(1, 11):
+            await next_tick()
+            health = scheduler.health_snapshot()
+            assert health["consecutive_tick_errors"] == errors
+            assert scheduler.last_tick_completed_at == clean_completed
+            if errors >= 3:
+                assert health["status"] == "degraded"
+            await watchdog._sweep()
+            if errors < 10:
+                notify.assert_not_awaited()
+        notify.assert_awaited_once_with("scheduler ticks failing for 5 min; restarts=0")
+        await watchdog._sweep()
+        notify.assert_awaited_once()
+        assert scheduler.loop_restarts == 0
+        fail[0] = False
+        await next_tick()
+        assert scheduler.health_snapshot()["consecutive_tick_errors"] == 0
+        assert scheduler.health_snapshot()["status"] == "ok"
+        await watchdog._sweep()
+        fail[0] = True
+        for _ in range(10):
+            await next_tick()
+        await watchdog._sweep()
+        assert notify.await_count == 2
+    finally:
+        await cleanup(scheduler)
