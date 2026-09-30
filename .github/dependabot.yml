@@ -9,7 +9,7 @@ updates:
       time: "08:00"
       timezone: America/Los_Angeles
     open-pull-requests-limit: 5
-    target-branch: beta
+    target-branch: main
     labels:
       - dependencies
       - python
@@ -26,7 +26,7 @@ updates:
       time: "08:00"
       timezone: America/Los_Angeles
     open-pull-requests-limit: 5
-    target-branch: beta
+    target-branch: main
     labels:
       - dependencies
       - javascript
@@ -43,7 +43,7 @@ updates:
       time: "08:00"
       timezone: America/Los_Angeles
     open-pull-requests-limit: 3
-    target-branch: beta
+    target-branch: main
     labels:
       - dependencies
       - github-actions
