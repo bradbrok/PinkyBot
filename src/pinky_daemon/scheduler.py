@@ -616,7 +616,8 @@ class AgentScheduler:
         self.last_tick_completed_monotonic: float | None = None
         self._started_monotonic: float | None = None
         self._last_cron_evaluated_at = time.time()
-        self._last_tick_phase = "none"
+        self._prev_tick_slowest_phase = "none"
+        self._prev_tick_slowest_s = 0.0
         self._last_clock_slot: dict[str, int] = {}  # agent_name -> last fired clock slot (minutes since midnight)
         self._clock_wake_attempts: dict[str, tuple[int, int]] = {}
         self._last_dream_check: dict[str, tuple] = {}  # agent_name -> (date_str, cron-minute) dedup key
@@ -797,7 +798,8 @@ class AgentScheduler:
                     if gap > 3 * self._tick_interval:
                         _log(
                             f"scheduler: TICK_GAP gap_s={gap:g} "
-                            f"last_phase={self._last_tick_phase}"
+                            f"prev_slowest_phase={self._prev_tick_slowest_phase} "
+                            f"prev_slowest_s={self._prev_tick_slowest_s:g}"
                         )
                 await self._tick()
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
@@ -833,8 +835,9 @@ class AgentScheduler:
             "_check_auto_sleep", "_check_idle_sessions", "_cleanup_expired_messages",
             "_check_dreams", "_check_librarian", "_check_url_watchers",
         )
+        self._prev_tick_slowest_phase = "none"
+        self._prev_tick_slowest_s = 0.0
         for name in phases:
-            self._last_tick_phase = name
             started = time.monotonic()
             try:
                 phase = getattr(self, name)
@@ -843,6 +846,9 @@ class AgentScheduler:
                     await result
             finally:
                 elapsed = time.monotonic() - started
+                if elapsed > self._prev_tick_slowest_s:
+                    self._prev_tick_slowest_phase = name
+                    self._prev_tick_slowest_s = elapsed
                 if elapsed > _SLOW_TICK_PHASE_SECONDS:
                     _log(f"scheduler: SLOW_TICK_PHASE phase={name} elapsed_s={elapsed:g}")
 

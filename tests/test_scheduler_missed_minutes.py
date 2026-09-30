@@ -258,6 +258,8 @@ async def test_slow_phase_is_named_and_next_tick_reports_gap(env, monkeypatch, c
     ), "tick gap did not identify the previous tick's slowest phase"
     assert scheduler.last_tick_started_monotonic == 155
     assert scheduler.consecutive_tick_errors == 0
+    assert scheduler._prev_tick_slowest_s == 0, "quiet tick retained an older slow phase duration"
+    assert scheduler._prev_tick_slowest_phase == "none"
 
 
 async def test_gap_uses_existing_monotonic_start_even_when_wall_clock_rewinds(env, monkeypatch, capsys):
@@ -344,7 +346,7 @@ async def test_phase_timing_threshold_and_exception_propagation(env, monkeypatch
         await scheduler._tick()
     assert ("SLOW_TICK_PHASE phase=_check_heartbeats" in capsys.readouterr().err) is logged
     assert scheduler._prev_tick_slowest_phase == "_check_heartbeats"
-    assert scheduler._prev_tick_slowest_s == duration
+    assert scheduler._prev_tick_slowest_s == pytest.approx(duration)
 
 
 async def test_trace_upgrade_preserves_existing_rows_and_adds_late_fields(env):
