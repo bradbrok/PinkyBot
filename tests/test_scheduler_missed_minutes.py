@@ -165,6 +165,38 @@ async def test_fall_back_coalesces_both_local_occurrences(env):
     assert row["scheduled_minute"] == "2026-11-01T01:30:00-08:00", "latest fold instant was not selected"
 
 
+async def test_queued_catchup_merges_metadata_with_registry_fire_id(env):
+    schedule = add(env, "30 4 * * *", "queued")
+    scheduler = env.scheduler()
+    env.clock.set("2026-09-30T05:01:00+00:00")
+    await check(scheduler, env.clock)
+    rows = trace_rows(env)
+    assert len(rows) == 1, "queued catch-up split one fire into multiple trace rows"
+    row = rows[0]
+    with sqlite3.connect(env.registry._db_path) as db:
+        ledger = db.execute(
+            "SELECT id FROM pending_schedule_wakes WHERE schedule_id=? AND fired_at=?",
+            (schedule.id, env.clock.wall),
+        ).fetchone()
+    assert ledger is not None, "queued catch-up has no registry fire identity"
+    assert row["fire_id"] == ledger[0], "late metadata did not merge with registry fire_id"
+    assert row["scheduled_minute"] == "2026-09-30T04:30:00+00:00"
+    assert row["late_fire"] == 1 and row["lateness_s"] == 1860
+
+
+async def test_catchup_claim_loser_creates_no_trace_row(env, monkeypatch):
+    schedule = add(env, "30 4 * * *", "lost")
+    scheduler = env.scheduler()
+    snapshots = env.registry.get_all_schedules(enabled_only=True)
+    monkeypatch.setattr(env.registry, "get_all_schedules", lambda **kw: copy.deepcopy(snapshots))
+    env.clock.set("2026-09-30T05:01:00+00:00")
+    # Make the evaluator's snapshot stale without creating a winning trace row.
+    env.registry.update_schedule_last_run(schedule.id, env.clock.wall)
+    await check(scheduler, env.clock)
+    assert trace_rows(env) == [], "claim loser created a trace row"
+    assert env.fired == [], "claim loser delivered a wake"
+
+
 async def test_spring_forward_does_not_invent_nonexistent_local_slot(env):
     env.clock.set("2026-03-08T09:59:30+00:00")
     add(env, "30 2 * * *", "missing", timezone="America/Los_Angeles")
@@ -221,7 +253,9 @@ async def test_slow_phase_is_named_and_next_tick_reports_gap(env, monkeypatch, c
     assert seen == list(PHASES) * 2, "phase order or inline execution changed"
     logs = capsys.readouterr().err
     assert f"SLOW_TICK_PHASE phase={slow_phase} elapsed_s=45" in logs, "slow phase was not named"
-    assert "TICK_GAP gap_s=55 last_phase=_check_url_watchers" in logs, "tick gap was silent"
+    assert (
+        f"TICK_GAP gap_s=55 prev_slowest_phase={slow_phase} prev_slowest_s=45" in logs
+    ), "tick gap did not identify the previous tick's slowest phase"
     assert scheduler.last_tick_started_monotonic == 155
     assert scheduler.consecutive_tick_errors == 0
 
@@ -239,7 +273,9 @@ async def test_gap_uses_existing_monotonic_start_even_when_wall_clock_rewinds(en
     monkeypatch.setattr(module, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": AsyncMock()}))
     scheduler._running = True
     await scheduler._loop()
-    assert "TICK_GAP gap_s=100 last_phase=" in capsys.readouterr().err, "existing monotonic progress was not used"
+    assert (
+        "TICK_GAP gap_s=100 prev_slowest_phase=none prev_slowest_s=0" in capsys.readouterr().err
+    ), "existing monotonic progress was not used"
 
 
 async def test_current_minute_startup_and_next_minute_keep_existing_behavior(env, capsys):
@@ -307,7 +343,8 @@ async def test_phase_timing_threshold_and_exception_propagation(env, monkeypatch
     with pytest.raises(RuntimeError, match="phase failed"):
         await scheduler._tick()
     assert ("SLOW_TICK_PHASE phase=_check_heartbeats" in capsys.readouterr().err) is logged
-    assert scheduler._last_tick_phase == "_check_heartbeats"
+    assert scheduler._prev_tick_slowest_phase == "_check_heartbeats"
+    assert scheduler._prev_tick_slowest_s == duration
 
 
 async def test_trace_upgrade_preserves_existing_rows_and_adds_late_fields(env):
