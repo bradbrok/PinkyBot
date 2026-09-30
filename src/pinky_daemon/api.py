@@ -2082,6 +2082,21 @@ def create_api(
             raise HTTPException(404, f"Message context '{message_id}' not found for {agent_name}")
         return ctx
 
+    def _resolve_media_target(
+        agent_name: str, platform: str, chat_id: str, message_id: str,
+    ) -> tuple[str, str, str]:
+        """Resolve a media reply and reject conflicting destination arguments."""
+        if not message_id:
+            return platform, chat_id, ""
+        ctx = _resolve_message_context(agent_name, message_id)
+        if chat_id and chat_id != ctx.chat_id:
+            raise HTTPException(
+                400,
+                f"chat_id '{chat_id}' does not match resolved chat_id '{ctx.chat_id}' "
+                f"for message_id '{message_id}'",
+            )
+        return ctx.platform, ctx.chat_id, ctx.message_id
+
     def _buzz_reply_metadata(ctx) -> dict | None:
         """Copy only verified public routing fields from durable context."""
         if ctx.platform != "buzz" or not isinstance(ctx.metadata, dict):
@@ -10848,12 +10863,9 @@ npm run build</pre>
         # (json-gate-strict-type-check / bool-is-int-hazard).
         has_spoiler = req.get("has_spoiler") is True
         show_caption_above_media = req.get("show_caption_above_media") is True
-        reply_to = ""
-        if source_message_id and not chat_id:
-            ctx = _resolve_message_context(agent_name, source_message_id)
-            platform = ctx.platform
-            chat_id = ctx.chat_id
-            reply_to = ctx.message_id
+        platform, chat_id, reply_to = _resolve_media_target(
+            agent_name, platform, chat_id, source_message_id,
+        )
         if not agent_name or not chat_id or not file_path:
             raise HTTPException(400, "agent_name, chat_id, and file_path are required")
 
@@ -10987,13 +10999,9 @@ npm run build</pre>
         chat_id = req.get("chat_id", "")
         query = req.get("query", "").strip()
         caption = req.get("caption", "")
-        reply_to = ""
-
-        if source_message_id and not chat_id:
-            ctx = _resolve_message_context(agent_name_req, source_message_id)
-            platform = ctx.platform
-            chat_id = ctx.chat_id
-            reply_to = ctx.message_id
+        platform, chat_id, reply_to = _resolve_media_target(
+            agent_name_req, platform, chat_id, source_message_id,
+        )
 
         if not agent_name_req or not chat_id or not query:
             raise HTTPException(400, "agent_name, chat_id, and query are required")
@@ -11151,13 +11159,9 @@ npm run build</pre>
         provider = req.get("provider", "openai")
         voice = req.get("voice", "")
         model = req.get("model", "")
-        reply_to = ""
-
-        if source_message_id and not chat_id:
-            ctx = _resolve_message_context(agent_name_req, source_message_id)
-            platform = ctx.platform
-            chat_id = ctx.chat_id
-            reply_to = ctx.message_id
+        platform, chat_id, reply_to = _resolve_media_target(
+            agent_name_req, platform, chat_id, source_message_id,
+        )
 
         if not agent_name_req or not chat_id or not text:
             raise HTTPException(400, "agent_name, chat_id, and text are required")

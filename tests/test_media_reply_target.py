@@ -37,9 +37,11 @@ def media(tmp_path, monkeypatch):
     def remote(request, **kwargs):
         url = request if isinstance(request, str) else request.full_url
         if url.startswith("https://api.giphy.com/v1/gifs/search?"):
-            return io.BytesIO(json.dumps({
-                "data": [{"images": {"original": {"url": "https://fixture.test/media.gif"}}}]
-            }).encode())
+            return io.BytesIO(
+                json.dumps(
+                    {"data": [{"images": {"original": {"url": "https://fixture.test/media.gif"}}}]}
+                ).encode()
+            )
         assert url in ("https://fixture.test/media.gif", "https://api.openai.com/v1/audio/speech")
         return io.BytesIO(b"fixture-media")
 
@@ -50,22 +52,36 @@ def media(tmp_path, monkeypatch):
     with TestClient(app) as client:
         app.state.agents.register("sender", working_dir=str(tmp_path))
         yield SimpleNamespace(
-            app=app, client=client, adapter=adapter, select_adapter=select_adapter,
-            network=network, file=file,
+            app=app,
+            client=client,
+            adapter=adapter,
+            select_adapter=select_adapter,
+            network=network,
+            file=file,
         )
 
 
 def remember(media, *, platform="telegram", chat=CHAT, message=MESSAGE):
-    media.app.state.broker.remember_message_context(BrokerMessage(
-        platform=platform, chat_id=chat, message_id=message, agent_name="sender",
-        sender_name="fixture", sender_id="fixture-user", content="source message",
-    ))
+    media.app.state.broker.remember_message_context(
+        BrokerMessage(
+            platform=platform,
+            chat_id=chat,
+            message_id=message,
+            agent_name="sender",
+            sender_name="fixture",
+            sender_id="fixture-user",
+            content="source message",
+        )
+    )
 
 
 def payload(media, kind):
     return {
-        "agent_name": "sender", "platform": "telegram", "file_path": str(media.file),
-        "query": "fixture", "text": "fixture audio",
+        "agent_name": "sender",
+        "platform": "telegram",
+        "file_path": str(media.file),
+        "query": "fixture",
+        "text": "fixture audio",
     }
 
 
@@ -129,18 +145,25 @@ def test_matching_chat_and_message_reach_slack_file_upload_thread(media, monkeyp
     adapter = SlackAdapter("xoxb-fixture-token")
     media.select_adapter.return_value = adapter
     upload_url = "https://files.slack.com/upload/fixture"
-    post = Mock(side_effect=[
-        SimpleNamespace(json=lambda: {"ok": True, "upload_url": upload_url, "file_id": "F123"}),
-        SimpleNamespace(json=lambda: {"ok": True, "files": [{"id": "F123"}]}),
-    ])
+    post = Mock(
+        side_effect=[
+            SimpleNamespace(json=lambda: {"ok": True, "upload_url": upload_url, "file_id": "F123"}),
+            SimpleNamespace(json=lambda: {"ok": True, "files": [{"id": "F123"}]}),
+        ]
+    )
     monkeypatch.setattr(adapter._client, "post", post)
     upload = Mock(return_value=SimpleNamespace(status_code=200))
     monkeypatch.setattr("pinky_outreach.slack.httpx.post", upload)
     try:
-        response = media.client.post("/broker/send-document", json={
-            **payload(media, "document"), "chat_id": "C123", "message_id": thread_ts,
-            "platform": "slack",
-        })
+        response = media.client.post(
+            "/broker/send-document",
+            json={
+                **payload(media, "document"),
+                "chat_id": "C123",
+                "message_id": thread_ts,
+                "platform": "slack",
+            },
+        )
 
         assert response.status_code == 200, response.text
         upload.assert_called_once()
