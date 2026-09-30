@@ -213,6 +213,7 @@ from pinky_daemon.poller_status import PollerStatus
 from pinky_daemon.presentation_store import PresentationStore
 from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.scheduler import AgentScheduler, read_rate_limit_status
+from pinky_daemon.scheduler import _log as _scheduler_log
 from pinky_daemon.session_store import SessionEventStore, SessionStore
 from pinky_daemon.session_watchdog import (
     MCP_ATTACH_FAILURE_PROTOCOL,
@@ -303,7 +304,7 @@ _TOOL_POLICY_LAST_EXPIRE = float("-inf")
 
 
 def _log(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
+    _scheduler_log(msg)
 
 
 _STATUS_HOOK_RECEIPT_LOG_INTERVAL_SEC = 60.0
@@ -7282,8 +7283,9 @@ npm run build</pre>
 
     @app.get("/system/health")
     async def system_health():
-        """Authenticated access-log availability and counted receipt gaps."""
+        """Authenticated scheduler liveness, access-log and storage health."""
         return {
+            "scheduler": app.state.scheduler.health_snapshot(),
             "access_log": app.state.access_log.status(),
             "sqlite_locks": getattr(app.state, "sqlite_lock_health", {"healthy": None}),
         }
@@ -13593,8 +13595,17 @@ npm run build</pre>
             )
             raise
 
+    async def _scheduler_stale_notify(message: str) -> bool:
+        # Direct owner delivery remains available when scheduler tasks are dead.
+        enabled = agents.list(enabled_only=True)
+        if not enabled:
+            return False
+        return await _notify_owner_alert(enabled[0].name, message)
+
     watchdog = SessionWatchdog(
         streaming_sessions_fn=lambda: broker._streaming,
+        scheduler_health_fn=scheduler.health_snapshot,
+        scheduler_notify_fn=_scheduler_stale_notify,
         recover_fn=_watchdog_recover,
         alert_fn=_watchdog_alert,
         agent_config_fn=_get_watchdog_config,

@@ -396,6 +396,8 @@ class SessionWatchdog:
             [str, str, Any],
             Coroutine[Any, Any, FrozenLoginPane],
         ] | None = None,
+        scheduler_health_fn: Callable[[], dict] | None = None,
+        scheduler_notify_fn: Callable[[str], Coroutine[Any, Any, bool]] | None = None,
         check_interval: int = DEFAULT_CHECK_INTERVAL,
     ) -> None:
         """
@@ -431,9 +433,19 @@ class SessionWatchdog:
                 Renames one positively walled tmux session before recapturing
                 its URL. It is called once per fleet incident and always before
                 the first owner notification.
+            scheduler_health_fn:
+                Scheduler progress snapshot, sampled independently of its loop.
+            scheduler_notify_fn:
+                Direct owner notification; True confirms delivery for this episode.
             check_interval:
                 Seconds between sweeps.
         """
+        self._scheduler_health_fn = scheduler_health_fn
+        self._scheduler_notify_fn = scheduler_notify_fn
+        self._scheduler_stale_notified = False
+        self._scheduler_notify_attempts = 0
+        self._scheduler_notify_after = 0.0
+        self.stale_alert_undelivered = 0
         self._streaming_fn = streaming_sessions_fn
         self._recover_fn = recover_fn
         self._alert_fn = alert_fn
@@ -498,8 +510,45 @@ class SessionWatchdog:
                 _warn("watchdog sweep error: %s", exc)
                 await asyncio.sleep(self._interval)
 
+    async def _check_scheduler_liveness(self) -> None:
+        """Notify independently of scheduler tasks, once per confirmed episode."""
+        if self._scheduler_health_fn is None:
+            return
+        health = self._scheduler_health_fn()
+        age = health["last_tick_age_s"]
+        if not health["enabled"] or age is None or age <= 4 * health["tick_interval_s"]:
+            self._scheduler_stale_notified = False
+            self._scheduler_notify_attempts = 0
+            self._scheduler_notify_after = 0.0
+            return
+        if age <= max(300, 10 * health["tick_interval_s"]):
+            return
+        if self._scheduler_stale_notified or self._scheduler_notify_fn is None:
+            return
+        if self._scheduler_notify_attempts >= 3 or time.monotonic() < self._scheduler_notify_after:
+            return
+        self._scheduler_notify_attempts += 1
+        message = (
+            f"scheduler has not ticked for {int(age // 60)} min; "
+            f"restarts={health['loop_restarts']}"
+        )
+        try:
+            delivered = await self._scheduler_notify_fn(message)
+        except Exception:
+            # Delivery may have succeeded before acknowledgement failed.
+            delivered = False
+        if delivered is True:
+            self._scheduler_stale_notified = True
+        elif self._scheduler_notify_attempts >= 3:
+            self.stale_alert_undelivered += 1
+        else:
+            self._scheduler_notify_after = time.monotonic() + (60, 300)[
+                self._scheduler_notify_attempts - 1
+            ]
+
     async def _sweep(self) -> None:
         """Sample all streaming sessions and check for stuck ones."""
+        await self._check_scheduler_liveness()
         streaming = self._streaming_fn()
         now = time.time()
         seen_keys: set[tuple[str, str]] = set()
@@ -1644,6 +1693,11 @@ class SessionWatchdog:
         return {
             "running": self._running,
             "check_interval": self._interval,
+            "scheduler_alert": {
+                "notification_attempts": self._scheduler_notify_attempts,
+                "notification_latched": self._scheduler_stale_notified or self._scheduler_notify_attempts >= 3,
+                "stale_alert_undelivered": self.stale_alert_undelivered,
+            },
             "agents": sessions,  # kept as "agents" for API compat
             "tmux_liveness": tmux_liveness,
             "login_walls": login_walls,
