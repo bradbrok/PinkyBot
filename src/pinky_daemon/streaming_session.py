@@ -516,7 +516,14 @@ class StreamingSession(TransportReplacementMixin):
             options.max_turns = self._config.max_turns
 
         if self._config.system_prompt:
-            options.system_prompt = self._config.system_prompt
+            # snapshot=False: Claude Code >= 2.1.265 otherwise records the prompt
+            # on the first request and reuses it after resume, so soul, directive
+            # and skill changes would not apply until the next compaction.
+            options.system_prompt = {
+                "type": "custom",
+                "prompt": self._config.system_prompt,
+                "snapshot": False,
+            }
 
         if self._config.subagents:
             options.agents = self._config.subagents

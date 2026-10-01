@@ -58,7 +58,8 @@ class RecoveryOperation:
 def sdk_rejection(error: BaseException, requested_id: str, generation: int) -> ResumeEvidence | None:
     from claude_agent_sdk._errors import ProcessError
 
-    # Pinned SDK 0.2.138 / bundled CLI: observed during initialize, without a query.
+    # Pinned SDK 0.2.163 / bundled CLI 2.1.286: observed during initialize, without a query.
+    # 0.2.163 raises ResultError (a ProcessError subclass) with this same rendering.
     expected = ("Claude Code returned an error result: No conversation found with session ID: "
                 f"{requested_id} (exit code: 1)")
     if (is_uuid(requested_id) and isinstance(error, ProcessError)
@@ -90,7 +91,7 @@ def sdk_contract() -> tuple[str, bool]:
     except PackageNotFoundError:
         installed = "unknown"
     display = installed if len(installed) <= 64 and re.fullmatch(r"\d+\.\d+\.\d+(?:[a-z0-9.+-]{0,20})?", installed) else "unknown"
-    compatible = installed == "0.2.138" and str(ProcessError("canary", exit_code=1)) == "canary (exit code: 1)"
+    compatible = installed == "0.2.163" and str(ProcessError("canary", exit_code=1)) == "canary (exit code: 1)"
     return display, compatible
 
 
