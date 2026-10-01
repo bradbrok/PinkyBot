@@ -304,8 +304,9 @@ async def test_sdk_verified_missing_target_one_owner_and_one_fresh_attempt(
 ):
     from claude_agent_sdk._errors import ProcessError
 
-    # SDK 0.2.138 Query._read_messages propagates the CLI error result through
-    # a pending initialize. Verified offline with its bundled CLI: this exact
+    # SDK 0.2.163 Query._read_messages propagates the CLI error result through
+    # a pending initialize (as ResultError, a ProcessError subclass with the same
+    # rendering). Verified offline with its bundled CLI: this exact
     # requested-UUID message rejects connect before any user query is sent.
     rejection = ProcessError(
         f"Claude Code returned an error result: No conversation found with session ID: {MISSING_THREAD}",

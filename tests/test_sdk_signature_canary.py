@@ -5,7 +5,7 @@ import json
 from unittest.mock import MagicMock
 
 import pytest
-from claude_agent_sdk._errors import ProcessError
+from claude_agent_sdk._errors import ProcessError, ResultError
 
 from pinky_daemon.resume_recovery import sdk_rejection
 from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
@@ -24,7 +24,7 @@ def rejection(requested=REQUESTED, stderr=None):
 
 
 def test_installed_process_error_rendering_contract():
-    assert importlib.metadata.version("claude-agent-sdk") == "0.2.138", (
+    assert importlib.metadata.version("claude-agent-sdk") == "0.2.163", (
         "SDK changed: re-characterize the initialize rejection before updating this canary"
     )
     plain = rejection()
@@ -33,14 +33,29 @@ def test_installed_process_error_rendering_contract():
     assert str(decorated) == str(plain) + "\nError output: synthetic-diagnostic"
     assert sdk_rejection(decorated, REQUESTED, 0) is None
     assert sdk_rejection(rejection(OTHER), REQUESTED, 0) is None
+    # Shape the installed SDK raises for a missing session, observed with its
+    # bundled CLI: the result text rides on ResultError with stderr dropped.
+    observed = ResultError(
+        f"Claude Code returned an error result: No conversation found with session ID: {REQUESTED}",
+        data={
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "errors": [f"No conversation found with session ID: {REQUESTED}"],
+            "session_id": REQUESTED,
+        },
+        exit_code=1,
+    )
+    assert str(observed) == str(plain)
+    assert sdk_rejection(observed, REQUESTED, 0) is not None
 
 
 @pytest.mark.parametrize(
     "case,version,reason",
     [
         ("version", "0.2.999", "unsupported_sdk_version"),
-        ("stderr", "0.2.138", "stderr_shape_changed"),
-        ("unknown", "0.2.138", "unclassified_initialize"),
+        ("stderr", "0.2.163", "stderr_shape_changed"),
+        ("unknown", "0.2.163", "unclassified_initialize"),
     ],
 )
 async def test_signature_drift_is_visible_once_without_fresh_retry(
