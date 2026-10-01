@@ -212,7 +212,9 @@ class SDKRunner:
         # System prompt
         sys_prompt = system_prompt or self._config.system_prompt
         if sys_prompt:
-            options.system_prompt = sys_prompt
+            # snapshot=False: rebuild the prompt on every request, including on
+            # resume (see streaming_session for why).
+            options.system_prompt = {"type": "custom", "prompt": sys_prompt, "snapshot": False}
 
         _log(f"sdk-runner: query len={len(prompt)} session={session_id or 'new'}")
 
