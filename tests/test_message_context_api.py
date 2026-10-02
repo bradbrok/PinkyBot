@@ -345,6 +345,8 @@ def test_text_path_requires_self_caller_before_lookup(tmp_path, monkeypatch, cal
 @pytest.mark.parametrize("kind", ["missing", "outbound", "legacy", "expired", "capped", "cache", "no-store", "failed-put"])
 def test_text_path_all_invisible_rows_share_routing_miss_body(tmp_path, monkeypatch, kind):
     with _gateway(tmp_path, monkeypatch) as client:
+        if kind == "capped":
+            client.app.state.message_context_store.max_per_agent = 1
         expected = _signed(client, _TEXT_BASE).json()
         broker, store = client.app.state.broker, client.app.state.message_context_store
         if kind == "outbound":
@@ -362,7 +364,6 @@ def test_text_path_all_invisible_rows_share_routing_miss_body(tmp_path, monkeypa
                 store._db.execute("UPDATE message_contexts SET stored_at=?", (time.time() - 31 * 86400,))
                 store._db.commit()
             elif kind == "capped":
-                store.max_per_agent = 1
                 _remember_text(client, message_id="new-record")
             elif kind == "cache":
                 store._db.execute("DELETE FROM message_contexts")

@@ -616,7 +616,8 @@ class MessageBroker:
             self._message_contexts.pop(stale_key, None)
             self._message_context_stored_at.pop(stale_key, None)
 
-    def _remember_context(self, context: MessageContext) -> None:
+    def _remember_context(self, context: MessageContext, *, content: str | None = None,
+                          sender_id: str = "") -> None:
         """Cache immediately and persist best-effort for restart survival."""
         stored_at = time.time()
         with self._message_context_lock:
@@ -624,7 +625,8 @@ class MessageBroker:
             if self._message_context_store is None:
                 return
             try:
-                self._message_context_store.put(context.to_dict(), stored_at=stored_at)
+                self._message_context_store.put(context.to_dict(), stored_at=stored_at,
+                                                content=content, sender_id=sender_id)
             except Exception as exc:  # noqa: BLE001 — routing must survive store faults
                 _log(f"message-context persistence failed: {type(exc).__name__}")
 
@@ -653,7 +655,7 @@ class MessageBroker:
             source_was_voice=source_was_voice,
             attachments=list(message.attachments or []),
             metadata=metadata,
-        ))
+        ), content=message.content, sender_id=message.sender_id)
 
     def remember_outbound_message_context(
         self,

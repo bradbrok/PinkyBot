@@ -8667,6 +8667,41 @@ npm run build</pre>
             "is_group": bool(context.is_group),
         }
 
+    @app.get("/agents/{name}/message-context/{platform}/{chat_id}/{message_id}/text")
+    async def get_agent_message_text(
+        name: str, platform: str, chat_id: str, message_id: str, request: Request
+    ):
+        """Read exact stored inbound text using its own signed path."""
+        name = _agent_name_or_400(name)
+        if getattr(request.state, "internal_caller", None) != name:
+            raise HTTPException(403, "verified caller must match the target agent")
+        not_found = {
+            "code": "message_context_not_found",
+            "detail": ("no inbound message context for that identity within the "
+                       f"retention window ({message_context_store.retention_days} days, "
+                       f"{message_context_store.max_per_agent} most recent per agent)"),
+        }
+        if any(ch in segment for segment in (platform, chat_id, message_id) for ch in "?#"):
+            raise HTTPException(404, not_found)
+        found = broker.get_message_context_by_identity(name, platform, chat_id, message_id)
+        if found is None or (found[0].metadata or {}).get("direction") != "inbound":
+            raise HTTPException(404, not_found)
+        context, stored_at = found
+        try:
+            private = message_context_store.get_text(name, message_id, platform=platform,
+                                                     chat_id=chat_id, stored_at=stored_at)
+        except Exception:  # A failed durable read has the same shape as a missing row.
+            private = None
+        if private is None:
+            raise HTTPException(404, not_found)
+        content, status, sender_id = private
+        text = content if status == "ok" else None
+        return {"message_ts": float(context.timestamp), "stored_at": float(stored_at),
+                "is_group": bool(context.is_group), "sender_id": sender_id,
+                "source_was_voice": bool(context.source_was_voice), "text_status": status,
+                "text": text, "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()
+                if text is not None else None}
+
     # Action policy routes compose with the existing signed caller and owner gates.
     def _policy_agent(request: Request, name: str):
         name = _agent_name_or_400(name)
