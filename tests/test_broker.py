@@ -2413,3 +2413,128 @@ class TestEventLoopOffload:
             assert ("barsik", "telegram", "6770805286", "hello in voice") in sent_messages
         finally:
             tmpdir.cleanup()
+
+
+
+def _private_text_broker(tmp_path):
+    from pinky_daemon.message_context_store import MessageContextStore
+
+    registry = AgentRegistry(db_path=str(tmp_path / "registry.db"))
+    registry.register("sample", working_dir=str(tmp_path))
+    store = MessageContextStore(str(tmp_path / "context.db"))
+    return MessageBroker(registry, SessionManager(), message_context_store=store), store
+
+
+def _private_text_message(**kwargs):
+    values = dict(platform="test", chat_id="chat", sender_name="sender", sender_id="sender-1",
+                  content="source text", agent_name="sample", message_id="record")
+    values.update(kwargs)
+    return BrokerMessage(**values)
+
+
+def _private_text_read(store):
+    getter = getattr(store, "get_text", None)
+    assert callable(getter), "dedicated text lookup must be available"
+    return getter("sample", "record", platform="test", chat_id="chat")
+
+
+def test_inbound_text_is_persisted_outside_routing_context_and_cleared_by_outbound(tmp_path):
+    from dataclasses import fields
+
+    from pinky_daemon.broker import MessageContext
+
+    broker, store = _private_text_broker(tmp_path)
+    expected = {"agent_name", "message_id", "platform", "chat_id", "timestamp", "reply_to",
+                "is_group", "source_was_voice", "attachments", "metadata"}
+    try:
+        message = _private_text_message(metadata={"direction": "outbound", "text": "forged",
+                                                 "content": "forged", "sender_id": "forged"})
+        broker.remember_message_context(message)
+        assert _private_text_read(store) == ("source text", "ok", "sender-1")
+        context = broker.get_message_context("sample", "record")
+        assert {f.name for f in fields(MessageContext)} == expected
+        assert set(context.to_dict()) == expected
+        assert "source text" not in repr(context.to_dict())
+        assert "sender-1" not in repr(context.to_dict())
+        assert context.metadata["direction"] == "inbound"
+        broker.remember_outbound_message_context("sample", "record", platform="test", chat_id="chat")
+        assert _private_text_read(store) == (None, "absent", "")
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("original_text", ["caption", ""])
+async def test_text_capture_includes_transcript_but_excludes_rendered_attachment_hints(
+    tmp_path, monkeypatch, original_text,
+):
+    from unittest.mock import AsyncMock
+
+    from pinky_daemon.transport_state import SessionState
+
+    broker, store = _private_text_broker(tmp_path)
+
+    class Session:
+        state = SessionState.CONNECTED
+        send = AsyncMock()
+
+    session = Session()
+    monkeypatch.setattr(broker, "_get_streaming_session", lambda *args: session)
+    monkeypatch.setattr(broker, "_start_typing", AsyncMock())
+    monkeypatch.setattr(broker, "_transcribe_voice", AsyncMock(return_value="spoken text"))
+
+    async def download(*args):
+        args[-1].attachments[-1]["local_path"] = "/synthetic/attachment.png"
+
+    monkeypatch.setattr(broker, "_download_photo_attachments", download)
+    message = _private_text_message(content=original_text, attachments=[{"type": "voice"}, {"type": "photo"}])
+    try:
+        assert await broker._route_streaming("sample", message)
+        expected = (original_text + "\n\n[Voice transcript]: spoken text" if original_text
+                    else "[Voice message]: spoken text")
+        assert _private_text_read(store) == (expected, "ok", "sender-1")
+        assert broker.get_message_context("sample", "record").source_was_voice is True
+        assert "/synthetic/attachment.png" in session.send.call_args.args[0]
+        assert "Attachments:" not in _private_text_read(store)[0]
+    finally:
+        store.close()
+
+
+def test_private_text_and_sender_never_enter_persistence_diagnostics(tmp_path, monkeypatch, caplog, capsys):
+    broker, store = _private_text_broker(tmp_path)
+    text, sender = "payload-canary-4821", "sender-canary-4821"
+    try:
+        broker.remember_message_context(_private_text_message(content=text, sender_id=sender))
+        assert _private_text_read(store) == (text, "ok", sender)
+
+        def fail(*args, **kwargs):
+            raise ValueError(text + sender)
+
+        monkeypatch.setattr(store, "put", fail)
+        broker.remember_message_context(_private_text_message(content=text, sender_id=sender))
+        captured = capsys.readouterr()
+        logs = caplog.text + captured.out + captured.err
+        assert text not in logs and sender not in logs
+    finally:
+        store.close()
+
+
+async def test_missing_identity_and_failed_transcription_do_not_persist_text(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from pinky_daemon.transport_state import SessionState
+
+    broker, store = _private_text_broker(tmp_path)
+
+    class Session:
+        state = SessionState.CONNECTED
+
+    monkeypatch.setattr(broker, "_get_streaming_session", lambda *args: Session())
+    monkeypatch.setattr(broker, "_download_photo_attachments", AsyncMock())
+    monkeypatch.setattr(broker, "_transcribe_voice", AsyncMock(return_value=""))
+    monkeypatch.setattr(broker, "_send_message", AsyncMock())
+    try:
+        broker.remember_message_context(_private_text_message(message_id=""))
+        assert not await broker._route_streaming("sample", _private_text_message(attachments=[{"type": "voice"}]))
+        assert store._db.execute("SELECT count(*) FROM message_contexts").fetchone()[0] == 0
+    finally:
+        store.close()
