@@ -11907,7 +11907,16 @@ class TestWakeSubmissionVerification:
         assert target == ss.agent_name
         assert instruction.startswith("CONTEXT-RELOAD:")
         assert "already oriented" in instruction
-        assert "take no other action" in instruction
+        assert "continue the work you were doing in this same turn" in instruction, (
+            "already-oriented recovery must continue current work in the same turn"
+        )
+        assert "do not reload or restart" in instruction, (
+            "already-oriented recovery must not reload or restart"
+        )
+        assert "take no other action" not in instruction, (
+            "already-oriented recovery must not halt current work"
+        )
+        assert "never replay" in instruction, "recovery must retain the no-replay guard"
         assert "load_my_context" in instruction
         assert turn.prompt not in instruction
         assert await receipt is False
@@ -12124,7 +12133,16 @@ class TestWakeSubmissionVerification:
                 "CONTEXT-RELOAD:"
             )
             assert "already oriented" in pasted[1]
-            assert "take no other action" in pasted[1]
+            assert "continue the work you were doing in this same turn" in pasted[1], (
+                "already-oriented recovery must continue current work in the same turn"
+            )
+            assert "do not reload or restart" in pasted[1], (
+                "already-oriented recovery must not reload or restart"
+            )
+            assert "take no other action" not in pasted[1], (
+                "already-oriented recovery must not halt current work"
+            )
+            assert "never replay" in pasted[1], "recovery must retain the no-replay guard"
             assert "load_my_context" in pasted[1]
             assert any(
                 event.get("rung") == "broker_context_reload_drain"
