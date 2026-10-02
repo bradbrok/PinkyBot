@@ -18,6 +18,7 @@ from pinky_daemon.pricing import (
     compute_turn_cost_usd,
     lookup_rate,
 )
+from tests._gc_quiet import gc_quiet
 
 
 def test_pure_input_output_opus() -> None:
@@ -587,11 +588,12 @@ def test_strip_tier_handles_long_open_bracket_input_within_50ms() -> None:
         raise TimeoutError("strip_tier exceeded 50 ms")
 
     previous_handler = signal.signal(signal.SIGALRM, fail_if_slow)
-    signal.setitimer(signal.ITIMER_REAL, 0.05)
-    started = time.perf_counter()
     try:
-        assert strip_tier(model_id) == model_id
-        elapsed = time.perf_counter() - started
+        with gc_quiet():
+            signal.setitimer(signal.ITIMER_REAL, 0.05)
+            started = time.perf_counter()
+            assert strip_tier(model_id) == model_id
+            elapsed = time.perf_counter() - started
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_handler)
