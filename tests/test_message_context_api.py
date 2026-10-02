@@ -449,3 +449,47 @@ def test_text_route_does_not_log_text_or_sender(tmp_path, monkeypatch, caplog, c
         captured = capsys.readouterr()
         logs = caplog.text + captured.out + captured.err
         assert text not in logs and sender not in logs
+
+
+@pytest.mark.parametrize("sender, expected", [(None, ""), (12345, "12345")])
+def test_inbound_sender_coercion_preserves_routing_row(tmp_path, monkeypatch, sender, expected):
+    with _gateway(tmp_path, monkeypatch) as client:
+        _remember_text(client, sender=sender)
+        store = client.app.state.message_context_store
+        assert store.get("sample", "record", platform="test", chat_id="chat") is not None
+        assert _signed(client, _TEXT_BASE).status_code == 200
+        response = _signed(client, _TEXT_BASE + "/text")
+        assert response.status_code == 200
+        assert response.json()["sender_id"] == expected
+        assert isinstance(response.json()["sender_id"], str)
+
+
+def test_text_read_exception_uses_identical_not_found_body(tmp_path, monkeypatch):
+    with _gateway(tmp_path, monkeypatch) as client:
+        monkeypatch.setattr(client._transport, "raise_server_exceptions", False)
+        expected = _signed(client, _TEXT_BASE)
+        assert expected.status_code == 404
+        _remember_text(client)
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("synthetic read failure")
+
+        monkeypatch.setattr(client.app.state.message_context_store, "get_text", fail)
+        response = _signed(client, _TEXT_BASE + "/text")
+        assert response.status_code == 404
+        assert response.json() == expected.json()
+
+
+@pytest.mark.parametrize("status", ["too_long", "absent"])
+def test_non_ok_raw_text_is_never_returned_or_hashed(tmp_path, monkeypatch, status):
+    with _gateway(tmp_path, monkeypatch) as client:
+        _remember_text(client)
+        store = client.app.state.message_context_store
+        store._db.execute("UPDATE message_contexts SET content=?, content_status=?",
+                          ("raw text must remain hidden", status))
+        store._db.commit()
+        response = _signed(client, _TEXT_BASE + "/text")
+        assert response.status_code == 200
+        assert response.json()["text_status"] == status
+        assert response.json()["text"] is None
+        assert response.json()["text_sha256"] is None

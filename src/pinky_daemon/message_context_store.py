@@ -220,8 +220,10 @@ class MessageContextStore:
         content_status = "absent"
         if not isinstance(metadata, dict) or metadata.get("direction") != "inbound":
             content, sender_id = None, ""
-        elif isinstance(content, str):
-            content_status = "ok" if len(content.encode("utf-8")) <= 16384 else "too_long"
+        else:
+            sender_id = "" if sender_id is None else str(sender_id)
+            if isinstance(content, str):
+                content_status = "ok" if len(content.encode("utf-8")) <= 16384 else "too_long"
         content = content if content_status == "ok" else None
         now = time.time() if stored_at is None else float(stored_at)
         with self._lock:
