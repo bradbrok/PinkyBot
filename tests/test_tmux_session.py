@@ -46,6 +46,7 @@ from pinky_daemon.tmux_session import (
 )
 from pinky_daemon.tmux_transcript import TmuxTranscriptTailer, TurnResponse
 from pinky_daemon.transport_state import SessionState, TransitionResult, Trigger
+from tests._gc_quiet import gc_quiet
 
 _REAL_ASYNCIO_SLEEP = asyncio.sleep
 
@@ -9035,9 +9036,10 @@ class TestWakePromptReadinessGate:
             internal=True, reason="wake_new_session",
         )
 
-        start = _time.monotonic()
-        await ss._deliver_turn(wake_turn)
-        elapsed_ms = (_time.monotonic() - start) * 1000
+        with gc_quiet():
+            start = _time.monotonic()
+            await ss._deliver_turn(wake_turn)
+            elapsed_ms = (_time.monotonic() - start) * 1000
 
         assert elapsed_ms < 100, (
             f"already-open gate must short-circuit; took {elapsed_ms:.1f}ms"
@@ -9060,11 +9062,12 @@ class TestWakePromptReadinessGate:
             internal=True, reason="idle_sleep_presave",
         )
 
-        start = _time.monotonic()
-        await asyncio.wait_for(
-            ss._deliver_turn(presave_turn), timeout=2.0,
-        )
-        elapsed_ms = (_time.monotonic() - start) * 1000
+        with gc_quiet():
+            start = _time.monotonic()
+            await asyncio.wait_for(
+                ss._deliver_turn(presave_turn), timeout=2.0,
+            )
+            elapsed_ms = (_time.monotonic() - start) * 1000
 
         assert elapsed_ms < 100, (
             f"non-wake reason must skip the gate; took {elapsed_ms:.1f}ms"
@@ -9089,11 +9092,12 @@ class TestWakePromptReadinessGate:
             internal=False, reason="",
         )
 
-        start = _time.monotonic()
-        await asyncio.wait_for(
-            ss._deliver_turn(external_turn), timeout=2.0,
-        )
-        elapsed_ms = (_time.monotonic() - start) * 1000
+        with gc_quiet():
+            start = _time.monotonic()
+            await asyncio.wait_for(
+                ss._deliver_turn(external_turn), timeout=2.0,
+            )
+            elapsed_ms = (_time.monotonic() - start) * 1000
 
         assert elapsed_ms < 100, (
             f"external turn must skip the gate; took {elapsed_ms:.1f}ms"
