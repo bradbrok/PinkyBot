@@ -196,9 +196,14 @@ async def test_trace_read_endpoint_must_not_block_event_loop(tmp_path, endpoint)
             )
             assert lag < 0.1, "diagnostic reads blocked the event loop"
     finally:
-        timer.join()
-        lock.close()
-        registry.close()
+        try:
+            if timer.ident is not None:
+                timer.join()
+        finally:
+            try:
+                lock.close()
+            finally:
+                registry.close()
 
 
 def test_failure_handoff_must_not_temporarily_hide_failure(registry, monkeypatch):
