@@ -4723,7 +4723,7 @@ def create_api(
             except Exception:
                 _log(f"schedule fire trace SDK callback failed ({type(exc).__name__})")
 
-    async def _deliver_streaming(name, prompt, *, label="main", schedule_receipt=None, scheduler=False, busy_deliver_at=None, **kwargs):
+    async def _deliver_streaming(name, prompt, *, label="main", schedule_receipt=None, scheduler=False, busy_deliver_at=None, require_api_ready=False, **kwargs):
         for _ in range(3):
             ss = await _ensure_streaming_session(name, label=label)
             async with _session_scope(name, label):
@@ -4733,6 +4733,8 @@ def create_api(
                     continue
                 if ss is None or ss.state != TransportSessionState.CONNECTED:
                     raise HTTPException(409, "Session is not ready for delivery")
+                if require_api_ready and not broker._listener_allows_route(name, ss):
+                    return ss, False
                 if scheduler:
                     sender = getattr(ss, "send_scheduler_prompt", None)
                     if callable(sender):

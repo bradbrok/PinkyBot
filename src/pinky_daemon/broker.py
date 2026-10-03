@@ -1858,9 +1858,12 @@ class MessageBroker:
                     )
         if compatible:
             try:
+                if not self._listener_allows_route(agent_name, streaming):
+                    return False
                 streaming, accepted = await compatible(
                     agent_name, prompt, label=label, platform=message.platform,
                     chat_id=message.chat_id, message_id=message.message_id, agent_hint=hint,
+                    require_api_ready=True,
                 )
             except Exception:
                 return False
@@ -1869,6 +1872,8 @@ class MessageBroker:
                 _log(f"ERROR broker: streaming send refused for {agent_name}; handoff not delivered")
                 return False
         else:
+            if not self._listener_allows_route(agent_name, streaming):
+                return False
             accepted = await streaming.send(
                 prompt, platform=message.platform, chat_id=message.chat_id,
                 message_id=message.message_id, agent_hint=hint,
