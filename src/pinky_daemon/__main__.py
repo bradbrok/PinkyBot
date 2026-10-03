@@ -135,6 +135,7 @@ def _run_api_with_authority(args) -> None:
     import uvicorn
 
     from pinky_daemon.api import create_api
+    from pinky_daemon.api_readiness import ApiReadiness
     from pinky_daemon.routes.triggers import uvicorn_log_config
 
     # The access log prints raw request paths; /hooks/<token> carries a
@@ -157,10 +158,15 @@ def _run_api_with_authority(args) -> None:
         db_path=args.db_path,
     )
 
+    readiness = getattr(app.state, "api_readiness", None)
+    if not isinstance(readiness, ApiReadiness):
+        message = "daemon API readiness barrier missing; refusing to start"
+        print(f"ERROR {message}", file=sys.stderr)
+        raise RuntimeError(message)
+
     main_server = uvicorn.Server(
         uvicorn.Config(app, host=args.host, port=args.port, log_config=log_config)
     )
-    readiness = app.state.api_readiness
     readiness.attach(main_server)
     original_serve = main_server.serve
 

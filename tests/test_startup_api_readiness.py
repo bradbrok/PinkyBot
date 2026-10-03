@@ -488,6 +488,26 @@ def test_main_serve_completion_or_error_is_terminal_despite_late_started_flag(
     assert "ERROR" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("kind", ("missing", "null"))
+def test_daemon_refuses_to_start_without_a_readiness_barrier(tmp_path, monkeypatch, capsys, kind):
+    import uvicorn
+
+    state = SimpleNamespace()
+    if kind == "null":
+        state.api_readiness = None
+    monkeypatch.setattr(api, "create_api", lambda **kwargs: SimpleNamespace(state=state))
+    server = Mock()
+    monkeypatch.setattr(uvicorn, "Server", server)
+    args = SimpleNamespace(
+        host=None, port=0, working_dir=str(tmp_path), max_sessions=1,
+        db_path=str(tmp_path / "test.db"),
+    )
+    with pytest.raises(RuntimeError, match="daemon API readiness barrier missing"):
+        daemon_main._run_api(args)
+    server.assert_not_called()
+    assert "ERROR daemon API readiness barrier missing; refusing to start" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("mode", MODES)
 def test_refused_boot_wake_preserves_one_shot_restart_manifest(
     boot_run, tmp_path, monkeypatch, mode,

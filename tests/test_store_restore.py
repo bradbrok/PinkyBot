@@ -222,17 +222,22 @@ def test_supported_daemon_entrypoint_holds_authority_lock_before_create_api_and_
         observations.append(phase)
 
     def fake_create_api(**kwargs: Any) -> SimpleNamespace:
+        from pinky_daemon.api_readiness import ApiReadiness
+
         assert kwargs["db_path"] == os.fspath(base)
         assert_lock_held("create_api")
-        return SimpleNamespace(state=SimpleNamespace(ferry_listener=None))
+        return SimpleNamespace(
+            state=SimpleNamespace(ferry_listener=None, api_readiness=ApiReadiness())
+        )
 
-    def fake_uvicorn_run(_app: Any, **_kwargs: Any) -> None:
+    def fake_uvicorn_run(server: Any, **_kwargs: Any) -> None:
         assert_lock_held("uvicorn")
+        assert server.config.app.state.api_readiness.server is server
 
     monkeypatch.delenv("PINKYBOT_FERRY_ENABLED", raising=False)
     monkeypatch.setattr(api_module, "create_api", fake_create_api)
     uvicorn = importlib.import_module("uvicorn")
-    monkeypatch.setattr(uvicorn, "run", fake_uvicorn_run)
+    monkeypatch.setattr(uvicorn.Server, "run", fake_uvicorn_run)
     args = SimpleNamespace(
         host="127.0.0.1",
         port=8888,
