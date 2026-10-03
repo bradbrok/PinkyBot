@@ -2397,7 +2397,7 @@ class AgentRegistry:
             "ON buzz_identities(tos_receipt) WHERE tos_receipt != ''"
         )
 
-        self._migrate_model_catalog_schema()
+        added_write_columns = self._migrate_model_catalog_schema()
         self._migrate_agent_costs_schema()
 
         # Deployment seed for the explicitly verified owner principal in #545.
@@ -2422,7 +2422,7 @@ class AgentRegistry:
         self._db.commit()
 
         # Seed default models
-        self._seed_models()
+        self._seed_models(added_write_columns=added_write_columns)
         self._validate_model_catalog()
 
     def _seed_verified_contacts(self, *, _commit: bool = True) -> None:
@@ -8416,7 +8416,7 @@ except Exception as exc:
         ("openai/gpt-5.6-sol", (1_000_000, 1), (200_000, 0)),
     ]
 
-    def _migrate_model_catalog_schema(self) -> None:
+    def _migrate_model_catalog_schema(self) -> frozenset[str]:
         """Add nullable write-rate columns and fill only known static gaps."""
         from pinky_daemon.pricing import RATE_TABLE
 
@@ -8433,7 +8433,7 @@ except Exception as exc:
                 _log(f"agent_registry: migrated — added column {column_name}")
 
         if not added_columns:
-            return
+            return frozenset()
         rate_keys = {
             "cache_write_5m_price": "cache_write_5m",
             "cache_write_1h_price": "cache_write_1h",
@@ -8445,6 +8445,7 @@ except Exception as exc:
                 tuple(rate[rate_keys[column_name]] for column_name in added_columns)
                 + (model_id,),
             )
+        return frozenset(added_columns)
 
     def _migrate_agent_costs_schema(self) -> None:
         """Rebuild the usage ledger with nullable costs and an error marker."""
@@ -8528,7 +8529,9 @@ except Exception as exc:
                     f"{row['id']}: {column_name}"
                 )
 
-    def _ensure_sonnet_5_catalog(self, now: float) -> int:
+    def _ensure_sonnet_5_catalog(
+        self, now: float, added_write_columns: frozenset[str],
+    ) -> int:
         """Correct known stale Sonnet 5 seeds while preserving custom values."""
         from pinky_daemon.pricing import RATE_TABLE
 
@@ -8539,13 +8542,16 @@ except Exception as exc:
                    cache_write_5m_price=?, cache_write_1h_price=?, updated_at=?
                WHERE id='anthropic/claude-sonnet-5'
                  AND input_price=3.0 AND output_price=15.0 AND cached_input_price=0.3
-                 AND ((cache_write_5m_price=3.75 AND cache_write_1h_price=6.0)
-                      OR (cache_write_5m_price=? AND cache_write_1h_price=?))""",
+                 AND (cache_write_5m_price=3.75
+                      OR (cache_write_5m_price=? AND ?))
+                 AND (cache_write_1h_price=6.0
+                      OR (cache_write_1h_price=? AND ?))""",
             (rate["input"], rate["output"], rate["cache_read"],
              rate["cache_write_5m"], rate["cache_write_1h"], now,
-             rate["cache_write_5m"], rate["cache_write_1h"]),
+             rate["cache_write_5m"], "cache_write_5m_price" in added_write_columns,
+             rate["cache_write_1h"], "cache_write_1h_price" in added_write_columns),
         )
-        # Older schemas acquire the current write pair before seeds are corrected.
+        # Only newly added columns prove a static backfill in this initialization.
         stale_description = (
             "Current Sonnet (2026-06). Best speed+intelligence balance — daily driver. "
             "1M context; adaptive thinking, effort defaults to high. "
@@ -8558,7 +8564,7 @@ except Exception as exc:
         )
         return cur.rowcount
 
-    def _seed_models(self) -> None:
+    def _seed_models(self, *, added_write_columns: frozenset[str] = frozenset()) -> None:
         """Ensure default models exist (idempotent).
 
         Per-row ``INSERT OR IGNORE`` adds any missing model and never
@@ -8588,7 +8594,7 @@ except Exception as exc:
                  rate["cache_write_1h"], thinking, sort, now, now),
             )
             added += cur.rowcount
-        corrected = self._ensure_sonnet_5_catalog(now)
+        corrected = self._ensure_sonnet_5_catalog(now, added_write_columns)
         for mid, (old_in, old_out, old_cached), (new_in, new_out, new_cached) \
                 in self._PRICE_CORRECTIONS:
             cur = self._db.execute(
