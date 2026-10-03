@@ -306,8 +306,9 @@ async def test_expired_monitor_backs_off_but_detects_late_readiness(monkeypatch)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("elapsed", (1.0, 1.5))
+@pytest.mark.parametrize("observer", ("refresh", "monitor", "new-submission"))
 async def test_first_started_observation_at_cap_refuses_old_waiters(
-    monkeypatch, capsys, elapsed,
+    monkeypatch, capsys, elapsed, observer,
 ):
     gate = ApiReadiness()
     server = SimpleNamespace(started=False, should_exit=False)
@@ -316,14 +317,23 @@ async def test_first_started_observation_at_cap_refuses_old_waiters(
     gate.cap_seconds = 1.0
     clock = SimpleNamespace(now=10.0)
     monkeypatch.setattr(api_readiness, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    callback = AsyncMock()
+    gate.after_ready(callback)
     held = asyncio.create_task(gate.wait("held wake"))
     await asyncio.sleep(0)
     clock.now += elapsed
     server.started = True
-    gate._refresh()
+    if observer == "new-submission":
+        assert await gate.wait("first new wake") is True
+    elif observer == "monitor":
+        await gate._monitor()
+    else:
+        gate._refresh()
     assert await held is False, "Late observation released a prompt held beyond the cap"
     assert gate.expired and gate.ready and not gate.closed
     assert await gate.wait("new wake") is True
+    await gate._after_ready_task
+    assert callback.await_count == 1
     output = capsys.readouterr().err
     assert "ERROR" in output and "held wake" in output
     assert "WARNING" in output and "ready after cap" in output
@@ -410,6 +420,44 @@ def test_stop_is_safe_before_a_real_poller_has_started(kind):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("path", ("approval", "ferry"))
+async def test_ready_sdk_send_failure_is_still_a_refused_handoff(tmp_path, monkeypatch, path):
+    registry = AgentRegistry(str(tmp_path / "registry.db"))
+    registry.register("primary", working_dir=str(tmp_path))
+    registry.approve_user("primary", "sample-chat", display_name="sender")
+    registry.queue_pending_message("primary", "web", "sample-chat", "sender", "held message")
+    gate = ApiReadiness()
+    gate.attach(SimpleNamespace(started=True, should_exit=False))
+    session = StreamingSession(StreamingSessionConfig(
+        agent_name="primary", working_dir=str(tmp_path), api_readiness=gate,
+    ))
+    session._state_machine._state = SessionState.CONNECTED
+    session._client = SimpleNamespace(query=AsyncMock(side_effect=RuntimeError("query refused")))
+    monkeypatch.setattr(session, "attempt_reconnect", AsyncMock())
+    broker = MessageBroker(registry, Mock())
+    monkeypatch.setattr(broker, "_get_streaming_session", lambda *args: session)
+    try:
+        if path == "approval":
+            with pytest.raises(RuntimeError, match="handoff unavailable"):
+                await broker.handle_approval("primary", "sample-chat")
+        else:
+            registry.add_peer_fleet_acl("primary", fleet="sample", agent_id="recovery@sample")
+            host = HostPinky(registry=registry, broker=broker, fleet_name="sample")
+            result = await host.deliver(FerryEnvelope(
+                v="0.1", id="sample-envelope", from_="recovery@sample", to="primary@sample",
+                ts=1, body={"kind": "message", "text": "held ferry message"},
+            ))
+            assert result.status == "transient_failure"
+            assert host.stats["delivered"] == 0 and host.stats["messages_routed"] == 0
+        assert len(registry.get_pending_messages("primary", "sample-chat")) == 1
+        assert broker.stats["routed"] == 0
+        session._client.query.assert_awaited_once()
+    finally:
+        await gate.close()
+        registry.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("ready", (False, True))
 async def test_healthy_ready_line_counts_released_waiters_once(monkeypatch, capsys, ready):
     gate = ApiReadiness()
@@ -445,17 +493,25 @@ def test_deferred_startup_jobs_have_an_actual_start_line(boot_run, tmp_path, mon
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", MODES)
-@pytest.mark.parametrize("condition", ("expired", "stopped", "pending", "ready"))
+@pytest.mark.parametrize("rebuild", (False, True))
+@pytest.mark.parametrize("condition", ("expired", "stopped", "pending", "ready", "stops-before-send"))
 @pytest.mark.parametrize("path", ("approval", "ferry"))
 async def test_every_transport_refuses_durable_handoff_before_queueing_unless_ready(
-    boot_run, tmp_path, monkeypatch, mode, condition, path,
+    boot_run, tmp_path, monkeypatch, mode, condition, path, rebuild,
 ):
     registry = boot_run.app.state.agents
-    registry.register("primary", working_dir=str(tmp_path))
+    registry.register(
+        "primary", working_dir=str(tmp_path),
+        runtime="codex_cli" if mode.startswith("codex") else "claude_sdk",
+        transport="tmux" if mode.endswith("tmux") else "sdk",
+    )
     registry.approve_user("primary", "sample-chat", display_name="sender")
     registry.queue_pending_message("primary", "web", "sample-chat", "sender", "durable message")
     gate = boot_run.app.state.api_readiness
-    server = SimpleNamespace(started=condition == "ready", should_exit=condition == "stopped", phase=2)
+    server = SimpleNamespace(
+        started=condition in ("ready", "stops-before-send"),
+        should_exit=condition == "stopped", phase=2,
+    )
     boot_run.server = server
     gate.attach(server)
     gate.started_at = 10.0
@@ -509,8 +565,15 @@ async def test_every_transport_refuses_durable_handoff_before_queueing_unless_re
     send = AsyncMock(wraps=session.send)
     monkeypatch.setattr(session, "send", send)
     broker = boot_run.app.state.broker
+    broker._streaming["primary"] = {"main": session}
+    monkeypatch.setenv("PINKY_SESSION_CLASS_REBUILD", "1" if rebuild else "0")
     monkeypatch.setattr(broker, "_get_streaming_session", lambda *args: session)
     monkeypatch.setattr(broker, "_start_typing", AsyncMock())
+    if condition == "stops-before-send":
+        async def stop_during_preparation(*args):
+            server.should_exit = True
+
+        monkeypatch.setattr(broker, "_download_photo_attachments", stop_during_preparation)
     host = None
     result = None
     timed_out = False
@@ -535,6 +598,9 @@ async def test_every_transport_refuses_durable_handoff_before_queueing_unless_re
         if condition == "ready":
             send.assert_awaited_once()
             await boot_run.wait_for_delivery(1)
+            # The observed exec stdin edge precedes its fake EOF/turn finish.
+            # Drain that completion before cancelling the worker in teardown.
+            await boot_run.checkpoint()
             assert broker.stats["routed"] == 1
             if host is not None:
                 assert result.status == "delivered"
@@ -543,7 +609,6 @@ async def test_every_transport_refuses_durable_handoff_before_queueing_unless_re
                 assert result == 1
                 assert registry.get_pending_messages("primary", "sample-chat") == []
         else:
-            send.assert_not_awaited()
             await boot_run.checkpoint()
             assert boot_run.observed == []
             assert len(registry.get_pending_messages("primary", "sample-chat")) == 1
@@ -553,6 +618,7 @@ async def test_every_transport_refuses_durable_handoff_before_queueing_unless_re
                 assert host.stats["delivered"] == 0 and host.stats["messages_routed"] == 0
             else:
                 assert result == 0
+            send.assert_not_awaited()
     finally:
         await gate.close()
         worker = getattr(session, "_worker_task", None)
