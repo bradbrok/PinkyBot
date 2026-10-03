@@ -225,13 +225,64 @@ async def test_pending_effort_reports_last_launch_until_rebuilt(monkeypatch):
     monkeypatch.setattr(session, "_has_prior_transcript", lambda: False)
     session._build_claude_cmd()
     assert session.stats["thinking_effort"] == "low"
+    assert session.stats["thinking_effort_pending"] is False
 
     assert await session.apply_effort_live("max") == "pending_restart"
     assert session.stats["thinking_effort"] == "low"
+    assert session.stats["thinking_effort_pending"] is True
+    assert session.stats["pending_thinking_effort"] == "max"
 
     argv = shlex.split(session._build_claude_cmd())
     assert _reasoning_config_values(argv) == ['model_reasoning_effort="max"']
     assert session.stats["thinking_effort"] == "max"
+    assert session.stats["thinking_effort_pending"] is False
+    assert session.stats["pending_thinking_effort"] is None
+
+
+@pytest.mark.asyncio
+async def test_pending_auto_effort_preserves_last_launch_until_rebuilt(monkeypatch):
+    session = _session(model="gpt-6.1-sol", effort="auto")
+    monkeypatch.setattr(session, "_has_prior_transcript", lambda: False)
+    session._build_claude_cmd()
+    assert session.stats["thinking_effort"] is None
+
+    assert await session.apply_effort_live("low") == "pending_restart"
+    assert session.stats["thinking_effort"] is None
+    assert session.stats["pending_thinking_effort"] == "low"
+    session._build_claude_cmd()
+    assert session.stats["thinking_effort"] == "low"
+
+    assert await session.apply_effort_live("auto") == "pending_restart"
+    assert session.stats["thinking_effort"] == "low"
+    assert session.stats["thinking_effort_pending"] is True
+    assert session.stats["pending_thinking_effort"] is None
+    argv = shlex.split(session._build_claude_cmd())
+    assert _reasoning_config_values(argv) == []
+    assert session.stats["thinking_effort"] is None
+    assert session.stats["thinking_effort_pending"] is False
+
+
+def test_stashed_effort_and_clear_apply_on_next_launch(monkeypatch):
+    session = _session(model="gpt-6.1-sol", effort="high")
+    monkeypatch.setattr(session, "_has_prior_transcript", lambda: False)
+    session._build_claude_cmd()
+
+    session.set_effort("ultracode")
+    assert session.stats["thinking_effort"] == "high"
+    assert session.stats["thinking_effort_pending"] is True
+    assert session.stats["pending_thinking_effort"] == "xhigh"
+    argv = shlex.split(session._build_claude_cmd())
+    assert _reasoning_config_values(argv) == ['model_reasoning_effort="xhigh"']
+    assert session.stats["thinking_effort"] == "xhigh"
+
+    session.clear_effort_override()
+    assert session.stats["thinking_effort"] == "xhigh"
+    assert session.stats["thinking_effort_pending"] is True
+    assert session.stats["pending_thinking_effort"] == "high"
+    argv = shlex.split(session._build_claude_cmd())
+    assert _reasoning_config_values(argv) == ['model_reasoning_effort="high"']
+    assert session.stats["thinking_effort"] == "high"
+    assert session.stats["thinking_effort_pending"] is False
 
 
 def test_build_cmd_injects_mcp(monkeypatch):
