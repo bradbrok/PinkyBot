@@ -36,6 +36,9 @@ class BootRun:
     extra_source: str = ""
     manual: bool = False
     manual_result: object = None
+    approved_backlog: bool = False
+    pending_before_stop: list[dict] = field(default_factory=list)
+    surviving_tasks: list[str] = field(default_factory=list)
 
     def submit(self, edge, prompt):
         self.observed.append((edge, prompt, self.server.phase, self.server.started))
@@ -196,7 +199,7 @@ def boot_run(tmp_path, monkeypatch):
                 if run.bind and not run.stop_before_bind:
                     self.started = True
                     self.phase = READY_PHASE
-                    expected = 1 + bool(run.extra_source)
+                    expected = 1 + bool(run.extra_source) + run.approved_backlog
                     await run.wait_for_delivery(expected)
                     if run.manual:
                         endpoint = next(
@@ -214,6 +217,8 @@ def boot_run(tmp_path, monkeypatch):
                     # Keep the listener unavailable beyond the configured cap.
                     # The generous scheduling margin tolerates concurrent suites.
                     await asyncio.sleep(0.15)
+                if run.approved_backlog:
+                    run.pending_before_stop = app.state.agents.get_pending_messages("primary")
                 self.should_exit = True
             self.phase = 3
             if run.stop_before_bind:
@@ -223,6 +228,11 @@ def boot_run(tmp_path, monkeypatch):
             for task in run.tasks:
                 task.cancel()
             await asyncio.gather(*run.tasks, return_exceptions=True)
+            await run.checkpoint()
+            run.surviving_tasks = [
+                task.get_name() for task in asyncio.all_tasks()
+                if task is not asyncio.current_task() and not task.done()
+            ]
 
     monkeypatch.setattr(uvicorn, "Server", FakeServer)
     monkeypatch.setattr(
@@ -242,6 +252,11 @@ def _run_boot(run, tmp_path, monkeypatch, mode):
         "primary", runtime=runtime, transport=transport, working_dir=str(work),
     )
     run.app.state.agents.set_main_agent("primary")
+    if run.approved_backlog:
+        run.app.state.agents.approve_user("primary", "sample-chat", display_name="sender")
+        run.app.state.agents.queue_pending_message(
+            "primary", "web", "sample-chat", "sender", "approved inbound replay",
+        )
     monkeypatch.setenv("PINKY_CODEX_APP_SERVER", "1" if mode == "codex-app-server" else "0")
     daemon_main._run_api_with_authority(SimpleNamespace(
         host="", port=0, working_dir=str(tmp_path), max_sessions=4,
@@ -310,6 +325,32 @@ def test_shutdown_cancels_waiting_prompts_before_a_late_ready_flag(
     assert boot_run.observed == [], (
         f"Shutdown must cancel held prompts; none may survive stop: {boot_run.observed!r}"
     )
+    assert boot_run.surviving_tasks == [], "Shutdown must join listener and delivery waiters"
+
+
+def test_startup_approved_backlog_flush_waits_for_listener_without_blocking_bind(
+    boot_run, tmp_path, monkeypatch,
+):
+    boot_run.approved_backlog = True
+    _run_boot(boot_run, tmp_path, monkeypatch, "claude-sdk")
+    replay = [entry for entry in boot_run.observed if "approved inbound replay" in entry[1]]
+    assert replay, "The approved startup backlog must be replayed after binding"
+    assert all(phase >= READY_PHASE and ready for _, _, phase, ready in replay), (
+        f"Approved startup replay observed before main listener readiness: {replay!r}"
+    )
+
+
+def test_listener_timeout_preserves_unsubmitted_approved_backlog(
+    boot_run, tmp_path, monkeypatch,
+):
+    boot_run.approved_backlog = True
+    boot_run.bind = False
+    monkeypatch.setenv("PINKY_API_READINESS_CAP_SEC", "0.03")
+    _run_boot(boot_run, tmp_path, monkeypatch, "claude-sdk")
+    assert len(boot_run.pending_before_stop) == 1, (
+        "Listener timeout must preserve the durable inbound row for a later retry"
+    )
+    assert boot_run.observed == [], "An unavailable listener must not accept backlog delivery"
 
 
 def test_post_startup_manual_wake_handler_has_no_readiness_delay(
