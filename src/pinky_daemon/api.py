@@ -1770,6 +1770,9 @@ def create_api(
         description="Stateful Claude Code session API",
         version="0.1.0",
     )
+    from pinky_daemon.api_readiness import ApiReadiness
+
+    app.state.api_readiness = ApiReadiness()
     app.state.store_snapshot_service = store_snapshot_service
     app.state.storage_observability = storage_observability
     app.state.ferry_listener = FerryListenerState.from_config(FerryConfig.from_env())
@@ -4120,12 +4123,11 @@ def create_api(
             system_prompt=("" if is_tmux else
                            agents.build_system_prompt(agent_name, skill_store=skills)),
             resume_handle=resume_id,
-            # commit=False here: the connect-time rebuild via
-            # ``wake_context_builder`` is the delivered (committed) build
-            # that consumes restart_manifest. An eager committed build here
-            # would consume it before the delivered one runs.
+            # Preview only: daemon transports rebuild committed wake text at
+            # submission, so an unavailable listener cannot consume the manifest.
             wake_context=_build_streaming_wake_context(agent_name, commit=False),
             wake_context_builder=_build_streaming_wake_context,
+            api_readiness=app.state.api_readiness,
             on_wake_delivered=_log_agent_wake_event,
             on_turn_idle=_notify_scheduler_turn_idle,
             wake_submission_recovery_injector=_inject_wake_context_reload,
@@ -13764,6 +13766,17 @@ npm run build</pre>
         nonlocal shared_mcp_manager
         nonlocal active_boot_mcp_gate
 
+        readiness = app.state.api_readiness
+        readiness.start()
+        pending_pollers = []
+        initial_replay_done = False
+
+        def _start_startup_poller(poller):
+            if readiness.attached and not initial_replay_done:
+                pending_pollers.append(poller)
+            else:
+                start_poller(poller)
+
         storage_observability.enable_runtime()
 
         # Lock down SQLite file permissions to owner-only. Runs here (not in
@@ -13806,12 +13819,6 @@ npm run build</pre>
                 f"ERROR startup: tmux spawn cleanup debt reconciliation "
                 f"failed ({type(exc).__name__}: {exc})"
             )
-
-        # #863: resume durable owner-approval notification retries before
-        # pollers can accept more inbound messages.
-        app.state.approval_notification_retry_task = (
-            broker.start_approval_notification_retries()
-        )
 
         # Rotate the daemon console log (logs/api.log): daily + size-capped,
         # gzipped 0600 archives with Telegram tokens redacted, pruned past the
@@ -13867,24 +13874,27 @@ npm run build</pre>
             await shared_mcp_manager.start()
             _log(f"startup: shared MCP server started on {shared_mcp_manager.url}")
 
-        # The migration settled qualifying approval requests synchronously in
-        # create_api. Flush their held messages only after shared MCP is ready
-        # (so a cold-started session can really accept them), but before any
-        # platform poller can ingest new traffic. The same durable journal then
-        # carries the one-time owner digest until confirmed delivery.
-        await _resume_grandfather_migration(agents, broker)
-
-        # #998: heal every approved-but-undelivered backlog, not only rows
-        # created by the grandfather migration. This catches approval changes
-        # made by older migrations/direct registry paths before any poller can
-        # accept new traffic; the broker's maintenance loop keeps reconciling
-        # later runtime transitions as well.
-        reconciled = await broker.reconcile_approved_pending_messages()
-        if reconciled:
-            _log(
-                "startup: reconciled "
-                f"{reconciled} approved pending message(s)"
+        # Keep backlog-before-poller ordering without awaiting our own listener
+        # inside ASGI startup. Queue acceptance must not checkpoint pending rows
+        # while their final delivery edge is still held.
+        async def _finish_startup_replay():
+            nonlocal initial_replay_done
+            await _resume_grandfather_migration(agents, broker)
+            reconciled = await broker.reconcile_approved_pending_messages()
+            if reconciled:
+                _log(f"startup: reconciled {reconciled} approved pending message(s)")
+            app.state.approval_notification_retry_task = (
+                broker.start_approval_notification_retries()
             )
+            initial_replay_done = True
+            for poller in pending_pollers:
+                start_poller(poller)
+            pending_pollers.clear()
+
+        if readiness.attached:
+            readiness.after_ready(_finish_startup_replay)
+        else:
+            await _finish_startup_replay()
 
         # Boot policy: the main agent always starts. Enabled siblings start only
         # when the shutdown manifest proves they had a live streaming transport;
@@ -13970,7 +13980,7 @@ npm run build</pre>
                 else:
                     poller = _new_telegram_broker_poller(agent.name, token)
                     _broker_pollers.append(poller)
-                    start_poller(poller)
+                    _start_startup_poller(poller)
                     _log(f"startup: broker poller started for {agent.name}")
 
             # Discord poller — REST polling (Gateway/WebSocket is a future v0.2)
@@ -13994,7 +14004,7 @@ npm run build</pre>
                         poll_interval = d_poller._poll_interval
                         watched = d_poller._configured_channels
                         _broker_pollers.append(d_poller)
-                        start_poller(d_poller)
+                        _start_startup_poller(d_poller)
                         _log(
                             f"startup: discord poller started for {agent.name} "
                             f"(interval={poll_interval}s, "
@@ -14038,7 +14048,7 @@ npm run build</pre>
                                 app_token=app_token,
                             )
                             _broker_pollers.append(s_poller)
-                            start_poller(s_poller)
+                            _start_startup_poller(s_poller)
                             _log(f"startup: slack socket-mode poller started for {agent.name}")
                     except Exception as e:
                         _log(f"startup: slack poller failed for {agent.name}: {e}")
@@ -14064,7 +14074,7 @@ npm run build</pre>
                         im_adapter, agent.name, broker,
                     )
                     _broker_pollers.append(im_poller)
-                    start_poller(im_poller)
+                    _start_startup_poller(im_poller)
                     _log(f"startup: iMessage poller started for {agent.name}")
                 except Exception as e:
                     _log(f"startup: iMessage poller failed for {agent.name}: {e}")
@@ -14182,6 +14192,8 @@ npm run build</pre>
     @app.on_event("shutdown")
     async def on_shutdown():
         """Stop scheduler, autonomy, broker pollers, and streaming sessions on shutdown."""
+        if app.state.api_readiness.attached:
+            await app.state.api_readiness.close()
         import json as _json
         from datetime import datetime, timezone
 

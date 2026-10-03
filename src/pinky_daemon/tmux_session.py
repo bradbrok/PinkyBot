@@ -85,6 +85,12 @@ from pinky_daemon.agent_registry import (
     CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS,
     validate_restart_tokens_cap,
 )
+from pinky_daemon.api_readiness import (
+    api_allows_submission,
+    defer_wake,
+    render_prompt,
+    wait_for_api,
+)
 from pinky_daemon.auth_relay import coordinator as _auth_relay
 from pinky_daemon.auth_relay import extract_relay_oauth_url, looks_like_login_wall
 from pinky_daemon.codex_tmux_transcript import _DISCOVERY_SCAN_LIMIT
@@ -3847,26 +3853,31 @@ class TmuxSession(TransportReplacementMixin):
         # the exact symptom #591 was filed for. Falls back to the stored
         # body when no builder is wired (tests). Trailing positional
         # kwarg keeps legacy 1-arg builders working.
-        wake_context_body = self._config.wake_context or ""
-        if self._config.wake_context_builder:
-            try:
-                wake_context_body = self._config.wake_context_builder(
-                    self.agent_name, reason
+        def _build_initial_prompt():
+            wake_context_body = self._config.wake_context or ""
+            if self._config.wake_context_builder:
+                try:
+                    wake_context_body = self._config.wake_context_builder(
+                        self.agent_name, reason
+                    )
+                except TypeError:
+                    pass
+                except Exception as e:
+                    _log(
+                        f"tmux[{self.agent_name}]: wake context rebuild failed: {e} "
+                        "— using stored body"
+                    )
+            wake_prompt = build_wake_prompt(
+                WakePromptInput(
+                    reason=reason,
+                    context_body=wake_context_body,
+                    timezone=self._config.timezone or "America/Los_Angeles",
                 )
-            except TypeError:
-                pass
-            except Exception as e:
-                _log(
-                    f"tmux[{self.agent_name}]: wake context rebuild failed: {e} "
-                    "— using stored body"
-                )
-        wake_prompt = build_wake_prompt(
-            WakePromptInput(
-                reason=reason,
-                context_body=wake_context_body,
-                timezone=self._config.timezone or "America/Los_Angeles",
             )
-        )
+            return wake_prompt
+
+        wake_prompt = defer_wake(self._config, _build_initial_prompt)
+
         # #591 P1#2 (Murzik round-2): defer on_wake_delivered until actual
         # delivery, not enqueue success. #953 now makes that proof an exact
         # transcript turn-start receipt; a successful paste/Enter command is
@@ -11593,6 +11604,14 @@ class TmuxSession(TransportReplacementMixin):
             "transcript receipt after bounded Enter retries"
         )
 
+    def _refuse_api_turn(self, turn: _QueuedTurn) -> None:
+        self._resolve_submission_receipt(turn, False)
+        if turn.scheduler_delivery is not None and not turn.scheduler_delivery.done():
+            turn.scheduler_delivery.set_result(False)
+        if turn.completion_event is not None:
+            turn.completion_event.set()
+        self._turn_done.set()
+
     async def _deliver_turn(self, turn: _QueuedTurn) -> None:
         """Push one turn through to the tmux pane.
 
@@ -11658,6 +11677,10 @@ class TmuxSession(TransportReplacementMixin):
         the wake prompt (broker calls ``send`` the moment ``state ==
         CONNECTED``, which fires before this wait would have ended).
         """
+        if not await wait_for_api(self._config, "tmux-turn"):
+            self._refuse_api_turn(turn)
+            return
+
         # #931: scheduled prompts are not steering messages. Mid-turn pastes
         # can vanish after a successful tmux command, so wait for the pane's
         # prior FIFO turn to complete before injecting this one. Do this before
@@ -11852,6 +11875,10 @@ class TmuxSession(TransportReplacementMixin):
                     retry_scheduler_gate = True
                 else:
                     retry_scheduler_gate = False
+                    if not api_allows_submission(self._config, "tmux-turn"):
+                        self._refuse_api_turn(turn)
+                        return
+                    turn.prompt = render_prompt(turn.prompt)
                     transcript_ticket = (
                         self._capture_transcript_occurrence_ticket()
                     )

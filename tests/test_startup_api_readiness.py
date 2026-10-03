@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -40,6 +43,17 @@ class BootRun:
     approved_backlog: bool = False
     pending_before_stop: list[dict] = field(default_factory=list)
     surviving_tasks: list[str] = field(default_factory=list)
+    late_bind: bool = False
+    observed_before_late_bind: list = field(default_factory=list)
+    post_cap_handoff: object = None
+    replay_phases: list[int] = field(default_factory=list)
+    start_manifest: bool = False
+    manifest_before_stop: object = None
+    entry_branch: str = "single"
+    embedder: bool = False
+    serve_early: str = ""
+    embedder_run: object = None
+    ferry_started_before_main: bool = False
 
     def submit(self, edge, prompt):
         self.observed.append((edge, prompt, self.server.phase, self.server.started))
@@ -50,9 +64,12 @@ class BootRun:
             await asyncio.sleep(0)
 
     async def wait_for_delivery(self, count):
-        async with asyncio.timeout(5):
-            while len(self.observed) < count:
-                await asyncio.sleep(0.001)
+        try:
+            async with asyncio.timeout(5):
+                while len(self.observed) < count:
+                    await asyncio.sleep(0.001)
+        except TimeoutError:
+            raise AssertionError("A ready listener did not release the expected prompts") from None
 
 
 @pytest.fixture
@@ -69,6 +86,13 @@ def boot_run(tmp_path, monkeypatch):
     app = api.create_api(db_path=str(tmp_path / "test.db"), default_working_dir=str(tmp_path))
     run = BootRun(app)
     monkeypatch.setattr(api, "create_api", lambda **kwargs: app)
+    original_migration_replay = api._resume_grandfather_migration
+
+    async def record_migration_replay(*args, **kwargs):
+        run.replay_phases.append(run.server.phase)
+        return await original_migration_replay(*args, **kwargs)
+
+    monkeypatch.setattr(api, "_resume_grandfather_migration", record_migration_replay)
 
     class FakeClient:
         def __init__(self, options):
@@ -177,12 +201,27 @@ def boot_run(tmp_path, monkeypatch):
             self.started = False
             self.should_exit = False
             self.phase = 0
-            run.server = self
+            if config.app is app:
+                run.server = self
+
+        async def startup(self):
+            self.started = True
 
         def run(self):
             asyncio.run(self.serve())
 
         async def serve(self):
+            if self.config.app is not app:
+                await self.startup()
+                run.ferry_started_before_main = not run.server.started
+                while not run.server.should_exit:
+                    await asyncio.sleep(0)
+                self.should_exit = True
+                return
+            if run.serve_early:
+                if run.serve_early == "raise":
+                    raise RuntimeError("server startup failed")
+                return
             async with AsyncExitStack() as stack:
                 # A delivery waiter inside foreground startup must not hold
                 # the fake listener's bind hostage for the default five minutes.
@@ -201,10 +240,17 @@ def boot_run(tmp_path, monkeypatch):
                         ))
                     run.tasks.append(task)
                 await run.checkpoint()
+                if run.late_bind:
+                    await asyncio.sleep(0.15)
+                    run.observed_before_late_bind = list(run.observed)
+                    session = app.state.broker._get_streaming_session("primary")
+                    async with asyncio.timeout(0.1):
+                        run.post_cap_handoff = await session.send("new before late ready")
+                    assert run.observed == [], "Post-cap delivery escaped an unavailable listener"
                 if run.bind and not run.stop_before_bind:
                     self.started = True
                     self.phase = READY_PHASE
-                    expected = 1 + bool(run.extra_source) + run.approved_backlog
+                    expected = (0 if run.late_bind else 1) + bool(run.extra_source) + run.approved_backlog
                     await run.wait_for_delivery(expected)
                     if run.manual:
                         endpoint = next(
@@ -224,6 +270,9 @@ def boot_run(tmp_path, monkeypatch):
                     await asyncio.sleep(0.15)
                 if run.approved_backlog:
                     run.pending_before_stop = app.state.agents.get_pending_messages("primary")
+                if run.start_manifest:
+                    manifest = Path(app.state.agents._db_path).parent / "restart_manifest.json"
+                    run.manifest_before_stop = json.loads(manifest.read_text()) if manifest.exists() else None
                 self.should_exit = True
             self.phase = 3
             if run.stop_before_bind:
@@ -245,6 +294,7 @@ def boot_run(tmp_path, monkeypatch):
             uvicorn.Config(application, **kwargs),
         ).run(),
     )
+    run.embedder_run = lambda: FakeServer(uvicorn.Config(app)).run()
     return run
 
 
@@ -262,7 +312,25 @@ def _run_boot(run, tmp_path, monkeypatch, mode):
         run.app.state.agents.queue_pending_message(
             "primary", "web", "sample-chat", "sender", "approved inbound replay",
         )
+    if run.start_manifest:
+        (tmp_path / "restart_manifest.json").write_text(json.dumps({
+            "restart_time": datetime.now(timezone.utc).isoformat(),
+            "agents": {"primary": {"in_progress": "reserved activity", "label": "main"}},
+        }))
+    if run.entry_branch != "single":
+        from pinky_daemon.ferry import inbound_server
+        from pinky_daemon.ferry.config import FerryConfig
+
+        monkeypatch.setattr(FerryConfig, "from_env", lambda: SimpleNamespace(
+            enabled=True, bind_host="", bind_port=0, fleet_name="sample",
+        ))
+        monkeypatch.setattr(inbound_server, "build_ferry_app", lambda **kwargs: object())
+        if run.entry_branch == "fallback":
+            run.app.state.host_pinky = None
     monkeypatch.setenv("PINKY_CODEX_APP_SERVER", "1" if mode == "codex-app-server" else "0")
+    if run.embedder:
+        run.embedder_run()
+        return
     daemon_main._run_api_with_authority(SimpleNamespace(
         host="", port=0, working_dir=str(tmp_path), max_sessions=4,
         db_path=str(tmp_path / "test.db"),
@@ -366,3 +434,136 @@ def test_post_startup_manual_wake_handler_has_no_readiness_delay(
     manual = [entry for entry in boot_run.observed if entry[1] == "manual request"]
     assert manual == [("sdk-query", "manual request", READY_PHASE, True)]
     assert boot_run.manual_result["sent"] is True
+
+
+def test_timeout_then_late_ready_admits_only_new_prompts_and_flushes_backlog_once(
+    boot_run, tmp_path, monkeypatch, capsys,
+):
+    boot_run.late_bind = True
+    boot_run.approved_backlog = True
+    boot_run.manual = True
+    monkeypatch.setenv("PINKY_API_READINESS_CAP_SEC", "0.03")
+    _run_boot(boot_run, tmp_path, monkeypatch, "claude-sdk")
+    assert boot_run.observed_before_late_bind == []
+    assert boot_run.post_cap_handoff is False
+    assert len(boot_run.observed) == 2, "Refused boot wakes must never release on late readiness"
+    assert "approved inbound replay" in boot_run.observed[0][1]
+    assert boot_run.observed[1][1] == "manual request"
+    assert all(phase == READY_PHASE and ready for _, _, phase, ready in boot_run.observed)
+    assert boot_run.replay_phases == [READY_PHASE], "Deferred startup jobs must run exactly once"
+    assert boot_run.pending_before_stop == []
+    output = capsys.readouterr().err
+    assert re.search(r"WARNING.*ready after cap.*elapsed=", output)
+    assert "ERROR" in output and "source=" in output and "refused_count=" in output
+
+
+@pytest.mark.parametrize("branch", ("fallback", "dual"))
+def test_each_daemon_entry_branch_waits_for_the_main_listener(
+    boot_run, tmp_path, monkeypatch, branch,
+):
+    boot_run.entry_branch = branch
+    _run_boot(boot_run, tmp_path, monkeypatch, "claude-sdk")
+    assert boot_run.observed
+    assert all(phase >= READY_PHASE and ready for _, _, phase, ready in boot_run.observed)
+    assert boot_run.app.state.api_readiness.attached
+    if branch == "dual":
+        assert boot_run.ferry_started_before_main, "The ferry must be ready during the pre-bind window"
+
+
+@pytest.mark.parametrize("exit_kind", ("return", "raise"))
+def test_main_serve_completion_or_error_is_terminal_despite_late_started_flag(
+    boot_run, tmp_path, monkeypatch, capsys, exit_kind,
+):
+    boot_run.serve_early = exit_kind
+    if exit_kind == "raise":
+        with pytest.raises(RuntimeError, match="server startup failed"):
+            _run_boot(boot_run, tmp_path, monkeypatch, "claude-sdk")
+    else:
+        _run_boot(boot_run, tmp_path, monkeypatch, "claude-sdk")
+    gate = boot_run.app.state.api_readiness
+    assert not boot_run.server.should_exit, "Completion must be observed independently of should_exit"
+    assert asyncio.run(gate.wait("direct-probe")) is False
+    boot_run.server.started = True
+    assert asyncio.run(gate.wait("late-probe")) is False
+    assert "ERROR" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_refused_boot_wake_preserves_one_shot_restart_manifest(
+    boot_run, tmp_path, monkeypatch, mode,
+):
+    boot_run.start_manifest = True
+    boot_run.bind = False
+    monkeypatch.setenv("PINKY_API_READINESS_CAP_SEC", "0.03")
+    _run_boot(boot_run, tmp_path, monkeypatch, mode)
+    assert boot_run.observed == []
+    assert boot_run.manifest_before_stop is not None, "A refused wake consumed its manifest"
+    assert boot_run.manifest_before_stop["agents"]["primary"]["in_progress"] == "reserved activity"
+
+
+def test_embedder_without_listener_owner_keeps_immediate_delivery(
+    boot_run, tmp_path, monkeypatch,
+):
+    boot_run.embedder = True
+    _run_boot(boot_run, tmp_path, monkeypatch, "claude-sdk")
+    assert not boot_run.app.state.api_readiness.attached
+    assert boot_run.observed and all(phase < READY_PHASE for _, _, phase, _ in boot_run.observed)
+
+
+@pytest.mark.parametrize("mode", ("claude-tmux", "codex-tmux"))
+def test_tmux_pending_inbound_row_survives_listener_timeout(
+    boot_run, tmp_path, monkeypatch, mode,
+):
+    boot_run.approved_backlog = True
+    boot_run.bind = False
+    monkeypatch.setenv("PINKY_API_READINESS_CAP_SEC", "0.03")
+    _run_boot(boot_run, tmp_path, monkeypatch, mode)
+    assert len(boot_run.pending_before_stop) == 1
+    assert boot_run.replay_phases == []
+    assert boot_run.observed == []
+
+
+@pytest.mark.parametrize("use_app_server", (False, True))
+@pytest.mark.asyncio
+async def test_direct_idle_save_exec_waits_without_a_message_worker(
+    boot_run, tmp_path, monkeypatch, use_app_server,
+):
+    from pinky_daemon.api_readiness import ApiReadiness
+    from pinky_daemon.streaming_session import StreamingSessionConfig
+
+    monkeypatch.setenv("PINKY_CODEX_APP_SERVER", "1" if use_app_server else "0")
+    gate = ApiReadiness()
+    server = SimpleNamespace(started=False, should_exit=False, phase=1)
+    boot_run.server = server
+    gate.attach(server)
+    gate.start()
+    session = CodexSession(StreamingSessionConfig(
+        agent_name="primary", working_dir=str(tmp_path), api_readiness=gate,
+    ))
+
+    class Client:
+        async def request(self, method, params):
+            if method == "turn/start":
+                boot_run.submit("direct-turn", params["input"][0]["text"])
+                session._turn_done.set_result(None)
+                return {}
+            return {"thread": {"id": "sample-thread"}}
+
+    session._app_client = Client()
+    session._ensure_app_server = AsyncMock(return_value=True)
+    task = asyncio.create_task(session._exec_codex("direct idle save"))
+    try:
+        await boot_run.checkpoint()
+        assert boot_run.observed == [], "Direct idle-save exec bypassed API readiness"
+        assert not task.done(), "A held direct prompt must await readiness rather than disappear"
+        server.started = True
+        server.phase = READY_PHASE
+        async with asyncio.timeout(2):
+            result = await task
+        assert not result.failed
+        assert len(boot_run.observed) == 1
+        assert boot_run.observed[0][1:] == ("direct idle save", READY_PHASE, True)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await gate.close()
