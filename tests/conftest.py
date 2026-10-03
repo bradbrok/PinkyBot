@@ -28,6 +28,7 @@ import atexit
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 
@@ -114,6 +115,19 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "real_transport: test intentionally uses a real external transport",
     )
+    # When the system temp dir is world-writable (e.g. /tmp at mode 1777 in a
+    # root-owned container) and no explicit --basetemp was given, redirect
+    # pytest's basetemp under the home dir so tmp_path fixtures produce
+    # directories that pass the WAL-preflight ancestor check.
+    if not getattr(config.option, "basetemp", None):
+        tmpdir = tempfile.gettempdir()
+        if stat.S_IMODE(os.stat(tmpdir).st_mode) & 0o022:
+            # world-writable /tmp (e.g. mode 1777 in root-owned containers);
+            # redirect basetemp under /root so tmp_path passes WAL preflight.
+            if hasattr(os, "getuid") and os.getuid() == 0 and os.access("/root", os.W_OK):
+                safe_base = "/root/pinky-test-tmp"
+                os.makedirs(safe_base, mode=0o700, exist_ok=True)
+                config.option.basetemp = safe_base
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
