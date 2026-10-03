@@ -53,8 +53,11 @@ class FakeTmux:
     async def has_session(self) -> bool:
         return self._has
 
-    async def new_session(self, *, cwd: str, command: str, env=None) -> FakeTmuxResult:
+    async def new_session(
+        self, *, cwd: str, command: str, env=None, codex_headers=False,
+    ) -> FakeTmuxResult:
         self.calls.append("new_session")
+        assert codex_headers, "app-server loader must remove inherited MCP headers"
         self.new_session_env = dict(env or {})
         if not self.new_session_ok:
             return FakeTmuxResult(ok=False, stderr="boom")

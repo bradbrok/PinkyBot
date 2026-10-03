@@ -60,9 +60,11 @@ class _Finalizer:
 class StoreShutdownCoordinator:
     """Run store finalizers in dependency order within one aggregate deadline.
 
-    Each callback receives a fair share of the remaining aggregate budget. A
-    callback that exceeds its share remains on a daemon thread, is reported as
-    unfinalized, and cannot prevent later stores from being attempted.
+    Each callback first receives a fair share of the remaining aggregate budget.
+    Callbacks that exceed their shares remain on daemon threads while later stores
+    are attempted, then are rejoined in order using the remaining aggregate time.
+    Finalized stores and failures follow dependency/registration order, regardless
+    of completion order. Only workers still alive after these waits are unfinalized.
     """
 
     def __init__(self, *, deadline_seconds: float) -> None:
@@ -97,6 +99,8 @@ class StoreShutdownCoordinator:
         attempted: list[str] = []
         finalized: list[str] = []
         failures: list[StoreShutdownFailure] = []
+        entries: list[tuple[_Finalizer, threading.Thread, list[BaseException]]] = []
+        stragglers: list[threading.Thread] = []
 
         for index, item in enumerate(ordered):
             attempted.append(item.logical_name)
@@ -120,6 +124,16 @@ class StoreShutdownCoordinator:
             remaining_stores = len(ordered) - index
             remaining_seconds = max(0.0, deadline - time.monotonic())
             worker.join(remaining_seconds / remaining_stores)
+            entries.append((item, worker, callback_errors))
+            if worker.is_alive():
+                stragglers.append(worker)
+
+        for worker in stragglers:
+            remaining_seconds = max(0.0, deadline - time.monotonic())
+            if worker.is_alive() and remaining_seconds > 0:
+                worker.join(remaining_seconds)
+
+        for item, worker, callback_errors in entries:
             if worker.is_alive():
                 failures.append(
                     StoreShutdownFailure(

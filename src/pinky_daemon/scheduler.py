@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import math
 import os
 import sys
@@ -35,9 +36,16 @@ from pinky_daemon.scheduler_delivery import scheduler_busy_delay
 from pinky_daemon.transport_state import SessionState
 from pinky_daemon.watchdog_log import log_watchdog_decision
 
+log_write_failures = 0
+
 
 def _log(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
+    """Best-effort control-loop logging, including closed or full streams."""
+    global log_write_failures
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        log_write_failures += 1
 
 
 _PROVEN_LIVE_HEARTBEAT_STATUSES = frozenset(
@@ -51,6 +59,8 @@ _RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"
 _RATE_LIMIT_THRESHOLD = 80  # percent — skip heartbeats above this
 _rate_limit_last_warned_at: float | None = None
 _CLOCK_WAKE_MAX_ATTEMPTS = 3
+_CRON_CATCHUP_MAX_SECONDS = 6 * 60 * 60
+_SLOW_TICK_PHASE_SECONDS = 30
 
 # #1029 transport-health guard. tmux builds can reject command argvs around
 # 8–16 KiB; prompts now travel over stdin, but surfacing large enabled rows
@@ -476,6 +486,7 @@ class AgentScheduler:
         # only, NOT owner-notified (#1043).
         self._owner_notify_callback = owner_notify_callback
         self._trigger_store = trigger_store  # TriggerStore | None
+        self._url_refusal_warned_at: dict[int, float] = {}
         self._activity = activity  # ActivityStore | None
         self._tick_interval = tick_interval
         self._schedule_delivery_timeout = schedule_delivery_timeout
@@ -593,6 +604,20 @@ class AgentScheduler:
         )
         self._running = False
         self._task: asyncio.Task | None = None
+        self._restart_handle: asyncio.TimerHandle | None = None
+        self._restart_attempt = 0
+        self._clean_ticks = 0
+        self.consecutive_tick_errors = 0
+        self.loop_restarts = 0
+        self.last_loop_exit: str | None = None
+        self.last_tick_started_at: float | None = None
+        self.last_tick_completed_at: float | None = None
+        self.last_tick_started_monotonic: float | None = None
+        self.last_tick_completed_monotonic: float | None = None
+        self._started_monotonic: float | None = None
+        self._last_cron_evaluated_at = time.time()
+        self._prev_tick_slowest_phase = "none"
+        self._prev_tick_slowest_s = 0.0
         self._last_clock_slot: dict[str, int] = {}  # agent_name -> last fired clock slot (minutes since midnight)
         self._clock_wake_attempts: dict[str, tuple[int, int]] = {}
         self._last_dream_check: dict[str, tuple] = {}  # agent_name -> (date_str, cron-minute) dedup key
@@ -644,25 +669,31 @@ class AgentScheduler:
         if self._running:
             return
         self._running = True
+        self._started_monotonic = time.monotonic()
+        self.last_tick_started_at = self.last_tick_completed_at = None
+        self.last_tick_started_monotonic = self.last_tick_completed_monotonic = None
+        self._restart_attempt = self._clean_ticks = 0
+        self.consecutive_tick_errors = 0
         now = time.time()
+        self._last_cron_evaluated_at = now
         self._run_outbox_reaper_if_due(now)
         self._warn_oversized_schedule_prompts(now, force=True)
         for pending in self._registry.list_pending_schedule_wakes():
             self.replay_pending_for_agent(pending.agent_name)
         # Queue startup catch-up before the first live tick can enqueue newer
         # cron fires. Per-agent delivery locks preserve that ordering.
-        self._task = asyncio.create_task(self._loop())
+        self._spawn_loop()
         _log(f"scheduler: started (tick every {self._tick_interval}s)")
 
     async def stop(self) -> None:
         """Stop the scheduler."""
         self._running = False
+        if self._restart_handle is not None:
+            self._restart_handle.cancel()
+            self._restart_handle = None
         if self._task:
             self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+            await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
         # Cancel in-flight dream/librarian/sleep runs. Before #702 these ran
         # inside the loop task, so stop() cancelled them implicitly — keep
@@ -706,53 +737,120 @@ class AgentScheduler:
         self._owner_alert_tasks.clear()
         _log("scheduler: stopped")
 
+    def _spawn_loop(self) -> None:
+        self._task = asyncio.create_task(self._loop(), name="agent-scheduler")
+        self._task.add_done_callback(self._loop_done)
+
+    def _loop_done(self, task: asyncio.Task) -> None:
+        # Always retrieve the outcome, even if stop() or a later start won a race.
+        error = None if task.cancelled() else task.exception()
+        if not self._running or task is not self._task:
+            return
+        self.loop_restarts += 1
+        self.last_loop_exit = (
+            "CancelledError" if task.cancelled() else
+            type(error).__name__ if error is not None else "None"
+        )
+        self._clean_ticks = 0
+        delay = (1, 5, 30, 60)[min(self._restart_attempt, 3)]
+        self._restart_attempt = min(self._restart_attempt + 1, 3)
+        self._restart_handle = asyncio.get_running_loop().call_later(
+            delay, self._restart_loop,
+        )
+
+    def _restart_loop(self) -> None:
+        self._restart_handle = None
+        if self._running:
+            # Startup replay belongs to start(), never to loop supervision.
+            self._spawn_loop()
+
+    def health_snapshot(self) -> dict:
+        """Use monotonic progress so wall-clock corrections cannot hide a stall."""
+        last = self.last_tick_completed_monotonic
+        if last is None:
+            last = self._started_monotonic
+        age = max(0.0, time.monotonic() - last) if last is not None else None
+        running = self._running and self._task is not None and not self._task.done()
+        degraded = self._running and (
+            not running or self.consecutive_tick_errors >= 3
+            or (age is not None and age > 4 * self._tick_interval)
+        )
+        return {
+            "running": running,
+            "last_tick_age_s": age,
+            "loop_restarts": self.loop_restarts,
+            "consecutive_tick_errors": self.consecutive_tick_errors,
+            "log_write_failures": log_write_failures,
+            "tick_interval_s": self._tick_interval,
+            "enabled": self._running,
+            "status": "degraded" if degraded else "ok" if self._running else "stopped",
+        }
+
     async def _loop(self) -> None:
-        """Main scheduler loop."""
+        """Keep ticking through failures, including failures while reporting errors."""
         while self._running:
+            previous_start = self.last_tick_started_monotonic
+            self.last_tick_started_monotonic = time.monotonic()
+            self.last_tick_started_at = time.time()
             try:
+                if previous_start is not None:
+                    gap = self.last_tick_started_monotonic - previous_start
+                    if gap > 3 * self._tick_interval:
+                        _log(
+                            f"scheduler: TICK_GAP gap_s={gap:g} "
+                            f"prev_slowest_phase={self._prev_tick_slowest_phase} "
+                            f"prev_slowest_s={self._prev_tick_slowest_s:g}"
+                        )
                 await self._tick()
-            except Exception as e:
-                _log(f"scheduler: error in tick: {e}")
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as error:
+                self.consecutive_tick_errors += 1
+                self._clean_ticks = 0
+                try:
+                    _log(f"scheduler: error in tick: {error}")
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException:
+                    # Error formatting and logging must not kill this control loop.
+                    pass
+            else:
+                self.consecutive_tick_errors = 0
+                self._clean_ticks += 1
+                if self._clean_ticks >= 10:
+                    self._restart_attempt = 0
+                    self._clean_ticks = 0
+                self.last_tick_completed_monotonic = time.monotonic()
+                self.last_tick_completed_at = time.time()
             await asyncio.sleep(self._tick_interval)
 
     async def _tick(self) -> None:
         """Single scheduler tick — check schedules, heartbeats, clock-aligned wakes, auto-sleep, idle sessions, expired messages, dreams, and url watchers."""
         now = time.time()
-
-        self._run_outbox_reaper_if_due(now)
-        self._warn_oversized_schedule_prompts(now)
-
-        # Check cron schedules
-        await self._check_schedules(now)
-
-        # Check clock-aligned wakes
-        await self._check_clock_aligned_wakes(now)
-
-        # Idle notifications are the primary low-latency outbox drain.  This
-        # bounded fallback prevents a lost edge from stranding a busy-deferred
-        # fire forever, including agents that keep the default heartbeat=0.
-        self._check_pending_wake_liveness(now)
-
-        # Check heartbeat health
-        await self._check_heartbeats(now)
-
-        # Check auto-sleep (idle too long)
-        await self._check_auto_sleep(now)
-
-        # Check for idle streaming sessions
-        await self._check_idle_sessions(now)
-
-        # Cleanup expired inbox messages
-        self._cleanup_expired_messages()
-
-        # Check dream schedules
-        await self._check_dreams(now)
-
-        # Check librarian schedule
-        await self._check_librarian(now)
-
-        # Check URL watcher triggers
-        await self._check_url_watchers(now)
+        # Preserve inline execution and ordering; timing must not detach work.
+        phases = (
+            "_run_outbox_reaper_if_due", "_warn_oversized_schedule_prompts",
+            "_check_schedules", "_check_clock_aligned_wakes",
+            "_check_pending_wake_liveness", "_check_heartbeats",
+            "_check_auto_sleep", "_check_idle_sessions", "_cleanup_expired_messages",
+            "_check_dreams", "_check_librarian", "_check_url_watchers",
+        )
+        self._prev_tick_slowest_phase = "none"
+        self._prev_tick_slowest_s = 0.0
+        for name in phases:
+            started = time.monotonic()
+            try:
+                phase = getattr(self, name)
+                result = phase() if name == "_cleanup_expired_messages" else phase(now)
+                if inspect.isawaitable(result):
+                    await result
+            finally:
+                elapsed = time.monotonic() - started
+                if elapsed > self._prev_tick_slowest_s:
+                    self._prev_tick_slowest_phase = name
+                    self._prev_tick_slowest_s = elapsed
+                if elapsed > _SLOW_TICK_PHASE_SECONDS:
+                    _log(f"scheduler: SLOW_TICK_PHASE phase={name} elapsed_s={elapsed:g}")
 
     def _run_outbox_reaper_if_due(self, now: float) -> bool:
         """Run host-owned outbox maintenance once per local calendar day."""
@@ -844,10 +942,15 @@ class AgentScheduler:
 
     async def _check_schedules(self, now: float) -> None:
         """Stamp due schedules fired, then deliver each agent's cohort in order."""
+        window_start = max(self._last_cron_evaluated_at, now - _CRON_CATCHUP_MAX_SECONDS)
+        if self._last_cron_evaluated_at < now - _CRON_CATCHUP_MAX_SECONDS:
+            _log(
+                "scheduler: SCHEDULER_CATCHUP_TRUNCATED "
+                f"gap_s={now - self._last_cron_evaluated_at:g} "
+                f"bound_s={_CRON_CATCHUP_MAX_SECONDS}"
+            )
         schedules = self._registry.get_all_schedules(enabled_only=True)
-        if not schedules:
-            return
-
+        current_minute = math.floor(now / 60) * 60
         due_by_agent: dict[str, list] = {}
         for schedule in schedules:
             try:
@@ -855,16 +958,24 @@ class AgentScheduler:
             except (KeyError, ValueError):
                 tz = ZoneInfo("America/Los_Angeles")
 
-            dt = datetime.fromtimestamp(now, tz=tz)
-            current_minute = dt.hour * 60 + dt.minute
-
-            # Skip if we already checked this minute for this schedule
-            if schedule.last_run > 0:
-                last_dt = datetime.fromtimestamp(schedule.last_run, tz=tz)
-                last_minute = last_dt.hour * 60 + last_dt.minute
-                last_day = last_dt.date()
-                if last_minute == current_minute and last_day == dt.date():
-                    continue
+            # Walk absolute instants, not local wall minutes: folds have two
+            # instants and spring-forward gaps have none. Coalesce to latest.
+            scheduled_at = current_minute
+            while scheduled_at == current_minute or scheduled_at > window_start:
+                if schedule.last_run >= scheduled_at:
+                    break
+                if scheduled_at < current_minute and scheduled_at < schedule.created_at:
+                    break
+                dt = datetime.fromtimestamp(scheduled_at, tz=tz)
+                if cron_matches(schedule.cron, dt):
+                    break
+                scheduled_at -= 60
+            else:
+                continue
+            if schedule.last_run >= scheduled_at or (
+                scheduled_at < current_minute and scheduled_at < schedule.created_at
+            ):
+                continue
 
             if cron_matches(schedule.cron, dt):
                 if schedule.direct_send:
@@ -893,6 +1004,19 @@ class AgentScheduler:
                         f"#{schedule.id} — skipping fire"
                     )
                     continue
+                late = scheduled_at < current_minute
+                lateness = max(0.0, now - scheduled_at)
+                if late:
+                    _log(
+                        f"scheduler: LATE_FIRE schedule={schedule.id} "
+                        f"scheduled_minute={dt.isoformat()} lateness_s={lateness:g}"
+                    )
+                trace_event(
+                    self._registry, "enqueue", schedule_id=schedule.id, fired_at=now,
+                    agent_name=schedule.agent_name, schedule_name=schedule.name,
+                    prompt=schedule.prompt or f"Scheduled wake: {schedule.name}",
+                    scheduled_minute=dt.isoformat(), late_fire=int(late), lateness_s=lateness,
+                )
                 _log(f"scheduler: firing schedule '{schedule.name}' for agent '{schedule.agent_name}' (direct_send={schedule.direct_send}, one_shot={schedule.one_shot})")
                 if self._activity:
                     try:
@@ -912,6 +1036,9 @@ class AgentScheduler:
 
                 due_by_agent.setdefault(schedule.agent_name, []).append(schedule)
 
+        # Commit evaluation progress only after every schedule was checked.
+        # A failed pass can retry unclaimed slots; last_run fences prior claims.
+        self._last_cron_evaluated_at = max(self._last_cron_evaluated_at, now)
         cohort_started: list[asyncio.Event] = []
         for agent_name, due_schedules in due_by_agent.items():
             attempt_started = asyncio.Event()
@@ -3866,13 +3993,11 @@ class AgentScheduler:
     async def _poll_url_trigger(self, trigger, now: float) -> None:
         """Poll a single url trigger and fire if its condition is met."""
         import urllib.error
-        import urllib.request
+
+        from pinky_daemon.trigger_fetch import InternalDestinationRefusedError, open_trigger_url
 
         def _fetch() -> tuple[int, str]:
-            req = urllib.request.Request(
-                trigger.url, method=trigger.method or "GET",
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with open_trigger_url(trigger.url, method=trigger.method or "GET", timeout=5) as resp:
                 body_bytes = resp.read(65536)  # cap at 64KB
                 return resp.status, body_bytes.decode(errors="replace")
 
@@ -3880,6 +4005,20 @@ class AgentScheduler:
             # Off-loop: a slow watched URL must not stall the shared event loop
             # (cf. the run_in_executor pattern in pollers.py).
             status_code, body_text = await asyncio.to_thread(_fetch)
+        except InternalDestinationRefusedError as e:
+            # Deduplicate by trigger, including redirect/connection-time refusals.
+            # Expire idle IDs so deleted triggers do not accumulate indefinitely.
+            self._url_refusal_warned_at = {
+                key: stamp for key, stamp in self._url_refusal_warned_at.items()
+                if 0 <= now - stamp < 3600
+            }
+            if trigger.id not in self._url_refusal_warned_at:
+                logging.getLogger(__name__).warning(
+                    "URL trigger %s refused internal destination %s", trigger.id, e.destination,
+                )
+                self._url_refusal_warned_at[trigger.id] = now
+            self._trigger_store.record_check(trigger.id, trigger.last_value)
+            return
         except urllib.error.HTTPError as e:
             status_code = e.code
             body_text = ""

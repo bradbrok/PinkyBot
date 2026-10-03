@@ -25,20 +25,22 @@ import shlex
 import time
 from dataclasses import dataclass, field
 
-from pinky_daemon import resume_recovery
+from pinky_daemon import codex_launch_env, resume_recovery
 from pinky_daemon.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
     spawn_app_server,
 )
 from pinky_daemon.codex_app_server_tmux import CodexAppServerSupervisor
+from pinky_daemon.codex_effort import resolve_codex_effort
 from pinky_daemon.codex_home import (
     per_agent_codex_home_enabled,
     prepare_agent_codex_home,
     validate_agent_codex_home,
 )
-from pinky_daemon.codex_mcp_env import mcp_cli_config, with_mcp_header_env
+from pinky_daemon.codex_mcp_env import mcp_cli_config
 from pinky_daemon.context_estimator import ContextTextEstimator
+from pinky_daemon.effort import CLI_EFFORT_LEVELS
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.streaming_session import (
     StreamingSessionConfig,
@@ -224,7 +226,8 @@ class CodexSession(TransportReplacementMixin):
         self._approval_mode = "full-auto"  # Could be configurable later
         self._working_dir = config.working_dir or "."
         self._openai_api_key = config.provider_key or os.environ.get("OPENAI_API_KEY", "")
-        self._reasoning_effort = config.thinking_effort or "medium"
+        self._reasoning_effort = config.thinking_effort
+        self._selected_reasoning_effort: str | None = None
 
         # MCP server config for Codex CLI (injected via -c flags)
         # Uses the shared MCP server's streamable HTTP transport
@@ -994,12 +997,9 @@ class CodexSession(TransportReplacementMixin):
         if not is_resume:
             cmd.extend(["-C", self._working_dir])
 
-        # Reasoning effort (maps thinking_effort to Codex's model_reasoning_effort)
-        if self._reasoning_effort and self._reasoning_effort != "medium":
-            # Codex supports: low, medium, high
-            effort = self._reasoning_effort
-            if effort == "max":
-                effort = "high"  # Codex doesn't have "max", map to highest
+        effort = resolve_codex_effort(self._reasoning_effort)
+        self._selected_reasoning_effort = effort
+        if effort is not None:
             cmd.extend(["-c", f'model_reasoning_effort="{effort}"'])
 
         # Inject MCP servers via -c flags (works on both new and resume calls)
@@ -1011,16 +1011,16 @@ class CodexSession(TransportReplacementMixin):
         return cmd
 
     def _build_codex_env(self) -> dict[str, str]:
-        """Build the full process environment with the agent-home overlay."""
-        env = {**os.environ}
-        if self._openai_api_key:
-            env["OPENAI_API_KEY"] = self._openai_api_key
+        """Build one explicit launch identity over the permitted ambient inputs."""
+        policy = codex_launch_env.capture_policy(
+            agent_name=self.agent_name, registry=self._registry, log=_log,
+        )
         prepared_home = self._prepare_agent_codex_home()
-        if prepared_home is not None:
-            env["CODEX_HOME"] = prepared_home
-        if not self._use_app_server:
-            env = with_mcp_header_env(env, self._mcp_servers)
-        return env
+        return codex_launch_env.build_env(
+            agent_name=self.agent_name, config=self._config, api_key=self._openai_api_key,
+            policy=policy, log=_log, prepared_home=prepared_home,
+            servers={} if self._use_app_server else self._mcp_servers,
+        )
 
     def _prepare_agent_codex_home(self) -> str | None:
         """Snapshot and publish isolated-home state for an actual spawn."""
@@ -1437,15 +1437,12 @@ class CodexSession(TransportReplacementMixin):
         return {"mcp_servers": mcp} if mcp else {}
 
     def _appserver_effort(self) -> str | None:
-        """Map the configured thinking_effort onto a ReasoningEffort value."""
-        effort = self._reasoning_effort or ""
-        if not effort:
-            return None
-        if effort == "max":
-            return "high"  # parity with legacy: Codex has no "max"
-        if effort in ("none", "minimal", "low", "medium", "high", "xhigh"):
-            return effort
-        return None
+        """Select the explicit effort for the next app-server turn."""
+        effort = resolve_codex_effort(self._reasoning_effort)
+        if effort not in ("none", "minimal", *CLI_EFFORT_LEVELS):
+            effort = None
+        self._selected_reasoning_effort = effort
+        return effort
 
     async def _exec_codex_app_server(
         self,
@@ -2687,7 +2684,7 @@ class CodexSession(TransportReplacementMixin):
             "activity_log": list(self._activity_log),
             "cost_usd": round(self.usage.total_cost_usd, 6),
             "account": self.account_info,
-            "thinking_effort": self._reasoning_effort,
+            "thinking_effort": self._selected_reasoning_effort,
         }
 
     @property

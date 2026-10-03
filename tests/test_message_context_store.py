@@ -6,6 +6,8 @@ import sqlite3
 import threading
 import time
 
+import pytest
+
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.broker import BrokerMessage, MessageBroker
 from pinky_daemon.message_context_store import MessageContextStore
@@ -225,3 +227,150 @@ def test_put_and_retention_sweep_hold_one_lock_against_close(tmp_path, monkeypat
     assert not writer.is_alive()
     assert not closer.is_alive()
     assert errors == []
+
+
+
+def _text_context(message_id="record", *, direction="inbound"):
+    return {"agent_name": "sample", "message_id": message_id, "platform": "test",
+            "chat_id": "chat", "timestamp": 1.0, "metadata": {"direction": direction}}
+
+
+def _put_text(store, context, **kwargs):
+    import inspect
+
+    assert {"content", "sender_id"} <= set(inspect.signature(store.put).parameters), (
+        "the store must accept text only through explicit keyword arguments"
+    )
+    store.put(context, **kwargs)
+
+
+def _read_text(store, message_id="record", **kwargs):
+    getter = getattr(store, "get_text", None)
+    assert callable(getter), "a separate bounded text getter is required"
+    return getter("sample", message_id, platform="test", chat_id="chat", **kwargs)
+
+
+@pytest.mark.parametrize("text", ["", " exact\r\ntext e\u0301 é 😀 ", "é" * 8192, "x" * 16384],
+                         ids=["empty", "unicode", "multibyte-limit", "ascii-limit"])
+def test_explicit_inbound_text_survives_reopen_without_normalization(tmp_path, text):
+    path = str(tmp_path / "context.db")
+    store = MessageContextStore(path)
+    _put_text(store, _text_context(), content=text, sender_id="sender-1")
+    store.close()
+    store = MessageContextStore(path)
+    try:
+        assert _read_text(store) == (text, "ok", "sender-1")
+        ordinary = store.get("sample", "record", platform="test", chat_id="chat")
+        assert not {"content", "text", "content_status", "sender_id"} & ordinary.keys()
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("text", ["é" * 8192 + "x", "x" * 16385], ids=["multibyte-over", "ascii-over"])
+def test_over_byte_cap_replaces_previous_text_with_null_not_prefix(tmp_path, text):
+    store = MessageContextStore(str(tmp_path / "context.db"))
+    try:
+        _put_text(store, _text_context(), content="old", sender_id="sender-0")
+        _put_text(store, _text_context(), content=text, sender_id="sender-1")
+        assert _read_text(store) == (None, "too_long", "sender-1")
+        assert store._db.execute("SELECT content FROM message_contexts").fetchone()[0] is None
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("direction", ["outbound", "", "Inbound"])
+def test_non_inbound_upsert_clears_every_text_column(tmp_path, direction):
+    store = MessageContextStore(str(tmp_path / "context.db"))
+    try:
+        _put_text(store, _text_context(), content="previous", sender_id="sender-1")
+        _put_text(store, _text_context(direction=direction), content="forged", sender_id="forged")
+        assert _read_text(store) == (None, "absent", "")
+        row = store._db.execute("SELECT content, content_status, sender_id FROM message_contexts").fetchone()
+        assert tuple(row) == (None, "absent", "")
+    finally:
+        store.close()
+
+
+def test_metadata_and_context_keys_cannot_supply_text_or_sender(tmp_path):
+    store = MessageContextStore(str(tmp_path / "context.db"))
+    try:
+        context = _text_context()
+        context.update(content="forged", text="forged", sender_id="forged")
+        context["metadata"].update(content="forged", text="forged", sender_id="forged")
+        store.put(context)
+        assert _read_text(store) == (None, "absent", "")
+        _put_text(store, context, content="exact", sender_id="sender-1")
+        assert _read_text(store) == ("exact", "ok", "sender-1")
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("legacy_key", [False, True])
+@pytest.mark.parametrize("seed_text", [False, True])
+def test_text_columns_migrate_twice_and_survive_identity_rebuild(tmp_path, legacy_key, seed_text):
+    path = str(tmp_path / "context.db")
+    db = sqlite3.connect(path)
+    key = "agent_name, message_id" if legacy_key else "agent_name, platform, chat_id, message_id"
+    db.execute(f"""CREATE TABLE message_contexts (
+        agent_name TEXT NOT NULL, message_id TEXT NOT NULL, platform TEXT NOT NULL,
+        chat_id TEXT NOT NULL, message_ts REAL NOT NULL, reply_to TEXT NOT NULL DEFAULT '',
+        is_group INTEGER NOT NULL DEFAULT 0, source_was_voice INTEGER NOT NULL DEFAULT 0,
+        attachments_json TEXT NOT NULL DEFAULT '[]', metadata_json TEXT NOT NULL DEFAULT '{{}}',
+        stored_at REAL NOT NULL, PRIMARY KEY ({key}))""")
+    db.execute("""INSERT INTO message_contexts
+        (agent_name, message_id, platform, chat_id, message_ts, metadata_json, stored_at)
+        VALUES ('sample', 'record', 'test', 'chat', 1, '{"direction":"inbound"}', ?)""",
+               (time.time(),))
+    if seed_text:
+        for column in ["content TEXT", "content_status TEXT NOT NULL DEFAULT 'absent'",
+                       "sender_id TEXT NOT NULL DEFAULT ''"]:
+            db.execute("ALTER TABLE message_contexts ADD COLUMN " + column)
+        db.execute("UPDATE message_contexts SET content='prior text', content_status='ok', sender_id='prior-sender'")
+    db.commit()
+    db.close()
+    for _ in range(2):
+        store = MessageContextStore(path)
+        try:
+            columns = {r["name"] for r in store._db.execute("PRAGMA table_info(message_contexts)")}
+            assert {"content", "content_status", "sender_id"} <= columns
+            assert _read_text(store) == (("prior text", "ok", "prior-sender") if seed_text
+                                         else (None, "absent", ""))
+        finally:
+            store.close()
+
+
+def test_text_visibility_matches_retention_cap_and_snapshot(tmp_path, monkeypatch):
+    store = MessageContextStore(str(tmp_path / "context.db"), max_per_agent=2)
+    now = time.time()
+    try:
+        _put_text(store, _text_context(), content="first", sender_id="sender", stored_at=now)
+        assert _read_text(store, stored_at=now) == ("first", "ok", "sender")
+        _put_text(store, _text_context(), content="second", sender_id="sender", stored_at=now + 1)
+        assert _read_text(store, stored_at=now) is None
+        for index in range(2):
+            _put_text(store, _text_context(str(index)), content="recent", stored_at=now + 2 + index)
+        assert _read_text(store) is None
+        assert store._db.execute("SELECT 1 FROM message_contexts WHERE message_id='record'").fetchone() is None
+        future = now + 32 * 86400
+        monkeypatch.setattr("pinky_daemon.message_context_store.time.time", lambda: future)
+        assert _read_text(store, "1") is None
+        store.sweep_retention(now=future)
+        assert store._db.execute("SELECT count(*) FROM message_contexts").fetchone()[0] == 0
+    finally:
+        store.close()
+
+
+def test_private_text_lookup_uses_every_identity_component(tmp_path):
+    store = MessageContextStore(str(tmp_path / "context.db"))
+    try:
+        _put_text(store, _text_context(), content="first", sender_id="sender-1")
+        _put_text(store, {**_text_context(), "chat_id": "other-chat"}, content="second", sender_id="sender-2")
+        getter = getattr(store, "get_text", None)
+        assert callable(getter)
+        assert getter("other", "record", platform="test", chat_id="chat") is None
+        assert getter("sample", "record", platform="other", chat_id="chat") is None
+        assert getter("sample", "other", platform="test", chat_id="chat") is None
+        assert getter("sample", "record", platform="test", chat_id="other-chat") == ("second", "ok", "sender-2")
+        assert _read_text(store) == ("first", "ok", "sender-1")
+    finally:
+        store.close()

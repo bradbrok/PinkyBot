@@ -139,13 +139,10 @@ def test_isolated_headers_are_added_after_scoping_and_grants(harness, monkeypatc
     monkeypatch.setenv(other, OTHER_TOKEN)
     monkeypatch.setenv(PREFIX + "API_ONE_AUTHORIZATION", OTHER_TOKEN)
     s = session("tmux", home, monkeypatch)
-    scoped = Mock(wraps=isolated_launch_env.scoped_codex_env)
-    monkeypatch.setattr(isolated_launch_env, "scoped_codex_env", scoped)
     policy = isolated_launch_env.LaunchPolicy(
         mode="enforce", status="isolated", agent_key="test-scoped-key", grants=(other,),
     )
     env = s._build_repl_env(launch_policy=policy)
-    scoped.assert_called_once_with(policy, "test-agent")
     assert {k: v for k, v in env.items() if k.startswith(PREFIX)} == EXPECTED
     assert env["PINKY_AGENT_KEY"] == "test-scoped-key"
     assert OTHER_TOKEN not in env.values()

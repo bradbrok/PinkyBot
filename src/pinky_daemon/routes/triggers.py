@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from pinky_daemon.access_log import _redact_hook_path as _redact_hook_path
 from pinky_daemon.api_models import CreateTriggerRequest, UpdateTriggerRequest
+from pinky_daemon.trigger_fetch import validate_trigger_url
 
 router = APIRouter(tags=["triggers"])
 
@@ -238,6 +239,12 @@ async def create_agent_trigger(agent_name: str, req: CreateTriggerRequest):
     if req.trigger_type not in valid_types:
         raise HTTPException(400, f"trigger_type must be one of: {', '.join(sorted(valid_types))}")
 
+    if req.trigger_type == "url":
+        try:
+            validate_trigger_url(req.url)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
     trigger = _trigger_store.create(
         agent_name=agent_name,
         name=req.name or req.trigger_type,
@@ -270,6 +277,11 @@ async def update_agent_trigger(agent_name: str, trigger_id: int, req: UpdateTrig
     if not trigger or trigger.agent_name != agent_name:
         raise HTTPException(404, f"Trigger {trigger_id} not found")
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if trigger.trigger_type == "url" and "url" in updates:
+        try:
+            validate_trigger_url(updates["url"])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     updated = _trigger_store.update(trigger_id, **updates)
     if not updated:
         raise HTTPException(404, f"Trigger {trigger_id} not found")

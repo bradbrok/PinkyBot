@@ -83,6 +83,9 @@ class MessageContextStore:
                 attachments_json TEXT NOT NULL DEFAULT '[]',
                 metadata_json    TEXT NOT NULL DEFAULT '{}',
                 stored_at        REAL NOT NULL,
+                content          TEXT,
+                content_status   TEXT NOT NULL DEFAULT 'absent',
+                sender_id        TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (agent_name, platform, chat_id, message_id)
             );
             """
@@ -118,6 +121,9 @@ class MessageContextStore:
                         attachments_json TEXT NOT NULL DEFAULT '[]',
                         metadata_json    TEXT NOT NULL DEFAULT '{}',
                         stored_at        REAL NOT NULL,
+                        content          TEXT,
+                        content_status   TEXT NOT NULL DEFAULT 'absent',
+                        sender_id        TEXT NOT NULL DEFAULT '',
                         PRIMARY KEY (agent_name, platform, chat_id, message_id)
                     )
                     """
@@ -127,11 +133,11 @@ class MessageContextStore:
                     INSERT INTO message_contexts_new (
                         agent_name, message_id, platform, chat_id, message_ts,
                         reply_to, is_group, source_was_voice, attachments_json,
-                        metadata_json, stored_at
+                        metadata_json, stored_at, content, content_status, sender_id
                     )
                     SELECT agent_name, message_id, platform, chat_id, message_ts,
                            reply_to, is_group, source_was_voice, attachments_json,
-                           metadata_json, stored_at
+                           metadata_json, stored_at, content, content_status, sender_id
                     FROM message_contexts
                     """
                 )
@@ -151,6 +157,9 @@ class MessageContextStore:
             ("attachments_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
             ("stored_at", "REAL NOT NULL DEFAULT 0"),
+            ("content", "TEXT"),
+            ("content_status", "TEXT NOT NULL DEFAULT 'absent'"),
+            ("sender_id", "TEXT NOT NULL DEFAULT ''"),
         ]
         existing = {
             row["name"]
@@ -197,7 +206,8 @@ class MessageContextStore:
             return {}
         return value if isinstance(value, dict) else {}
 
-    def put(self, context: dict[str, Any], *, stored_at: float | None = None) -> None:
+    def put(self, context: dict[str, Any], *, stored_at: float | None = None,
+            content: str | None = None, sender_id: str = "") -> None:
         """Insert or replace one agent-scoped message context."""
         agent_name = str(context.get("agent_name") or "")
         message_id = str(context.get("message_id") or "")
@@ -207,6 +217,14 @@ class MessageContextStore:
             return
         attachments = context.get("attachments")
         metadata = context.get("metadata")
+        content_status = "absent"
+        if not isinstance(metadata, dict) or metadata.get("direction") != "inbound":
+            content, sender_id = None, ""
+        else:
+            sender_id = "" if sender_id is None else str(sender_id)
+            if isinstance(content, str):
+                content_status = "ok" if len(content.encode("utf-8")) <= 16384 else "too_long"
+        content = content if content_status == "ok" else None
         now = time.time() if stored_at is None else float(stored_at)
         with self._lock:
             try:
@@ -215,8 +233,8 @@ class MessageContextStore:
                     INSERT INTO message_contexts (
                         agent_name, message_id, platform, chat_id, message_ts,
                         reply_to, is_group, source_was_voice, attachments_json,
-                        metadata_json, stored_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        metadata_json, stored_at, content, content_status, sender_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(agent_name, platform, chat_id, message_id) DO UPDATE SET
                         message_ts=excluded.message_ts,
                         reply_to=excluded.reply_to,
@@ -224,7 +242,10 @@ class MessageContextStore:
                         source_was_voice=excluded.source_was_voice,
                         attachments_json=excluded.attachments_json,
                         metadata_json=excluded.metadata_json,
-                        stored_at=excluded.stored_at
+                        stored_at=excluded.stored_at,
+                        content=excluded.content,
+                        content_status=excluded.content_status,
+                        sender_id=excluded.sender_id
                     """,
                     (
                         agent_name,
@@ -243,7 +264,7 @@ class MessageContextStore:
                             metadata if isinstance(metadata, dict) else {},
                             default=str,
                         ),
-                        now,
+                        now, content, content_status, sender_id,
                     ),
                 )
                 self._sweep_retention_locked(now)
@@ -317,6 +338,25 @@ class MessageContextStore:
             include_stored_at=include_stored_at,
         )
         return contexts[0] if len(contexts) == 1 else None
+
+    def get_text(
+        self, agent_name: str, message_id: str, *, platform: str, chat_id: str,
+        stored_at: float | None = None,
+    ) -> tuple[str | None, str, str] | None:
+        """Read private text separately, within the routing row's visibility bounds."""
+        with self._lock:
+            context = self.get(agent_name, message_id, platform=platform, chat_id=chat_id,
+                               include_stored_at=True)
+            if context is None or (stored_at is not None and context["_stored_at"] != stored_at):
+                return None
+            row = self._db.execute(
+                "SELECT content, content_status, sender_id FROM message_contexts "
+                "WHERE agent_name=? AND message_id=? AND platform=? AND chat_id=? "
+                "AND stored_at=? AND stored_at>=?",
+                (agent_name, message_id, platform, chat_id, context["_stored_at"],
+                 time.time() - self.retention_seconds),
+            ).fetchone()
+            return tuple(row) if row is not None else None
 
     def _sweep_retention_locked(self, now: float) -> int:
         """Prune rows while the caller owns ``_lock`` and the transaction."""

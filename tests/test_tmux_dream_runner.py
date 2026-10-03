@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import tempfile
 
 import pytest
 
 from pinky_daemon.dream_runner import DreamRunner
 from pinky_daemon.tmux_dream_runner import TmuxDreamConfig, TmuxDreamRunner
+from pinky_daemon.tmux_session import TmuxCommandResult
 
 
 class _FakeTmux:
@@ -26,6 +28,15 @@ class _FakeTmux:
         if args[0] == "capture-pane":
             return 0, "❯ try 'help'  ? for shortcuts"
         return 0, ""
+
+    async def new_session(self, *, cwd, command, env, codex_headers=False):
+        assert codex_headers is True
+        # Preserve the existing CLI assertions at the common loader seam.
+        wrapper = shlex.split(command)
+        assert wrapper[0] == "/usr/bin/env"
+        cli = shlex.split(wrapper[-1])
+        rc, out = await self("new-session", "-d", "-c", cwd, *cli)
+        return TmuxCommandResult(returncode=rc, stdout="", stderr=out)
 
     def named(self, cmd: str) -> list[tuple[str, ...]]:
         return [c for c in self.calls if c[0] == cmd]
@@ -44,6 +55,7 @@ def _runner(tmp: str, fake: _FakeTmux, **overrides) -> TmuxDreamRunner:
     )
     runner = TmuxDreamRunner(cfg, agent_name="ivan")
     runner._tmux = fake  # type: ignore[method-assign]
+    runner._control.new_session = fake.new_session
 
     seeded: list[str] = []
     runner._seeded_dirs = seeded  # type: ignore[attr-defined]

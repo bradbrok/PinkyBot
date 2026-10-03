@@ -42,24 +42,25 @@ def builder(kind, registry, tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])
 @pytest.mark.parametrize("flag", [None, "off"])
-def test_shadow_is_explicitly_opt_in(tmp_path, monkeypatch, kind, flag):
+def test_isolated_host_shadow_is_minimum(tmp_path, monkeypatch, kind, flag):
     if flag is None:
         monkeypatch.delenv("PINKY_ISOLATED_ENV", raising=False)
     else:
         monkeypatch.setenv("PINKY_ISOLATED_ENV", flag)
     build, logs = builder(kind, Registry(), tmp_path, monkeypatch)
     build()
-    assert not reports(logs)
+    assert bool(reports(logs))
 
 
 @pytest.mark.parametrize("kind", ["codex", "app_server"])
-def test_flag_off_adds_no_registry_lookups(tmp_path, monkeypatch, kind):
-    registry = Mock()
+def test_flag_off_resolves_codex_identity_and_isolation(tmp_path, monkeypatch, kind):
+    registry = Mock(wraps=Registry())
     build, logs = builder(kind, registry, tmp_path, monkeypatch)
     registry.reset_mock()
     build()
-    assert registry.mock_calls == []
-    assert not reports(logs)
+    registry.get.assert_called_once_with("test-tenant")
+    registry.get_signing_key.assert_called_once_with("test-tenant")
+    assert len(reports(logs)) == 1
 
 
 @pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])
@@ -78,7 +79,8 @@ def test_tri_state_predicate_and_name_only_reports(
     build, logs = builder(kind, Registry(status, key=key), tmp_path, monkeypatch)
     before = dict(os.environ)
     env = build()
-    assert dict(os.environ) == before
+    unchanged = dict(os.environ) == before
+    assert unchanged
     emitted = reports(logs)
     assert bool(emitted) is expected
     if expected:
@@ -94,7 +96,8 @@ def test_tri_state_predicate_and_name_only_reports(
     assert all(value not in "\n".join(logs) for value in SYNTHETIC_VALUES.values())
     assert "synthetic-future-grant" not in "\n".join(logs)
     if kind != "claude":
-        assert DAEMON_NAMES <= env.keys(), "shadow accidentally enforces payload filtering"
+        assert "HRPOS_PASSWORD" in env, "shadow removed an ordinary tool input"
+        assert not isolated_launch_env.DAEMON_ONLY.intersection(env)
 
 
 @pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])
@@ -115,13 +118,13 @@ def test_shadow_preserves_payload_bytes(tmp_path, monkeypatch, kind):
     off = build()
     monkeypatch.setenv("PINKY_ISOLATED_ENV", "shadow")
     on = build()
-    # Codex forwards the operator's flag as part of existing full-env parity.
+    # All host transports forward the operator's flag in the daemon payload.
     # That input difference is the only allowed difference in output bytes.
-    if kind != "claude":
-        assert off.pop("PINKY_ISOLATED_ENV") == "off"
-        assert on.pop("PINKY_ISOLATED_ENV") == "shadow"
-    assert json.dumps(off, sort_keys=True).encode() == json.dumps(on, sort_keys=True).encode()
-    assert len(reports(logs)) == 1
+    assert off.pop("PINKY_ISOLATED_ENV") == "off"
+    assert on.pop("PINKY_ISOLATED_ENV") == "shadow"
+    same_bytes = json.dumps(off, sort_keys=True).encode() == json.dumps(on, sort_keys=True).encode()
+    assert same_bytes
+    assert len(reports(logs)) == 2
 
 
 @pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])
@@ -134,9 +137,11 @@ async def test_real_tmux_shadow_preserves_child_names(tmp_path, monkeypatch, kin
             async with launch_probe(root, launch_patch) as probe:
                 launch_patch.setenv("PINKY_ISOLATED_ENV", flag)
                 names = await probe.launch(kind)
-                assert DAEMON_NAMES <= names, "shadow must leave the existing inheritance intact"
+                assert "HRPOS_PASSWORD" in names
+                assert not isolated_launch_env.DAEMON_ONLY.intersection(names)
                 assert "CLAUDE_CODE_OAUTH_TOKEN" in json.loads(probe.empty_names_path.read_text())
-                assert bool(reports(probe.logs)) is (flag == "shadow")
+                assert bool(reports(probe.logs))
+                assert len(reports(probe.logs)) == 1
                 if kind == "claude":
                     assert "PINKY_AGENT_KEY" in names
                 observed.append(names)

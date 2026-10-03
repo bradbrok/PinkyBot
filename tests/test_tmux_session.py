@@ -46,6 +46,7 @@ from pinky_daemon.tmux_session import (
 )
 from pinky_daemon.tmux_transcript import TmuxTranscriptTailer, TurnResponse
 from pinky_daemon.transport_state import SessionState, TransitionResult, Trigger
+from tests._gc_quiet import gc_quiet
 
 _REAL_ASYNCIO_SLEEP = asyncio.sleep
 
@@ -1750,16 +1751,14 @@ async def test_deliver_turn_native_effort_send_failure_still_pastes(
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def test_build_repl_env_propagates_pinky_session_secret_when_set(
+def test_build_repl_env_removes_pinky_session_secret_when_set(
     monkeypatch,
 ) -> None:
-    """When the daemon env has ``PINKY_SESSION_SECRET``, it must be
-    included in the tmux env so the HMAC-signing hook scripts inside
-    the tmux session can authenticate to the daemon."""
+    """Local Claude hosts never receive daemon-wide signing authority."""
     monkeypatch.setenv("PINKY_SESSION_SECRET", "test-secret-32-bytes-min-xyz")
     ss, _ = _make_session()
     env = ss._build_repl_env()
-    assert env.get("PINKY_SESSION_SECRET") == "test-secret-32-bytes-min-xyz"
+    assert "PINKY_SESSION_SECRET" not in env
 
 
 def test_build_repl_env_omits_pinky_session_secret_when_unset(
@@ -1796,15 +1795,15 @@ def test_build_repl_env_provisions_per_agent_key(monkeypatch) -> None:
     ss, _ = _make_session(agent_name="dymok")
     ss._registry = MagicMock()
     ss._registry.get_signing_key.return_value = "dymok-per-agent-key"
-    # Non-isolated agent: dual-accept fallback retains the global secret.
+    # Non-isolated host still receives only its scoped identity.
     ss._registry.get.return_value.isolated = False
     # #638: a bare MagicMock auto-generates a truthy Mock for isolation_mode,
     # which the non-local coupling rightly treats as isolated — declare local.
     ss._registry.get.return_value.isolation_mode = "local"
     env = ss._build_repl_env()
-    assert env.get("PINKY_AGENT_KEY") == "dymok-per-agent-key"
-    # Global secret still propagated (dual-accept fallback for other paths).
-    assert env.get("PINKY_SESSION_SECRET") == "global-secret-xyz"
+    own_key = env.get("PINKY_AGENT_KEY") == "dymok-per-agent-key"
+    assert own_key
+    assert "PINKY_SESSION_SECRET" not in env
     ss._registry.get_signing_key.assert_called_once_with("dymok")
 
 
@@ -1889,7 +1888,8 @@ async def test_concurrent_cold_start_runs_one_tmux_spawn() -> None:
     spawn_started = asyncio.Event()
     spawn_count = 0
 
-    async def blocking_new_session(*, cwd, command, env=None):
+    async def blocking_new_session(*, cwd, command, env=None, codex_headers=False):
+        assert codex_headers is True
         nonlocal spawn_count
         spawn_count += 1
         spawn_started.set()
@@ -1933,7 +1933,8 @@ async def test_concurrent_cold_start_subscriber_raises_on_owner_dead() -> None:
     release_spawn = asyncio.Event()
     spawn_started = asyncio.Event()
 
-    async def failing_new_session(*, cwd, command, env=None):
+    async def failing_new_session(*, cwd, command, env=None, codex_headers=False):
+        assert codex_headers is True
         spawn_started.set()
         await release_spawn.wait()
         return _fail("rc=1")
@@ -2067,7 +2068,8 @@ async def test_concurrent_warm_wake_runs_one_spawn() -> None:
     spawn_started = asyncio.Event()
     spawn_count = 0
 
-    async def blocking_new_session(*, cwd, command, env=None):
+    async def blocking_new_session(*, cwd, command, env=None, codex_headers=False):
+        assert codex_headers is True
         nonlocal spawn_count
         spawn_count += 1
         spawn_started.set()
@@ -9034,9 +9036,10 @@ class TestWakePromptReadinessGate:
             internal=True, reason="wake_new_session",
         )
 
-        start = _time.monotonic()
-        await ss._deliver_turn(wake_turn)
-        elapsed_ms = (_time.monotonic() - start) * 1000
+        with gc_quiet():
+            start = _time.monotonic()
+            await ss._deliver_turn(wake_turn)
+            elapsed_ms = (_time.monotonic() - start) * 1000
 
         assert elapsed_ms < 100, (
             f"already-open gate must short-circuit; took {elapsed_ms:.1f}ms"
@@ -9059,11 +9062,12 @@ class TestWakePromptReadinessGate:
             internal=True, reason="idle_sleep_presave",
         )
 
-        start = _time.monotonic()
-        await asyncio.wait_for(
-            ss._deliver_turn(presave_turn), timeout=2.0,
-        )
-        elapsed_ms = (_time.monotonic() - start) * 1000
+        with gc_quiet():
+            start = _time.monotonic()
+            await asyncio.wait_for(
+                ss._deliver_turn(presave_turn), timeout=2.0,
+            )
+            elapsed_ms = (_time.monotonic() - start) * 1000
 
         assert elapsed_ms < 100, (
             f"non-wake reason must skip the gate; took {elapsed_ms:.1f}ms"
@@ -9088,11 +9092,12 @@ class TestWakePromptReadinessGate:
             internal=False, reason="",
         )
 
-        start = _time.monotonic()
-        await asyncio.wait_for(
-            ss._deliver_turn(external_turn), timeout=2.0,
-        )
-        elapsed_ms = (_time.monotonic() - start) * 1000
+        with gc_quiet():
+            start = _time.monotonic()
+            await asyncio.wait_for(
+                ss._deliver_turn(external_turn), timeout=2.0,
+            )
+            elapsed_ms = (_time.monotonic() - start) * 1000
 
         assert elapsed_ms < 100, (
             f"external turn must skip the gate; took {elapsed_ms:.1f}ms"
@@ -11902,7 +11907,16 @@ class TestWakeSubmissionVerification:
         assert target == ss.agent_name
         assert instruction.startswith("CONTEXT-RELOAD:")
         assert "already oriented" in instruction
-        assert "take no other action" in instruction
+        assert "continue the work you were doing in this same turn" in instruction, (
+            "already-oriented recovery must continue current work in the same turn"
+        )
+        assert "do not reload or restart" in instruction, (
+            "already-oriented recovery must not reload or restart"
+        )
+        assert "take no other action" not in instruction, (
+            "already-oriented recovery must not halt current work"
+        )
+        assert "never replay" in instruction, "recovery must retain the no-replay guard"
         assert "load_my_context" in instruction
         assert turn.prompt not in instruction
         assert await receipt is False
@@ -12119,7 +12133,16 @@ class TestWakeSubmissionVerification:
                 "CONTEXT-RELOAD:"
             )
             assert "already oriented" in pasted[1]
-            assert "take no other action" in pasted[1]
+            assert "continue the work you were doing in this same turn" in pasted[1], (
+                "already-oriented recovery must continue current work in the same turn"
+            )
+            assert "do not reload or restart" in pasted[1], (
+                "already-oriented recovery must not reload or restart"
+            )
+            assert "take no other action" not in pasted[1], (
+                "already-oriented recovery must not halt current work"
+            )
+            assert "never replay" in pasted[1], "recovery must retain the no-replay guard"
             assert "load_my_context" in pasted[1]
             assert any(
                 event.get("rung") == "broker_context_reload_drain"

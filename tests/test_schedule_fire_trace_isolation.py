@@ -17,6 +17,7 @@ import pytest
 import pinky_daemon.agent_registry as ar
 import pinky_daemon.schedule_fire_trace as ft
 from pinky_daemon.scheduler import ScheduleWakeReceipt
+from tests._gc_quiet import gc_quiet
 
 
 @pytest.fixture
@@ -163,39 +164,46 @@ async def test_trace_read_endpoint_must_not_block_event_loop(tmp_path, endpoint)
     registry.register("review-worker", working_dir=str(tmp_path / "worker"))
     fire(registry)
     lock = sqlite3.connect(registry._fire_trace.path, timeout=0, check_same_thread=False)
-    lock.execute("BEGIN EXCLUSIVE")
     timer = threading.Timer(0.30, lock.rollback)
-    timer.start()
 
     async def heartbeat():
         started = time.monotonic()
         await asyncio.sleep(0.01)
         return time.monotonic() - started
 
-    beat = asyncio.create_task(heartbeat())
-    await asyncio.sleep(0)
     try:
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app),
-            base_url="http://test",
-            cookies={
-                SESSION_COOKIE_NAME: create_session_cookie(os.environ["PINKY_SESSION_SECRET"]),
-            },
-        ) as client:
-            response = await client.get("/scheduler/" + endpoint)
-        lag = await beat
-        assert response.status_code == 200
-        result = response.json()
-        assert (
-            len(result["rows"]) == 1
-            if endpoint == "fire-trace"
-            else result["fire_trace_24h"]["pending"] == 1
-        )
-        assert lag < 0.1, "diagnostic reads blocked the event loop"
+        # Collect before taking the lock so GC cannot consume its hold interval.
+        with gc_quiet():
+            lock.execute("BEGIN EXCLUSIVE")
+            timer.start()
+            beat = asyncio.create_task(heartbeat())
+            await asyncio.sleep(0)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+                cookies={
+                    SESSION_COOKIE_NAME: create_session_cookie(os.environ["PINKY_SESSION_SECRET"]),
+                },
+            ) as client:
+                response = await client.get("/scheduler/" + endpoint)
+            lag = await beat
+            assert response.status_code == 200
+            result = response.json()
+            assert (
+                len(result["rows"]) == 1
+                if endpoint == "fire-trace"
+                else result["fire_trace_24h"]["pending"] == 1
+            )
+            assert lag < 0.1, "diagnostic reads blocked the event loop"
     finally:
-        timer.join()
-        lock.close()
-        registry.close()
+        try:
+            if timer.ident is not None:
+                timer.join()
+        finally:
+            try:
+                lock.close()
+            finally:
+                registry.close()
 
 
 def test_failure_handoff_must_not_temporarily_hide_failure(registry, monkeypatch):
@@ -514,9 +522,10 @@ def test_idle_trace_scan_must_not_delay_replay_scheduling(registry, monkeypatch)
     monkeypatch.setattr(
         scheduler, "replay_pending_for_agent", lambda name: replay_times.append(time.monotonic())
     )
-    start = time.monotonic()
-    scheduler.notify_agent_idle("review-worker")
-    assert replay_times[-1] - start < 0.1
+    with gc_quiet():
+        start = time.monotonic()
+        scheduler.notify_agent_idle("review-worker")
+        assert replay_times[-1] - start < 0.1
     assert registry._fire_trace.flush()
     lock = sqlite3.connect(registry._db_path, timeout=0, check_same_thread=False)
     lock.execute("BEGIN EXCLUSIVE")

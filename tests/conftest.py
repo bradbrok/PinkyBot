@@ -29,11 +29,13 @@ import logging
 import os
 import shutil
 import stat
+import subprocess
 import tempfile
 
 import pytest
 from fastapi.testclient import TestClient
 
+from pinky_daemon.tmux_launch_env_loader import DAEMON_ONLY
 from tests._tmp_hygiene import restore_tree_readability
 
 # Test session secret. Long-enough random-looking value; never used in
@@ -93,7 +95,7 @@ _REAL_TRANSPORT_OPTED_IN = os.environ.get(
 def _scrub_test_env() -> None:
     """Replace ambient runtime configuration with deterministic test values."""
     for key in tuple(os.environ):
-        if key.startswith("PINKY_"):
+        if key.startswith(("PINKY_", "PINKYBOT_")) or key in DAEMON_ONLY:
             os.environ.pop(key, None)
     os.environ.update(_PINNED_TEST_ENV)
 
@@ -203,7 +205,7 @@ def _isolate_test_env(request, monkeypatch):
     environment leakage from a prior test that mutated ``os.environ`` directly.
     """
     for key in tuple(os.environ):
-        if key.startswith("PINKY_"):
+        if key.startswith(("PINKY_", "PINKYBOT_")) or key in DAEMON_ONLY:
             monkeypatch.delenv(key, raising=False)
     for key, value in _PINNED_TEST_ENV.items():
         monkeypatch.setenv(key, value)
@@ -220,6 +222,43 @@ def _isolate_test_env(request, monkeypatch):
     finally:
         # Also contain direct os.environ writes that bypassed monkeypatch.
         _scrub_test_env()
+
+
+@pytest.fixture(autouse=True)
+def _guard_default_tmux_socket(monkeypatch):
+    """Never let an unpatched test spawn reach the operator's default server."""
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    original = subprocess.Popen
+
+    class PrivatePopen(original):
+        def __init__(self, args, *positional, **kwargs):
+            if (
+                isinstance(args, (list, tuple)) and args
+                and os.path.basename(os.fsdecode(args[0])) == "tmux"
+            ):
+                argv = [os.fsdecode(arg) for arg in args[1:]]
+                if argv != ["-V"]:
+                    selected = None
+                    index = 0
+                    while index < len(argv) and argv[index].startswith("-"):
+                        flag = argv[index]
+                        if flag in {"-L", "-S", "-f"}:
+                            if index + 1 >= len(argv):
+                                break
+                            if flag in {"-L", "-S"}:
+                                selected = argv[index + 1]
+                            index += 2
+                        elif flag.startswith(("-L", "-S")):
+                            selected = flag[2:]
+                            index += 1
+                        else:
+                            index += 1
+                    if not selected or os.path.basename(selected) == "default":
+                        raise RuntimeError("test tmux command requires an explicit private socket")
+            super().__init__(args, *positional, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", PrivatePopen)
 
 
 @pytest.fixture(autouse=True)

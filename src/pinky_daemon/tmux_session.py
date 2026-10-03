@@ -75,7 +75,12 @@ from pathlib import Path
 from stat import S_ISREG
 from typing import Literal
 
-from pinky_daemon import isolated_launch_env, tmux_launch_env, tmux_launch_env_loader
+from pinky_daemon import (
+    isolated_launch_env,
+    launch_env_authority,
+    tmux_launch_env,
+    tmux_launch_env_loader,
+)
 from pinky_daemon.agent_registry import (
     CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS,
     validate_restart_tokens_cap,
@@ -520,11 +525,11 @@ _WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC = 5.0
 _WAKE_SUBMISSION_BROKER_TIMEOUT_SEC = 5.0
 _WAKE_CONTEXT_RELOAD_INSTRUCTION = (
     "CONTEXT-RELOAD: If an orientation wake for this session already appears "
-    "above and you have begun acting on it, reply exactly 'already oriented' "
-    "and take no other action. Otherwise, reload the saved continuation state "
-    "now with load_my_context, then resume from that durable artifact. This is "
-    "a distinct recovery instruction; never replay the failed orientation "
-    "wake text."
+    "above and you have begun acting on it, reply 'already oriented', "
+    "do not reload or restart, and continue the work you were doing in this same "
+    "turn. Otherwise, reload the saved continuation state now with load_my_context, "
+    "then resume from that durable artifact. This is a distinct recovery "
+    "instruction; never replay the failed orientation wake text."
 )
 
 
@@ -2154,6 +2159,99 @@ _EFFORT_DIALOG_NEEDLES = ("change effort", "effort level?")
 # CLI prints for an unknown model id.
 _MODEL_DIALOG_NEEDLES = ("change model", "switch model?")
 _MODEL_ERROR_NEEDLES = ("unknown model", "invalid model", "not a valid model")
+
+
+# Auth names shared by host Claude sessions and dreams are builder-owned;
+# configured values (including empty strings) remain in the private payload.
+_CLAUDE_AUTH_ENV_NAMES = frozenset("""
+ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS
+CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN
+CLAUDE_CODE_OAUTH_SCOPES CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
+CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_MANTLE CLAUDE_CODE_USE_ANTHROPIC_AWS
+CLAUDE_CODE_SKIP_BEDROCK_AUTH CLAUDE_CODE_SKIP_VERTEX_AUTH CLAUDE_CODE_SKIP_FOUNDRY_AUTH
+CLAUDE_CODE_SKIP_MANTLE_AUTH CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH
+CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST ANTHROPIC_BEDROCK_BASE_URL
+ANTHROPIC_BEDROCK_MANTLE_BASE_URL ANTHROPIC_FOUNDRY_API_KEY ANTHROPIC_FOUNDRY_AUTH_TOKEN
+ANTHROPIC_FOUNDRY_BASE_URL ANTHROPIC_FOUNDRY_RESOURCE ANTHROPIC_VERTEX_BASE_URL
+ANTHROPIC_VERTEX_PROJECT_ID ANTHROPIC_AWS_API_KEY ANTHROPIC_AWS_BASE_URL
+ANTHROPIC_AWS_WORKSPACE_ID ANTHROPIC_FEDERATION_RULE_ID ANTHROPIC_ORGANIZATION_ID
+ANTHROPIC_WORKSPACE_ID ANTHROPIC_PROFILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+AWS_SESSION_TOKEN AWS_BEARER_TOKEN_BEDROCK AWS_PROFILE AWS_REGION AWS_DEFAULT_REGION
+AWS_SHARED_CREDENTIALS_FILE AWS_CONFIG_FILE GOOGLE_APPLICATION_CREDENTIALS
+GCLOUD_PROJECT GOOGLE_CLOUD_PROJECT CLOUD_ML_REGION
+""".split())
+# Every key whose presence or value is decided by the explicit Claude builder,
+# including auth helpers and the retired autocompact override.
+_CLAUDE_BUILDER_ENV_NAMES = _CLAUDE_AUTH_ENV_NAMES | frozenset({
+    "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW", "PINKY_AGENT_NAME", "PINKY_AGENT_KEY",
+    "PINKY_DAEMON_URL", "PINKY_CONTAINER_DAEMON_URL", "PINKY_EXPECTED_EFFORT",
+    "PINKY_STRICT_EFFORT", "PINKY_TOOL_POLICY", "PINKY_SESSION_SECRET",
+    _TMUX_TRANSCRIPT_BIND_MARKER_ENV,
+})
+_CLAUDE_PANE_ENV_NAMES = frozenset({"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG"})
+
+
+def _claude_host_payload(explicit: dict[str, str]) -> dict[str, str]:
+    """Overlay daemon configuration while retaining pane shell/terminal state."""
+    ambient = tmux_launch_env.ambient_env(os.environ.items(), _log)
+    resolved = _claude_daemon_controls(ambient)
+    resolved.update(launch_env_authority.filter_env(explicit))
+    inherited = launch_env_authority.filter_env(ambient, _CLAUDE_BUILDER_ENV_NAMES)
+    inherited = {
+        name: value for name, value in inherited.items()
+        if name not in _CLAUDE_PANE_ENV_NAMES and not name.startswith(("LC_", "TMUX"))
+    }
+    return {**inherited, **resolved}
+
+
+def _claude_daemon_controls(ambient: dict[str, str]) -> dict[str, str]:
+    """A daemon-held route/policy is an explicit input, never server inheritance."""
+    return {
+        name: ambient[name] for name in ("PINKY_DAEMON_URL", "PINKY_TOOL_POLICY")
+        if name in ambient
+    }
+
+
+def _claude_forward_oauth_enabled() -> bool:
+    return os.environ.get("PINKY_FORWARD_OAUTH_TOKEN", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _claude_host_auth_env(
+    *, provider_url: str = "", provider_key: str = "", forward_oauth: bool | None = None,
+) -> dict[str, str]:
+    """Resolve auth without overriding subscription intent or provider authority."""
+    env = tmux_launch_env.ambient_env(
+        ((name, value) for name, value in os.environ.items() if name in _CLAUDE_AUTH_ENV_NAMES),
+        _log,
+    )
+    if forward_oauth is None:
+        forward_oauth = _claude_forward_oauth_enabled()
+    custom_provider = bool(provider_url or provider_key or env.get("ANTHROPIC_BASE_URL", "").strip())
+    custom_provider = custom_provider or any(
+        env.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+        for name in (
+            "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+        )
+    )
+    if forward_oauth and not custom_provider:
+        # Static subscription intent must not silently select API billing.
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    else:
+        # Never send a first-party subscription token to a custom endpoint.
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    return env
+
+
+def _claude_host_command(command: str, env: dict[str, str]) -> str:
+    """Remove unowned server authority without placing values in argv."""
+    absent = launch_env_authority.absent_names(env, _CLAUDE_BUILDER_ENV_NAMES)
+    unset = [arg for name in sorted(absent) for arg in ("-u", name)]
+    return shlex.join(["/usr/bin/env", *unset, "/bin/sh", "-c", command])
 
 
 class TmuxSession(TransportReplacementMixin):
@@ -3994,8 +4092,6 @@ class TmuxSession(TransportReplacementMixin):
         than docstring-only.
         """
         self._check_startup_owner()
-        launch_policy = self._launch_env_policy()
-        policy_args = {"launch_policy": launch_policy} if launch_policy.mode == "enforce" else {}
         cwd = self._config.working_dir or "."
         # Ensure cwd exists — claude --continue needs it.
         Path(cwd).mkdir(parents=True, exist_ok=True)
@@ -4010,6 +4106,12 @@ class TmuxSession(TransportReplacementMixin):
         # raises → BOOT_FAILED, never a quiet local fallback.
         container_agent = self._container_agent(strict=True)
         self._tmux.set_command_runner(self._select_command_runner(container_agent))
+        launch_policy = self._launch_env_policy()
+        policy_args = (
+            {"launch_policy": launch_policy}
+            if (launch_policy.mode == "enforce" or self._scrub_codex_headers
+                or self._uses_claude_host_payload(launch_policy)) else {}
+        )
         _log(
             f"tmux[{self.agent_name}]: claude_auth_mode={_claude_auth_mode(self.agent_name)} "
             f"container_agent={str(container_agent is not None).lower()}"
@@ -4070,7 +4172,12 @@ class TmuxSession(TransportReplacementMixin):
                         k: v for k, v in effective_env.items()
                         if k in isolated_launch_env.BASE_ALLOWLIST or k.startswith(("LC_", "XDG_"))
                     }
-                effective_env.update(self._build_repl_env(**policy_args))
+                effective_env.update(self._build_repl_env(
+                    **policy_args,
+                    **({"report_shadow": False} if (
+                        self._scrub_codex_headers or self._uses_claude_host_payload(launch_policy)
+                    ) else {}),
+                ))
                 cfg_path = _resolve_claude_config_path(effective_env)
                 if _seed_claude_trust_file(cfg_path, cwd):
                     _log(
@@ -4112,6 +4219,7 @@ class TmuxSession(TransportReplacementMixin):
         # if none exists.
         claude_cmd = self._build_claude_cmd()
         env = self._build_repl_env(**policy_args)
+        claude_cmd = self._wrap_launch_command(claude_cmd, env, launch_policy)
 
         launch_env = None
 
@@ -4140,7 +4248,9 @@ class TmuxSession(TransportReplacementMixin):
                 command=claude_cmd,
                 env=env,
                 **launch_policy.spawn_options(env),
-                **({"codex_headers": True} if self._scrub_codex_headers else {}),
+                **({"codex_headers": True} if (
+                    self._scrub_codex_headers or self._uses_claude_host_payload(launch_policy)
+                ) else {}),
             )
             launch_env = result.launch_env
             if not result.ok:
@@ -4503,9 +4613,7 @@ class TmuxSession(TransportReplacementMixin):
         on, token missing) must fail CLOSED (a loud login wall) rather than
         silently fall back to the shared refresh-token file (Murzik #781 P2).
         """
-        return os.environ.get("PINKY_FORWARD_OAUTH_TOKEN", "0").strip().lower() in (
-            "1", "true", "yes", "on",
-        )
+        return _claude_forward_oauth_enabled()
 
     def _static_oauth_token(self) -> str:
         """The long-lived ``CLAUDE_CODE_OAUTH_TOKEN`` to inject into this
@@ -4566,10 +4674,30 @@ class TmuxSession(TransportReplacementMixin):
         return isolated_launch_env.capture_policy(
             agent_name=self.agent_name, registry=self._registry,
             status_lookup=self._isolation_status, log=_log,
+            minimum_shadow=(
+                self._trace_transport_kind == "tmux_claude"
+                and type(self._tmux._runner) is LocalCommandRunner
+            ),
+        )
+
+    def _wrap_launch_command(
+        self, command: str, env: dict[str, str], policy: isolated_launch_env.LaunchPolicy,
+    ) -> str:
+        # Only the Claude host payload uses inherited-authority removal here.
+        if self._uses_claude_host_payload(policy):
+            return _claude_host_command(command, env)
+        return command
+
+    def _uses_claude_host_payload(self, policy: isolated_launch_env.LaunchPolicy) -> bool:
+        return (
+            self._trace_transport_kind == "tmux_claude"
+            and type(self._tmux._runner) is LocalCommandRunner
+            and not policy.clean
         )
 
     def _build_repl_env(
         self, *, launch_policy: isolated_launch_env.LaunchPolicy | None = None,
+        report_shadow: bool = True,
     ) -> dict[str, str]:
         """Env vars injected into the tmux session.
 
@@ -4577,24 +4705,27 @@ class TmuxSession(TransportReplacementMixin):
         (e.g. ``hook_verify_effort.py``) see the same signals on both
         backends.
 
-        **#515 follow-up: PINKY_SESSION_SECRET propagation.**
-        The launch boundary explicitly delivers these env vars; the tmux
-        server drops the caller environment except for the small
-        ``update-environment`` allowlist (DISPLAY, SSH_*, etc.). Without
-        explicit propagation, every PinkyBot-managed hook
-        (``hook_idle.py``, ``hook_working.py``, ``hook_verify_effort.py``,
-        ``hook_tmux_wake.py``, ``hook_tmux_session_start.py``) hits the
-        guard ``if not secret: sys.exit(0)`` and silently no-ops. That
-        broke #515 (tailer never repoints from placeholder), and also
-        breaks tmux-agent presence updates, effort-drift logging, and
-        Stop-hook wakeups across the whole hook fleet. SDK agents are
-        unaffected because claude inherits daemon env via subprocess.
-
-        Propagating the secret here re-enables the entire hook fleet
-        for tmux agents without touching any individual hook script.
+        Local non-clean hosts receive only their resolved signing identity.
+        Hooks without a provisioned per-agent key can no-op; global authority
+        is never a fallback on that path. Other runners retain their existing
+        identity contract.
         """
         launch_policy = launch_policy or self._launch_env_policy()
+        host_payload = self._uses_claude_host_payload(launch_policy)
         env: dict[str, str] = {}
+        host_auth = None
+        if self._uses_claude_host_payload(launch_policy):
+            host_auth = _claude_host_auth_env(
+                provider_url=self._config.provider_url or "", provider_key=self._config.provider_key or "",
+                forward_oauth=self._forward_oauth_enabled(),
+            )
+            env = dict(host_auth)
+            # These remain controlled by the existing account/forwarding guards.
+            env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            env.pop("CLAUDE_CONFIG_DIR", None)
+            if self._config.provider_url or self._config.provider_key:
+                for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+                    env.pop(name, None)
         if self._config.provider_url:
             env["ANTHROPIC_BASE_URL"] = self._config.provider_url
         if self._config.provider_key:
@@ -4630,6 +4761,8 @@ class TmuxSession(TransportReplacementMixin):
         # this agent's CLAUDE_CONFIG_DIR (.claude-local, populated by a manual
         # `claude /login`). Verified end-to-end on CC 2.1.226 + real tmux.
         oauth_token = self._static_oauth_token()
+        if host_auth is not None and "CLAUDE_CODE_OAUTH_TOKEN" not in host_auth:
+            oauth_token = ""
         if dedicated_config_dir:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = ""
         elif oauth_token:
@@ -4673,7 +4806,7 @@ class TmuxSession(TransportReplacementMixin):
         # internal requests with a non-forgeable identity. Lookup guarded like
         # _restart_threshold_pct — a registry hiccup must not break session env.
         agent_key = ""
-        if launch_policy.mode == "enforce":
+        if launch_policy.mode == "enforce" or host_payload:
             agent_key = launch_policy.agent_key
         elif self._registry and self.agent_name:
             try:
@@ -4695,30 +4828,15 @@ class TmuxSession(TransportReplacementMixin):
                 "PINKY_CONTAINER_DAEMON_URL", "http://host.containers.internal:8888"
             )
 
-        # PINKY_SESSION_SECRET — the daemon-wide secret. Read from os.environ
-        # rather than a config field because the daemon's own SDK clients and
-        # FastAPI middleware read it from the same env var. Empty/missing is
-        # tolerated: hooks already handle that gracefully (silent no-op).
-        #
-        # Resolve the explicit identity independently of the inheritance mode.
-        # #149 phase-3 security gate (fail CLOSED — Murzik #639 review): the
-        # global secret is the fleet-wide signing key; the daemon dual-accepts
-        # it for EVERY agent name, so any child that holds it can sign internal
-        # requests AS ANY OTHER AGENT. Inject it ONLY when the agent is *proven*
-        # non-isolated. Withhold it whenever:
-        #   - the agent is isolated — with a per-agent key it signs as itself;
-        #     WITHOUT one it is a provisioning failure, so omit BOTH and let
-        #     hooks/MCP no-op rather than hand a sandbox the forgeable secret
-        #     (fail closed, not degraded-available); or
-        #   - isolation can't be proven (registry unwired/errored) AND a
-        #     per-agent key is present — the key already gives a working
-        #     identity, and registry uncertainty must not cause secret exposure
-        #     (same fail-open class as #635).
-        # The only paths that still receive the global secret are proven
-        # non-isolated agents and the legacy/dev "unknown + no key" case (an
-        # agent with no key genuinely needs the shared secret to sign at all).
+        # Local non-clean Claude hosts never receive daemon-wide authority.
+        # Other runners retain the legacy isolation-sensitive contract here:
+        # proven non-isolated, or unknown without a scoped key, may use the
+        # global fallback. Their policy rollout is separate from host cleanup.
         secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
-        status = launch_policy.status if launch_policy.mode == "enforce" else self._isolation_status()
+        status = (
+            launch_policy.status if launch_policy.mode == "enforce" or host_payload
+            else self._isolation_status()
+        )
         if status == "isolated":
             if agent_key:
                 _log(
@@ -4734,14 +4852,23 @@ class TmuxSession(TransportReplacementMixin):
                 f"tmux[{self.agent_name}]: isolation status unknown but per-agent "
                 f"key present — scoped identity configured"
             )
-        elif secret:
+        elif secret and not host_payload:
             env["PINKY_SESSION_SECRET"] = secret
 
-        isolated_launch_env.report_shadow(
-            agent_name=self.agent_name, status=status, has_agent_key=bool(agent_key),
-            explicit_names=env, log=_log,
-        )
+        if host_payload:
+            controls = _claude_daemon_controls(tmux_launch_env.ambient_env(os.environ.items(), _log))
+            env = {**controls, **launch_env_authority.filter_env(env)}
+            if not agent_key:
+                _log(f"tmux[{self.agent_name}]: launch signing key unavailable; status={status}")
+        if report_shadow:
+            isolated_launch_env.report_shadow(
+                agent_name=self.agent_name, status=status, has_agent_key=bool(agent_key),
+                explicit_names=env, log=_log,
+                mode=launch_policy.mode if host_payload else None,
+            )
         env = isolated_launch_env.with_grants(launch_policy, env)
+        if self._uses_claude_host_payload(launch_policy):
+            env = _claude_host_payload(env)
         if launch_policy.clean and (self._config.provider_url or self._config.provider_key):
             if not dedicated_config_dir:
                 env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)

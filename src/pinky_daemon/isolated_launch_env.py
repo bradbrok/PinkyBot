@@ -139,18 +139,24 @@ def _load_grants(registry, agent_name: str, log: Callable[[str], None]) -> tuple
 
 def capture_policy(
     *, agent_name: str, registry, status_lookup: Callable[[], str], log: Callable[[str], None],
+    minimum_shadow: bool = False,
 ) -> LaunchPolicy:
     mode = os.environ.get(MODE_ENV, "off")
-    if mode in ("off", "shadow"):
+    if mode in ("off", "shadow") and not minimum_shadow:
         return LaunchPolicy(mode=mode)
     status = status_lookup()
     key = signing_key(registry, agent_name)
     isolated = is_isolated(status, bool(key))
+    if mode in ("off", "shadow"):
+        return LaunchPolicy(
+            mode="shadow" if isolated else mode, status=status, agent_key=key,
+        )
     if mode != "enforce":
         if isolated:
             log("ERROR isolated launch mode configuration refused")
             raise LaunchConfigError("isolated launch mode configuration refused")
-        return LaunchPolicy()
+        # Compatibility fallback changes the mode, not the resolved identity.
+        return LaunchPolicy(status=status, agent_key=key)
     grants = _load_grants(registry, agent_name, log) if isolated else ()
     return LaunchPolicy(mode=mode, status=status, agent_key=key, grants=grants)
 
@@ -178,10 +184,11 @@ def scoped_codex_env(policy: LaunchPolicy, agent_name: str) -> dict[str, str]:
 
 def report_shadow(
     *, agent_name: str, status: str, has_agent_key: bool,
-    explicit_names: Iterable[str], log: Callable[[str], None],
+    explicit_names: Iterable[str], log: Callable[[str], None], mode: str | None = None,
 ) -> None:
     """Predict name changes from the current daemon environment."""
-    if not shadow_enabled():
+    enabled = shadow_enabled() if mode is None else mode == "shadow"
+    if not enabled:
         return
     if not is_isolated(status, has_agent_key):
         return
