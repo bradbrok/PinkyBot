@@ -8342,6 +8342,11 @@ except Exception as exc:
 
     # ── Model Registry ──────────────────────────────────────
 
+    _SONNET_5_DESCRIPTION = (
+        "Sonnet 5 (2026-06). Speed and intelligence for daily work at $2/$10 per MTok. "
+        "1M context; adaptive thinking, effort defaults to high."
+    )
+
     _MODEL_SEEDS = [
         # Anthropic
         ("anthropic", "claude-fable-5-1", "Claude Fable 5.1", "Anthropic's most capable model (2026-09-01). Extends Fable 5 at the same $10/$50 price with stronger long-horizon agentic coding, multistep research, and document work; cache reads 4× cheaper. 1M context; adaptive thinking always on (use effort to control depth).", "fable", 1_000_000, 1, 10.0, 50.0, 0.25, 1, 1),
@@ -8353,7 +8358,7 @@ except Exception as exc:
         ("anthropic", "claude-opus-4-8", "Claude Opus 4.8", "Newest Opus (2026-05-28). Sharper judgement, more honest progress reporting, longer independent runs. Effort defaults to high; adaptive thinking triggers only when needed.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 3),
         ("anthropic", "claude-opus-4-7", "Claude Opus 4.7", "Stricter instruction-following, xhigh effort, larger vision.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 5),
         ("anthropic", "claude-opus-4-6", "Claude Opus 4.6", "Maximum intelligence. Deep reasoning.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 10),
-        ("anthropic", "claude-sonnet-5", "Claude Sonnet 5", "Current Sonnet (2026-06). Best speed+intelligence balance — daily driver. 1M context; adaptive thinking, effort defaults to high. Intro pricing $2/$10 through Aug 2026.", "sonnet", 1_000_000, 1, 3.0, 15.0, 0.3, 1, 15),
+        ("anthropic", "claude-sonnet-5", "Claude Sonnet 5", _SONNET_5_DESCRIPTION, "sonnet", 1_000_000, 1, 2.0, 10.0, 0.2, 1, 15),
         ("anthropic", "claude-sonnet-4-6", "Claude Sonnet 4.6", "Fast + smart. Daily driver.", "sonnet", 1_000_000, 1, 3.0, 15.0, 0.3, 1, 20),
         ("anthropic", "claude-haiku-4-5", "Claude Haiku 4.5", "Lightning fast. Simple tasks.", "haiku", 200_000, 0, 1.0, 5.0, 0.1, 1, 30),
         ("anthropic", "claude-opus-4-5", "Claude Opus 4.5", "Previous-gen Opus.", "opus", 200_000, 0, 5.0, 25.0, 0.5, 1, 40),
@@ -8522,6 +8527,36 @@ except Exception as exc:
                     f"{row['id']}: {column_name}"
                 )
 
+    def _ensure_sonnet_5_catalog(self, now: float) -> int:
+        """Correct known stale Sonnet 5 seeds while preserving custom values."""
+        from pinky_daemon.pricing import RATE_TABLE
+
+        rate = RATE_TABLE["claude-sonnet-5"]
+        cur = self._db.execute(
+            """UPDATE models
+               SET input_price=?, output_price=?, cached_input_price=?,
+                   cache_write_5m_price=?, cache_write_1h_price=?, updated_at=?
+               WHERE id='anthropic/claude-sonnet-5'
+                 AND input_price=3.0 AND output_price=15.0 AND cached_input_price=0.3
+                 AND ((cache_write_5m_price=3.75 AND cache_write_1h_price=6.0)
+                      OR (cache_write_5m_price=? AND cache_write_1h_price=?))""",
+            (rate["input"], rate["output"], rate["cache_read"],
+             rate["cache_write_5m"], rate["cache_write_1h"], now,
+             rate["cache_write_5m"], rate["cache_write_1h"]),
+        )
+        # Older schemas acquire the current write pair before seeds are corrected.
+        stale_description = (
+            "Current Sonnet (2026-06). Best speed+intelligence balance — daily driver. "
+            "1M context; adaptive thinking, effort defaults to high. "
+            "Intro pricing $2/$10 through Aug 2026."
+        )
+        self._db.execute(
+            """UPDATE models SET description=?, updated_at=?
+               WHERE id='anthropic/claude-sonnet-5' AND description=?""",
+            (self._SONNET_5_DESCRIPTION, now, stale_description),
+        )
+        return cur.rowcount
+
     def _seed_models(self) -> None:
         """Ensure default models exist (idempotent).
 
@@ -8552,7 +8587,7 @@ except Exception as exc:
                  rate["cache_write_1h"], thinking, sort, now, now),
             )
             added += cur.rowcount
-        corrected = 0
+        corrected = self._ensure_sonnet_5_catalog(now)
         for mid, (old_in, old_out, old_cached), (new_in, new_out, new_cached) \
                 in self._PRICE_CORRECTIONS:
             cur = self._db.execute(
