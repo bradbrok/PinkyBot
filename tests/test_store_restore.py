@@ -233,6 +233,7 @@ def test_supported_daemon_entrypoint_holds_authority_lock_before_create_api_and_
     def fake_uvicorn_run(server: Any, **_kwargs: Any) -> None:
         assert_lock_held("uvicorn")
         assert server.config.app.state.api_readiness.server is server
+        server.started = True
 
     monkeypatch.delenv("PINKYBOT_FERRY_ENABLED", raising=False)
     monkeypatch.setattr(api_module, "create_api", fake_create_api)

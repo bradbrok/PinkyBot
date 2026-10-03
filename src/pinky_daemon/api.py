@@ -9564,7 +9564,7 @@ npm run build</pre>
 
     app.state.buzz_poller_tasks = set()
 
-    async def _restart_buzz_poller(name: str) -> bool:
+    async def _restart_buzz_poller(name: str, *, startup_queue=None) -> bool:
         """Apply one identity's current owner policy without restarting the daemon."""
         from pinky_daemon.buzz_inbound import BrokerBuzzPoller
 
@@ -9593,8 +9593,6 @@ npm run build</pre>
             _notify_owner_alert,
         )
         _broker_pollers.append(poller)
-        task = asyncio.create_task(poller.start())
-        app.state.buzz_poller_tasks.add(task)
 
         def _release_buzz_task(done: asyncio.Task) -> None:
             app.state.buzz_poller_tasks.discard(done)
@@ -9607,8 +9605,17 @@ npm run build</pre>
             if exc is not None:
                 _log(f"api: Buzz poller task failed for {name} ({type(exc).__name__})")
 
-        task.add_done_callback(_release_buzz_task)
-        _log(f"api: native Buzz inbound poller started for {name}")
+        def _start_buzz_poller(poller):
+            task = asyncio.create_task(poller.start())
+            app.state.buzz_poller_tasks.add(task)
+            task.add_done_callback(_release_buzz_task)
+            if startup_queue is None:
+                _log(f"api: native Buzz inbound poller started for {name}")
+
+        if startup_queue is None:
+            _start_buzz_poller(poller)
+        else:
+            startup_queue(poller, "Buzz inbound", starter=_start_buzz_poller)
         return True
 
     @app.get("/system/buzz-identities")
@@ -13766,16 +13773,25 @@ npm run build</pre>
         nonlocal shared_mcp_manager
         nonlocal active_boot_mcp_gate
 
-        readiness = app.state.api_readiness
-        readiness.start()
+        listener_readiness = app.state.api_readiness
+        listener_readiness.start()
         pending_pollers = []
         initial_replay_done = False
 
-        def _start_startup_poller(poller):
-            if readiness.attached and not initial_replay_done:
-                pending_pollers.append(poller)
+        def _start_startup_poller(poller, label, *, detail="", starter=start_poller):
+            def _start():
+                # An owner-policy edit can replace a queued Buzz poller while
+                # replay awaits delivery. Never resurrect that retired entry.
+                if poller not in _broker_pollers or listener_readiness.closed:
+                    return
+                starter(poller)
+                _log(f"startup: {label} poller started for {poller._agent_name}{detail}")
+
+            if listener_readiness.attached and not initial_replay_done:
+                pending_pollers.append(_start)
+                _log(f"startup: {label} poller queued for {poller._agent_name}{detail}")
             else:
-                start_poller(poller)
+                _start()
 
         storage_observability.enable_runtime()
 
@@ -13879,20 +13895,28 @@ npm run build</pre>
         # while their final delivery edge is still held.
         async def _finish_startup_replay():
             nonlocal initial_replay_done
-            await _resume_grandfather_migration(agents, broker)
-            reconciled = await broker.reconcile_approved_pending_messages()
-            if reconciled:
-                _log(f"startup: reconciled {reconciled} approved pending message(s)")
-            app.state.approval_notification_retry_task = (
-                broker.start_approval_notification_retries()
-            )
-            initial_replay_done = True
-            for poller in pending_pollers:
-                start_poller(poller)
-            pending_pollers.clear()
+            step = "grandfather migration"
+            try:
+                await _resume_grandfather_migration(agents, broker)
+                step = "approved pending-message reconcile"
+                reconciled = await broker.reconcile_approved_pending_messages()
+                if reconciled:
+                    _log(f"startup: reconciled {reconciled} approved pending message(s)")
+            except Exception as exc:
+                _log(f"ERROR startup: {step} failed ({type(exc).__name__}); starting inbound retries")
+                raise
+            finally:
+                initial_replay_done = True
+                if not listener_readiness.closed:
+                    app.state.approval_notification_retry_task = (
+                        broker.start_approval_notification_retries()
+                    )
+                    for start in pending_pollers:
+                        start()
+                pending_pollers.clear()
 
-        if readiness.attached:
-            readiness.after_ready(_finish_startup_replay)
+        if listener_readiness.attached:
+            listener_readiness.after_ready(_finish_startup_replay)
         else:
             await _finish_startup_replay()
 
@@ -13980,8 +14004,7 @@ npm run build</pre>
                 else:
                     poller = _new_telegram_broker_poller(agent.name, token)
                     _broker_pollers.append(poller)
-                    _start_startup_poller(poller)
-                    _log(f"startup: broker poller started for {agent.name}")
+                    _start_startup_poller(poller, "broker")
 
             # Discord poller — REST polling (Gateway/WebSocket is a future v0.2)
             discord_token = agents.get_raw_token(agent.name, "discord")
@@ -14004,11 +14027,10 @@ npm run build</pre>
                         poll_interval = d_poller._poll_interval
                         watched = d_poller._configured_channels
                         _broker_pollers.append(d_poller)
-                        _start_startup_poller(d_poller)
-                        _log(
-                            f"startup: discord poller started for {agent.name} "
-                            f"(interval={poll_interval}s, "
-                            f"channels={'auto' if not watched else len(watched)})"
+                        _start_startup_poller(
+                            d_poller, "discord",
+                            detail=(f" (interval={poll_interval}s, "
+                                    f"channels={'auto' if not watched else len(watched)})"),
                         )
                     except Exception as e:
                         _log(f"startup: discord poller failed for {agent.name}: {e}")
@@ -14048,8 +14070,7 @@ npm run build</pre>
                                 app_token=app_token,
                             )
                             _broker_pollers.append(s_poller)
-                            _start_startup_poller(s_poller)
-                            _log(f"startup: slack socket-mode poller started for {agent.name}")
+                            _start_startup_poller(s_poller, "slack socket-mode")
                     except Exception as e:
                         _log(f"startup: slack poller failed for {agent.name}: {e}")
 
@@ -14057,8 +14078,7 @@ npm run build</pre>
             # default-deny unless the encrypted identity AND both inbound
             # authorization-gate tables are fully configured.
             try:
-                if await _restart_buzz_poller(agent.name):
-                    _log(f"startup: Buzz inbound poller started for {agent.name}")
+                await _restart_buzz_poller(agent.name, startup_queue=_start_startup_poller)
             except Exception as e:
                 _log(
                     f"startup: Buzz inbound poller refused for {agent.name}: "
@@ -14074,8 +14094,7 @@ npm run build</pre>
                         im_adapter, agent.name, broker,
                     )
                     _broker_pollers.append(im_poller)
-                    _start_startup_poller(im_poller)
-                    _log(f"startup: iMessage poller started for {agent.name}")
+                    _start_startup_poller(im_poller, "iMessage")
                 except Exception as e:
                     _log(f"startup: iMessage poller failed for {agent.name}: {e}")
 

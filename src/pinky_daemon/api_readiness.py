@@ -106,6 +106,10 @@ class ApiReadiness:
         if self.server.should_exit:
             self._close_now("main server stopped")
             return
+        if (not self.ready and not self.expired and self.started_at
+                and time.monotonic() - self.started_at >= self.cap_seconds):
+            self.expired = True
+            self._refuse_waiters("timeout")
         if self.server.started:
             if not self.ready:
                 self.ready = True
@@ -116,9 +120,6 @@ class ApiReadiness:
                     if not future.done():
                         future.set_result(True)
             return
-        if not self.expired and self.started_at and time.monotonic() - self.started_at >= self.cap_seconds:
-            self.expired = True
-            self._refuse_waiters("timeout")
 
     def can_submit(self, source: str) -> bool:
         self._refresh()
@@ -147,7 +148,7 @@ class ApiReadiness:
             self._refresh()
             if self.ready or self.closed:
                 return
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.5 if self.expired else 0.01)
 
     def after_ready(self, callback: Callable[[], Awaitable[None]]) -> None:
         if self._after_ready_task is not None:

@@ -28,9 +28,16 @@ from pinky_daemon.pollers import (
 from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
 from pinky_daemon.tmux_session import TmuxSession
 from pinky_daemon.transport_state import SessionState
-from tests.test_startup_api_readiness import _run_boot, boot_run  # noqa: F401
+from pinky_daemon.wake_prompt import WakeReason
+from tests import test_startup_api_readiness as boot_harness
+from tests.test_startup_api_readiness import _run_boot
 
 POLLERS = (BrokerTelegramPoller, BrokerDiscordPoller, BrokerSlackPoller, BrokeriMessagePoller)
+
+
+@pytest.fixture
+def boot_run(tmp_path, monkeypatch):
+    return boot_harness.boot_run.__wrapped__(tmp_path, monkeypatch)
 
 
 def _buzz_material():
@@ -227,6 +234,48 @@ def test_wake_marker_hashes_the_rendered_prompt(boot_run, tmp_path, monkeypatch,
     assert marker["prompt_chars"] == len(prompt)
     assert marker["prompt_hash"] == hashlib.sha256(prompt.encode()).hexdigest()[:12]
     assert phase == 2, "A deferred preview must not be reported as a submitted wake"
+
+
+def test_deferred_sdk_builder_keeps_the_captured_restart_reason(
+    boot_run, tmp_path, monkeypatch,
+):
+    original_connect = StreamingSession.connect
+    rendered = []
+    before = []
+
+    async def connect(session):
+        session._config.restart_reason = "context_restart"
+        builder = session._config.wake_context_builder
+
+        def record_builder(agent_name, reason):
+            rendered.append((session._config.restart_reason, reason))
+            return builder(agent_name, reason)
+
+        session._config.wake_context_builder = record_builder
+        await original_connect(session)
+
+    async def before_bind():
+        before.append(list(rendered))
+
+    monkeypatch.setattr(StreamingSession, "connect", connect)
+    boot_run.before_bind_hook = before_bind
+    _run_boot(boot_run, tmp_path, monkeypatch, "claude-sdk")
+    assert before == [[]]
+    assert rendered == [("", WakeReason.CONTEXT_RESTART)]
+
+
+@pytest.mark.asyncio
+async def test_ready_observation_before_cap_does_not_expire_a_healthy_server(monkeypatch):
+    gate = ApiReadiness()
+    gate.attach(SimpleNamespace(started=True, should_exit=False))
+    gate.started_at = 10.0
+    gate.cap_seconds = 1.0
+    clock = SimpleNamespace(now=10.5)
+    monkeypatch.setattr(api_readiness, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    assert await gate.wait("before cap") is True
+    clock.now = 100.0
+    assert await gate.wait("healthy long-running listener") is True
+    assert gate.ready and not gate.expired and not gate.closed
 
 
 @pytest.mark.asyncio

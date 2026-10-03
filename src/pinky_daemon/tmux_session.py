@@ -86,6 +86,7 @@ from pinky_daemon.agent_registry import (
     validate_restart_tokens_cap,
 )
 from pinky_daemon.api_readiness import (
+    DeferredPrompt,
     api_allows_submission,
     defer_wake,
     render_prompt,
@@ -5489,6 +5490,20 @@ class TmuxSession(TransportReplacementMixin):
                 receipt.set_result(False)
             raise
 
+    async def _emit_internal_prompt_marker(self, prompt, reason, wait_for_completion):
+        import hashlib
+
+        prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+        _log(
+            f"tmux[{self.agent_name}]: wake_prompt_sent reason={reason} "
+            f"prompt_chars={len(prompt)} prompt_hash={prompt_hash} wait={wait_for_completion}"
+        )
+        await self._emit_stream_event({
+            "type": "wake_prompt_sent", "agent_name": self.agent_name, "reason": reason,
+            "prompt_chars": len(prompt), "prompt_hash": prompt_hash,
+            "wait_for_completion": wait_for_completion,
+        })
+
     async def _enqueue_internal_prompt(
         self,
         prompt: str,
@@ -5579,29 +5594,8 @@ class TmuxSession(TransportReplacementMixin):
             return None
 
         self.last_active = time.time()
-        # Audit log — the diagnostic marker validation tooling greps for.
-        # Hash gives a stable identity per prompt body without leaking the
-        # text into operator log streams.
-        import hashlib as _hashlib
-
-        _prompt_hash = _hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
-        _log(
-            f"tmux[{self.agent_name}]: wake_prompt_sent "
-            f"reason={reason} "
-            f"prompt_chars={len(prompt)} "
-            f"prompt_hash={_prompt_hash} "
-            f"wait={wait_for_completion}"
-        )
-        await self._emit_stream_event(
-            {
-                "type": "wake_prompt_sent",
-                "agent_name": self.agent_name,
-                "reason": reason,
-                "prompt_chars": len(prompt),
-                "prompt_hash": _prompt_hash,
-                "wait_for_completion": wait_for_completion,
-            }
-        )
+        if not isinstance(prompt, DeferredPrompt):
+            await self._emit_internal_prompt_marker(prompt, reason, wait_for_completion)
 
         completion = asyncio.Event() if wait_for_completion else None
         submission_receipt = (
@@ -11878,7 +11872,17 @@ class TmuxSession(TransportReplacementMixin):
                     if not api_allows_submission(self._config, "tmux-turn"):
                         self._refuse_api_turn(turn)
                         return
+                    deferred = isinstance(turn.prompt, DeferredPrompt)
                     turn.prompt = render_prompt(turn.prompt)
+                    if deferred and turn.internal:
+                        await self._emit_internal_prompt_marker(
+                            turn.prompt, turn.reason, turn.completion_event is not None,
+                        )
+                        # Event delivery can yield to shutdown. Check again
+                        # before the actual pane submission.
+                        if not api_allows_submission(self._config, "tmux-turn"):
+                            self._refuse_api_turn(turn)
+                            return
                     transcript_ticket = (
                         self._capture_transcript_occurrence_ticket()
                     )

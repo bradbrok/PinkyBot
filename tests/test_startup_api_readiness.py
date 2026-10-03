@@ -337,10 +337,14 @@ def _run_boot(run, tmp_path, monkeypatch, mode):
     if run.embedder:
         run.embedder_run()
         return
-    daemon_main._run_api_with_authority(SimpleNamespace(
-        host="", port=0, working_dir=str(tmp_path), max_sessions=4,
-        db_path=str(tmp_path / "test.db"),
-    ))
+    try:
+        daemon_main._run_api_with_authority(SimpleNamespace(
+            host="", port=0, working_dir=str(tmp_path), max_sessions=4,
+            db_path=str(tmp_path / "test.db"),
+        ))
+    except SystemExit as failure:
+        if failure.code != 3 or not (not run.bind or run.serve_early == "return"):
+            raise
 
 
 @pytest.mark.parametrize("mode", MODES)

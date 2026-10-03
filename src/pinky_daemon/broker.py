@@ -1845,12 +1845,18 @@ class MessageBroker:
             except Exception:
                 return False
             if accepted is False:
+                self._stats["routed_failed"] += 1
+                _log(f"ERROR broker: streaming send refused for {agent_name}; handoff not delivered")
                 return False
         else:
-            await streaming.send(
+            accepted = await streaming.send(
                 prompt, platform=message.platform, chat_id=message.chat_id,
                 message_id=message.message_id, agent_hint=hint,
             )
+            if accepted is False:
+                self._stats["routed_failed"] += 1
+                _log(f"ERROR broker: streaming send refused for {agent_name}; handoff not delivered")
+                return False
         # Server-side presence: successful inbound delivery = agent pipe is working
         try:
             self._registry.stamp_last_seen(agent_name)

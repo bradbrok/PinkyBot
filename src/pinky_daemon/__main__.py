@@ -178,6 +178,16 @@ def _run_api_with_authority(args) -> None:
 
     main_server.serve = _serve_main
 
+    def _run_single_listener():
+        from uvicorn.main import STARTUP_FAILURE
+
+        try:
+            main_server.run()
+        except KeyboardInterrupt:
+            pass
+        if not main_server.started:
+            sys.exit(STARTUP_FAILURE)
+
     from pinky_daemon.ferry.config import FerryConfig
     from pinky_daemon.ferry.listener import FerryListenerState, serve_ferry_with_retry
 
@@ -209,7 +219,7 @@ def _run_api_with_authority(args) -> None:
         )
         if enabled_requested:
             print(f"[pinky] Ferry disabled: {ferry_cfg.why_disabled()}", file=sys.stderr)
-        main_server.run()
+        _run_single_listener()
         return
 
     # Ferry enabled: run the main API + a dedicated ferry listener bound to the
@@ -230,7 +240,7 @@ def _run_api_with_authority(args) -> None:
             "[pinky] ferry enabled but host_pinky missing — starting API only",
             file=sys.stderr,
         )
-        main_server.run()
+        _run_single_listener()
         return
 
     ferry_app = build_ferry_app(host_pinky=host_pinky, config=ferry_cfg)
