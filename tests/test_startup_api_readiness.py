@@ -54,6 +54,8 @@ class BootRun:
     serve_early: str = ""
     embedder_run: object = None
     ferry_started_before_main: bool = False
+    before_bind_hook: object = None
+    after_ready_hook: object = None
 
     def submit(self, edge, prompt):
         self.observed.append((edge, prompt, self.server.phase, self.server.started))
@@ -240,6 +242,8 @@ def boot_run(tmp_path, monkeypatch):
                         ))
                     run.tasks.append(task)
                 await run.checkpoint()
+                if run.before_bind_hook is not None:
+                    await run.before_bind_hook()
                 if run.late_bind:
                     await asyncio.sleep(0.15)
                     run.observed_before_late_bind = list(run.observed)
@@ -252,6 +256,8 @@ def boot_run(tmp_path, monkeypatch):
                     self.phase = READY_PHASE
                     expected = (0 if run.late_bind else 1) + bool(run.extra_source) + run.approved_backlog
                     await run.wait_for_delivery(expected)
+                    if run.after_ready_hook is not None:
+                        await run.after_ready_hook()
                     if run.manual:
                         endpoint = next(
                             route.endpoint for route in app.routes
