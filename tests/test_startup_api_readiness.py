@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -182,7 +183,11 @@ def boot_run(tmp_path, monkeypatch):
             asyncio.run(self.serve())
 
         async def serve(self):
-            async with app.router.lifespan_context(app):
+            async with AsyncExitStack() as stack:
+                # A delivery waiter inside foreground startup must not hold
+                # the fake listener's bind hostage for the default five minutes.
+                async with asyncio.timeout(5):
+                    await stack.enter_async_context(app.router.lifespan_context(app))
                 assert run.connections, "The session must connect before the API bind"
                 self.phase = 1
                 if run.extra_source:
