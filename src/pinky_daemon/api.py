@@ -2772,6 +2772,7 @@ def create_api(
         stop_all_callback=_broker_stop_all,
         activity_store=activity,
         message_context_store=message_context_store,
+        api_readiness=app.state.api_readiness,
     )
     _broker_pollers: list[PollerStatus] = []  # Track active broker pollers
 
@@ -13895,6 +13896,7 @@ npm run build</pre>
         # while their final delivery edge is still held.
         async def _finish_startup_replay():
             nonlocal initial_replay_done
+            _log("startup: deferred startup jobs starting")
             step = "grandfather migration"
             try:
                 await _resume_grandfather_migration(agents, broker)

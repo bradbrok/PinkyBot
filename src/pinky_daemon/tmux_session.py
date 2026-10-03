@@ -11874,15 +11874,6 @@ class TmuxSession(TransportReplacementMixin):
                         return
                     deferred = isinstance(turn.prompt, DeferredPrompt)
                     turn.prompt = render_prompt(turn.prompt)
-                    if deferred and turn.internal:
-                        await self._emit_internal_prompt_marker(
-                            turn.prompt, turn.reason, turn.completion_event is not None,
-                        )
-                        # Event delivery can yield to shutdown. Check again
-                        # before the actual pane submission.
-                        if not api_allows_submission(self._config, "tmux-turn"):
-                            self._refuse_api_turn(turn)
-                            return
                     transcript_ticket = (
                         self._capture_transcript_occurrence_ticket()
                     )
@@ -11948,6 +11939,10 @@ class TmuxSession(TransportReplacementMixin):
                 f"stderr={result.stderr.strip()!r}"
             )
 
+        if deferred and turn.internal:
+            await self._emit_internal_prompt_marker(
+                turn.prompt, turn.reason, turn.completion_event is not None,
+            )
         await self._finish_submitted_turn(turn)
 
     def _fire_on_delivered(self, turn: _QueuedTurn) -> None:

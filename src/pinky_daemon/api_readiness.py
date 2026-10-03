@@ -113,6 +113,10 @@ class ApiReadiness:
         if self.server.started:
             if not self.ready:
                 self.ready = True
+                released = sum(not future.done() for future in self._waiters)
+                elapsed = max(0.0, time.monotonic() - self.started_at) if self.started_at else 0.0
+                print(f"INFO api listener ready after {elapsed:.2f}s; "
+                      f"released {released} held submission(s)", file=sys.stderr)
                 if self.expired:
                     self._log("WARNING", "ready after cap; opening for new submissions")
                 self._ready_event.set()

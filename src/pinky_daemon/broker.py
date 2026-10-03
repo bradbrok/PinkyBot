@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.api_readiness import api_allows_submission
 from pinky_daemon.auth_relay import coordinator as _auth_relay
 from pinky_daemon.auth_relay import extract_auth_code
 from pinky_daemon.message_context_store import MessageContextStore
@@ -217,9 +218,11 @@ class MessageBroker:
         stop_all_callback=None,  # async fn() → force-stop all agents
         activity_store=None,  # ActivityStore — for logging message events
         message_context_store: MessageContextStore | None = None,
+        api_readiness=None,
     ) -> None:
         self._registry = registry
         self._sessions = session_manager
+        self._api_readiness = api_readiness
         self._send_callback = send_callback
         self._reaction_callback = reaction_callback
         self._typing_callback = typing_callback
@@ -1633,6 +1636,16 @@ class MessageBroker:
         # Fall back to main
         return sessions.get("main")
 
+    def _listener_allows_route(self, agent_name, streaming=None) -> bool:
+        allowed = (self._api_readiness is None
+                   or self._api_readiness.can_submit("broker-inbound"))
+        if allowed and streaming is not None:
+            allowed = api_allows_submission(getattr(streaming, "_config", None), "broker-inbound")
+        if not allowed:
+            self._stats["routed_failed"] += 1
+            _log(f"ERROR broker: API listener refused handoff for {agent_name}; not queued or delivered")
+        return allowed
+
     async def _route_streaming(self, agent_name: str, message: BrokerMessage) -> bool:
         """Route a message via streaming session — non-blocking.
 
@@ -1655,6 +1668,10 @@ class MessageBroker:
         via ``_ensure_streaming_session``. See bradbrok/PinkyBot fix branch
         ``fix/inbound-msg-cold-wake``.
         """
+        # Check before a cold-start/reconnect can await anything. Durable
+        # callers and ferry ACKs must refuse promptly while the API is held.
+        if not self._listener_allows_route(agent_name):
+            return False
         streaming = self._get_streaming_session(agent_name, message.chat_id)
         compatible = (getattr(self, "_compatible_delivery", None)
                       if os.environ.get("PINKY_SESSION_CLASS_REBUILD", "0") == "1" else None)
@@ -1771,6 +1788,9 @@ class MessageBroker:
                 agent_name, message.platform, message.chat_id,
                 f"⚠️ {agent_name} is not running right now. Try again later.",
             )
+            return False
+
+        if not self._listener_allows_route(agent_name, streaming):
             return False
 
         # Show typing indicator
