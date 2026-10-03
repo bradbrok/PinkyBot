@@ -2397,7 +2397,7 @@ class AgentRegistry:
             "ON buzz_identities(tos_receipt) WHERE tos_receipt != ''"
         )
 
-        self._migrate_model_catalog_schema()
+        added_write_columns = self._migrate_model_catalog_schema()
         self._migrate_agent_costs_schema()
 
         # Deployment seed for the explicitly verified owner principal in #545.
@@ -2422,7 +2422,7 @@ class AgentRegistry:
         self._db.commit()
 
         # Seed default models
-        self._seed_models()
+        self._seed_models(added_write_columns=added_write_columns)
         self._validate_model_catalog()
 
     def _seed_verified_contacts(self, *, _commit: bool = True) -> None:
@@ -8342,6 +8342,11 @@ except Exception as exc:
 
     # ── Model Registry ──────────────────────────────────────
 
+    _SONNET_5_DESCRIPTION = (
+        "Sonnet 5 (2026-06). Speed and intelligence for daily work at $2/$10 per MTok. "
+        "1M context; adaptive thinking, effort defaults to high."
+    )
+
     _MODEL_SEEDS = [
         # Anthropic
         ("anthropic", "claude-fable-5-1", "Claude Fable 5.1", "Anthropic's most capable model (2026-09-01). Extends Fable 5 at the same $10/$50 price with stronger long-horizon agentic coding, multistep research, and document work; cache reads 4× cheaper. 1M context; adaptive thinking always on (use effort to control depth).", "fable", 1_000_000, 1, 10.0, 50.0, 0.25, 1, 1),
@@ -8353,7 +8358,8 @@ except Exception as exc:
         ("anthropic", "claude-opus-4-8", "Claude Opus 4.8", "Newest Opus (2026-05-28). Sharper judgement, more honest progress reporting, longer independent runs. Effort defaults to high; adaptive thinking triggers only when needed.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 3),
         ("anthropic", "claude-opus-4-7", "Claude Opus 4.7", "Stricter instruction-following, xhigh effort, larger vision.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 5),
         ("anthropic", "claude-opus-4-6", "Claude Opus 4.6", "Maximum intelligence. Deep reasoning.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 10),
-        ("anthropic", "claude-sonnet-5", "Claude Sonnet 5", "Current Sonnet (2026-06). Best speed+intelligence balance — daily driver. 1M context; adaptive thinking, effort defaults to high. Intro pricing $2/$10 through Aug 2026.", "sonnet", 1_000_000, 1, 3.0, 15.0, 0.3, 1, 15),
+        ("anthropic", "claude-sonnet-5-5", "Claude Sonnet 5.5", "Current Sonnet. Fast reasoning and coding at $2/$10 per MTok. 1M context at standard pricing, 128K output; adaptive thinking, effort defaults to high.", "sonnet", 1_000_000, 1, 2.0, 10.0, 0.2, 1, 14),
+        ("anthropic", "claude-sonnet-5", "Claude Sonnet 5", _SONNET_5_DESCRIPTION, "sonnet", 1_000_000, 1, 2.0, 10.0, 0.2, 1, 15),
         ("anthropic", "claude-sonnet-4-6", "Claude Sonnet 4.6", "Fast + smart. Daily driver.", "sonnet", 1_000_000, 1, 3.0, 15.0, 0.3, 1, 20),
         ("anthropic", "claude-haiku-4-5", "Claude Haiku 4.5", "Lightning fast. Simple tasks.", "haiku", 200_000, 0, 1.0, 5.0, 0.1, 1, 30),
         ("anthropic", "claude-opus-4-5", "Claude Opus 4.5", "Previous-gen Opus.", "opus", 200_000, 0, 5.0, 25.0, 0.5, 1, 40),
@@ -8410,7 +8416,7 @@ except Exception as exc:
         ("openai/gpt-5.6-sol", (1_000_000, 1), (200_000, 0)),
     ]
 
-    def _migrate_model_catalog_schema(self) -> None:
+    def _migrate_model_catalog_schema(self) -> frozenset[str]:
         """Add nullable write-rate columns and fill only known static gaps."""
         from pinky_daemon.pricing import RATE_TABLE
 
@@ -8427,7 +8433,7 @@ except Exception as exc:
                 _log(f"agent_registry: migrated — added column {column_name}")
 
         if not added_columns:
-            return
+            return frozenset()
         rate_keys = {
             "cache_write_5m_price": "cache_write_5m",
             "cache_write_1h_price": "cache_write_1h",
@@ -8439,6 +8445,7 @@ except Exception as exc:
                 tuple(rate[rate_keys[column_name]] for column_name in added_columns)
                 + (model_id,),
             )
+        return frozenset(added_columns)
 
     def _migrate_agent_costs_schema(self) -> None:
         """Rebuild the usage ledger with nullable costs and an error marker."""
@@ -8522,7 +8529,42 @@ except Exception as exc:
                     f"{row['id']}: {column_name}"
                 )
 
-    def _seed_models(self) -> None:
+    def _ensure_sonnet_5_catalog(
+        self, now: float, added_write_columns: frozenset[str],
+    ) -> int:
+        """Correct known stale Sonnet 5 seeds while preserving custom values."""
+        from pinky_daemon.pricing import RATE_TABLE
+
+        rate = RATE_TABLE["claude-sonnet-5"]
+        cur = self._db.execute(
+            """UPDATE models
+               SET input_price=?, output_price=?, cached_input_price=?,
+                   cache_write_5m_price=?, cache_write_1h_price=?, updated_at=?
+               WHERE id='anthropic/claude-sonnet-5'
+                 AND input_price=3.0 AND output_price=15.0 AND cached_input_price=0.3
+                 AND (cache_write_5m_price=3.75
+                      OR (cache_write_5m_price=? AND ?))
+                 AND (cache_write_1h_price=6.0
+                      OR (cache_write_1h_price=? AND ?))""",
+            (rate["input"], rate["output"], rate["cache_read"],
+             rate["cache_write_5m"], rate["cache_write_1h"], now,
+             rate["cache_write_5m"], "cache_write_5m_price" in added_write_columns,
+             rate["cache_write_1h"], "cache_write_1h_price" in added_write_columns),
+        )
+        # Only newly added columns prove a static backfill in this initialization.
+        stale_description = (
+            "Current Sonnet (2026-06). Best speed+intelligence balance — daily driver. "
+            "1M context; adaptive thinking, effort defaults to high. "
+            "Intro pricing $2/$10 through Aug 2026."
+        )
+        self._db.execute(
+            """UPDATE models SET description=?, updated_at=?
+               WHERE id='anthropic/claude-sonnet-5' AND description=?""",
+            (self._SONNET_5_DESCRIPTION, now, stale_description),
+        )
+        return cur.rowcount
+
+    def _seed_models(self, *, added_write_columns: frozenset[str] = frozenset()) -> None:
         """Ensure default models exist (idempotent).
 
         Per-row ``INSERT OR IGNORE`` adds any missing model and never
@@ -8552,7 +8594,7 @@ except Exception as exc:
                  rate["cache_write_1h"], thinking, sort, now, now),
             )
             added += cur.rowcount
-        corrected = 0
+        corrected = self._ensure_sonnet_5_catalog(now, added_write_columns)
         for mid, (old_in, old_out, old_cached), (new_in, new_out, new_cached) \
                 in self._PRICE_CORRECTIONS:
             cur = self._db.execute(

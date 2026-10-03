@@ -88,6 +88,13 @@ _SONNET = {
     "cache_write_5m": 3.75,
     "cache_write_1h": 6.00,
 }
+_SONNET_5 = {
+    "input": 2.00,
+    "output": 10.00,
+    "cache_read": 0.20,
+    "cache_write_5m": 2.50,
+    "cache_write_1h": 4.00,
+}
 _HAIKU_45 = {
     "input": 1.00,
     "output": 5.00,
@@ -185,14 +192,9 @@ RATE_TABLE: dict[str, dict[str, float]] = {
     "claude-opus-4-5": _OPUS_STD,
     "claude-opus-4-1": _OPUS_LEGACY,
     "claude-opus-4": _OPUS_LEGACY,
-    # Sonnet 5 (2026-06): the current Sonnet tier. Standard pricing is
-    # $3/$15 per Mtok — identical to the flat ``_SONNET`` tier. NOTE:
-    # introductory pricing of $2/$10 applies through 2026-08-31, then
-    # reverts to standard. We deliberately use the durable standard rate
-    # here: this table only powers the tmux/subscription cost ESTIMATE
-    # (those agents aren't billed per-token), and a hard-coded intro rate
-    # would silently over-discount every turn after the revert date.
-    "claude-sonnet-5": _SONNET,
+    "claude-sonnet-5-5": _SONNET_5,
+    # Sonnet 5 standard pricing is $2/$10 per MTok; the increase was cancelled.
+    "claude-sonnet-5": _SONNET_5,
     "claude-sonnet-4-6": _SONNET,
     "claude-sonnet-4-5": _SONNET,
     "claude-sonnet-4": _SONNET,
