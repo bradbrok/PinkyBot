@@ -54,6 +54,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from pinky_daemon import codex_launch_env, isolated_launch_env
+from pinky_daemon.codex_effort import resolve_codex_effort
 from pinky_daemon.codex_home import (
     MANAGED_CONFIG_SENTINEL,
     codex_home_for,
@@ -216,7 +217,8 @@ class CodexTmuxSession(TmuxSession):
         # codex identity/config (mirrors CodexSession.__init__).
         self._codex_model = config.model or ""
         self._openai_api_key = config.provider_key or os.environ.get("OPENAI_API_KEY", "")
-        self._reasoning_effort = config.thinking_effort or "medium"
+        self._reasoning_effort = config.thinking_effort
+        self._selected_reasoning_effort: str | None = None
         self._codex_mcp_servers = config.mcp_servers or {}
         self._codex_last_scheduler_gate_signature: tuple[bool, ...] | None = None
         self._codex_user_content_warned = False
@@ -261,10 +263,9 @@ class CodexTmuxSession(TmuxSession):
             parts += ["-m", self._codex_model]
         if not use_resume:
             parts += ["-C", str(Path(self._config.working_dir or ".").resolve())]
-        effort = self._reasoning_effort
-        if effort and effort != "medium":
-            if effort == "max":
-                effort = "high"  # codex has no "max"
+        effort = resolve_codex_effort(self._reasoning_effort)
+        self._selected_reasoning_effort = effort
+        if effort is not None:
             parts += ["-c", f'model_reasoning_effort="{effort}"']
         # MCP injection (same -c form as CodexSession; works on fresh + resume).
         mcp_args, _ = mcp_cli_config(self._codex_mcp_servers or {})
@@ -285,13 +286,29 @@ class CodexTmuxSession(TmuxSession):
     # only; the change lands on the next relaunch.
 
     async def apply_effort_live(self, level: str) -> str:
-        from pinky_daemon.effort import resolve_cli_effort
-
         self.set_effort(level)
-        # ultracode is Claude-native — resolve it so the codex launch flag
-        # never sees the literal (max→high still maps at build time).
-        self._reasoning_effort = resolve_cli_effort(self.effective_effort)
         return "pending_restart"
+
+    def set_effort(self, level: str) -> None:
+        """Stash a validated override for the next Codex launch."""
+        super().set_effort(level)
+        self._reasoning_effort = self._effort_override or self._config.thinking_effort
+
+    def clear_effort_override(self) -> None:
+        super().clear_effort_override()
+        self._reasoning_effort = self._config.thinking_effort
+
+    @property
+    def stats(self) -> dict:
+        stats = super().stats
+        desired = resolve_codex_effort(self._reasoning_effort)
+        pending = desired != self._selected_reasoning_effort
+        stats.update(
+            thinking_effort=self._selected_reasoning_effort,
+            thinking_effort_pending=pending,
+            pending_thinking_effort=desired if pending else None,
+        )
+        return stats
 
     async def apply_model_live(self, model: str) -> str:
         model = (model or "").strip()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import sys
 import tempfile
 from unittest.mock import AsyncMock, patch
@@ -11,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from pinky_daemon.codex_session import CodexSession, CodexTurnResult
+from pinky_daemon.codex_tmux_session import CodexTmuxSession
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.transport_state import SessionState, Trigger
@@ -598,6 +600,14 @@ class TestCodexSessionDisconnect:
         assert s.stats["reconnects"] == 1
 
 
+def _reasoning_config_values(argv):
+    return [
+        value
+        for flag, value in zip(argv, argv[1:])
+        if flag == "-c" and value.startswith("model_reasoning_effort=")
+    ]
+
+
 class TestCodexCommandConstruction:
     """Pin down `_build_codex_cmd()` against #351 regression: `--sandbox=...`
     is not accepted by `codex exec resume`, so the resume path used to fail
@@ -615,6 +625,51 @@ class TestCodexCommandConstruction:
         }
         kwargs.update(overrides)
         return CodexSession(StreamingSessionConfig(**kwargs))
+
+    @pytest.mark.parametrize("resume", [False, True], ids=["fresh", "resume"])
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("xhigh", "xhigh"),
+            ("max", "max"),
+            ("ultracode", "xhigh"),
+            ("auto", None),
+            (None, None),
+            ("", None),
+        ],
+        ids=["low", "medium", "high", "xhigh", "max", "ultracode", "auto", "unset", "empty"],
+    )
+    def test_effort_matrix(self, configured, expected, resume):
+        session = self._make(model="gpt-6.1-sol", thinking_effort=configured)
+        if resume:
+            session.codex_session_id = "existing-thread"
+
+        argv = session._build_codex_cmd()
+
+        assert argv[:2] == ["codex", "exec"]
+        assert ("resume" in argv) is resume
+        assert _reasoning_config_values(argv) == (
+            [] if expected is None else [f'model_reasoning_effort="{expected}"']
+        )
+        assert session.stats["thinking_effort"] == expected
+
+    @pytest.mark.parametrize("backend", ["exec", "tmux", "app-server"])
+    def test_unsupported_model_effort_passed_verbatim(self, monkeypatch, backend):
+        session = self._make(model="gpt-5.5", thinking_effort="max")
+        if backend == "app-server":
+            assert session._appserver_effort() == "max"
+        else:
+            if backend == "tmux":
+                session = CodexTmuxSession(session._config)
+                monkeypatch.setattr(session, "_has_prior_transcript", lambda: False)
+                argv = shlex.split(session._build_claude_cmd())
+            else:
+                argv = session._build_codex_cmd()
+            assert _reasoning_config_values(argv) == ['model_reasoning_effort="max"']
+        assert session.stats["thinking_effort"] == "max"
 
     def test_fresh_session_uses_yolo_flag_not_sandbox(self):
         """Fresh session: command must use the bypass flag, not --sandbox."""
@@ -1318,15 +1373,51 @@ class TestCodexAppServerApprovals:
 
 
 class TestCodexAppServerEffortAndConfig:
+    @pytest.mark.parametrize("resume", [False, True], ids=["fresh", "resume"])
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("xhigh", "xhigh"),
+            ("max", "max"),
+            ("ultracode", "xhigh"),
+            ("auto", None),
+            (None, None),
+            ("", None),
+        ],
+        ids=["low", "medium", "high", "xhigh", "max", "ultracode", "auto", "unset", "empty"],
+    )
+    @pytest.mark.asyncio
+    async def test_turn_start_effort_matrix(self, configured, expected, resume):
+        session = _appserver_session(model="gpt-6.1-sol", thinking_effort=configured)
+        if resume:
+            session.codex_session_id = "existing-thread"
+        fake = _FakeAppClient(session, [
+            ("turn/completed", {"turn": {"status": "completed"}}),
+        ])
+        _patch_ensure(session, fake)
+
+        result = await session._exec_codex_app_server("say ok")
+
+        assert not result.failed
+        assert [method for method, _ in fake.requests] == [
+            "thread/resume" if resume else "thread/start", "turn/start",
+        ]
+        params = dict(fake.requests)["turn/start"]
+        assert ("effort" in params) is (expected is not None)
+        assert params.get("effort") == expected
+        assert session.stats["thinking_effort"] == expected
+
     def test_effort_passthrough(self):
         s = _appserver_session()
         s._reasoning_effort = "high"
         assert s._appserver_effort() == "high"
 
-    def test_effort_max_maps_to_high(self):
-        s = _appserver_session()
-        s._reasoning_effort = "max"
-        assert s._appserver_effort() == "high"
+    def test_effort_max_passed_through(self):
+        s = _appserver_session(model="gpt-6.1-sol", thinking_effort="max")
+        assert s._appserver_effort() == "max"
 
     def test_effort_invalid_returns_none(self):
         s = _appserver_session()
