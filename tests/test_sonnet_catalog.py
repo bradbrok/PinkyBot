@@ -173,6 +173,66 @@ def test_pre_update_registry_without_write_columns_gets_all_correct_rates(tmp_pa
         assert _prices(registry.get_model("claude-sonnet-5")) == _NEW_PRICES
 
 
+def test_operator_current_write_prices_survive_second_and_third_startup(tmp_path):
+    path = tmp_path / "registry.db"
+    expected_prices = (3.0, 15.0, 0.3, 2.5, 4.0)
+    with closing(AgentRegistry(str(path))) as registry:
+        expected = registry.add_model(
+            provider="anthropic", model_id="claude-sonnet-5",
+            display_name="Custom Sonnet", description="Custom catalog note", tier="sonnet",
+            input_price=3.0, output_price=15.0, cached_input_price=0.3,
+            cache_write_5m_price=2.5, cache_write_1h_price=4.0,
+        )
+        assert _prices(expected) == expected_prices
+    for _ in range(2):
+        with closing(AgentRegistry(str(path))) as registry:
+            actual = registry.get_model("claude-sonnet-5")
+            assert _prices(actual) == expected_prices
+            assert actual == expected
+
+
+@pytest.mark.parametrize("missing_column", _REGISTRY_PRICE_COLUMNS[-2:])
+def test_single_missing_write_column_corrects_stale_seed_and_is_idempotent(
+    tmp_path, missing_column,
+):
+    path = _pre_update_db(tmp_path, "sonnet_registry_pre_update")
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute(f"ALTER TABLE models DROP COLUMN {missing_column}")
+        conn.commit()
+    with closing(AgentRegistry(str(path))) as registry:
+        assert _prices(registry.get_model("claude-sonnet-5")) == _NEW_PRICES
+        expected_rows = registry.list_models(active_only=False)
+    for _ in range(2):
+        with closing(AgentRegistry(str(path))) as registry:
+            assert _prices(registry.get_model("claude-sonnet-5")) == _NEW_PRICES
+            assert registry.list_models(active_only=False) == expected_rows
+
+
+@pytest.mark.parametrize("missing_column", _REGISTRY_PRICE_COLUMNS[-2:])
+def test_single_missing_write_column_preserves_existing_operator_write_value(
+    tmp_path, missing_column,
+):
+    path = tmp_path / "registry.db"
+    expected_prices = (3.0, 15.0, 0.3, 2.5, 4.0)
+    with closing(AgentRegistry(str(path))) as registry:
+        registry.add_model(
+            provider="anthropic", model_id="claude-sonnet-5",
+            description="Custom catalog note", input_price=3.0, output_price=15.0,
+            cached_input_price=0.3, cache_write_5m_price=2.5, cache_write_1h_price=4.0,
+        )
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute(f"ALTER TABLE models DROP COLUMN {missing_column}")
+        conn.commit()
+    with closing(AgentRegistry(str(path))) as registry:
+        row = registry.get_model("claude-sonnet-5")
+        assert _prices(row) == expected_prices
+        assert row["description"] == "Custom catalog note"
+        expected_rows = registry.list_models(active_only=False)
+    for _ in range(2):
+        with closing(AgentRegistry(str(path))) as registry:
+            assert registry.list_models(active_only=False) == expected_rows
+
+
 @pytest.mark.parametrize("column", _REGISTRY_PRICE_COLUMNS)
 def test_pre_update_registry_preserves_custom_price_rows(tmp_path, column):
     path = _pre_update_db(tmp_path, "sonnet_registry_pre_update")
