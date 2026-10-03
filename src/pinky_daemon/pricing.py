@@ -192,6 +192,7 @@ RATE_TABLE: dict[str, dict[str, float]] = {
     "claude-opus-4-5": _OPUS_STD,
     "claude-opus-4-1": _OPUS_LEGACY,
     "claude-opus-4": _OPUS_LEGACY,
+    "claude-sonnet-5-5": _SONNET_5,
     # Sonnet 5 standard pricing is $2/$10 per MTok; the increase was cancelled.
     "claude-sonnet-5": _SONNET_5,
     "claude-sonnet-4-6": _SONNET,
