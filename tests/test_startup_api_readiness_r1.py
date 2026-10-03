@@ -17,6 +17,8 @@ from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.api_readiness import ApiReadiness
 from pinky_daemon.broker import MessageBroker
 from pinky_daemon.buzz_inbound import BrokerBuzzPoller, BuzzNostrSigner
+from pinky_daemon.codex_session import CodexSession
+from pinky_daemon.codex_tmux_session import CodexTmuxSession
 from pinky_daemon.ferry.host_pinky import HostPinky
 from pinky_daemon.ferry.types import FerryEnvelope
 from pinky_daemon.pollers import (
@@ -30,7 +32,7 @@ from pinky_daemon.tmux_session import TmuxSession
 from pinky_daemon.transport_state import SessionState
 from pinky_daemon.wake_prompt import WakeReason
 from tests import test_startup_api_readiness as boot_harness
-from tests.test_startup_api_readiness import _run_boot
+from tests.test_startup_api_readiness import MODES, _run_boot
 
 POLLERS = (BrokerTelegramPoller, BrokerDiscordPoller, BrokerSlackPoller, BrokeriMessagePoller)
 
@@ -405,3 +407,155 @@ def test_stop_is_safe_before_a_real_poller_has_started(kind):
     poller.stop()
     assert not poller._running
     assert adapter.mock_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ready", (False, True))
+async def test_healthy_ready_line_counts_released_waiters_once(monkeypatch, capsys, ready):
+    gate = ApiReadiness()
+    server = SimpleNamespace(started=False, should_exit=False)
+    gate.attach(server)
+    gate.started_at = 10.0
+    gate.cap_seconds = 1.0
+    clock = SimpleNamespace(now=10.0)
+    monkeypatch.setattr(api_readiness, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    held = [asyncio.create_task(gate.wait(source)) for source in ("boot", "replay")]
+    try:
+        await asyncio.sleep(0)
+        clock.now = 10.5 if ready else 11.0
+        server.started = ready
+        gate._refresh()
+        assert await asyncio.gather(*held) == [ready, ready]
+        gate._refresh()
+        output = capsys.readouterr().err
+        if ready:
+            assert "INFO api listener ready after 0.50s; released 2 held submission(s)" in output
+            assert output.count("INFO api listener ready after") == 1
+        else:
+            assert "ERROR" in output
+            assert "INFO api listener ready after" not in output
+    finally:
+        await gate.close()
+
+
+def test_deferred_startup_jobs_have_an_actual_start_line(boot_run, tmp_path, monkeypatch, capsys):
+    _run_boot(boot_run, tmp_path, monkeypatch, "claude-sdk")
+    assert capsys.readouterr().err.count("startup: deferred startup jobs starting") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("condition", ("expired", "stopped", "pending", "ready"))
+@pytest.mark.parametrize("path", ("approval", "ferry"))
+async def test_every_transport_refuses_durable_handoff_before_queueing_unless_ready(
+    boot_run, tmp_path, monkeypatch, mode, condition, path,
+):
+    registry = boot_run.app.state.agents
+    registry.register("primary", working_dir=str(tmp_path))
+    registry.approve_user("primary", "sample-chat", display_name="sender")
+    registry.queue_pending_message("primary", "web", "sample-chat", "sender", "durable message")
+    gate = boot_run.app.state.api_readiness
+    server = SimpleNamespace(started=condition == "ready", should_exit=condition == "stopped", phase=2)
+    boot_run.server = server
+    gate.attach(server)
+    gate.started_at = 10.0
+    gate.cap_seconds = 10.0
+    monkeypatch.setattr(api_readiness, "time", SimpleNamespace(
+        monotonic=lambda: 21.0 if condition == "expired" else 10.5,
+    ))
+    config = StreamingSessionConfig(
+        agent_name="primary", working_dir=str(tmp_path), api_readiness=gate,
+        live_status_fn=lambda: {"status": "idle", "last_updated": 0},
+    )
+    cls = {
+        "claude-sdk": StreamingSession, "claude-tmux": TmuxSession,
+        "codex-tmux": CodexTmuxSession, "codex-exec": CodexSession,
+        "codex-app-server": CodexSession,
+    }[mode]
+    session = cls(config)
+    session._state_machine._state = SessionState.CONNECTED
+    monkeypatch.setenv("PINKY_CODEX_APP_SERVER", "1" if mode == "codex-app-server" else "0")
+    if mode == "claude-sdk":
+        session._client = SimpleNamespace(query=AsyncMock(
+            side_effect=lambda prompt: boot_run.submit("sdk-query", prompt),
+        ))
+    elif mode.endswith("tmux"):
+        session._session_ready_event.set()
+
+        async def paste(prompt, **kwargs):
+            boot_run.submit("pane-paste", prompt)
+            return SimpleNamespace(ok=True, returncode=0, stderr="")
+
+        async def finish(turn):
+            session._resolve_submission_receipt(turn, True)
+            session._fire_on_delivered(turn)
+            session._turn_done.set()
+
+        session._tmux.paste_text = paste
+        session._finish_submitted_turn = finish
+        session._worker_task = asyncio.create_task(session._message_worker())
+    else:
+        class AppClient:
+            async def request(self, method, params):
+                if method == "turn/start":
+                    boot_run.submit("app-server-turn", params["input"][0]["text"])
+                    session._turn_done.set_result(None)
+                    return {}
+                return {"thread": {"id": "sample-thread"}}
+
+        session._app_client = AppClient()
+        session._ensure_app_server = AsyncMock(return_value=True)
+        session._start_worker()
+    send = AsyncMock(wraps=session.send)
+    monkeypatch.setattr(session, "send", send)
+    broker = boot_run.app.state.broker
+    monkeypatch.setattr(broker, "_get_streaming_session", lambda *args: session)
+    monkeypatch.setattr(broker, "_start_typing", AsyncMock())
+    host = None
+    result = None
+    timed_out = False
+    try:
+        try:
+            async with asyncio.timeout(0.5):
+                if path == "approval":
+                    try:
+                        result = await broker.handle_approval("primary", "sample-chat")
+                    except RuntimeError:
+                        result = 0
+                else:
+                    registry.add_peer_fleet_acl("primary", fleet="sample", agent_id="recovery@sample")
+                    host = HostPinky(registry=registry, broker=broker, fleet_name="sample")
+                    result = await host.deliver(FerryEnvelope(
+                        v="0.1", id="sample-envelope", from_="recovery@sample", to="primary@sample",
+                        ts=1, body={"kind": "message", "text": "durable ferry message"},
+                    ))
+        except TimeoutError:
+            timed_out = True
+        assert not timed_out, "Ferry/broker admission waited past the prompt retry bound"
+        if condition == "ready":
+            send.assert_awaited_once()
+            await boot_run.wait_for_delivery(1)
+            assert broker.stats["routed"] == 1
+            if host is not None:
+                assert result.status == "delivered"
+                assert host.stats["delivered"] == 1 and host.stats["messages_routed"] == 1
+            else:
+                assert result == 1
+                assert registry.get_pending_messages("primary", "sample-chat") == []
+        else:
+            send.assert_not_awaited()
+            await boot_run.checkpoint()
+            assert boot_run.observed == []
+            assert len(registry.get_pending_messages("primary", "sample-chat")) == 1
+            assert broker.stats["routed"] == 0
+            if host is not None:
+                assert result.status == "transient_failure"
+                assert host.stats["delivered"] == 0 and host.stats["messages_routed"] == 0
+            else:
+                assert result == 0
+    finally:
+        await gate.close()
+        worker = getattr(session, "_worker_task", None)
+        if worker is not None:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
