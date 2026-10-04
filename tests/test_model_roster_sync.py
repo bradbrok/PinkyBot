@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -34,6 +35,7 @@ from tests.test_model_roster_fetch import (
     make_service,
     required,
     result,
+    sync_module,
 )
 
 
@@ -65,6 +67,8 @@ def no_network(monkeypatch):
 
     monkeypatch.setattr(urllib.request.OpenerDirector, "open", refuse)
     monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket, "create_connection", refuse)
 
 
 def assert_error(exc, code):
@@ -453,3 +457,13 @@ def test_unset_switch_and_url_capture_production_defaults(registry, monkeypatch)
     assert service.url == (
         "https://raw.githubusercontent.com/bradbrok/PinkyBot/main/src/pinky_daemon/catalog/models.json"
     )
+
+
+def test_default_deadline_first_delay_and_uniform_jitter(registry, monkeypatch):
+    module = sync_module()
+    draw = Mock(return_value=321.0)
+    monkeypatch.setattr(module.random, "uniform", draw)
+    service = make_service(registry, getter=Mock())
+    assert service.timeout == 10 and service.first_delay == 60
+    assert service.jitter() == 321.0
+    draw.assert_called_once_with(0, 1800)

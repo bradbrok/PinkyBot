@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import sqlite3
 import threading
 import urllib.error
@@ -55,6 +56,8 @@ def apps(tmp_path, monkeypatch):
 
     monkeypatch.setattr(urllib.request.OpenerDirector, "open", no_network)
     monkeypatch.setattr(urllib.request, "urlopen", no_network)
+    monkeypatch.setattr(socket.socket, "connect", no_network)
+    monkeypatch.setattr(socket, "create_connection", no_network)
 
     def build(*, mode="shadow", enabled=False, getter=None, url=URL):
         monkeypatch.setenv("PINKY_ISOLATED_POLICY_MODE", mode)
@@ -368,7 +371,7 @@ def test_sync_returns_real_apply_or_preview_report(apps, dry_run):
     ],
 )
 def test_http_failures_have_fixed_bodies_and_apply_is_recorded_once(
-    apps, monkeypatch, fault, expected
+    apps, monkeypatch, capsys, fault, expected
 ):
     value = document()
 
@@ -408,9 +411,35 @@ def test_http_failures_have_fixed_bodies_and_apply_is_recorded_once(
             "collision-private-id",
         )
     assert last_good(d.registry) == good
+    stderr = capsys.readouterr().err
+    for marker in (
+        "query-private-marker",
+        "transport-private-marker",
+        "response-private-marker",
+        "storage-private-marker",
+    ):
+        assert marker not in stderr
     if fault == "apply":
         assert d.registry._model_roster_errors == errors + 1
         assert "collision-private-id" in status(d.registry)["last_error"]
+
+
+def test_release_storage_failure_is_fixed_503_without_log_or_write(apps, monkeypatch, capsys):
+    d = apps()
+    before = snapshot(d.registry)
+    monkeypatch.setattr(
+        d.registry,
+        "release_model_roster_fields",
+        Mock(side_effect=sqlite3.OperationalError("storage-private-marker")),
+    )
+    with browser(d.app) as client:
+        fixed_error(
+            client.post("/models/roster/release", json={"id": SONNET, "fields": "all"}),
+            503,
+            "storage-private-marker",
+        )
+    assert snapshot(d.registry) == before
+    assert "storage-private-marker" not in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("saved", [None, "", "not-json", " \n\t", "{}"])

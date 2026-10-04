@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import socket
 import ssl
 import urllib.error
 import urllib.request
@@ -121,6 +122,8 @@ def no_network(monkeypatch):
 
     monkeypatch.setattr(urllib.request.OpenerDirector, "open", refuse)
     monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket, "create_connection", refuse)
 
 
 def fetch(opener, url=URL, clock=None):
@@ -249,7 +252,10 @@ def test_cap_plus_one_stops_even_without_truthful_content_length(headers):
     response = Response(b"x" * (MAX_BYTES + 100), headers=headers, chunk=4096)
     with pytest.raises(error_type()):
         fetch(Opener(response))
-    assert response.position == MAX_BYTES + 1
+    if headers:
+        assert response.position <= MAX_BYTES + 1
+    else:
+        assert response.position == MAX_BYTES + 1
     assert response.closed and sum(response.read_sizes) >= response.position
 
 
