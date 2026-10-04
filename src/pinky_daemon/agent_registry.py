@@ -43,6 +43,7 @@ from pinky_daemon.agent_signing_key_store import (
 )
 from pinky_daemon.cron_utils import _field_matches
 from pinky_daemon.effort import is_ultracode
+from pinky_daemon.model_roster import load_bundled
 from pinky_daemon.schedule_fire_trace import ScheduleFireTrace, trace_event
 from pinky_daemon.store_catalog import (
     StoreCatalog,
@@ -8348,37 +8349,12 @@ except Exception as exc:
     )
 
     _MODEL_SEEDS = [
-        # Anthropic
-        ("anthropic", "claude-fable-5-1", "Claude Fable 5.1", "Anthropic's most capable model (2026-09-01). Extends Fable 5 at the same $10/$50 price with stronger long-horizon agentic coding, multistep research, and document work; cache reads 4× cheaper. 1M context; adaptive thinking always on (use effort to control depth).", "fable", 1_000_000, 1, 10.0, 50.0, 0.25, 1, 1),
-        ("anthropic", "claude-mythos-5-1", "Claude Mythos 5.1", "Claude Fable 5.1 capabilities without the safety classifiers. Limited availability via Project Glasswing (approved customers only).", "fable", 1_000_000, 1, 10.0, 50.0, 0.25, 1, 2),
-        ("anthropic", "claude-fable-5", "Claude Fable 5", "Anthropic's most capable widely-released model (2026-06-09). Demanding reasoning + long-horizon agentic work. 1M context; adaptive thinking always on (use effort to control depth).", "fable", 1_000_000, 1, 10.0, 50.0, 1.0, 1, 1),
-        ("anthropic", "claude-mythos-5", "Claude Mythos 5", "Claude Fable 5 capabilities without the safety classifiers. Limited availability via Project Glasswing (approved customers only).", "fable", 1_000_000, 1, 10.0, 50.0, 1.0, 1, 2),
-        ("anthropic", "claude-opus-5-5", "Claude Opus 5.5", "Current Opus (2026-09-22). Built for long-running agentic coding and knowledge work at $4/$20 per MTok with a 5% cache read; 1M context, 128K output; adaptive thinking always on, effort defaults to medium. Knowledge cutoff Jun 2026.", "opus", 1_000_000, 1, 4.0, 20.0, 0.2, 1, 2),
-        ("anthropic", "claude-opus-5", "Claude Opus 5", "For complex agentic coding + enterprise work. 1M context; effort defaults high; adaptive thinking. Knowledge cutoff May 2026.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 2),
-        ("anthropic", "claude-opus-4-8", "Claude Opus 4.8", "Newest Opus (2026-05-28). Sharper judgement, more honest progress reporting, longer independent runs. Effort defaults to high; adaptive thinking triggers only when needed.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 3),
-        ("anthropic", "claude-opus-4-7", "Claude Opus 4.7", "Stricter instruction-following, xhigh effort, larger vision.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 5),
-        ("anthropic", "claude-opus-4-6", "Claude Opus 4.6", "Maximum intelligence. Deep reasoning.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 10),
-        ("anthropic", "claude-sonnet-5-5", "Claude Sonnet 5.5", "Current Sonnet. Fast reasoning and coding at $2/$10 per MTok. 1M context at standard pricing, 128K output; adaptive thinking, effort defaults to high.", "sonnet", 1_000_000, 1, 2.0, 10.0, 0.2, 1, 14),
-        ("anthropic", "claude-sonnet-5", "Claude Sonnet 5", _SONNET_5_DESCRIPTION, "sonnet", 1_000_000, 1, 2.0, 10.0, 0.2, 1, 15),
-        ("anthropic", "claude-sonnet-4-6", "Claude Sonnet 4.6", "Fast + smart. Daily driver.", "sonnet", 1_000_000, 1, 3.0, 15.0, 0.3, 1, 20),
-        ("anthropic", "claude-haiku-4-5", "Claude Haiku 4.5", "Lightning fast. Simple tasks.", "haiku", 200_000, 0, 1.0, 5.0, 0.1, 1, 30),
-        ("anthropic", "claude-opus-4-5", "Claude Opus 4.5", "Previous-gen Opus.", "opus", 200_000, 0, 5.0, 25.0, 0.5, 1, 40),
-        ("anthropic", "claude-sonnet-4-5", "Claude Sonnet 4.5", "Previous-gen Sonnet.", "sonnet", 200_000, 0, 3.0, 15.0, 0.3, 1, 50),
-        # OpenAI / Codex CLI
-        # gpt-daybreak-blue-latest: OpenAI Daybreak Access alias (enrollment-
-        # gated tier for authorized defensive-security work). Officially "an
-        # alias that currently points to gpt-5.6-sol"; OpenAI repoints it as
-        # new Daybreak models release, "with pricing adjusted to match each
-        # underlying model" (developers.openai.com/api/docs/pricing, verified
-        # 2026-09-01). Seeded at sol parity on every inherited axis — prices
-        # and 200k-class window — so revisit all three tables (catalog /
-        # RATE_TABLE / analytics seeds) together when the alias moves.
-        ("openai", "gpt-daybreak-blue-latest", "Daybreak Blue", "Daybreak Access alias — currently gpt-5.6-sol with safeguards tuned for authorized defensive-security work. Tracks the newest Daybreak Blue model; pricing follows the underlying model. 200k-class context. Codex sign-in auth.", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 53),
-        ("openai", "gpt-5.6-sol", "GPT-5.6 Sol", "200k-class context; backend window observed near 167k. Codex sign-in auth only (API pending).", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 54),
-        ("openai", "gpt-5.5", "GPT-5.5", "Previous frontier. Coding + reasoning. Codex sign-in auth only (API pending).", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 55),
-        ("openai", "gpt-5.4", "GPT-5.4", "Flagship. Complex reasoning & coding.", "flagship", 200_000, 0, 1.75, 14.0, 0.175, 0, 60),
-        ("openai", "gpt-5.4-mini", "GPT-5.4 Mini", "Fast + capable. Daily driver.", "mid", 200_000, 0, 0.25, 2.0, 0.025, 0, 70),
-        ("openai", "gpt-5.4-nano", "GPT-5.4 Nano", "Cheapest. High-volume tasks.", "low", 200_000, 0, 0.05, 0.4, 0.005, 0, 80),
+        (
+            row.provider, row.model_id, row.display_name, row.description, row.tier,
+            row.context_window, int(row.is_1m), row.pricing.input, row.pricing.output,
+            row.pricing.cached_input, int(row.supports_thinking), row.sort_order,
+        )
+        for row in load_bundled().models
     ]
 
     # One-time data corrections for rows already seeded with wrong values.

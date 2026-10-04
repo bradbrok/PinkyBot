@@ -29,6 +29,7 @@ from pinky_daemon.api_readiness import (
 )
 from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.effort import CLI_EFFORT_LEVELS, resolve_cli_effort
+from pinky_daemon.model_roster import load_bundled
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.transport import TransportReplacementMixin
 from pinky_daemon.transport_state import SessionState, StateMachine, Trigger
@@ -40,24 +41,9 @@ from pinky_daemon.wake_prompt import (
     wake_reason_from_runtime,
 )
 
-# Models with native 1M context (SDK reports 200k incorrectly).
-# INVARIANT: must contain every model the registry flags is_1m=1
-# (agent_registry._MODEL_SEEDS) — pinned by
-# test_1m_models_set_matches_registry_is_1m so this can't drift again (#839).
-_1M_MODELS = {
-    "claude-fable-5",
-    "claude-mythos-5",
-    "claude-fable-5-1",
-    "claude-mythos-5-1",
-    "claude-sonnet-5-5",
-    "claude-sonnet-5",
-    "claude-sonnet-4-6",
-    "claude-opus-4-6",
-    "claude-opus-4-7",
-    "claude-opus-4-8",
-    "claude-opus-5",
-    "claude-opus-5-5",
-}
+# Native 1M-context fallback derived from the shipped catalog.
+# Used when no runtime model catalog is bound; the registry derives the same flags.
+_1M_MODELS = {row.model_id for row in load_bundled().models if row.is_1m}
 
 
 def is_1m_model(model_id: str, model_set: "set[str] | None" = None) -> bool:

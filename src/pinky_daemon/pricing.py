@@ -29,6 +29,7 @@ Cache-*read* tokens are billed at the cheap ``cache_read`` rate.
 
 from __future__ import annotations
 
+from pinky_daemon.model_roster import load_bundled
 from pinky_daemon.runtime_model_catalog import (
     ModelCatalogReadError,
     lookup_model,
@@ -37,185 +38,54 @@ from pinky_daemon.runtime_model_catalog import (
 
 _M = 1_000_000
 
-# --------------------------------------------------------------------- #
-# Rate table — keep in sync with ~/.pinkybot/burn/rates/anthropic_*.jsonl
-# (the snapshot overlay's out-of-tree copy). All values usd_per_mtok.
-# --------------------------------------------------------------------- #
-
-# Standard Opus tier (4.5 and newer): the price has been flat across
-# 4.5 → 4.6 → 4.7 → 4.8 → 5. 1M context is sold at the same per-token price
-# as 200K, so no tier split is needed here.
-_OPUS_STD = {
-    "input": 5.00,
-    "output": 25.00,
-    "cache_read": 0.50,
-    "cache_write_5m": 6.25,
-    "cache_write_1h": 10.00,
-}
-# Fable / Mythos 5 (2026-06-09): the new flagship family. 1M context,
-# priced at $10 in / $50 out per Mtok; same cache ratios as Opus
-# (read 0.1×, write-5m 1.25×, write-1h 2×). Mythos shares Fable's pricing.
-_FABLE = {
-    "input": 10.00,
-    "output": 50.00,
-    "cache_read": 1.00,
-    "cache_write_5m": 12.50,
-    "cache_write_1h": 20.00,
-}
-# Fable / Mythos 5.1 (2026-09-01): extends Fable 5 at the same $10/$50 per
-# Mtok, but cache reads are 4× cheaper ($0.25 vs $1.00). 1M context, 128K
-# output. Mythos 5.1 shares Fable 5.1's pricing.
-_FABLE_51 = {
-    "input": 10.00,
-    "output": 50.00,
-    "cache_read": 0.25,
-    "cache_write_5m": 12.50,
-    "cache_write_1h": 20.00,
-}
-# Pre-4.5 Opus (4, 4.1): the old 3×-more-expensive tier. Kept for
-# historical-transcript pricing accuracy.
-_OPUS_LEGACY = {
-    "input": 15.00,
-    "output": 75.00,
-    "cache_read": 1.50,
-    "cache_write_5m": 18.75,
-    "cache_write_1h": 30.00,
-}
-_SONNET = {
-    "input": 3.00,
-    "output": 15.00,
-    "cache_read": 0.30,
-    "cache_write_5m": 3.75,
-    "cache_write_1h": 6.00,
-}
-_SONNET_5 = {
-    "input": 2.00,
-    "output": 10.00,
-    "cache_read": 0.20,
-    "cache_write_5m": 2.50,
-    "cache_write_1h": 4.00,
-}
-_HAIKU_45 = {
-    "input": 1.00,
-    "output": 5.00,
-    "cache_read": 0.10,
-    "cache_write_5m": 1.25,
-    "cache_write_1h": 2.00,
-}
-_HAIKU_35 = {
-    "input": 0.80,
-    "output": 4.00,
-    "cache_read": 0.08,
-    "cache_write_5m": 1.00,
-    "cache_write_1h": 1.60,
-}
-# OpenAI / Codex family (#860): powers the live tmux cost path for codex
-# agents (CodexTmuxSession rides the same _log_turn_cost_and_analytics as
-# Claude tmux). Official OpenAI API rates (developers.openai.com, verified
-# 2026-07-10); codex agents run on sign-in subscription, so as with CC
-# subscription agents these are notional usage-value figures (#648).
-# Cache-write billing DIFFERS per model page: gpt-5.6-sol documents cache
-# writes at 1.25x the uncached input rate ($6.25/Mtok); the gpt-5.5 and
-# gpt-5.3-codex pages list no write tariff, so those bill $0. OpenAI has no
-# 5m/1h TTL split — the documented tariff goes in both positions. Cached
-# reads use the published cached-input rate. Must mirror the analytics
-# openai seeds (test_seed_pricing_matches_rate_table, #669 — that guard
-# pins input/output/cache_read; the seed table has no write column).
-_GPT_56_SOL = {
-    "input": 5.00,
-    "output": 30.00,
-    "cache_read": 0.50,
-    "cache_write_5m": 6.25,  # 1.25x input per the sol model page
-    "cache_write_1h": 6.25,
-}
-_GPT_55 = {
-    "input": 5.00,
-    "output": 30.00,
-    "cache_read": 0.50,
-    "cache_write_5m": 0.0,
-    "cache_write_1h": 0.0,
-}
-_GPT_53_CODEX = {
-    "input": 1.75,
-    "output": 14.00,
-    "cache_read": 0.175,
-    "cache_write_5m": 0.0,
-    "cache_write_1h": 0.0,
-}
-# OpenAI publishes no separate cache-write tariff for the GPT-5.4 family.
-# Writes therefore carry no premium; cached reads use the published
-# cached-input rate.
-_GPT_54 = {
-    "input": 1.75,
-    "output": 14.00,
-    "cache_read": 0.175,
-    "cache_write_5m": 0.0,
-    "cache_write_1h": 0.0,
-}
-_GPT_54_MINI = {
-    "input": 0.25,
-    "output": 2.00,
-    "cache_read": 0.025,
-    "cache_write_5m": 0.0,
-    "cache_write_1h": 0.0,
-}
-_GPT_54_NANO = {
-    "input": 0.05,
-    "output": 0.40,
-    "cache_read": 0.005,
-    "cache_write_5m": 0.0,
-    "cache_write_1h": 0.0,
+# Preserve historical pricing for identifiers absent from the bundled catalog.
+_LEGACY_RATES = {
+    "claude-haiku-3-5": {
+        "input": 0.80, "output": 4.00, "cache_read": 0.08,
+        "cache_write_5m": 1.00, "cache_write_1h": 1.60,
+    },
+    "claude-opus-4": {
+        "input": 15.00, "output": 75.00, "cache_read": 1.50,
+        "cache_write_5m": 18.75, "cache_write_1h": 30.00,
+    },
+    "claude-opus-4-1": {
+        "input": 15.00, "output": 75.00, "cache_read": 1.50,
+        "cache_write_5m": 18.75, "cache_write_1h": 30.00,
+    },
+    "claude-sonnet-4": {
+        "input": 3.00, "output": 15.00, "cache_read": 0.30,
+        "cache_write_5m": 3.75, "cache_write_1h": 6.00,
+    },
+    "gpt-5.3-codex": {
+        "input": 1.75, "output": 14.00, "cache_read": 0.175,
+        "cache_write_5m": 0.0, "cache_write_1h": 0.0,
+    },
 }
 
-# Opus 5.5 (2026-09-22): the current Opus tier at $4/$20 per Mtok, cache
-# reads at 5% of input ($0.20), cache writes $5 (5m) / $8 (1h). 1M context,
-# 128K output. Cheaper than Opus 5's $5/$25 standard tier on every field.
-_OPUS_55 = {
-    "input": 4.00,
-    "output": 20.00,
-    "cache_read": 0.20,
-    "cache_write_5m": 5.00,
-    "cache_write_1h": 8.00,
-}
 
-# Bare-model-id → rate dict. Add new model ids here on each release.
-RATE_TABLE: dict[str, dict[str, float]] = {
-    "claude-fable-5": _FABLE,
-    "claude-mythos-5": _FABLE,
-    "claude-fable-5-1": _FABLE_51,
-    "claude-mythos-5-1": _FABLE_51,
-    "claude-opus-5-5": _OPUS_55,
-    "claude-opus-5": _OPUS_STD,
-    "claude-opus-4-8": _OPUS_STD,
-    "claude-opus-4-7": _OPUS_STD,
-    "claude-opus-4-6": _OPUS_STD,
-    "claude-opus-4-5": _OPUS_STD,
-    "claude-opus-4-1": _OPUS_LEGACY,
-    "claude-opus-4": _OPUS_LEGACY,
-    "claude-sonnet-5-5": _SONNET_5,
-    # Sonnet 5 standard pricing is $2/$10 per MTok; the increase was cancelled.
-    "claude-sonnet-5": _SONNET_5,
-    "claude-sonnet-4-6": _SONNET,
-    "claude-sonnet-4-5": _SONNET,
-    "claude-sonnet-4": _SONNET,
-    "claude-haiku-4-5": _HAIKU_45,
-    "claude-haiku-3-5": _HAIKU_35,
-    # Codex fleet models (#860). gpt-5.6-sol is the current fleet model
-    # (2026-07-09→); gpt-5.5 the previous one; gpt-5.3-codex kept because the
-    # analytics seed carries it (parity-pinned).
-    "gpt-5.6-sol": _GPT_56_SOL,
-    # gpt-daybreak-blue-latest: Daybreak Access alias — officially "currently
-    # point[s] to gpt-5.6-sol", with pricing "adjusted to match each
-    # underlying model" (developers.openai.com/api/docs/pricing, verified
-    # 2026-09-01). Sol's dict verbatim; update together with the catalog and
-    # analytics seeds when OpenAI repoints the alias.
-    "gpt-daybreak-blue-latest": _GPT_56_SOL,
-    "gpt-5.5": _GPT_55,
-    "gpt-5.4": _GPT_54,
-    "gpt-5.4-mini": _GPT_54_MINI,
-    "gpt-5.4-nano": _GPT_54_NANO,
-    "gpt-5.3-codex": _GPT_53_CODEX,
-}
+def _build_rate_table() -> dict[str, dict[str, float]]:
+    rates = dict(_LEGACY_RATES)
+    pool: dict[tuple[float, float, float, float, float], dict[str, float]] = {}
+    for row in load_bundled().models:
+        if row.model_id in _LEGACY_RATES:
+            raise ValueError(f"Bundled roster overlaps legacy rate id: {row.model_id}")
+        price = row.pricing
+        key = (price.input, price.output, price.cached_input,
+               price.cache_write_5m, price.cache_write_1h)
+        if key not in pool:
+            pool[key] = {
+                "input": key[0], "output": key[1], "cache_read": key[2],
+                "cache_write_5m": key[3], "cache_write_1h": key[4],
+            }
+        rates[row.model_id] = pool[key]
+    return rates
+
+
+# Equal-priced catalog entries share a plain dictionary; consumers only read it.
+RATE_TABLE: dict[str, dict[str, float]] = _build_rate_table()
+_FABLE_51 = RATE_TABLE["claude-fable-5-1"]  # Anchor: claude-fable-5-1.
+_OPUS_55 = RATE_TABLE["claude-opus-5-5"]  # Anchor: claude-opus-5-5.
+_OPUS_STD = RATE_TABLE["claude-opus-5"]  # Anchor: claude-opus-5.
 
 
 def lookup_rate(model_id: str) -> dict[str, float] | None:
