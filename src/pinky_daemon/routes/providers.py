@@ -10,13 +10,19 @@ the original file.
 from __future__ import annotations
 
 import os
+import sqlite3
 import time
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field
 
+from pinky_daemon.api_models import ModelRosterReleaseRequest, ModelRosterSyncRequest
+from pinky_daemon.model_roster_sync import RosterSyncError
 from pinky_daemon.pricing import RATE_TABLE
 
 router = APIRouter(tags=["providers"])
@@ -169,6 +175,67 @@ async def delete_provider(provider_id: str):
 async def list_models(provider: str = "", active_only: bool = True):
     """List available AI models."""
     return _agents.list_models(provider=provider, active_only=active_only)
+
+
+class _RosterRequestRoute(APIRoute):
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def validated(request):
+            try:
+                return await handler(request)
+            except RequestValidationError:
+                error = RosterSyncError("request_invalid")
+                return JSONResponse(status_code=error.status_code, content={"detail": error.detail()})
+
+        return validated
+
+
+def _roster_http_error(error):
+    return HTTPException(status_code=error.status_code, detail=error.detail())
+
+
+def _roster_service(request):
+    service = getattr(request.app.state, "model_roster_sync", None)
+    if service is None:
+        raise _roster_http_error(RosterSyncError("storage_unavailable"))
+    return service
+
+
+async def get_model_roster(request: Request):
+    try:
+        return _roster_service(request).status()
+    except RosterSyncError as exc:
+        raise _roster_http_error(exc) from None
+
+
+async def sync_model_roster(request: Request, body: ModelRosterSyncRequest):
+    try:
+        return await _roster_service(request).sync(dry_run=body.dry_run)
+    except RosterSyncError as exc:
+        raise _roster_http_error(exc) from None
+
+
+async def release_model_roster(request: Request, body: ModelRosterReleaseRequest):
+    registry = request.app.state.agents
+    try:
+        exact = registry._get_model_by_id(body.id)
+        if exact is None or exact["id"] != body.id:
+            raise RosterSyncError("model_not_found")
+        return registry.release_model_roster_fields(body.id, body.fields)
+    except sqlite3.Error:
+        raise _roster_http_error(RosterSyncError("storage_unavailable")) from None
+    except ValueError:
+        raise _roster_http_error(RosterSyncError("release_refused")) from None
+    except RosterSyncError as exc:
+        raise _roster_http_error(exc) from None
+
+
+router.add_api_route("/models/roster", get_model_roster, methods=["GET"])
+router.add_api_route("/models/roster/sync", sync_model_roster, methods=["POST"],
+                     route_class_override=_RosterRequestRoute)
+router.add_api_route("/models/roster/release", release_model_roster, methods=["POST"],
+                     route_class_override=_RosterRequestRoute)
 
 
 @router.get("/models/{model_id:path}")
