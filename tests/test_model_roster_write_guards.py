@@ -146,7 +146,9 @@ def test_frozen_correction_only_targets_exact_baseline_row(registry):
         SONNET, {"input_price": 3.0}, {"input_price": baseline["input_price"]}, 124.0
     ) == 1
     registry._db.commit()
-    corrected = registry.get_model(SONNET)
+    corrected = dict(zip(columns, registry._db.execute(
+        "SELECT * FROM models WHERE id=?", (SONNET,)
+    ).fetchone()))
     assert corrected["input_price"] == baseline["input_price"]
     assert corrected["updated_at"] == 124.0
     id_index = columns.index("id")
