@@ -37,7 +37,7 @@ def rig(tmp_path, monkeypatch, caplog):
         state.staged.append(True)
         if kwargs.get("inherit") == "none":
             raise AssertionError("isolated launch staged before rejecting server")
-        return None
+        return state.real_stage(*args, **kwargs)
 
     monkeypatch.setattr(LocalCommandRunner, "run", run)
     monkeypatch.setattr(tmux_session.tmux_launch_env, "stage_env", stage)
@@ -49,8 +49,10 @@ def rig(tmp_path, monkeypatch, caplog):
 
 
 async def launch(rig, *, clean=True):
-    return await rig.ctrl.new_session(cwd=str(rig.root), command="true", env={},
-                                      inherit="none" if clean else "all")
+    result = await rig.ctrl.new_session(cwd=str(rig.root), command="true", env={},
+                                       inherit="none" if clean else "all")
+    await tmux_session._cleanup_launch_env(result.launch_env)
+    return result
 
 
 @pytest.mark.parametrize("view", ["normal", "hidden"])
@@ -94,14 +96,32 @@ async def test_read_failure_refuses_or_warns_without_value_leak(rig, failure, cl
 
 
 @pytest.mark.parametrize("view", ["normal", "hidden"])
-async def test_compatibility_warns_once_names_only_and_never_repairs(rig, view, caplog):
+async def test_compatibility_warns_once_count_only_and_never_repairs(rig, view, caplog):
     setattr(rig, view, ("UNLISTED_DAEMON_NAME=" + CANARY + "\n").encode())
     await launch(rig, clean=False)
     await launch(rig, clean=False)
     messages = rig.logs + [r.getMessage() for r in caplog.records]
     assert len(messages) == 1, "foreign server names need one deduplicated warning"
-    assert "UNLISTED_DAEMON_NAME" in messages[0]
+    assert "UNLISTED_DAEMON_NAME" not in messages[0]
+    assert "unexpected names: 1" in messages[0]
+    assert "tmux -L test-fleet show-environment -g" in messages[0]
     assert not any("set-environment" in a or "kill-server" in a for a, _ in rig.calls)
+
+
+async def test_warning_dedup_remains_per_server_and_foreign_set(rig, monkeypatch):
+    rig.normal = b"FIRST_FOREIGN=value\n"
+    await launch(rig, clean=False)
+    await launch(rig, clean=False)
+    rig.normal = b"SECOND_FOREIGN=value\n"
+    await launch(rig, clean=False)
+    await launch(rig, clean=False)
+    monkeypatch.setenv("PINKY_TMUX_SOCKET", "test-other")
+    rig.ctrl = control(owner("claude", rig.root))
+    await launch(rig, clean=False)
+    await launch(rig, clean=False)
+    assert len(rig.logs) == 3
+    assert all("unexpected names: 1" in message for message in rig.logs)
+    assert all("FOREIGN" not in message for message in rig.logs)
 
 
 async def test_both_views_verified_each_launch_capability_once_per_server(rig):
