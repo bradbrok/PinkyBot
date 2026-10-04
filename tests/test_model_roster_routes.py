@@ -379,6 +379,7 @@ def test_unstorable_revision_route_has_fixed_parse_refused_502(
     monkeypatch.setattr(d.registry, "apply_model_roster", applier)
     with client_for(d.app, raise_server_exceptions=False) as client:
         client.cookies.set(SESSION_COOKIE_NAME, create_session_cookie(TEST_SESSION_SECRET))
+        capsys.readouterr()  # Discard synthetic app setup output before the request.
         response = client.post("/models/roster/sync", json={"dry_run": dry_run})
     assert fixed_error(response, 502) == {
         "code": "parse_refused", "message": "The roster document was refused."
