@@ -1259,7 +1259,10 @@ async def reap_legacy_tmux_sessions(registry, *, log=_log):
     from pinky_daemon.tmux_dream_runner import TmuxDreamRunner
 
     config = tmux_server_env.ServerConfig.capture()
-    if config.label == "default" or registry.get_setting(_LEGACY_TMUX_COMPLETE):
+    if config.label == "default":
+        # Compatibility authorizes only that route, not a later managed launch.
+        return set()
+    if registry.get_setting(_LEGACY_TMUX_COMPLETE):
         _LEGACY_TMUX_BLOCK_ALL = False
         _LEGACY_TMUX_BLOCKED.clear()
         return set()
