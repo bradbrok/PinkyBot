@@ -11,7 +11,7 @@ import pytest
 
 from pinky_daemon import api, claude_runner
 from tests import test_startup_api_readiness as boot_harness
-from tests._model_roster_local import document, encode, status
+from tests._model_roster_local import bundled_revision, document, encode, status
 from tests.test_model_roster_fetch import required, result
 from tests.test_model_roster_sync import until
 from tests.test_startup_api_readiness import _run_boot
@@ -55,7 +55,7 @@ def test_one_task_starts_after_replay_and_listener_ready(boot_run, tmp_path, mon
 
     async def before_bind():
         assert calls == [] and getattr(boot_run.app.state, "model_roster_sync_task", None) is None
-        assert status(boot_run.app.state.agents)["last_applied_revision"] == 1
+        assert status(boot_run.app.state.agents)["last_applied_revision"] == bundled_revision()
 
     async def after_ready():
         await boot_run.app.state.api_readiness._after_ready_task
@@ -140,7 +140,7 @@ def test_off_has_no_loop_or_worker_and_preserves_bundled_boot(boot_run, tmp_path
     async def after_ready():
         await boot_run.app.state.api_readiness._after_ready_task
         assert getattr(boot_run.app.state, "model_roster_sync_task", None) is None
-        assert status(boot_run.app.state.agents)["last_applied_revision"] == 1
+        assert status(boot_run.app.state.agents)["last_applied_revision"] == bundled_revision()
         service.getter.assert_not_called()
 
     boot_run.after_ready_hook = after_ready
@@ -232,7 +232,7 @@ def test_shutdown_drains_operation_before_store_close_and_discards_worker(
         if origin == "manual":
             operation.append(asyncio.create_task(required(service, "sync")(dry_run=False)))
         await until(entered.is_set)
-        assert status(registry)["last_applied_revision"] == 1
+        assert status(registry)["last_applied_revision"] == bundled_revision()
 
     boot_run.after_ready_hook = after_ready
     try:

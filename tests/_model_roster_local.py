@@ -6,8 +6,14 @@ import copy
 import inspect
 import json
 import sqlite3
-from contextlib import closing
+from contextlib import closing, contextmanager
 from importlib import resources
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+_PACKAGE_FILES = resources.files
+_FIXTURES = Path(__file__).parent / "fixtures"
 
 SOURCE = "https://raw.githubusercontent.com/example/project/main/models.json"
 MARKER = "migration:model_roster_baseline_v1"
@@ -39,13 +45,74 @@ PRICE_FIELDS = {
 
 
 def bundled_bytes(name="models.json"):
-    return resources.files("pinky_daemon.catalog").joinpath(name).read_bytes()
+    """Read the actual bundle even inside an explicit reference resource view."""
+    return _PACKAGE_FILES("pinky_daemon.catalog").joinpath(name).read_bytes()
 
 
-def document(revision=2):
+def bundled_revision():
+    return json.loads(bundled_bytes())["revision"]
+
+
+def document(revision=None):
+    """Copy live content; an explicit revision is exact, never an offset."""
     result = json.loads(bundled_bytes())
-    result.update(revision=revision, updated="2026-10-04")
+    result["revision"] = bundled_revision() + 1 if revision is None else revision
     return result
+
+
+def fixture_document(revision=None):
+    """Historical rows with the next live revision unless explicitly supplied."""
+    result = json.loads((_FIXTURES / "model_roster_revision1.json").read_bytes())
+    result["revision"] = bundled_revision() + 1 if revision is None else revision
+    return result
+
+
+def baseline_document():
+    return json.loads(bundled_bytes("models.baseline.json"))
+
+
+@contextmanager
+def reference_bundle(root, revision):
+    """Expose frozen input only while the caller runs a real constructor/import."""
+    root = Path(root)
+    with TemporaryDirectory(dir=root, prefix="reference-bundle-") as directory:
+        package = Path(directory)
+        catalog = package / "catalog"
+        catalog.mkdir()
+        (catalog / "models.json").write_bytes(encode(fixture_document(revision)))
+        for name in ("models.baseline.json", "models.schema.json"):
+            (catalog / name).write_bytes(bundled_bytes(name))
+        original_files = resources.files
+
+        def files(anchor=None, **kwargs):
+            anchor = anchor if anchor is not None else kwargs.get("package")
+            name = getattr(anchor, "__name__", anchor)
+            if name == "pinky_daemon.catalog":
+                return catalog
+            if name == "pinky_daemon":
+                return package
+            return original_files(anchor)
+
+        with patch.object(resources, "files", files):
+            yield
+
+
+def reference_registry(db_path):
+    """Run the complete registry constructor over an explicit historical bundle."""
+    from pinky_daemon.agent_registry import AgentRegistry
+
+    revision = bundled_revision()
+    with reference_bundle(Path(db_path).parent, revision):
+        return AgentRegistry(db_path=str(db_path))
+
+
+def unused_model_id(stem="roster-added-model"):
+    used = {row["model_id"] for value in (document(), fixture_document()) for row in value["models"]}
+    candidate, index = stem, 0
+    while candidate in used:
+        index += 1
+        candidate = f"{stem}-{index}"
+    return candidate
 
 
 def encode(value):
@@ -57,7 +124,7 @@ def model_row(value, full_id=SONNET):
 
 
 def new_model(model_id="roster-added-model", *, active=True):
-    result = copy.deepcopy(model_row(document()))
+    result = copy.deepcopy(model_row(fixture_document()))
     result.update(provider="openai", model_id=model_id, display_name="Added model", active=active)
     return result
 

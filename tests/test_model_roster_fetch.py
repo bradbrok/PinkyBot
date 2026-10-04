@@ -13,7 +13,7 @@ from email.message import Message
 import pytest
 
 from pinky_daemon.model_roster import MAX_BYTES
-from tests._model_roster_local import document, encode
+from tests._model_roster_local import encode, fixture_document
 
 URL = "https://raw.githubusercontent.com/example/catalog/main/models.json"
 FINAL = "https://pinkybot.ai/catalog/models.json"
@@ -142,7 +142,7 @@ def fetch(opener, url=URL, clock=None):
     ],
 )
 def test_allowed_url_keeps_exact_document_bytes(url):
-    raw = encode(document()) + b"\n "
+    raw = encode(fixture_document()) + b"\n "
     response = Response(raw, headers=[("Content-Type", "text/plain")])
     opener = Opener(response)
     value = fetch(opener, url)
@@ -189,7 +189,7 @@ def test_invalid_initial_url_is_refused_before_contact(url):
 @pytest.mark.parametrize("location", [FINAL, "../next.json"])
 def test_one_validated_redirect_never_reads_redirect_body(status, location):
     redirect = Response(b"discard", status=status, headers=[("Location", location)])
-    final = Response(encode(document()))
+    final = Response(encode(fixture_document()))
     opener = Opener(redirect, final)
     value = fetch(opener)
     expected = urllib.parse.urljoin(URL, location)
@@ -231,7 +231,7 @@ def test_second_redirect_is_refused_before_third_contact():
 def test_redirect_http_error_from_disabled_handler_is_followed_manually():
     redirect = Response(b"discard", status=302, headers=[("Location", FINAL)])
     raised = urllib.error.HTTPError(URL, 302, "redirect", redirect.headers, redirect)
-    final = Response(encode(document()))
+    final = Response(encode(fixture_document()))
     opener = Opener(raised, final)
     value = fetch(opener)
     assert value.url == FINAL and value.document == final.body
@@ -261,7 +261,7 @@ def test_cap_plus_one_stops_even_without_truthful_content_length(headers):
 
 
 def test_exact_byte_cap_requires_eof_and_accepts_valid_padded_document():
-    raw = encode(document())
+    raw = encode(fixture_document())
     raw += b" " * (MAX_BYTES - len(raw))
     response = Response(raw, headers=[("Content-Length", str(MAX_BYTES))])
     value = fetch(Opener(response))
@@ -309,7 +309,7 @@ def test_transport_failures_are_typed_and_do_not_expose_exception_text(failure):
 def test_budget_is_shared_across_redirect_and_body():
     clock = Clock()
     redirect = Response(status=302, headers=[("Location", FINAL)])
-    final = Response(encode(document()), clock=clock, step=3, chunk=1)
+    final = Response(encode(fixture_document()), clock=clock, step=3, chunk=1)
     opener = Opener(redirect, final, clock=clock, open_step=3)
     with pytest.raises(error_type()):
         fetch(opener, clock=clock)
@@ -318,7 +318,7 @@ def test_budget_is_shared_across_redirect_and_body():
 
 
 def test_default_opener_verifies_tls_and_disables_automatic_redirects(monkeypatch):
-    raw = encode(document())
+    raw = encode(fixture_document())
     response = Response(raw)
     observations = []
 

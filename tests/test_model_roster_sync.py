@@ -12,18 +12,19 @@ from unittest.mock import Mock
 import pytest
 
 from pinky_daemon import runtime_model_catalog
-from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.pricing import lookup_rate
 from pinky_daemon.streaming_session import is_1m_model
 from tests._model_roster_local import (
     SONNET,
     add,
     apply,
-    document,
+    bundled_revision,
     encode,
+    fixture_document,
     last_good,
     model_row,
     new_model,
+    reference_registry,
     snapshot,
     status,
 )
@@ -51,7 +52,7 @@ async def until(predicate):
 @pytest.fixture
 def registry(tmp_path, monkeypatch):
     monkeypatch.setenv("PINKY_MODEL_ROSTER_SYNC", "on")
-    instance = AgentRegistry(str(tmp_path / "agents.db"))
+    instance = reference_registry(tmp_path / "agents.db")
     runtime_model_catalog.bind_registry(instance)
     try:
         yield instance
@@ -87,7 +88,7 @@ def prime():
 async def test_unstorable_revision_is_parse_refused_before_apply(
     registry, monkeypatch, capsys, operation, dry_run
 ):
-    value = document(2**63)
+    value = fixture_document(2**63)
     model_row(value)["pricing"]["input"] = 7.0
     if operation == "insert":
         value["models"].append(new_model("signed-limit-insert"))
@@ -126,7 +127,7 @@ async def test_unstorable_revision_is_parse_refused_before_apply(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["update", "insert"])
 async def test_maximum_storable_revision_applies_for_update_and_insertion(registry, operation):
-    value = document(2**63 - 1)
+    value = fixture_document(2**63 - 1)
     model_row(value)["pricing"]["input"] = 7.0
     target = SONNET
     if operation == "insert":
@@ -168,7 +169,7 @@ async def test_post_fetch_monotonic_deadline_discards_result_without_asyncio_exp
 
     def getter(url, *, timeout):
         clock.now += timeout + 1
-        return result(encode(document()))
+        return result(encode(fixture_document()))
 
     monkeypatch.setattr(asyncio, "timeout", timeout_context)
     service = make_service(registry, getter=getter, monotonic=clock, timeout=10)
@@ -196,7 +197,7 @@ async def test_post_fetch_monotonic_deadline_discards_result_without_asyncio_exp
 async def test_success_applies_exact_raw_bytes_on_loop_and_updates_primed_cache(
     registry, monkeypatch
 ):
-    value = document()
+    value = fixture_document()
     model_row(value).update(context_window=800_000, is_1m=False)
     model_row(value)["pricing"]["input"] = 7.0
     raw = encode(value) + b"\n "
@@ -218,7 +219,7 @@ async def test_success_applies_exact_raw_bytes_on_loop_and_updates_primed_cache(
     service = make_service(registry, getter=getter, url=URL)
     try:
         report = await required(service, "sync")(dry_run=False)
-        assert report["revision"] == 2 and report["revision_gate"] == "accepted"
+        assert report["revision"] == value["revision"] and report["revision_gate"] == "accepted"
         assert getter_threads and getter_threads[0] != loop_thread
         assert apply_threads == [(loop_thread, raw, {"source": FINAL, "dry_run": False})]
         assert registry.get_setting("model_roster.last_applied_document").encode() == raw
@@ -229,11 +230,11 @@ async def test_success_applies_exact_raw_bytes_on_loop_and_updates_primed_cache(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("revision,gate", [(2, "equal"), (1, "lower")])
-async def test_equal_and_lower_remote_revisions_keep_last_good(registry, revision, gate):
-    apply(registry, document(2))
+@pytest.mark.parametrize("offset,gate", [(0, "equal"), (-1, "lower")])
+async def test_equal_and_lower_remote_revisions_keep_last_good(registry, offset, gate):
+    apply(registry, fixture_document(bundled_revision() + 1))
     before, cached = last_good(registry), prime()
-    value = document(revision)
+    value = fixture_document(bundled_revision() + 1 + offset)
     model_row(value)["pricing"]["input"] = 99.0
     service = make_service(registry, getter=lambda url, **kw: result(encode(value)))
     try:
@@ -292,7 +293,7 @@ async def test_final_url_is_validated_again_before_parse_or_apply(registry, monk
     monkeypatch.setattr(registry, "apply_model_roster", apply_spy)
     service = make_service(
         registry,
-        getter=lambda url, **kw: result(encode(document()), "https://example.invalid/private"),
+        getter=lambda url, **kw: result(encode(fixture_document()), "https://example.invalid/private"),
     )
     try:
         with pytest.raises(error_type()) as caught:
@@ -352,7 +353,7 @@ async def test_apply_refusal_records_once_through_unchanged_b1_path(registry, mo
     custom = new_model("collision-model")
     custom["provider"] = "custom"
     add(registry, custom)
-    value = document()
+    value = fixture_document()
     value["models"].append(new_model("collision-model"))
     good, cached = last_good(registry), prime()
     facade = required(registry, "record_model_roster_sync_error")
@@ -409,7 +410,7 @@ async def test_sixty_second_first_delay_and_start_based_daily_cadence(registry, 
         clock.now += 30
         if fails:
             raise urllib.error.URLError("fixed failure")
-        return result(encode(document()))
+        return result(encode(fixture_document()))
 
     service = make_service(
         registry, getter=getter, monotonic=clock, sleep=sleep, jitter=lambda: jitter
@@ -438,7 +439,7 @@ async def test_manual_sync_does_not_reset_pending_daily_deadline(registry):
 
     def getter(url, **kwargs):
         calls.append(clock.now)
-        return result(encode(document()))
+        return result(encode(fixture_document()))
 
     service = make_service(registry, getter=getter, monotonic=clock, sleep=sleep, jitter=lambda: 0)
     task = asyncio.create_task(required(service, "run")())
@@ -465,7 +466,7 @@ async def test_overdue_scheduled_work_has_no_catchup_burst(registry):
 
     def getter(url, **kwargs):
         clock.now += 3 * 86400
-        return result(encode(document()))
+        return result(encode(fixture_document()))
 
     service = make_service(registry, getter=getter, monotonic=clock, sleep=sleep, jitter=lambda: 0)
     task = asyncio.create_task(required(service, "run")())
@@ -496,7 +497,7 @@ async def test_retained_worker_refuses_new_work_and_discards_late_completion(
         assert release.wait(5), "Test must release its worker"
         if late_error and len(calls) == 1:
             raise urllib.error.URLError("late-private-marker")
-        return result(encode(document()))
+        return result(encode(fixture_document()))
 
     service = make_service(registry, getter=getter, timeout=0.03 if ending == "timeout" else 10)
     good = last_good(registry)
@@ -544,7 +545,7 @@ async def test_retained_worker_refuses_new_work_and_discards_late_completion(
 async def test_off_captures_configuration_and_never_attempts_fetch(registry, monkeypatch, dry_run):
     monkeypatch.setenv("PINKY_MODEL_ROSTER_SYNC", " OFF ")
     monkeypatch.setenv("PINKY_MODEL_ROSTER_URL", URL)
-    getter = Mock(return_value=result(encode(document())))
+    getter = Mock(return_value=result(encode(fixture_document())))
     service = make_service(registry, getter=getter)
     monkeypatch.setenv("PINKY_MODEL_ROSTER_SYNC", "on")
     monkeypatch.setenv("PINKY_MODEL_ROSTER_URL", FINAL)
@@ -585,7 +586,7 @@ def test_default_deadline_first_delay_and_uniform_jitter(registry, monkeypatch):
 async def test_unexpected_worker_failure_is_fixed_and_releases_admission(
     registry, monkeypatch, capsys, caplog, dry_run
 ):
-    getter = Mock(side_effect=[RuntimeError("private-marker"), result(encode(document()))])
+    getter = Mock(side_effect=[RuntimeError("private-marker"), result(encode(fixture_document()))])
     facade = Mock(wraps=required(registry, "record_model_roster_sync_error"))
     monkeypatch.setattr(registry, "record_model_roster_sync_error", facade)
     service = make_service(registry, getter=getter)
@@ -610,7 +611,7 @@ async def test_unexpected_worker_failure_is_fixed_and_releases_admission(
         assert "private-marker" not in rendered
         after = snapshot(registry)
         report = await required(service, "sync")(dry_run=True)
-        assert report["revision"] == 2 and getter.call_count == 2
+        assert report["revision"] == bundled_revision() + 1 and getter.call_count == 2
         assert snapshot(registry) == after and facade.call_count == (0 if dry_run else 1)
     finally:
         await required(service, "close")()
@@ -666,7 +667,7 @@ async def test_default_on_switch_accepts_all_disabled_spellings(
         monkeypatch.delenv("PINKY_MODEL_ROSTER_SYNC", raising=False)
     else:
         monkeypatch.setenv("PINKY_MODEL_ROSTER_SYNC", switch)
-    getter = Mock(return_value=result(encode(document())))
+    getter = Mock(return_value=result(encode(fixture_document())))
     service = make_service(registry, getter=getter)
     before = snapshot(registry)
     try:

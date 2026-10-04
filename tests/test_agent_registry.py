@@ -25,6 +25,7 @@ from pinky_daemon.agent_registry import (
     SoulMutationRejectedError,
     resolve_agent_path,
 )
+from tests._model_roster_local import reference_registry
 
 
 @pytest.mark.parametrize("failures", [2, 3])
@@ -1710,7 +1711,8 @@ class TestAgentContextToPrompt:
 class TestModelSeeds:
     """Model registry seeding — Claude Fable 5 / Mythos 5 + idempotency."""
 
-    def test_fable_and_mythos_seeded(self, registry):
+    def test_fable_and_mythos_seeded(self, historical_registry):
+        registry = historical_registry
         models = {
             m["model_id"]: m
             for m in registry.list_models(provider="anthropic", active_only=False)
@@ -1783,9 +1785,10 @@ class TestModelSeeds:
             f"(would cap context at 200k on the SDK path): {sorted(missing)}"
         )
 
-    def test_stale_prices_corrected_on_existing_rows(self, registry):
+    def test_stale_prices_corrected_on_existing_rows(self, historical_registry):
         """#741: rows already seeded with the stale tier are rewritten on the
         next seed pass (INSERT OR IGNORE alone never reaches existing DBs)."""
+        registry = historical_registry
         registry._db.execute(
             "UPDATE models SET input_price=15.0, output_price=75.0,"
             " cached_input_price=1.5 WHERE id='anthropic/claude-opus-4-8'"
@@ -1821,9 +1824,10 @@ class TestModelSeeds:
         )
         assert opus["input_price"] == 12.34
 
-    def test_gpt_56_sol_seeded_at_frontier_rates(self, registry):
+    def test_gpt_56_sol_seeded_at_frontier_rates(self, historical_registry):
         """#860: gpt-5.6-sol (the codex fleet model since 2026-07) must be in
         the catalog at the official $5/$30 (cached $0.50)."""
+        registry = historical_registry
         models = {
             m["model_id"]: m
             for m in registry.list_models(provider="openai", active_only=False)
@@ -1837,7 +1841,7 @@ class TestModelSeeds:
         assert sol["is_1m"] == 0
         assert "gpt-5.6-sol" not in registry.get_1m_models()
 
-    def test_daybreak_blue_alias_seeded_at_sol_parity(self, registry):
+    def test_daybreak_blue_alias_seeded_at_sol_parity(self, historical_registry, reference_pricing):
         """gpt-daybreak-blue-latest is OpenAI's Daybreak Access alias,
         officially "an alias that currently points to gpt-5.6-sol" with
         pricing "adjusted to match each underlying model"
@@ -1845,6 +1849,7 @@ class TestModelSeeds:
         catalog parity with sol on every inherited axis — a price or window
         that drifts from sol's is a missed alias-repoint or a half-updated
         table."""
+        registry = historical_registry
         models = {
             m["model_id"]: m
             for m in registry.list_models(provider="openai", active_only=False)
@@ -1876,10 +1881,11 @@ class TestModelSeeds:
         assert resolve_context_window("gpt-daybreak-blue-latest") == \
             resolve_context_window("gpt-5.6-sol") == 200_000
 
-    def test_fable_5_1_seeded_at_fable_parity(self, registry):
+    def test_fable_5_1_seeded_at_fable_parity(self, historical_registry, reference_pricing):
         """Claude Fable 5.1 (2026-09-01) extends Fable 5 at the same in/out
         price but with a 4× cheaper cache read ($0.25 vs $1.00). Pin the
         catalog + RATE_TABLE + 1M-set so a half-updated table fails loud."""
+        registry = historical_registry
         models = {
             m["model_id"]: m
             for m in registry.list_models(provider="anthropic", active_only=False)
@@ -1922,7 +1928,7 @@ class TestModelSeeds:
         assert _FABLE_51["cache_write_5m"] == 12.50
         assert _FABLE_51["cache_write_1h"] == 20.00
 
-    def test_fable_5_1_cost_path_prices_all_five_fields(self):
+    def test_fable_5_1_cost_path_prices_all_five_fields(self, reference_pricing):
         """A hand-computed mixed-token turn through the live cost engine —
         display-price asserts alone let a mutated cache-write tariff ride
         (every field below contributes a distinct dollar amount)."""
@@ -1941,11 +1947,12 @@ class TestModelSeeds:
         # The 1M-tier suffix strips to the same rate row.
         assert lookup_rate("claude-fable-5-1[1m]") is _FABLE_51
 
-    def test_opus_5_5_seeded_at_current_opus_tier(self, registry):
+    def test_opus_5_5_seeded_at_current_opus_tier(self, historical_registry, reference_pricing):
         """Claude Opus 5.5 (2026-09-22) is the current Opus at $4/$20 per MTok
         with a 5% cache read ($0.20) — cheaper than Opus 5 on every field.
         Pin the catalog + RATE_TABLE + 1M-set so a half-updated table fails
         loud (four registration sites must agree)."""
+        registry = historical_registry
         models = {
             m["model_id"]: m
             for m in registry.list_models(provider="anthropic", active_only=False)
@@ -1979,7 +1986,7 @@ class TestModelSeeds:
         assert _OPUS_55["cache_write_5m"] == 5.00
         assert _OPUS_55["cache_write_1h"] == 8.00
 
-    def test_opus_5_5_cost_path_prices_all_five_fields(self):
+    def test_opus_5_5_cost_path_prices_all_five_fields(self, reference_pricing):
         """A hand-computed mixed-token turn through the live cost engine —
         every field contributes a distinct dollar amount, so a mutated
         cache-write tariff cannot ride through on display-price asserts."""
@@ -2015,10 +2022,11 @@ class TestModelSeeds:
         # Guard the guard: gpt-5.6-sol + gpt-5.5 must both be intersecting.
         assert checked >= 2
 
-    def test_stale_gpt55_price_corrected_on_existing_rows(self, registry):
+    def test_stale_gpt55_price_corrected_on_existing_rows(self, historical_registry):
         """#860: deployed DBs seeded gpt-5.5 at the gpt-5.2-tier $1.75/$14;
         the next seed pass realigns existing rows to the official $5/$30
         (INSERT OR IGNORE alone never reaches them)."""
+        registry = historical_registry
         registry._db.execute(
             "UPDATE models SET input_price=1.75, output_price=14.0,"
             " cached_input_price=0.175 WHERE id='openai/gpt-5.5'"
@@ -2046,10 +2054,11 @@ class TestModelSeeds:
         )
         assert gpt["input_price"] == 9.99
 
-    def test_stale_gpt56_sol_context_corrected_on_existing_rows(self, registry):
+    def test_stale_gpt56_sol_context_corrected_on_existing_rows(self, historical_registry):
         """#356: deployed DBs carry #873's stale 1M designation. The next seed
         pass restores the live-evidenced 200k class so 400k-only logic cannot
         suppress compaction/restart below the real ~167k backend limit."""
+        registry = historical_registry
         registry._db.execute(
             "UPDATE models SET context_window=1000000, is_1m=1"
             " WHERE id='openai/gpt-5.6-sol'"
@@ -2107,11 +2116,12 @@ class TestRuntimeEditableModelCatalog:
     def test_legacy_schema_adds_and_backfills_write_rates_without_flipping_1m(
         self,
         tmp_path,
+        reference_pricing,
     ):
         from pinky_daemon.pricing import RATE_TABLE
 
         db_path = tmp_path / "legacy-models.db"
-        original = AgentRegistry(db_path=str(db_path))
+        original = reference_registry(db_path)
         before_1m = original.get_1m_models()
         original.close()
 
@@ -2125,7 +2135,7 @@ class TestRuntimeEditableModelCatalog:
                 if field in columns:
                     db.execute(f"ALTER TABLE models DROP COLUMN {field}")
 
-        migrated = AgentRegistry(db_path=str(db_path))
+        migrated = reference_registry(db_path)
         try:
             columns = {
                 row[1]
@@ -2282,7 +2292,8 @@ class TestRuntimeEditableModelCatalog:
         assert row["pricing_status"] == "complete"
         assert tuple(row[field] for field in self._RATE_FIELDS) == (0.0,) * 5
 
-    def test_gpt_54_fallbacks_have_explicit_zero_write_tariffs(self, registry):
+    def test_gpt_54_fallbacks_have_explicit_zero_write_tariffs(self, historical_registry, reference_pricing):
+        registry = historical_registry
         from pinky_daemon.pricing import RATE_TABLE
 
         for model_id in ("gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"):

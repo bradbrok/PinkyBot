@@ -19,9 +19,13 @@ from tests._model_roster_local import (
     DOCUMENT_KEY,
     MARKER,
     apply,
+    baseline_document,
     bundled_bytes,
+    bundled_revision,
     document,
     encode,
+    fixture_document,
+    flat,
     legacy_db,
     model_row,
     new_model,
@@ -39,6 +43,23 @@ def test_fresh_constructor_classifies_then_applies_the_bundle(tmp_path):
         assert status(instance)["source"] == "bundled"
         assert instance.get_setting(DOCUMENT_KEY).encode("utf-8") == bundled_bytes()
         assert owned(instance) == set()
+        baseline_ids = {f"{row['provider']}/{row['model_id']}" for row in baseline_document()["models"]}
+        expected_ids = set(baseline_ids)
+        for row in json.loads(bundled_bytes())["models"]:
+            full_id = f"{row['provider']}/{row['model_id']}"
+            actual = instance.get_model(full_id)
+            if not row["active"] and full_id not in baseline_ids:
+                assert actual is None
+                continue
+            expected_ids.add(full_id)
+            assert actual is not None
+            expected = flat(row)
+            # Existing baseline rows are intentionally never retired automatically.
+            if full_id in baseline_ids:
+                expected["active"] = True
+            assert {field: actual[field] for field in expected} == expected
+            assert owned(instance, full_id) == set()
+        assert {row["id"] for row in instance.list_models(active_only=False)} == expected_ids
     finally:
         instance.close()
 
@@ -119,7 +140,7 @@ def test_constructor_still_returns_when_error_metadata_cannot_be_written(
 def test_older_bundle_after_remote_revision_changes_nothing(tmp_path):
     path = tmp_path / "agents.db"
     instance = AgentRegistry(db_path=str(path))
-    value = document(10)
+    value = document(bundled_revision() + 9)
     model_row(value)["pricing"]["input"] = 7.0
     try:
         apply(instance, value)
@@ -129,7 +150,7 @@ def test_older_bundle_after_remote_revision_changes_nothing(tmp_path):
     reopened = AgentRegistry(db_path=str(path))
     try:
         assert snapshot(reopened) == original
-        assert status(reopened)["last_applied_revision"] == 10
+        assert status(reopened)["last_applied_revision"] == value["revision"]
     finally:
         reopened.close()
 
@@ -160,8 +181,12 @@ assert Path(pinky_daemon.__file__).resolve().is_relative_to(Path(sys.argv[1]).re
         for key, value in os.environ.items()
         if key in {"PATH", "HOME", "TMPDIR", "LANG"} or key.startswith("LC_")
     }
+    home = tmp_path / "empty-home"
+    home.mkdir()
+    child_env["HOME"] = str(home)
     completed = subprocess.run(
         [
+            "/usr/bin/env", "-i", *[f"{key}={item}" for key, item in child_env.items()],
             sys.executable,
             "-I",
             "-B",
@@ -170,9 +195,9 @@ assert Path(pinky_daemon.__file__).resolve().is_relative_to(Path(sys.argv[1]).re
             str(copied_src),
             str(tmp_path / "agents.db"),
             str(result_path),
+            str(value["revision"]),
         ],
         cwd=tmp_path,
-        env=child_env,
         capture_output=True,
         text=True,
         timeout=30,
@@ -183,7 +208,7 @@ assert Path(pinky_daemon.__file__).resolve().is_relative_to(Path(sys.argv[1]).re
 
 @pytest.mark.parametrize("count", [21, 500])
 def test_new_bundle_rows_are_managed_after_baseline_classification(tmp_path, count):
-    value = document(5)
+    value = fixture_document(bundled_revision() + 4)
     model_row(value)["pricing"]["input"] = 7.0
     for index in range(count - len(value["models"])):
         value["models"].append(new_model(f"roster-added-{index}"))
@@ -199,7 +224,7 @@ try:
     rows = instance.list_models(active_only=False)
     row = instance.get_model('anthropic/claude-sonnet-5')
     assert row.get('operator_fields') == '[]', 'current bundle differences must not become operator-owned'
-    assert row['input_price'] == 7.0 and row.get('roster_revision') == 5
+    assert row['input_price'] == 7.0 and row.get('roster_revision') == int(sys.argv[4])
     assert all(r.get('operator_fields') == '[]' for r in rows)
     Path(sys.argv[3]).write_text(json.dumps({'count': len(rows)}))
 finally:
@@ -210,7 +235,7 @@ finally:
 
 
 def test_new_inactive_bundle_row_is_not_inserted_at_boot(tmp_path):
-    value = document(5)
+    value = fixture_document(bundled_revision() + 4)
     value["models"].append(new_model(active=False))
     result = run_copied_bundle(
         tmp_path,
@@ -227,7 +252,7 @@ finally:
     instance.close()
 """,
     )
-    assert result["count"] == len(document()["models"])
+    assert result["count"] == len(fixture_document()["models"])
 
 
 def test_poll_mode_constructor_uses_the_same_local_bundle(tmp_path, monkeypatch):

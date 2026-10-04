@@ -3061,6 +3061,10 @@ class TestAPI:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
+            app.state.agents.add_model(
+                provider="anthropic", model_id="claude-opus-4-7",
+                context_window=1_000_000, is_1m=True,
+            )
             with TestClient(app) as client:
                 client.post("/agents", json={"name": "test-agent", "model": "sonnet"})
                 # Default fake has max_tokens=200_000 (not a 1M model). Switching to
@@ -3095,6 +3099,10 @@ class TestAPI:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
+            app.state.agents.add_model(
+                provider="openai", model_id="gpt-5.6-sol",
+                context_window=200_000, is_1m=False,
+            )
             with TestClient(app) as client:
                 # Cross window classes so the change forces the rebuild path.
                 # Start from a genuine 1M class and switch to 200k-class Sol;
@@ -6193,6 +6201,10 @@ class TestAgentCRUD:
         monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
         client = self._make_restart_cap_client(tmp_path)
         registry = client.app.state.agents
+        registry.add_model(
+            provider="anthropic", model_id="claude-haiku-4-5",
+            context_window=200_000, is_1m=False,
+        )
         registry.register(
             "cap-test", working_dir=str(tmp_path / "agent"),
             model="claude-haiku-4-5", restart_tokens_cap=100_000,
