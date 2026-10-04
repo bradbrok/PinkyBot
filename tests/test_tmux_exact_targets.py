@@ -26,6 +26,7 @@ import pytest
 from pinky_daemon import tmux_dream_runner
 from pinky_daemon.tmux_dream_runner import TmuxDreamConfig, TmuxDreamRunner
 from pinky_daemon.tmux_session import _is_dead_runtime_stderr, _TmuxControl
+from tests.tmux_socket_support import private_labels
 
 TMUX = shutil.which("tmux")
 
@@ -113,10 +114,12 @@ def private_tmux(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.delenv("TMUX_PANE", raising=False)
     server = PrivateTmux()
-    try:
-        yield server
-    finally:
-        server.close()
+    with private_labels(server.socket_name) as root:
+        monkeypatch.setenv("TMUX_TMPDIR", root)
+        try:
+            yield server
+        finally:
+            server.close()
 
 
 # -- target-session commands ---------------------------------------------------

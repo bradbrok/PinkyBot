@@ -2,6 +2,7 @@
 import pytest
 
 from tests import test_codex_mcp_header_env as supplied
+from tests.tmux_socket_support import private_socket
 
 harness = supplied.harness
 
@@ -82,7 +83,6 @@ async def test_real_shared_tmux_server_keeps_current_headers_out_of_global_env(h
     import shutil
     import subprocess
     import sys
-    import tempfile
     from pathlib import Path
 
     from pinky_daemon.tmux_session import _TmuxControl
@@ -94,8 +94,8 @@ async def test_real_shared_tmux_server_keeps_current_headers_out_of_global_env(h
     stale = supplied.PREFIX + 'AGENT_A_AUTHORIZATION'
     own = supplied.PREFIX + 'AGENT_B_AUTHORIZATION'
     server_env = {'HOME': str(home), 'PATH': os.defpath, stale: 'inert-agent-a'}
-    socket_root = Path(tempfile.mkdtemp(prefix='header-server-', dir='/tmp'))
-    socket = socket_root / 'server.sock'
+    socket_owner = private_socket()
+    socket = Path(socket_owner.__enter__())
     base = [binary, '-S', str(socket)]
     output = home / 'child-observations.json'
     code = (
@@ -126,4 +126,4 @@ async def test_real_shared_tmux_server_keeps_current_headers_out_of_global_env(h
         assert own.encode() not in names
     finally:
         subprocess.run(base + ['kill-server'], env=server_env, capture_output=True, timeout=5)
-        shutil.rmtree(socket_root)
+        socket_owner.__exit__(None, None, None)

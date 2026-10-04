@@ -7,7 +7,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +17,7 @@ from pinky_daemon.codex_session import CodexSession
 from pinky_daemon.codex_tmux_session import CodexTmuxSession
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import TmuxSession, _TmuxControl
+from tests.tmux_socket_support import private_socket
 
 DAEMON_NAMES = {"PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET", "HRPOS_PASSWORD"}
 SYNTHETIC_VALUES = {name: "synthetic-only-" + name.lower() for name in DAEMON_NAMES}
@@ -40,7 +40,7 @@ class Registry:
 
 
 class LaunchProbe:
-    def __init__(self, root, monkeypatch):
+    def __init__(self, root, monkeypatch, *, start_server=True):
         self.root, self.monkeypatch = root, monkeypatch
         self.logs = []
         self.tmux = shutil.which("tmux")
@@ -49,14 +49,24 @@ class LaunchProbe:
         self.home.mkdir(mode=0o700)
         self.names_path = root / "child-names.json"
         self.empty_names_path = root / "child-empty-names.json"
+        self.base_path = root / "child-base-booleans.json"
         self.bin = root / "bin"
         self.bin.mkdir()
+        # Retain this registered route through both the environment reset and
+        # the clean-child payload. Never rely on the invoking tmux server.
+        self._socket_owner = private_socket()
+        self.socket = Path(self._socket_owner.__enter__())
+        self.socket_root = self.socket.parent
+        source = Path(tmux_session.__file__).resolve()
+        assert source.parents[2] == Path(__file__).resolve().parents[1]
         # Fake only the provider executable. App-server still uses the real shim
         # and socket lifecycle; all three paths use real tmux and the JSON loader.
         code = (
             "import json,os,pathlib,sys,time\n"
             f"pathlib.Path({str(self.empty_names_path)!r}).write_text("
             "json.dumps(sorted(k for k,v in os.environ.items() if v == '')))\n"
+            f"pathlib.Path({str(self.base_path)!r}).write_text(json.dumps({{"
+            f"'home_matches':os.environ.get('HOME')=={str(self.home)!r}}}))\n"
             f"pathlib.Path({str(self.names_path)!r}).write_text(json.dumps(sorted(os.environ)))\n"
             "if 'app-server' in sys.argv:\n"
             " for line in sys.stdin:\n"
@@ -75,19 +85,18 @@ class LaunchProbe:
             "LANG": "C.UTF-8", "TERM": "xterm", **SYNTHETIC_VALUES,
             "EXPLICIT_ALLOWED_NAME": "synthetic-allowed",
             "CLAUDE_CODE_OAUTH_TOKEN": "synthetic-inherited-token",
-            "PYTHONPATH": str(Path(tmux_session.__file__).resolve().parents[1]),
+            "TMUX_TMPDIR": str(self.socket_root),
         }
         for key, value in self.seed.items():
             monkeypatch.setenv(key, value)
         for mod in (tmux_session, codex_tmux_session, codex_app_server_tmux, codex_session):
             monkeypatch.setattr(mod, "_log", self.logs.append)
-        self.socket_root = Path(tempfile.mkdtemp(prefix="isolated-env-", dir="/tmp"))
-        self.socket = self.socket_root / "tmux.sock"
-        subprocess.run(
-            [self.tmux, "-f", "/dev/null", "-S", str(self.socket),
-             "new-session", "-d", "-s", "seed", "sleep 60"],
-            env=self.seed, check=True, capture_output=True, timeout=5,
-        )
+        if start_server:
+            subprocess.run(
+                [self.tmux, "-f", "/dev/null", "-S", str(self.socket),
+                 "new-session", "-d", "-s", "seed", "sleep 60"],
+                env=self.seed, check=True, capture_output=True, timeout=5,
+            )
         self.control = _TmuxControl("probe", tmux_binary=self.tmux, socket_path=str(self.socket))
         self.supervisor = None
         self.client = None
@@ -105,6 +114,7 @@ class LaunchProbe:
             self.supervisor = None
         self.names_path.unlink(missing_ok=True)
         self.empty_names_path.unlink(missing_ok=True)
+        self.base_path.unlink(missing_ok=True)
         registry = registry if registry is not None else Registry()
         config = StreamingSessionConfig(
             agent_name="test-tenant", working_dir=str(self.root),
@@ -142,11 +152,11 @@ class LaunchProbe:
         def explicit_payload(**kwargs):
             env = real_builder(**kwargs)
             # Exercise explicit payload delivery without implementing registry
-            # grants here. PYTHONPATH binds the real shim to this test checkout.
+            # grants here. The shim imports this checkout's installed package.
             env["EXPLICIT_ALLOWED_NAME"] = "synthetic-allowed"
             if empty_token:
                 env["CLAUDE_CODE_OAUTH_TOKEN"] = ""
-            env["PYTHONPATH"] = self.seed["PYTHONPATH"]
+            env["TMUX_TMPDIR"] = self.seed["TMUX_TMPDIR"]
             if forbidden:
                 env[forbidden] = SYNTHETIC_VALUES[forbidden]
             return env
@@ -171,7 +181,7 @@ class LaunchProbe:
             await self.supervisor.teardown()
         subprocess.run([self.tmux, "-S", str(self.socket), "kill-server"],
                        env=self.seed, capture_output=True, timeout=5)
-        shutil.rmtree(self.socket_root)
+        self._socket_owner.__exit__(None, None, None)
 
 
 @asynccontextmanager

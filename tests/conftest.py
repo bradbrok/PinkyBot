@@ -24,6 +24,7 @@ opt out via the ``real_auth`` pytest marker (set as a module-level
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import logging
 import os
@@ -36,6 +37,7 @@ from fastapi.testclient import TestClient
 
 from pinky_daemon.tmux_launch_env_loader import DAEMON_ONLY
 from tests._tmp_hygiene import restore_tree_readability
+from tests.tmux_socket_support import check_tmux_argv
 
 # Test session secret. Long-enough random-looking value; never used in
 # production. Tests that need to override (e.g. test_auth.py) do so via
@@ -216,35 +218,19 @@ def _guard_default_tmux_socket(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.delenv("TMUX_PANE", raising=False)
     original = subprocess.Popen
+    original_async = asyncio.create_subprocess_exec
+
+    async def private_async(*args, **kwargs):
+        check_tmux_argv(args, kwargs.get("env"))
+        return await original_async(*args, **kwargs)
 
     class PrivatePopen(original):
         def __init__(self, args, *positional, **kwargs):
-            if (
-                isinstance(args, (list, tuple)) and args
-                and os.path.basename(os.fsdecode(args[0])) == "tmux"
-            ):
-                argv = [os.fsdecode(arg) for arg in args[1:]]
-                if argv != ["-V"]:
-                    selected = None
-                    index = 0
-                    while index < len(argv) and argv[index].startswith("-"):
-                        flag = argv[index]
-                        if flag in {"-L", "-S", "-f"}:
-                            if index + 1 >= len(argv):
-                                break
-                            if flag in {"-L", "-S"}:
-                                selected = argv[index + 1]
-                            index += 2
-                        elif flag.startswith(("-L", "-S")):
-                            selected = flag[2:]
-                            index += 1
-                        else:
-                            index += 1
-                    if not selected or os.path.basename(selected) == "default":
-                        raise RuntimeError("test tmux command requires an explicit private socket")
+            check_tmux_argv(args, kwargs.get("env"), shell=kwargs.get("shell", False))
             super().__init__(args, *positional, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", PrivatePopen)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", private_async)
 
 
 @pytest.fixture(autouse=True)

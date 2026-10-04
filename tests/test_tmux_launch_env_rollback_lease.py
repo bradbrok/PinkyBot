@@ -5,7 +5,6 @@ import fcntl
 import os
 import shutil
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +20,7 @@ from pinky_daemon.tmux_session import TmuxCommandResult, TmuxSession, _TmuxContr
 from tests.test_tmux_launch_env_json_control import FailingRunner
 from tests.tmux_env_r3_support import NONCE, OTHER_NONCE, SCOPE, SECRET, cancel, stage
 from tests.tmux_env_support import LaunchRecorder, secret_files
+from tests.tmux_socket_support import private_socket
 
 TMUX_BINARY = shutil.which("tmux")
 
@@ -103,8 +103,8 @@ async def test_every_post_spawn_rollback_cleans_after_kill(home, monkeypatch, ki
 async def test_real_tmux_missing_loader_is_cleaned_on_liveness_rollback(home, monkeypatch):
     if TMUX_BINARY is None:
         pytest.skip("real tmux unavailable")
-    root = Path(tempfile.mkdtemp(prefix="tmux-orphan-", dir="/tmp"))
-    socket = root / "server.sock"
+    socket_owner = private_socket()
+    socket = Path(socket_owner.__enter__())
     control = _TmuxControl("orphan-test", tmux_binary=TMUX_BINARY, socket_path=str(socket))
     session = session_for(home, control, monkeypatch)
     monkeypatch.setattr(tmux_session, "sys", SimpleNamespace(executable="/nonexistent/python3"))
@@ -114,7 +114,7 @@ async def test_real_tmux_missing_loader_is_cleaned_on_liveness_rollback(home, mo
         assert not secret_files(home, SECRET)
     finally:
         subprocess.run([TMUX_BINARY, "-S", str(socket), "kill-server"], capture_output=True, timeout=5)
-        shutil.rmtree(root)
+        socket_owner.__exit__(None, None, None)
 
 
 def test_any_scope_collects_abandoned_secrets_but_preserves_young_and_locked(home):
