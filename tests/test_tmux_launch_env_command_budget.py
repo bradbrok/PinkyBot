@@ -7,7 +7,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +17,7 @@ from pinky_daemon.command_runner import RunuserCommandRunner
 from pinky_daemon.tmux_session import _TmuxControl
 from tests.tmux_env_r3_support import SECRET
 from tests.tmux_env_support import LaunchRecorder, secret_files
+from tests.tmux_socket_support import private_socket
 
 TMUX_BINARY = shutil.which("tmux")
 
@@ -77,8 +77,8 @@ async def test_real_tmux_executes_long_command_with_empty_environment_overrides(
     if TMUX_BINARY is None:
         pytest.skip("real tmux is unavailable")
     cwd, command, env = long_launch(home)
-    socket_root = Path(tempfile.mkdtemp(prefix="tmux-budget-", dir="/tmp"))
-    socket = socket_root / "server.sock"
+    socket_owner = private_socket()
+    socket = Path(socket_owner.__enter__())
     control = _TmuxControl("budget-real", tmux_binary=TMUX_BINARY, socket_path=str(socket))
     try:
         result = await control.new_session(cwd=str(cwd), command=command, env=env)
@@ -92,4 +92,4 @@ async def test_real_tmux_executes_long_command_with_empty_environment_overrides(
     finally:
         subprocess.run([TMUX_BINARY, "-S", str(socket), "kill-server"],
                        env={"HOME": str(home), "PATH": os.defpath}, capture_output=True, timeout=5)
-        shutil.rmtree(socket_root)
+        socket_owner.__exit__(None, None, None)

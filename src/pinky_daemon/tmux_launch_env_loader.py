@@ -21,11 +21,13 @@ _SHELL_NAMES = frozenset((
 def is_valid_key_name(key):
     return isinstance(key, str) and _KEY.fullmatch(key) is not None
 
+def is_base_name(k):
+    return k in BASE_ALLOWLIST or is_valid_key_name(k) and k.startswith(("LC_", "XDG_"))
+
 def key_policy(key):
     if not is_valid_key_name(key):
         return "invalid"
-    return "shell" if key in _SHELL_NAMES else (
-        "reserved" if key.startswith("__PINKY_LAUNCH_") else None)
+    return "shell" if key in _SHELL_NAMES else ("reserved" if key.startswith("__PINKY_LAUNCH_") else None)
 
 def _invalid():
     raise ValueError("invalid launch environment") from None
@@ -57,23 +59,18 @@ def load_env(path, nonce, command):
             _invalid()
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         st = os.fstat(fd)
-        owned = (
-            os.path.basename(path) == f"env-{nonce}.json"
-            and stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid()
-        )
+        owned = (os.path.basename(path) == f"env-{nonce}.json"
+                 and stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid())
         if not owned or not _private_regular(st):
             raise PermissionError("unsafe launch file")
         with os.fdopen(fd, "r", encoding="utf-8") as stream:
             fd = None
             data = json.load(stream)
             if not isinstance(data, dict) or set(data) - {"codex_headers"} not in (
-                {"nonce", "env"}, {"nonce", "env", "inherit", "granted"},
-                {"nonce", "env", "inherit"},
-            ):
+                {"nonce", "env"}, {"nonce", "env", "inherit", "granted"}, {"nonce", "env", "inherit"}):
                 _invalid()
             scrub = data.get("codex_headers", False)
-            if (type(scrub) is not bool or data["nonce"] != nonce
-                    or ("inherit" in data and data["inherit"] != "none")):
+            if (type(scrub) is not bool or data["nonce"] != nonce or ("inherit" in data and data["inherit"] != "none")):
                 _invalid()
             validate_env(data["env"])
             inherit = data.get("inherit", "all")
@@ -88,7 +85,7 @@ def load_env(path, nonce, command):
         env = os.environ
         before = set(env)
         kept = {k: v for k, v in env.items()
-                if (inherit != "none" or k in BASE_ALLOWLIST or k.startswith(("LC_", "XDG_")))
+                if (inherit != "none" or is_base_name(k))
                 and (not scrub or not k.startswith("PINKY_MCP_HDR_"))}
         kept.update(data["env"])
         env.clear()

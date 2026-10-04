@@ -173,9 +173,9 @@ COMMANDS: dict[str, tuple[str | None, str | None, str | None]] = {
 }
 ALIASES = {alias: name for name, (alias, _t, _s) in COMMANDS.items() if alias}
 
-# The only commands src/ issues without a -t. Without one, tmux acts on the
-# most recently used session, so every other command carries an exact -t.
-UNTARGETED = frozenset({"list-sessions", "load-buffer", "new-session"})
+# The only command forms src/ issues without a -t. Global environment reads
+# must use one of the two explicit verify forms; session reads still need -t.
+UNTARGETED = frozenset({"list-sessions", "load-buffer", "new-session", "show-environment -g"})
 
 # Commands with free-text arguments.
 TEXT_COMMANDS = frozenset({"send-keys", "rename-session", "rename-window"})
@@ -585,8 +585,13 @@ def _check_command(command: str, word: ast.AST, body: list[ast.AST], report: Rep
         report.violation(pending[1], f"{pending[2]} without an inline target")
     if targeted:
         return
-    report.untargeted.append(command)
-    if command not in UNTARGETED:
+    untargeted = command
+    if command == "show-environment" and [_str_const(element) for element in body] in (
+        ["-g"], ["-g", "-h"],
+    ):
+        untargeted = "show-environment -g"
+    report.untargeted.append(untargeted)
+    if untargeted not in UNTARGETED:
         report.violation(word, f"{command} has no exact -t target before its first argument")
 
 
@@ -804,6 +809,19 @@ def test_untargeted_commands_are_exactly_those_src_issues(src_reports):
 
 
 # -- guard behaviour ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("args", ['"-g"', '"-g", "-h"'])
+def test_global_environment_verify_forms_are_untargeted(args):
+    report = check_source(f'run("show-environment", {args})')
+    assert report.violations == []
+    assert report.untargeted == ["show-environment -g"]
+
+
+@pytest.mark.parametrize("args", ['', ', "-h"', ', "--", "-g"', ', "NAME", "-g"', ', flag'])
+def test_other_environment_reads_still_require_exact_target(args):
+    report = check_source(f'run("show-environment"{args})')
+    assert any("has no exact -t target" in item.reason for item in report.violations)
 
 
 # Makes a snippet a module that issues tmux commands, where the module-level

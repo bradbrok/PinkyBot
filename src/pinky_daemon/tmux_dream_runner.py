@@ -23,11 +23,13 @@ import shlex
 import shutil
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from pinky_daemon.claude_runner import RunResult
+from pinky_daemon.isolated_launch_env import LaunchEnvError
 
 # Reuse the rails' first-run gate pre-seed (#112): without it a fresh
 # project dir wedges the REPL at the trust dialog / bypass-permissions
@@ -40,7 +42,8 @@ from pinky_daemon.tmux_session import (
     _cleanup_launch_env,
     _resolve_claude_config_path,
     _seed_claude_trust_file,
-    _TmuxControl,
+    production_tmux_control,
+    require_legacy_tmux_reaped,
 )
 from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target, text_argument
 
@@ -120,10 +123,12 @@ class TmuxDreamRunner:
     dream_runner can swap transports behind a flag.
     """
 
-    def __init__(self, config: TmuxDreamConfig | None = None, *, agent_name: str = "") -> None:
+    def __init__(self, config: TmuxDreamConfig | None = None, *, agent_name: str = "",
+                 setting_provider: Callable[[str], str] | None = None) -> None:
         self._config = config or TmuxDreamConfig()
         self._agent_name = agent_name or "agent"
-        self._control = _TmuxControl(self.session_name)
+        self._setting_provider = setting_provider
+        self._control = production_tmux_control(self.session_name)
 
     @property
     def session_name(self) -> str:
@@ -145,6 +150,7 @@ class TmuxDreamRunner:
             *self._control._base_cmd(), *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            **self._control.client_env_options(),
         )
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -169,6 +175,12 @@ class TmuxDreamRunner:
 
     async def run(self, prompt: str, *, system_prompt: str = "") -> RunResult:
         start = time.time()
+        try:
+            require_legacy_tmux_reaped(self._agent_name,
+                setting_provider=self._setting_provider,
+                server_config=self._control.server_config)
+        except LaunchEnvError as exc:
+            return RunResult(output="", exit_code=1, error=str(exc), duration_ms=0)
         work_dir = Path(self._config.working_dir).resolve()
         dreams_dir = work_dir / "dreams"
         dreams_dir.mkdir(parents=True, exist_ok=True)
@@ -328,7 +340,11 @@ class TmuxDreamRunner:
 
     def _seed_trust(self, project_dir: str) -> bool:
         """Seed first-run trust flags; seam for tests."""
-        return _seed_claude_trust_file(_resolve_claude_config_path(), project_dir)
+        env = dict(os.environ)
+        config = self._control.server_config
+        if config is not None:
+            env["HOME"] = config.client_env["HOME"]
+        return _seed_claude_trust_file(_resolve_claude_config_path(env), project_dir)
 
     # ── waiting ───────────────────────────────────────────────
 

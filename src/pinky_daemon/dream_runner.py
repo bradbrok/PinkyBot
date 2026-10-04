@@ -1251,6 +1251,7 @@ class DreamRunner:
                         allowed_tools=["Read", "Write", *_DREAM_ALLOWED_TOOLS],
                     ),
                     agent_name=agent_name,
+                    setting_provider=self._setting_provider,
                 )
                 timeout_s = None  # TmuxDreamRunner enforces its own one-hour cap.
                 _log(

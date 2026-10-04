@@ -26,6 +26,7 @@ import pytest
 from pinky_daemon import tmux_dream_runner
 from pinky_daemon.tmux_dream_runner import TmuxDreamConfig, TmuxDreamRunner
 from pinky_daemon.tmux_session import _is_dead_runtime_stderr, _TmuxControl
+from tests.tmux_socket_support import private_labels
 
 TMUX = shutil.which("tmux")
 
@@ -113,10 +114,12 @@ def private_tmux(monkeypatch):
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.delenv("TMUX_PANE", raising=False)
     server = PrivateTmux()
-    try:
-        yield server
-    finally:
-        server.close()
+    with private_labels(server.socket_name) as root:
+        monkeypatch.setenv("TMUX_TMPDIR", root)
+        try:
+            yield server
+        finally:
+            server.close()
 
 
 # -- target-session commands ---------------------------------------------------
@@ -379,7 +382,7 @@ class _PrivateAsyncio:
 def dream_tmux(private_tmux, monkeypatch):
     # Bind both the common loader spawn and follow-up commands to this server.
     monkeypatch.setattr(
-        tmux_dream_runner, "_TmuxControl",
+        tmux_dream_runner, "production_tmux_control",
         lambda session_name: private_tmux.control(session_name),
     )
     return private_tmux

@@ -13807,6 +13807,16 @@ npm run build</pre>
         except Exception as exc:  # never let hardening abort startup
             _log(f"startup: db permission sweep skipped ({exc})")
 
+        # Migrate only exact registered legacy sessions before any boot launch.
+        try:
+            from pinky_daemon.tmux_session import reap_legacy_tmux_sessions
+
+            await reap_legacy_tmux_sessions(agents, log=_log)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log("ERROR legacy tmux startup cleanup failed; tmux launches blocked")
+
         # R10/#580: a spawn that failed before broker registration may have
         # retained a durable, possibly-live tmux child. Reconcile every record
         # at daemon boot, including debts for dormant/disabled agents that the

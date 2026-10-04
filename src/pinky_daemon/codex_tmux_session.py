@@ -18,8 +18,8 @@ Overridden seams:
   * ``_build_session_name``      → ``pinky-codex-<agent>`` (distinct namespace)
   * ``_build_claude_cmd``        → the in-pane ``codex`` invocation (kept name;
                                    it's TmuxSession's spawn hook)
-  * ``_build_repl_env``          → full daemon-env parity (Murzik #795 P1; mirrors
-                                   the subprocess + app-server codex transports)
+  * ``_build_repl_env``          → filtered Codex authority and compatibility
+                                   payload, with the configured tmux pane PATH
   * ``_project_dir`` / ``_has_prior_transcript`` / ``_discover_transcript_path``
                                  → codex rollout store (``~/.codex/sessions``)
   * ``_start_tailer``            → ``CodexTmuxTranscriptTailer``
@@ -207,12 +207,16 @@ class CodexTmuxSession(TmuxSession):
         # Respect an injected control (tests). Otherwise upgrade the default
         # control to the codex-aware one (slower paste settle).
         if tmux_control is None:
-            self._tmux = _CodexTmuxControl(
+            from pinky_daemon.tmux_session import production_tmux_control
+
+            self._tmux = production_tmux_control(
                 self._session_name,
                 tmux_binary=self._tmux.tmux_binary,
                 socket_name=self._tmux.socket_name,
                 socket_path=self._tmux.socket_path,
                 command_runner=self._tmux._runner,
+                server_config=self._tmux.server_config,
+                control_type=_CodexTmuxControl,
             )
         # codex identity/config (mirrors CodexSession.__init__).
         self._codex_model = config.model or ""
@@ -339,11 +343,14 @@ class CodexTmuxSession(TmuxSession):
             daemon_url = os.environ.get(
                 "PINKY_CONTAINER_DAEMON_URL", "http://host.containers.internal:8888",
             )
-        return codex_launch_env.build_env(
+        env = codex_launch_env.build_env(
             agent_name=self.agent_name, config=self._config, api_key=self._openai_api_key,
             policy=policy, log=_log, servers=self._codex_mcp_servers,
             daemon_url=daemon_url, report=report_shadow,
         )
+        from pinky_daemon.tmux_server_env import normalize_codex_path
+
+        return normalize_codex_path(env, self._tmux)
 
     # ── seam: transcript discovery (codex rollout store) ────────────────────
     def _project_dir(self) -> Path:
