@@ -118,7 +118,7 @@ class LocalCommandRunner(CommandRunner):
                 proc.communicate(input=stdin_data) if max_output_bytes is None else communicate_bounded(),
                 timeout=timeout,
             )
-        except BaseException:
+        except (asyncio.TimeoutError if max_output_bytes is None else BaseException):
             try:
                 proc.kill()
             except ProcessLookupError:
@@ -131,7 +131,7 @@ class LocalCommandRunner(CommandRunner):
                     await asyncio.wait_for(asyncio.gather(discard(proc.stdout), discard(proc.stderr)), 1.0)
                 except TimeoutError:
                     # A descendant may retain a pipe after the client dies.
-                    # Close our transports rather than extend the read deadline.
+                    # CPython-private close prevents inherited pipes extending the deadline.
                     proc._transport.close()
                 await asyncio.wait_for(proc.wait(), 1.0)
             raise

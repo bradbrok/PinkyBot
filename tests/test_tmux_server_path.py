@@ -6,7 +6,12 @@ from types import SimpleNamespace
 import pytest
 
 from pinky_daemon import codex_launch_env
-from pinky_daemon.command_runner import CommandResult, LocalCommandRunner
+from pinky_daemon.command_runner import (
+    CommandResult,
+    ContainerCommandRunner,
+    LocalCommandRunner,
+    RunuserCommandRunner,
+)
 from pinky_daemon.isolated_launch_env import LaunchConfigError, LaunchPolicy
 from tests.tmux_server_env_support import STANDARD_DIRS, control, owner, seed
 
@@ -63,6 +68,19 @@ def test_codex_tmux_payload_uses_same_candidate(daemon, monkeypatch, kind, clean
 def test_direct_codex_keeps_existing_path_behavior(daemon, monkeypatch):
     monkeypatch.setenv("PINKY_TMUX_PANE_PATH", "/synthetic/tmux-only")
     env = codex_launch_env.build_env(agent_name="test-agent", config=None, api_key="", policy=LaunchPolicy(), log=lambda _: None)
+    assert env["PATH"] == "/usr/bin:/bin"
+
+
+@pytest.mark.parametrize("kind", ["codex", "app_server"])
+@pytest.mark.parametrize("runner_type", [RunuserCommandRunner, ContainerCommandRunner])
+@pytest.mark.parametrize("clean", [True, False])
+def test_wrapped_codex_tmux_keeps_existing_path(daemon, monkeypatch, kind, runner_type, clean):
+    monkeypatch.setenv("PINKY_TMUX_PANE_PATH", "/synthetic/local-only")
+    obj = owner(kind, daemon)
+    control(obj).set_command_runner(runner_type("synthetic-namespace"))
+    builder = obj._build_env if kind == "app_server" else obj._build_repl_env
+    policy = LaunchPolicy("enforce", "isolated") if clean else LaunchPolicy()
+    env = builder(launch_policy=policy)
     assert env["PATH"] == "/usr/bin:/bin"
 
 

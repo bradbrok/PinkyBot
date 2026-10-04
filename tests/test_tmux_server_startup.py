@@ -10,7 +10,7 @@ import pytest
 from pinky_daemon import tmux_session
 from pinky_daemon.command_runner import CommandResult, LocalCommandRunner
 from pinky_daemon.isolated_launch_env import LaunchEnvError
-from tests.test_tmux_legacy_socket_reap import Registry
+from tests.test_tmux_legacy_socket_reap import Registry, launch_probe
 from tests.tmux_server_env_support import seed
 
 
@@ -40,6 +40,9 @@ async def test_legacy_absence_completes_but_real_errors_block(tmp_path, monkeypa
         assert bool(blocked) is (state == "permission_error")
         assert bool(registry.writes) is (state != "permission_error")
         assert not any("kill-session" in argv for argv in calls)
+        for agent in registry.agents:
+            launch = launch_probe("app_server", tmp_path, monkeypatch, registry, agent=agent.name)
+            await launch(allowed=state != "permission_error")
     finally:
         registry.db.close()
 

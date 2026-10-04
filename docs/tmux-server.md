@@ -13,3 +13,7 @@ Homebrew, local, and system bin/sbin directories. Managed servers ignore tmux
 configuration files. Isolated clean launches refuse a polluted server; other
 launches warn without changing its global environment. The shared-server option
 does not support isolated clean launches.
+
+Don't start the dedicated server by hand: a server started outside the daemon
+inherits that shell's environment, and isolated launches refuse it until it is
+restarted.

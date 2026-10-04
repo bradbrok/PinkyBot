@@ -5,6 +5,7 @@ set of blocked agent names. These tests prescribe behavior, not a background
 worker: startup runs one pass and the persistent marker disables future passes.
 """
 
+import ast
 import asyncio
 import os
 import shutil
@@ -17,6 +18,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from pinky_daemon import tmux_session
+from pinky_daemon.isolated_launch_env import LaunchEnvError, LaunchPolicy
 from tests.tmux_server_env_support import CANARY, FAMILIES, control, no_values, owner, seed
 from tests.tmux_socket_support import private_labels
 
@@ -156,35 +158,138 @@ async def test_failed_pass_can_retry_without_killing_absent_names(rig):
     assert not rig.live and rig.registry.writes
 
 
-@pytest.mark.parametrize("kind", FAMILIES)
-async def test_failed_reap_blocks_replacement_launch(rig, tmp_path, monkeypatch, kind):
-    rig.mode, rig.live = "failure", set(rig.names)
-    assert await reaper()(rig.registry, log=rig.logs.append) == {"test-agent"}
-    obj = owner(kind, tmp_path, registry=rig.registry)
+class SpawnReachedError(RuntimeError):
+    pass
+
+
+REFUSAL = "legacy tmux cleanup has not completed"
+
+
+def launch_probe(kind, root, monkeypatch, registry, *, agent="test-agent"):
+    """Leave launch gating real and stop at the first process creation seam."""
+    obj = owner(kind, root, registry=registry, agent=agent)
     ctrl = control(obj)
     attempted = []
+    gate_errors = []
 
-    async def forbidden_spawn(**kwargs):
+    async def spawn(**kwargs):
         attempted.append(True)
-        raise AssertionError("replacement launched while legacy pane may live")
+        raise SpawnReachedError
 
     monkeypatch.setattr(ctrl, "has_session", AsyncMock(return_value=False))
-    monkeypatch.setattr(ctrl, "new_session", forbidden_spawn)
+    monkeypatch.setattr(ctrl, "new_session", spawn)
     if kind == "dream":
+        from pinky_daemon import tmux_dream_runner
+
+        def check(name):
+            try:
+                tmux_session.require_legacy_tmux_reaped(name)
+            except LaunchEnvError as exc:
+                gate_errors.append(exc)
+                raise
+
+        monkeypatch.setattr(tmux_dream_runner, "require_legacy_tmux_reaped", check)
         monkeypatch.setattr(obj, "_tmux", AsyncMock(return_value=(0, "")))
-        result = await obj.run("synthetic prompt")
-        assert not result.ok
+        monkeypatch.setattr(obj, "_seed_trust", lambda _: False)
+        monkeypatch.setattr(obj, "_resolve_binary", lambda: "synthetic-command")
     else:
-        if kind != "app_server":
-            for method in ("_ensure_container_started", "_reap_retained_spawn_cleanup_debt", "_stop_tailer", "_start_tailer"):
+        monkeypatch.setattr(obj, "_launch_env_policy", lambda: LaunchPolicy())
+        if kind == "app_server":
+            monkeypatch.setattr(obj, "_kill_tmux_session", AsyncMock())
+            monkeypatch.setattr(obj, "_unlink_sock", lambda: None)
+            monkeypatch.setattr(obj, "_ensure_sock_dir_secure", lambda: None)
+            monkeypatch.setattr(obj, "_build_env", lambda **kw: {})
+        else:
+            for method in ("_ensure_container_started", "_reap_retained_spawn_cleanup_debt",
+                           "_stop_tailer", "_start_tailer", "_seed_container_trust", "_seed_container_home_creds"):
                 monkeypatch.setattr(obj, method, AsyncMock())
             monkeypatch.setattr(obj, "_container_agent", lambda **kw: None)
             monkeypatch.setattr(obj, "_select_command_runner", lambda *a: ctrl._runner)
             monkeypatch.setattr(obj, "_prepare_tmux_spawn", lambda: None)
-            monkeypatch.setattr(obj, "_spawn_cleanup_state_dir", lambda: tmp_path)
-        with pytest.raises((RuntimeError, PermissionError)):
-            await (obj.start() if kind == "app_server" else obj._spawn_tmux_repl())
-    assert not attempted
+            monkeypatch.setattr(obj, "_build_claude_cmd", lambda: "synthetic-command")
+            monkeypatch.setattr(obj, "_build_repl_env", lambda **kw: {})
+            monkeypatch.setattr(obj, "_transcript_candidates", lambda: [])
+            monkeypatch.setattr(tmux_session, "_seed_claude_trust_file", lambda *a, **kw: False)
+
+    async def assert_launch(*, allowed):
+        before = len(attempted)
+        if allowed:
+            tmux_session.require_legacy_tmux_reaped(agent)
+        else:
+            with pytest.raises(LaunchEnvError, match="^" + REFUSAL + "$"):
+                tmux_session.require_legacy_tmux_reaped(agent)
+        if kind == "dream":
+            result = await obj.run("synthetic prompt")
+            assert not result.ok
+            assert result.error == ("tmux new-session failed: SpawnReachedError" if allowed else REFUSAL)
+            if not allowed:
+                assert type(gate_errors[-1]) is LaunchEnvError
+                assert str(gate_errors[-1]) == REFUSAL
+        else:
+            expected = SpawnReachedError if allowed else LaunchEnvError
+            with pytest.raises(expected) as caught:
+                await (obj.start() if kind == "app_server" else obj._spawn_tmux_repl())
+            assert type(caught.value) is expected
+            if not allowed:
+                assert str(caught.value) == REFUSAL
+        assert len(attempted) - before == int(allowed)
+
+    return assert_launch
+
+
+@pytest.mark.parametrize("kind", FAMILIES)
+async def test_failed_reap_blocks_replacement_launch(rig, tmp_path, monkeypatch, kind):
+    rig.mode, rig.live = "failure", set(rig.names)
+    assert await reaper()(rig.registry, log=rig.logs.append) == {"test-agent"}
+    launch = launch_probe(kind, tmp_path, monkeypatch, rig.registry)
+    await launch(allowed=False)
+    other = launch_probe(kind, tmp_path, monkeypatch, rig.registry, agent="other-agent")
+    await other(allowed=True)
+    rig.mode = "ok"
+    assert not await reaper()(rig.registry, log=rig.logs.append)
+    # The very same app-server fixture must reach spawn after the gate opens.
+    await launch(allowed=True)
+
+
+@pytest.mark.parametrize("kind", FAMILIES)
+@pytest.mark.parametrize("state", ["present", "absent", "marker", "compat"])
+async def test_completed_reap_unblocks_every_registered_launch(rig, tmp_path, monkeypatch, kind, state):
+    if state == "present":
+        rig.live = set(rig.names) | {"pinky-other-agent"}
+    if state == "marker":
+        rig.registry.set_setting(tmux_session._LEGACY_TMUX_COMPLETE, "1")
+    if state == "compat":
+        monkeypatch.setenv("PINKY_TMUX_SOCKET", "")
+    assert not await reaper()(rig.registry, log=rig.logs.append)
+    for agent in rig.registry.agents:
+        launch = launch_probe(kind, tmp_path, monkeypatch, rig.registry, agent=agent.name)
+        await launch(allowed=True)
+
+
+@pytest.mark.parametrize("kind", FAMILIES)
+async def test_unexpected_startup_reap_error_blocks_all_and_logs_no_values(rig, tmp_path, monkeypatch, kind):
+    def fail_marker(*args):
+        raise OSError(CANARY)
+
+    monkeypatch.setattr(rig.registry, "set_setting", fail_marker)
+    # Execute the actual startup error boundary without starting unrelated API services.
+    tree = ast.parse(Path(tmux_session.__file__).with_name("api.py").read_text())
+    blocks = [node for node in ast.walk(tree) if isinstance(node, ast.Try) and any(
+        isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Await)
+        and isinstance(stmt.value.value, ast.Call)
+        and isinstance(stmt.value.value.func, ast.Name)
+        and stmt.value.value.func.id == "reap_legacy_tmux_sessions" for stmt in node.body)]
+    assert len(blocks) == 1
+    wrapper = ast.parse("async def startup_reap():\n    pass\n")
+    wrapper.body[0].body = [blocks[0]]
+    namespace = {"asyncio": asyncio, "agents": rig.registry, "_log": rig.logs.append}
+    exec(compile(ast.fix_missing_locations(wrapper), "<startup-reap-test>", "exec"), namespace)
+    await namespace["startup_reap"]()
+    assert rig.logs == ["ERROR legacy tmux startup cleanup failed; tmux launches blocked"]
+    assert not rig.registry.writes
+    for agent in rig.registry.agents:
+        launch = launch_probe(kind, tmp_path, monkeypatch, rig.registry, agent=agent.name)
+        await launch(allowed=False)
 
 
 @pytest.mark.parametrize("kind", FAMILIES)
