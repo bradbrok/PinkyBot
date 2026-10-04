@@ -93,14 +93,20 @@ async def test_management_add_inserts_exact_id_despite_other_rows_slash_id(regis
     monkeypatch.setattr(providers, "_agents", registry)
     await providers.add_model(
         providers.AddModelRequest(
-            provider="openai", model_id="anthropic/upgrade-child", input_price=7.0
+            provider="openai", model_id="anthropic/upgrade-child", input_price=7.0,
+            output_price=0.0, cached_input_price=0.0, cache_write_5m_price=0.0,
+            cache_write_1h_price=0.0,
         )
     )
     other_id = "openai/anthropic/upgrade-child"
     before = registry._db.execute("SELECT * FROM models WHERE id=?", (other_id,)).fetchone()
     assert before is not None
     result = await providers.add_model(
-        providers.AddModelRequest(provider="anthropic", model_id="upgrade-child", input_price=9.0)
+        providers.AddModelRequest(
+            provider="anthropic", model_id="upgrade-child", input_price=9.0,
+            output_price=0.0, cached_input_price=0.0, cache_write_5m_price=0.0,
+            cache_write_1h_price=0.0,
+        )
     )
     target_id = "anthropic/upgrade-child"
     exact = registry._db.execute(
