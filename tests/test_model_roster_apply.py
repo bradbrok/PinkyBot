@@ -46,6 +46,7 @@ def test_higher_revision_changes_only_differing_rows_and_persists_exact_bytes(re
     model_row(value)["pricing"]["input"] = 7.0
     blob = b" \n" + encode(value) + b"\n\t"
     report = apply(registry, blob)
+    assert report["revision_gate"] == "accepted"
     actual = registry.get_model(SONNET)
     assert actual["input_price"] == 7.0
     assert actual["created_at"] == before["created_at"]
@@ -189,6 +190,7 @@ def test_dry_run_skips_revision_gate_and_writes_nothing(registry, revision):
     value["models"].append(new_model())
     report = apply(registry, value, dry_run=True)
     assert snapshot(registry) == before
+    assert report["revision_gate"] == {1: "lower", 2: "equal", 3: "accepted"}[revision]
     assert report["counts"]["updated"] == 1
     assert report["counts"]["inserted"] == 1
 

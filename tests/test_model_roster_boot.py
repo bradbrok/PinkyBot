@@ -145,7 +145,21 @@ def run_copied_bundle(tmp_path, value, script):
     )
     (package / "catalog/models.json").write_bytes(encode(value))
     result_path = tmp_path / "result.json"
-    code = "import sys; sys.path.insert(0, sys.argv[1]);\n" + script
+    code = (
+        """
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import pinky_daemon
+assert Path(pinky_daemon.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve()), 'child must import the synthetic package copy'
+"""
+        + script
+    )
+    child_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in {"PATH", "HOME", "TMPDIR", "LANG"} or key.startswith("LC_")
+    }
     completed = subprocess.run(
         [
             sys.executable,
@@ -158,7 +172,7 @@ def run_copied_bundle(tmp_path, value, script):
             str(result_path),
         ],
         cwd=tmp_path,
-        env=os.environ.copy(),
+        env=child_env,
         capture_output=True,
         text=True,
         timeout=30,
