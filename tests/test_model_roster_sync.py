@@ -467,3 +467,108 @@ def test_default_deadline_first_delay_and_uniform_jitter(registry, monkeypatch):
     assert service.timeout == 10 and service.first_delay == 60
     assert service.jitter() == 321.0
     draw.assert_called_once_with(0, 1800)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [False, True])
+async def test_unexpected_worker_failure_is_fixed_and_releases_admission(
+    registry, monkeypatch, capsys, caplog, dry_run
+):
+    getter = Mock(side_effect=[RuntimeError("private-marker"), result(encode(document()))])
+    facade = Mock(wraps=required(registry, "record_model_roster_sync_error"))
+    monkeypatch.setattr(registry, "record_model_roster_sync_error", facade)
+    service = make_service(registry, getter=getter)
+    before, good, cached = snapshot(registry), last_good(registry), prime()
+    errors = registry._model_roster_errors
+    try:
+        failure = None
+        try:
+            await required(service, "sync")(dry_run=dry_run)
+        except Exception as exc:
+            failure = exc
+        assert isinstance(failure, error_type()), "Unexpected workers need a fixed sync error"
+        assert_error(failure, 502)
+        assert failure.code == "fetch_failed"
+        assert last_good(registry) == good and prime() == cached
+        assert facade.call_count == (0 if dry_run else 1)
+        assert registry._model_roster_errors == errors + (0 if dry_run else 1)
+        if dry_run:
+            assert snapshot(registry) == before
+        rendered = str(failure) + str(failure.detail()) + status(registry)["last_error"]
+        rendered += capsys.readouterr().err + "".join(r.getMessage() for r in caplog.records)
+        assert "private-marker" not in rendered
+        after = snapshot(registry)
+        report = await required(service, "sync")(dry_run=True)
+        assert report["revision"] == 2 and getter.call_count == 2
+        assert snapshot(registry) == after and facade.call_count == (0 if dry_run else 1)
+    finally:
+        await required(service, "close")()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_unexpected_failure_keeps_cadence_with_one_fixed_log(
+    registry, monkeypatch, capsys, caplog
+):
+    clock, calls = Clock(), []
+    sleep = SleepGate(clock)
+    service = make_service(registry, getter=Mock(), monotonic=clock, sleep=sleep, jitter=lambda: 0)
+
+    async def attempt(*, dry_run):
+        assert dry_run is False
+        calls.append(clock.now)
+        clock.now += 30
+        if len(calls) == 1:
+            raise RuntimeError("private-marker")
+        return {}
+
+    monkeypatch.setattr(service, "sync", attempt)
+    before = snapshot(registry)
+    task = asyncio.create_task(required(service, "run")())
+    try:
+        sleep.advance(await sleep.next())
+        await until(lambda: task.done() or len(sleep.calls) == 2)
+        assert not task.done(), "An unexpected attempt must not terminate the daily loop"
+        second = await sleep.next()
+        assert second[0] == 84600 - 30 and calls == [160.0]
+        stderr = capsys.readouterr().err
+        assert stderr.count("ERROR model roster: scheduled_attempt_failed") == 1
+        assert "private-marker" not in stderr + "".join(r.getMessage() for r in caplog.records)
+        sleep.advance(second)
+        third = await sleep.next()
+        assert calls == [160.0, 160.0 + 84600] and third[0] == second[0]
+        assert snapshot(registry) == before
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await required(service, "close")()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("switch,enabled", [
+    ("0", False), ("false", False), (" FALSE ", False),
+    (None, True), ("on", True), ("1", True),
+])
+async def test_default_on_switch_accepts_all_disabled_spellings(
+    registry, monkeypatch, switch, enabled
+):
+    if switch is None:
+        monkeypatch.delenv("PINKY_MODEL_ROSTER_SYNC", raising=False)
+    else:
+        monkeypatch.setenv("PINKY_MODEL_ROSTER_SYNC", switch)
+    getter = Mock(return_value=result(encode(document())))
+    service = make_service(registry, getter=getter)
+    before = snapshot(registry)
+    try:
+        assert service.enabled is enabled, "Use the shared default-on kill-switch convention"
+        if enabled:
+            await required(service, "sync")(dry_run=True)
+            assert getter.call_count == 1
+        else:
+            assert required(service, "start")() is None
+            with pytest.raises(error_type()) as caught:
+                await required(service, "sync")(dry_run=False)
+            assert_error(caught.value, 409)
+            getter.assert_not_called()
+        assert snapshot(registry) == before
+    finally:
+        await required(service, "close")()

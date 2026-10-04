@@ -444,6 +444,29 @@ def test_release_storage_failure_is_fixed_503_without_log_or_write(apps, monkeyp
     assert "storage-private-marker" not in capsys.readouterr().err
 
 
+def test_unexpected_worker_route_has_fixed_502_and_can_sync_again(apps, capsys, caplog):
+    getter = Mock(side_effect=[RuntimeError("private-marker"), result(encode(document()))])
+    d = apps(enabled=True, getter=getter)
+    good, errors = last_good(d.registry), d.registry._model_roster_errors
+    with browser(d.app) as client:
+        response = None
+        try:
+            response = client.post("/models/roster/sync", json={"dry_run": False})
+        except Exception:
+            pass
+        assert response is not None, "An unexpected worker must return a fixed HTTP error"
+        body = fixed_error(response, 502, "private-marker")
+        assert body["code"] == "fetch_failed"
+        assert d.registry._model_roster_errors == errors + 1 and last_good(d.registry) == good
+        rendered = response.text + status(d.registry)["last_error"] + capsys.readouterr().err
+        rendered += "".join(r.getMessage() for r in caplog.records)
+        assert "private-marker" not in rendered
+        after = snapshot(d.registry)
+        retry = client.post("/models/roster/sync", json={"dry_run": True})
+        assert retry.status_code == 200 and getter.call_count == 2
+        assert snapshot(d.registry) == after and d.registry._model_roster_errors == errors + 1
+
+
 @pytest.mark.parametrize("saved", [None, "", "not-json", " \n\t", "{}"])
 def test_release_refuses_bad_saved_provenance_without_any_write(apps, monkeypatch, saved):
     d = apps()
