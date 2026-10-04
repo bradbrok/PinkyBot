@@ -188,6 +188,7 @@ async def add_model(req: AddModelRequest):
     if not provider or not model_id:
         raise HTTPException(400, "provider and model_id are required")
     return _agents.add_model(
+        operator=True,
         provider=provider,
         model_id=model_id,
         display_name=req.display_name,
@@ -208,7 +209,7 @@ async def add_model(req: AddModelRequest):
 @router.delete("/models/{model_id:path}")
 async def delete_model(model_id: str):
     """Soft-delete a model (deactivate)."""
-    if not _agents.delete_model(model_id):
+    if not _agents.delete_model(model_id, operator=True):
         raise HTTPException(404, f"Model '{model_id}' not found")
     return {"deleted": True, "id": model_id}
 
@@ -263,6 +264,7 @@ async def sync_models():
         # Determine display name
         display = m.get("display_name", mid)
         _agents.add_model(
+            operator=False,
             provider="anthropic",
             model_id=mid,
             display_name=display,
