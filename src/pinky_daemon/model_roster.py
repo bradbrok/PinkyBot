@@ -12,6 +12,7 @@ from importlib import resources
 SCHEMA = "pinky-model-roster/1"
 MAX_BYTES = 256 * 1024
 MAX_MODELS = 500
+MAX_REVISION = 2**63 - 1
 _MODEL_ID = re.compile(r"[a-z0-9][a-z0-9._:-]{0,99}")
 _DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _DOCUMENT_FIELDS = {"schema", "revision", "updated", "models"}
@@ -110,7 +111,7 @@ def parse(blob: bytes) -> Roster:
     document = _object(document, _DOCUMENT_FIELDS, "roster")
     if document["schema"] != SCHEMA:
         raise ValueError(f"roster.schema must be {SCHEMA!r}")
-    revision = _integer(document["revision"], 1, None, "roster.revision")
+    revision = _integer(document["revision"], 1, MAX_REVISION, "roster.revision")
     updated = document["updated"]
     if not isinstance(updated, str) or not _DATE.fullmatch(updated):
         raise ValueError("roster.updated must be a canonical YYYY-MM-DD date")
