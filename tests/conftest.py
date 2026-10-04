@@ -214,17 +214,28 @@ def _isolate_test_env(request, monkeypatch):
         _scrub_test_env()
 
 
+@pytest.fixture(scope="session")
+def _initial_legacy_tmux_gate():
+    from pinky_daemon.tmux_session import _LEGACY_TMUX_BLOCK_ALL
+
+    return _LEGACY_TMUX_BLOCK_ALL
+
+
 @pytest.fixture(autouse=True)
-def _isolate_legacy_tmux_reap(request, monkeypatch):
+def _isolate_legacy_tmux_reap(request, monkeypatch, _initial_legacy_tmux_gate):
     """Boot tests record migration calls without inspecting any real socket."""
     from pinky_daemon import tmux_server_env, tmux_session
 
     monkeypatch.setattr(tmux_server_env, "_CAPABILITIES", {})
     monkeypatch.setattr(tmux_server_env, "_WARNED", set())
     monkeypatch.setattr(tmux_session, "_LEGACY_TMUX_BLOCKED", set())
-    monkeypatch.setattr(tmux_session, "_LEGACY_TMUX_BLOCK_ALL", False)
+    # Gate contracts start from the actual module default on every test.
+    # Unrelated tests explicitly simulate an already completed startup pass.
+    gate_contract = request.node.get_closest_marker("legacy_tmux_reap")
+    monkeypatch.setattr(tmux_session, "_LEGACY_TMUX_BLOCK_ALL",
+                        _initial_legacy_tmux_gate if gate_contract else False)
     recording = AsyncMock(return_value=set())
-    if not request.node.get_closest_marker("legacy_tmux_reap"):
+    if not gate_contract:
         monkeypatch.setattr(tmux_session, "reap_legacy_tmux_sessions", recording)
     return recording
 
