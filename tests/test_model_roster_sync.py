@@ -82,6 +82,117 @@ def prime():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["update", "insert"])
+@pytest.mark.parametrize("dry_run", [False, True])
+async def test_unstorable_revision_is_parse_refused_before_apply(
+    registry, monkeypatch, capsys, operation, dry_run
+):
+    value = document(2**63)
+    model_row(value)["pricing"]["input"] = 7.0
+    if operation == "insert":
+        value["models"].append(new_model("signed-limit-insert"))
+    before, good, cached = snapshot(registry), last_good(registry), prime()
+    errors = registry._model_roster_errors
+    recorder = Mock(wraps=registry.record_model_roster_sync_error)
+    applier = Mock(wraps=registry.apply_model_roster)
+    monkeypatch.setattr(registry, "record_model_roster_sync_error", recorder)
+    monkeypatch.setattr(registry, "apply_model_roster", applier)
+    service = make_service(registry, getter=lambda url, **kw: result(encode(value)))
+    failure = None
+    try:
+        try:
+            await service.sync(dry_run=dry_run)
+        except Exception as exc:
+            failure = exc
+        assert isinstance(failure, error_type()), (
+            f"Unstorable revision must raise a fixed roster refusal, got {failure!r}"
+        )
+        assert failure.code == "parse_refused" and failure.status_code == 502
+        applier.assert_not_called()
+        assert snapshot(registry)["models"] == before["models"]
+        assert last_good(registry) == good and prime() == cached
+        assert registry._model_roster_errors == errors + (not dry_run)
+        if dry_run:
+            recorder.assert_not_called()
+            assert snapshot(registry) == before
+        else:
+            recorder.assert_called_once_with(failure)
+            assert status(registry)["last_error"] == "parse_refused"
+            assert capsys.readouterr().err == "ERROR model roster: parse_refused\n"
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["update", "insert"])
+async def test_maximum_storable_revision_applies_for_update_and_insertion(registry, operation):
+    value = document(2**63 - 1)
+    model_row(value)["pricing"]["input"] = 7.0
+    target = SONNET
+    if operation == "insert":
+        value["models"].append(new_model("signed-limit-insert"))
+        target = "openai/signed-limit-insert"
+    raw = encode(value)
+    service = make_service(registry, getter=lambda url, **kw: result(raw))
+    try:
+        report = await service.sync(dry_run=False)
+        assert report["revision"] == 2**63 - 1 and report["revision_gate"] == "accepted"
+        row = registry.get_model(target)
+        assert row is not None and row["roster_revision"] == 2**63 - 1
+        assert registry.get_model(SONNET)["input_price"] == 7.0
+        assert status(registry)["last_applied_revision"] == 2**63 - 1
+        assert registry.get_setting("model_roster.last_applied_document").encode() == raw
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [False, True])
+async def test_post_fetch_monotonic_deadline_discards_result_without_asyncio_expiry(
+    registry, monkeypatch, capsys, dry_run
+):
+    clock = Clock()
+    before, good, cached = snapshot(registry), last_good(registry), prime()
+    errors = registry._model_roster_errors
+    recorder = Mock(wraps=registry.record_model_roster_sync_error)
+    applier = Mock(wraps=registry.apply_model_roster)
+    monkeypatch.setattr(registry, "record_model_roster_sync_error", recorder)
+    monkeypatch.setattr(registry, "apply_model_roster", applier)
+    contexts = []
+    original_timeout = asyncio.timeout
+
+    def timeout_context(delay):
+        context = original_timeout(delay)
+        contexts.append(context)
+        return context
+
+    def getter(url, *, timeout):
+        clock.now += timeout + 1
+        return result(encode(document()))
+
+    monkeypatch.setattr(asyncio, "timeout", timeout_context)
+    service = make_service(registry, getter=getter, monotonic=clock, timeout=10)
+    try:
+        with pytest.raises(error_type()) as caught:
+            await service.sync(dry_run=dry_run)
+        assert caught.value.code == "timeout" and caught.value.status_code == 504
+        assert len(contexts) == 1 and contexts[0].expired() is False
+        applier.assert_not_called()
+        assert snapshot(registry)["models"] == before["models"]
+        assert last_good(registry) == good and prime() == cached
+        assert registry._model_roster_errors == errors + (not dry_run)
+        if dry_run:
+            recorder.assert_not_called()
+            assert snapshot(registry) == before
+        else:
+            recorder.assert_called_once_with(caught.value)
+            assert status(registry)["last_error"] == "timeout"
+            assert capsys.readouterr().err == "ERROR model roster: timeout\n"
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
 async def test_success_applies_exact_raw_bytes_on_loop_and_updates_primed_cache(
     registry, monkeypatch
 ):

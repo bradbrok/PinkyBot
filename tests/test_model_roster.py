@@ -60,6 +60,24 @@ def _loader():
     return importlib.import_module("pinky_daemon.model_roster")
 
 
+def test_revision_above_sqlite_integer_range_is_refused_at_the_field():
+    document = _document()
+    document["revision"] = 2**63
+    failure = None
+    try:
+        _loader().parse(_bytes(document))
+    except Exception as exc:
+        failure = exc
+    assert isinstance(failure, ValueError), "An unstorable revision must be refused by the parser"
+    assert str(failure) == "roster.revision must be an integer in 1..9223372036854775807"
+
+
+def test_maximum_sqlite_integer_revision_is_accepted():
+    document = _document()
+    document["revision"] = 2**63 - 1
+    assert _loader().parse(_bytes(document)).revision == 2**63 - 1
+
+
 def _resource(name):
     resource = importlib.resources.files("pinky_daemon").joinpath("catalog", name)
     assert resource.is_file(), f"Missing packaged catalog resource: {name}"

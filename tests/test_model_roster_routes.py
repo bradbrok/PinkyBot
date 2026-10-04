@@ -361,6 +361,42 @@ def test_sync_returns_real_apply_or_preview_report(apps, dry_run):
         assert lookup_rate(SONNET.split("/", 1)[1])["input"] == 7.0
 
 
+@pytest.mark.parametrize("operation", ["update", "insert"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_unstorable_revision_route_has_fixed_parse_refused_502(
+    apps, monkeypatch, capsys, operation, dry_run
+):
+    value = document(2**63)
+    model_row(value)["pricing"]["input"] = 7.0
+    if operation == "insert":
+        value["models"].append(new_model("signed-limit-insert"))
+    d = apps(enabled=True, getter=lambda url, **kw: result(encode(value)))
+    before, good = snapshot(d.registry), last_good(d.registry)
+    errors = d.registry._model_roster_errors
+    recorder = Mock(wraps=d.registry.record_model_roster_sync_error)
+    applier = Mock(wraps=d.registry.apply_model_roster)
+    monkeypatch.setattr(d.registry, "record_model_roster_sync_error", recorder)
+    monkeypatch.setattr(d.registry, "apply_model_roster", applier)
+    with client_for(d.app, raise_server_exceptions=False) as client:
+        client.cookies.set(SESSION_COOKIE_NAME, create_session_cookie(TEST_SESSION_SECRET))
+        response = client.post("/models/roster/sync", json={"dry_run": dry_run})
+    assert fixed_error(response, 502) == {
+        "code": "parse_refused", "message": "The roster document was refused."
+    }
+    applier.assert_not_called()
+    assert snapshot(d.registry)["models"] == before["models"]
+    assert last_good(d.registry) == good
+    assert d.registry._model_roster_errors == errors + (not dry_run)
+    if dry_run:
+        recorder.assert_not_called()
+        assert snapshot(d.registry) == before
+    else:
+        recorder.assert_called_once()
+        assert recorder.call_args.args[0].code == "parse_refused"
+        assert status(d.registry)["last_error"] == "parse_refused"
+        assert capsys.readouterr().err == "ERROR model roster: parse_refused\n"
+
+
 @pytest.mark.parametrize(
     "fault,expected",
     [

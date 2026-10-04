@@ -162,6 +162,7 @@ def test_allowed_url_keeps_exact_document_bytes(url):
         "https://pinkybot.ai./a",
         "https://user@pinkybot.ai/a",
         "https://user:secret@pinkybot.ai/a",
+        "https://pinkybot.ai:/a",
         "https://pinkybot.ai:444/a",
         "https://pinkybot.ai:bad/a",
         "https://pinkybot.ai:99999/a",
