@@ -369,7 +369,11 @@ def test_document_limit_counts_utf8_bytes():
     _assert_rejected(blob)
 
 
-@pytest.mark.parametrize("count", [0, 500])
+def test_empty_model_roster_is_rejected():
+    _assert_rejected(_bytes(_document(0)))
+
+
+@pytest.mark.parametrize("count", [1, 500])
 def test_model_count_boundaries_are_accepted(count):
     document = _document(count)
     blob = _bytes(document)
