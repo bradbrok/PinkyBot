@@ -44,6 +44,7 @@ changed fields. New operator rows own all managed fields; automated discovery
 rows remain roster-managed. Direct SQL edits after classification are unsupported
 and do not record ownership. Context window and the 1M flag form one ownership
 unit: editing or releasing either affects ownership of both.
+Edits made while running an older release are not tracked; re-check them after upgrading.
 
 Retiring a model is an operator action (DELETE `/models`). A roster never
 deactivates an existing active model or inserts an inactive new model. Missing
