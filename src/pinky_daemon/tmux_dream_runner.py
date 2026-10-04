@@ -40,7 +40,8 @@ from pinky_daemon.tmux_session import (
     _cleanup_launch_env,
     _resolve_claude_config_path,
     _seed_claude_trust_file,
-    _TmuxControl,
+    production_tmux_control,
+    require_legacy_tmux_reaped,
 )
 from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target, text_argument
 
@@ -123,7 +124,7 @@ class TmuxDreamRunner:
     def __init__(self, config: TmuxDreamConfig | None = None, *, agent_name: str = "") -> None:
         self._config = config or TmuxDreamConfig()
         self._agent_name = agent_name or "agent"
-        self._control = _TmuxControl(self.session_name)
+        self._control = production_tmux_control(self.session_name)
 
     @property
     def session_name(self) -> str:
@@ -145,6 +146,7 @@ class TmuxDreamRunner:
             *self._control._base_cmd(), *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            **self._control.client_env_options(),
         )
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -169,6 +171,10 @@ class TmuxDreamRunner:
 
     async def run(self, prompt: str, *, system_prompt: str = "") -> RunResult:
         start = time.time()
+        try:
+            require_legacy_tmux_reaped(self._agent_name)
+        except PermissionError:
+            return RunResult(output="", exit_code=1, error="legacy tmux cleanup has not completed", duration_ms=0)
         work_dir = Path(self._config.working_dir).resolve()
         dreams_dir = work_dir / "dreams"
         dreams_dir.mkdir(parents=True, exist_ok=True)
@@ -328,7 +334,11 @@ class TmuxDreamRunner:
 
     def _seed_trust(self, project_dir: str) -> bool:
         """Seed first-run trust flags; seam for tests."""
-        return _seed_claude_trust_file(_resolve_claude_config_path(), project_dir)
+        env = dict(os.environ)
+        config = self._control.server_config
+        if config is not None:
+            env["HOME"] = config.client_env["HOME"]
+        return _seed_claude_trust_file(_resolve_claude_config_path(env), project_dir)
 
     # ── waiting ───────────────────────────────────────────────
 

@@ -87,22 +87,48 @@ class LocalCommandRunner(CommandRunner):
         *,
         timeout: float | None = None,
         stdin_data: bytes | None = None,
+        env: dict[str, str] | None = None,
+        max_output_bytes: int | None = None,
     ) -> CommandResult:
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **({"env": env} if env is not None else {}),
         )
+        async def communicate_bounded():
+            if stdin_data is not None:
+                raise ValueError("bounded reads do not accept stdin")
+            async def read(stream):
+                chunks, size = [], 0
+                while chunk := await stream.read(min(8192, max_output_bytes + 1 - size)):
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size > max_output_bytes:
+                        raise ValueError("command output limit exceeded")
+                return b"".join(chunks)
+            async with asyncio.TaskGroup() as group:
+                out = group.create_task(read(proc.stdout))
+                err = group.create_task(read(proc.stderr))
+            await proc.wait()
+            return out.result(), err.result()
         try:
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=stdin_data), timeout=timeout
+                proc.communicate(input=stdin_data) if max_output_bytes is None else communicate_bounded(),
+                timeout=timeout,
             )
-        except asyncio.TimeoutError:
+        except BaseException:
             try:
                 proc.kill()
             except ProcessLookupError:
                 pass
+            if max_output_bytes is not None:
+                async def discard(stream):
+                    while await stream.read(8192):
+                        pass
+                await asyncio.gather(discard(proc.stdout), discard(proc.stderr))
+            await proc.wait()
             raise
         return CommandResult(
             returncode=proc.returncode or 0,

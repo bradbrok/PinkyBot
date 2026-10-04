@@ -20,6 +20,8 @@ from pinky_daemon import tmux_session
 from tests.tmux_server_env_support import CANARY, FAMILIES, control, no_values, owner, seed
 from tests.tmux_socket_support import private_labels
 
+pytestmark = pytest.mark.legacy_tmux_reap
+
 
 class Registry:
     def __init__(self, path):

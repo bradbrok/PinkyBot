@@ -10,7 +10,7 @@ from dataclasses import replace
 from pinky_daemon import isolated_launch_env, launch_env_authority, tmux_launch_env
 from pinky_daemon.codex_home import codex_home_for, per_agent_codex_home_enabled
 from pinky_daemon.codex_mcp_env import with_mcp_header_env
-from pinky_daemon.tmux_launch_env_loader import BASE_ALLOWLIST
+from pinky_daemon.tmux_launch_env_loader import is_base_name
 
 BUILDER_OWNED = frozenset(
     {
@@ -77,7 +77,7 @@ def build_env(
     baseline = {
         name: value
         for name, value in inherited.items()
-        if name in BASE_ALLOWLIST or name.startswith(("LC_", "XDG_"))
+        if is_base_name(name)
     }
     grants = isolated_launch_env.with_grants(replace(policy, mode="enforce"), {})
     grants = launch_env_authority.filter_env(grants, BUILDER_OWNED)

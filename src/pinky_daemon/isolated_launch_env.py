@@ -15,6 +15,7 @@ from pinky_daemon.tmux_launch_env_loader import (
 )
 from pinky_daemon.tmux_launch_env_loader import (
     _private_regular,
+    is_base_name,
     key_policy,
 )
 
@@ -196,7 +197,7 @@ def report_shadow(
     dropped = sorted(
         name for name in os.environ
         if name in DAEMON_ONLY or (
-            name not in BASE_ALLOWLIST and not name.startswith(("LC_", "XDG_"))
+            not is_base_name(name)
             and name not in explicit
         )
     )

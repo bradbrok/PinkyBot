@@ -31,6 +31,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -116,6 +117,7 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "real_transport: test intentionally uses a real external transport",
     )
+    config.addinivalue_line("markers", "legacy_tmux_reap: exercise startup reap on test-owned routes")
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
@@ -210,6 +212,21 @@ def _isolate_test_env(request, monkeypatch):
     finally:
         # Also contain direct os.environ writes that bypassed monkeypatch.
         _scrub_test_env()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_legacy_tmux_reap(request, monkeypatch):
+    """Boot tests record migration calls without inspecting any real socket."""
+    from pinky_daemon import tmux_server_env, tmux_session
+
+    monkeypatch.setattr(tmux_server_env, "_CAPABILITIES", {})
+    monkeypatch.setattr(tmux_server_env, "_WARNED", set())
+    monkeypatch.setattr(tmux_session, "_LEGACY_TMUX_BLOCKED", set())
+    monkeypatch.setattr(tmux_session, "_LEGACY_TMUX_BLOCK_ALL", False)
+    recording = AsyncMock(return_value=set())
+    if not request.node.get_closest_marker("legacy_tmux_reap"):
+        monkeypatch.setattr(tmux_session, "reap_legacy_tmux_sessions", recording)
+    return recording
 
 
 @pytest.fixture(autouse=True)

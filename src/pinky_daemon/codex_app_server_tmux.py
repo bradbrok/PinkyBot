@@ -11,10 +11,9 @@ from the daemon process.
 What this supervisor owns:
 
   * spawn the shim in a detached tmux session ``pinky-codex-as-<agent>``,
-    passing the daemon env through the private launch boundary (tmux drops parent env, so it
-    must be injected explicitly — parity with the subprocess path's
-    ``{**os.environ}`` so CODEX_HOME/HOME/XDG/proxy/cert all reach the
-    grandchild ``codex`` the shim spawns, not just the shim; see _build_env)
+    delivering the approved launch payload through the private JSON boundary.
+    The tmux client uses the managed base environment; the payload retains
+    Codex authority filtering and the same configured pane PATH.
   * idempotent pre-start cleanup: kill a stale tmux session + unlink a stale
     socket so a crashed predecessor can't wedge bind()
   * readiness = socket ACCEPT only. We open the one allowed connection and
@@ -54,7 +53,12 @@ from pinky_daemon.codex_home import (
 )
 from pinky_daemon.command_runner import LocalCommandRunner
 from pinky_daemon.streaming_session import _log
-from pinky_daemon.tmux_session import _cleanup_launch_env, _TmuxControl
+from pinky_daemon.tmux_server_env import normalize_codex_path
+from pinky_daemon.tmux_session import (
+    _cleanup_launch_env,
+    production_tmux_control,
+    require_legacy_tmux_reaped,
+)
 
 # Generous: covers tmux new-session + python import + shim bind. The shim binds
 # its socket before any slow work, so accept usually lands in well under a
@@ -128,7 +132,7 @@ class CodexAppServerSupervisor:
         self._registry = registry
         self._sock_dir, self._sock_dir_is_tmp = self._resolve_sock_dir(agent_name, working_dir)
         self.sock_path = os.path.join(self._sock_dir, "app.sock")
-        self._tmux = _TmuxControl(self.session_name, command_runner=LocalCommandRunner())
+        self._tmux = production_tmux_control(self.session_name, command_runner=LocalCommandRunner())
         self._kill_requested = False
 
     @staticmethod
@@ -169,6 +173,7 @@ class CodexAppServerSupervisor:
         timeout. The caller (CodexSession) performs the single ``initialize``."""
         self._kill_requested = False
         launch_policy = self._launch_env_policy()
+        require_legacy_tmux_reaped(self.agent_name)
         if per_agent_codex_home_enabled():
             if self._agent_config is None:
                 raise RuntimeError(
@@ -238,10 +243,11 @@ class CodexAppServerSupervisor:
             prepared_home = prepare_agent_codex_home(
                 self._agent_config, log=self._log, soul_version_store=self._soul_version_store,
             )
-        return codex_launch_env.build_env(
+        env = codex_launch_env.build_env(
             agent_name=self.agent_name, config=self._agent_config, api_key=self._openai_api_key,
             policy=policy, log=self._log, prepared_home=prepared_home,
         )
+        return normalize_codex_path(env, self._tmux)
 
     def _isolation_status(self) -> str:
         return isolated_launch_env.isolation_status(self._registry, self.agent_name)
