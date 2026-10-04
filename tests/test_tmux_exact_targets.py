@@ -382,7 +382,7 @@ class _PrivateAsyncio:
 def dream_tmux(private_tmux, monkeypatch):
     # Bind both the common loader spawn and follow-up commands to this server.
     monkeypatch.setattr(
-        tmux_dream_runner, "_TmuxControl",
+        tmux_dream_runner, "production_tmux_control",
         lambda session_name: private_tmux.control(session_name),
     )
     return private_tmux
