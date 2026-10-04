@@ -8,6 +8,7 @@ import os
 import random
 import sqlite3
 import ssl
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -206,7 +207,7 @@ class ModelRosterSync:
         self.getter = fetch_roster if getter is None else getter
         self.url = os.environ.get("PINKY_MODEL_ROSTER_URL", DEFAULT_URL) if url is None else url
         self.enabled = (
-            os.environ.get("PINKY_MODEL_ROSTER_SYNC", "").strip().lower() != "off"
+            os.environ.get("PINKY_MODEL_ROSTER_SYNC", "").strip().lower() not in ("off", "0", "false")
             if enabled is None
             else enabled
         )
@@ -267,7 +268,9 @@ class ModelRosterSync:
             except TimeoutError:
                 reason = "timeout" if outer_deadline.expired() else "fetch_failed"
                 raise RosterSyncError(reason) from None
-            except (OSError, http.client.HTTPException):
+            except RosterSyncError:
+                raise
+            except Exception:
                 raise RosterSyncError("fetch_failed") from None
             if self.closing:
                 raise RosterSyncError("closing")
@@ -314,6 +317,8 @@ class ModelRosterSync:
             except RosterSyncError:
                 # Genuine attempt failures already own one fixed-code error record.
                 pass
+            except Exception:
+                print("ERROR model roster: scheduled_attempt_failed", file=sys.stderr, flush=True)
             period = 84600 + self.jitter()
             delay = started + period - self.monotonic()
             await self.sleep(delay if delay > 0 else period)

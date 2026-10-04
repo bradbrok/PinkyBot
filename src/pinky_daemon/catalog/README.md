@@ -71,8 +71,9 @@ application is constructed. The first remote attempt follows listener readiness
 and startup replay by 60 seconds; subsequent scheduled starts are roughly 24 hours
 apart (23.5 hours plus up to 30 minutes of jitter). Manual requests do not reset
 that schedule. Each API install makes one daily GET to the roster host unless
-`PINKY_MODEL_ROSTER_SYNC=off` is set. This switch disables both scheduled and manual
-fetches; local bundled updates, status, and ownership release remain available.
+`PINKY_MODEL_ROSTER_SYNC` is set to `off`, `0`, or `false` (ignoring case and
+surrounding whitespace). This switch disables both scheduled and manual fetches;
+local bundled updates, status, and ownership release remain available.
 
 GET `/models/roster` returns read-only sync status, configured URL, enabled flag,
 and bundled revision. POST `/models/roster/sync` requires an explicit boolean
