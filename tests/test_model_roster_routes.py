@@ -66,7 +66,9 @@ def apps(tmp_path, monkeypatch):
         built.append(app)
         registry = app.state.agents
         for name, isolated in (("tenant", True), ("normal", False)):
-            registry.register(name, isolated=isolated, working_dir=str(root))
+            work = root / name
+            work.mkdir()
+            registry.register(name, isolated=isolated, working_dir=str(work))
         if getter is not None:
             service = getattr(app.state, "model_roster_sync", None)
             assert service is not None, "API must own a per-app roster sync service"
