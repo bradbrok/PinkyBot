@@ -21,6 +21,12 @@ from pathlib import Path
 
 from pinky_daemon import resume_recovery
 from pinky_daemon.agent_registry import validate_restart_tokens_cap
+from pinky_daemon.api_readiness import (
+    api_allows_submission,
+    defer_wake,
+    render_prompt,
+    wait_for_api,
+)
 from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.effort import CLI_EFFORT_LEVELS, resolve_cli_effort
 from pinky_daemon.sessions import SessionUsage
@@ -124,6 +130,7 @@ class StreamingSessionConfig:
     resume_handle: str = ""  # SDK resume token (opaque session-continuation handle) from previous run
     wake_context: str = ""  # Saved continuation context to inject on wake
     wake_context_builder: object = None  # Callable(agent_name) -> str; refreshes wake_context on restart
+    api_readiness: object = None  # Shared daemon listener gate; None keeps embedders open.
     # Fires AFTER successful wake-prompt delivery (paste/query landed).
     # Callers (api.py) wire it to log ``agent_wake`` so the previous-wake
     # timestamp the #591 cycle-bound gate reads is advanced on EVERY
@@ -739,43 +746,47 @@ class StreamingSession(TransportReplacementMixin):
         # predates this signal — kept as a fallback for tests / paths
         # without a builder. Trailing positional kwarg keeps 1-arg
         # callers of older builders working.
-        wake_context_body = self._config.wake_context or ""
-        if self._config.wake_context_builder:
-            try:
-                wake_context_body = self._config.wake_context_builder(
-                    self.agent_name, wake_reason
+        def _build_initial_prompt():
+            wake_context_body = self._config.wake_context or ""
+            if self._config.wake_context_builder:
+                try:
+                    wake_context_body = self._config.wake_context_builder(
+                        self.agent_name, wake_reason
+                    )
+                except TypeError:
+                    # Legacy 1-arg builder — fall back to the pre-built body.
+                    pass
+                except Exception as e:
+                    _log(
+                        f"streaming[{self.agent_name}]: wake context rebuild failed: {e} "
+                        "— using stored body"
+                    )
+            wake_prompt = build_wake_prompt(
+                WakePromptInput(
+                    reason=wake_reason,
+                    context_body=wake_context_body,
+                    timezone=self._config.timezone or "America/Los_Angeles",
                 )
-            except TypeError:
-                # Legacy 1-arg builder — fall back to the pre-built body.
-                pass
-            except Exception as e:
-                _log(
-                    f"streaming[{self.agent_name}]: wake context rebuild failed: {e} "
-                    "— using stored body"
-                )
-        wake_prompt = build_wake_prompt(
-            WakePromptInput(
-                reason=wake_reason,
-                context_body=wake_context_body,
-                timezone=self._config.timezone or "America/Los_Angeles",
             )
-        )
-        self._config.restart_reason = ""  # Clear after use.
 
-        # Instrumentation: a single structured log line per wake prompt
-        # gives validation tooling a grep-able marker. Tmux emits the
-        # same fields via ``_emit_stream_event`` because it has that
-        # surface; SDK lacks a stream-event callback today (deferred
-        # follow-up — would unify observability across transports).
-        _ctx_chars = len(wake_context_body or "")
-        _prompt_hash = hashlib.sha256(wake_prompt.encode("utf-8")).hexdigest()[:12]
-        _log(
-            f"streaming[{self.agent_name}]: wake_prompt_sent "
-            f"reason={wake_reason.value} "
-            f"context_chars={_ctx_chars} "
-            f"context_present={bool(wake_context_body)} "
-            f"prompt_hash={_prompt_hash}"
-        )
+            # Instrumentation: a single structured log line per wake prompt
+            # gives validation tooling a grep-able marker. Tmux emits the
+            # same fields via ``_emit_stream_event`` because it has that
+            # surface; SDK lacks a stream-event callback today (deferred
+            # follow-up — would unify observability across transports).
+            _ctx_chars = len(wake_context_body or "")
+            _prompt_hash = hashlib.sha256(wake_prompt.encode("utf-8")).hexdigest()[:12]
+            _log(
+                f"streaming[{self.agent_name}]: wake_prompt_sent "
+                f"reason={wake_reason.value} "
+                f"context_chars={_ctx_chars} "
+                f"context_present={bool(wake_context_body)} "
+                f"prompt_hash={_prompt_hash}"
+            )
+
+            return wake_prompt
+
+        wake_prompt = defer_wake(self._config, _build_initial_prompt)
 
         async def _send_wake_prompt() -> None:
             try:
@@ -805,7 +816,9 @@ class StreamingSession(TransportReplacementMixin):
         # Retain a strong reference via ``self._background_tasks`` per the
         # asyncio docs: tasks created here can otherwise be GC'd mid-flight,
         # which would silently drop the wake prompt.
+        self._config.restart_reason = ""
         wake_task = asyncio.create_task(_send_wake_prompt())
+        self._initial_wake_task = wake_task
         self._background_tasks.add(wake_task)
         wake_task.add_done_callback(self._background_tasks.discard)
 
@@ -837,6 +850,13 @@ class StreamingSession(TransportReplacementMixin):
         """
         if self.state != SessionState.CONNECTED or not self._client:
             _log(f"streaming[{self.agent_name}]: not connected, dropping message")
+            return False
+
+        if not await wait_for_api(self._config, "sdk-send"):
+            return False
+        await self._wait_for_initial_wake()
+        if (not api_allows_submission(self._config, "sdk-send")
+                or self.state != SessionState.CONNECTED or not self._client):
             return False
 
         self.last_active = time.time()
@@ -884,6 +904,14 @@ class StreamingSession(TransportReplacementMixin):
             await self.attempt_reconnect()
             return False
 
+    async def _wait_for_initial_wake(self) -> None:
+        gate = getattr(self._config, "api_readiness", None)
+        if gate is None or not gate.attached:
+            return
+        task = getattr(self, "_initial_wake_task", None)
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            await asyncio.shield(task)
+
     async def _query_unrouted(self, prompt: str) -> None:
         """Submit an internal prompt with boundary-safe bookkeeping.
 
@@ -893,8 +921,14 @@ class StreamingSession(TransportReplacementMixin):
         turn. Failure removes only this exact reservation because concurrent
         internal prompts have identical tuple values.
         """
+        if not await wait_for_api(self._config, "sdk-internal"):
+            raise RuntimeError("API listener unavailable; internal prompt refused")
+        await self._wait_for_initial_wake()
+        if not api_allows_submission(self._config, "sdk-internal"):
+            raise RuntimeError("API listener stopped; internal prompt refused")
         if not self._client:
             raise RuntimeError("streaming client is unavailable")
+        prompt = render_prompt(prompt)
         reservation = ("", "", "")
         self._pending_chats.append(reservation)
         try:
