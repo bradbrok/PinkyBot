@@ -8544,7 +8544,7 @@ except Exception as exc:
                 )
 
     def _correct_model_fields(self, full_id: str, stale: dict, desired: dict, now: float) -> int:
-        row = self.get_model(full_id)
+        row = self._get_model_by_id(full_id)
         if row is None or row["roster_revision"] is not None:
             return 0
         if any(row[field] != value for field, value in stale.items()):
@@ -8562,7 +8562,7 @@ except Exception as exc:
     ) -> int:
         """Repair recognized stale values using only immutable baseline targets."""
         full_id = "anthropic/claude-sonnet-5"
-        row = self.get_model(full_id)
+        row = self._get_model_by_id(full_id)
         target = self._BASELINE_MODELS[full_id][1]
         stale = dict(input_price=3.0, output_price=15.0, cached_input_price=0.3,
                      cache_write_5m_price=3.75, cache_write_1h_price=6.0)
@@ -8818,10 +8818,15 @@ except Exception as exc:
             raise ValueError("release fields must be a list or all")
         selected = context_unit(selected)
         with self._model_roster_transaction():
-            existing = self.get_model(full_id)
+            existing = self._get_model_by_id(full_id)
             if existing is None or existing["id"] != full_id:
                 raise ValueError(f"unknown full model id: {full_id}")
             saved = self.get_setting("model_roster.last_applied_document")
+            if not saved and (
+                int(self.get_setting("model_roster.last_applied_revision") or "0") > 0
+                or self.get_setting("model_roster.sha256")
+            ):
+                raise ValueError("saved model roster document is missing or empty")
             roster = None
             incoming = None
             if saved:
@@ -8875,6 +8880,15 @@ except Exception as exc:
         cols = [d[0] for d in cursor.description]
         return [self._with_pricing_status(dict(zip(cols, row))) for row in rows]
 
+    def _get_model_by_id(self, full_id: str) -> dict | None:
+        """Resolve a write target by primary key, without bare model-id aliases."""
+        cursor = self._db.execute("SELECT * FROM models WHERE id=?", (full_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        cols = [entry[0] for entry in cursor.description]
+        return self._with_pricing_status(dict(zip(cols, row)))
+
     def get_model(self, model_id: str) -> dict | None:
         """Get a model by its full ID (provider/model_id) or just model_id."""
         row = self._db.execute(
@@ -8904,7 +8918,7 @@ except Exception as exc:
                       supports_thinking=int(supports_thinking), active=1, sort_order=sort_order)
         with self._model_roster_transaction():
             now = time.time()
-            row = self.get_model(full_id)
+            row = self._get_model_by_id(full_id)
             if row is None:
                 self._insert_roster_model(provider, model_id, values, now,
                                            owned=MANAGED_FIELDS if operator else ())
@@ -8922,7 +8936,7 @@ except Exception as exc:
 
         runtime_model_catalog.invalidate()
         _log(f"agent_registry: added/updated model {full_id}")
-        return self.get_model(full_id) or {}
+        return self._get_model_by_id(full_id) or {}
 
     def delete_model(self, model_id: str, *, operator: bool = True) -> bool:
         """Soft deletion is an operator action and permanently owns the active field."""
