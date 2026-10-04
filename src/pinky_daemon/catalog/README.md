@@ -32,3 +32,32 @@ values, and empty model lists.
 `models.baseline.json` is the immutable byte copy of revision 1. Do not edit it for
 later roster revisions. `scripts/generate_model_roster.py` records how revision 1
 was extracted from the pinned historical source; it is not used at runtime.
+
+Constructing a registry seeds and repairs only the immutable baseline, classifies
+existing differences as operator-owned once, then applies the bundled document
+in a separate transaction. Scripts that construct a registry apply the bundle to
+that database too, including a scratch copy. An apply error is logged and retained
+as best-effort status metadata; construction continues with the last good rows.
+
+Operator changes through the registry methods or POST/DELETE `/models` own the
+changed fields. New operator rows own all managed fields; automated discovery
+rows remain roster-managed. Direct SQL edits after classification are unsupported
+and do not record ownership. Context window and the 1M flag form one ownership
+unit: editing or releasing either affects ownership of both.
+
+Retiring a model is an operator action (DELETE `/models`). A roster never
+deactivates an existing active model or inserts an inactive new model. Missing
+rows remain unchanged; an unowned inactive row may be activated by a roster.
+
+Apply accepts only a higher revision. A rollback publishes older values in a
+new, higher revision. Dry-run previews bypass this gate, report `revision_gate`
+as `accepted`, `equal`, or `lower`, and write no rows, status, or caches. Reports
+count inserted/updated/unchanged and skipped rows; categories can overlap for a
+partially owned row. Field counts distinguish individual writes and skips.
+Release clears ownership and immediately reapplies the selected fields from the
+exact saved document after validating its digest. It leaves global revision and
+last-applied metadata unchanged; malformed saved data refuses the entire release.
+
+Committed changes invalidate runtime price and 1M snapshots. Analytics reprices
+recorded tokens using current runtime rates; the stored lifetime cost ledger is
+unchanged. Static bundled fallback tables retain their import-time values.
