@@ -1204,8 +1204,10 @@ def production_tmux_control(
     """Create a managed control, or retain a recorded cleanup-only route."""
     if server_config is None:
         if cleanup:
+            base = {name: value for name, value in os.environ.items()
+                    if tmux_launch_env_loader.is_base_name(name) or name == "TMUX_TMPDIR"}
             server_config = tmux_server_env.ServerConfig(
-                socket_name or "default", tmux_server_env.client_environment({}),
+                socket_name or "default", tmux_server_env.client_environment(base),
             )
         else:
             server_config = tmux_server_env.ServerConfig.capture(label=socket_name)

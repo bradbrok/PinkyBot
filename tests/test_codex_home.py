@@ -94,11 +94,16 @@ def _rollout(home: Path, name: str, cwd: Path) -> Path:
     return path
 
 
-def _mark_tmux_server_socket(tmp_path: Path, monkeypatch) -> Path:
+def _mark_tmux_server_socket(tmp_path: Path, monkeypatch, control=None) -> Path:
     """Make the verifier take its server-alive session-listing leg."""
-    tmux_tmpdir = tmp_path / "tmux-tmp"
-    socket_path = tmux_tmpdir / f"tmux-{os.getuid()}" / "default"
-    socket_path.parent.mkdir(parents=True)
+    if control is not None:
+        socket_path = control._local_socket_path()
+        assert socket_path.is_relative_to(tmp_path)
+        tmux_tmpdir = socket_path.parent.parent
+    else:
+        tmux_tmpdir = tmp_path / "tmux-tmp"
+        socket_path = tmux_tmpdir / f"tmux-{os.getuid()}" / "default"
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
     socket_path.touch()
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.setenv("TMUX_TMPDIR", str(tmux_tmpdir))
@@ -2926,7 +2931,7 @@ async def test_tmux_app_server_stale_kill_failure_refuses_before_publication(
         agent_config=config,
         soul_version_store=soul_store,
     )
-    _mark_tmux_server_socket(tmp_path, monkeypatch)
+    _mark_tmux_server_socket(tmp_path, monkeypatch, supervisor._tmux)
     build_env_calls = 0
     tmux_calls: list[tuple[str, ...]] = []
     real_build_env = supervisor._build_env
@@ -3001,7 +3006,7 @@ async def test_tmux_app_server_permission_probe_refuses_before_publication(
         agent_config=config,
         soul_version_store=soul_store,
     )
-    _mark_tmux_server_socket(tmp_path, monkeypatch)
+    _mark_tmux_server_socket(tmp_path, monkeypatch, supervisor._tmux)
     tmux_calls: list[tuple[str, ...]] = []
     build_env_calls = 0
     permission_error = TmuxCommandResult(
@@ -3222,7 +3227,7 @@ async def test_tmux_repl_stale_kill_failure_refuses_before_publication(
     agents_md = working_dir / ".codex" / "AGENTS.md"
     agents_md.write_text("self edit before replacement", encoding="utf-8")
     session = CodexTmuxSession(config, registry=soul_store)
-    _mark_tmux_server_socket(tmp_path, monkeypatch)
+    _mark_tmux_server_socket(tmp_path, monkeypatch, session._tmux)
     tmux_calls: list[tuple[str, ...]] = []
 
     async def _noop(*_args, **_kwargs):
@@ -3307,7 +3312,7 @@ async def test_tmux_repl_permission_probe_refuses_before_publication(
     agents_md = working_dir / ".codex" / "AGENTS.md"
     agents_md.write_text("self edit before replacement", encoding="utf-8")
     session = CodexTmuxSession(config, registry=soul_store)
-    _mark_tmux_server_socket(tmp_path, monkeypatch)
+    _mark_tmux_server_socket(tmp_path, monkeypatch, session._tmux)
     tmux_calls: list[tuple[str, ...]] = []
     permission_error = TmuxCommandResult(
         returncode=1,
@@ -3396,7 +3401,7 @@ async def test_tmux_repl_returned_has_session_error_refuses_before_spawn_side_ef
     agents_md = working_dir / ".codex" / "AGENTS.md"
     agents_md.write_text("self edit before replacement", encoding="utf-8")
     session = CodexTmuxSession(config, registry=soul_store)
-    _mark_tmux_server_socket(tmp_path, monkeypatch)
+    _mark_tmux_server_socket(tmp_path, monkeypatch, session._tmux)
     tmux_calls: list[tuple[str, ...]] = []
     env_build_count = 0
     publication_count = 0

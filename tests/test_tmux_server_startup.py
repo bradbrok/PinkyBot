@@ -46,6 +46,27 @@ async def test_unrelated_tests_record_reap_without_socket_access(_isolate_legacy
     _isolate_legacy_tmux_reap.assert_awaited_once()
 
 
+async def test_cleanup_keeps_base_path_and_recorded_socket_despite_new_config(tmp_path, monkeypatch):
+    seed(monkeypatch, tmp_path)
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmp_path))
+    monkeypatch.setenv("PATH", "/synthetic/tools:/bin")
+    monkeypatch.setenv("PINKY_TMUX_SOCKET", "bad/config")
+    monkeypatch.setenv("PINKY_TMUX_PANE_PATH", "bad/path")
+    seen = {}
+
+    async def run(self, argv, **kwargs):
+        seen.update(kwargs)
+        return CommandResult(0, b"", b"")
+
+    monkeypatch.setattr(LocalCommandRunner, "run", run)
+    recorded = tmp_path / "recorded.sock"
+    ctrl = tmux_session.production_tmux_control("pinky-test-agent", socket_path=str(recorded), cleanup=True)
+    await ctrl._run("has-session")
+    assert ctrl._local_socket_path() == recorded
+    assert seen["env"]["PATH"].startswith("/synthetic/tools:/bin:")
+    assert seen["env"]["TMUX_TMPDIR"] == str(tmp_path)
+
+
 @pytest.mark.parametrize("stream", ["stdout", "stderr"])
 async def test_bounded_client_read_refuses_oversize(stream):
     with pytest.raises(ExceptionGroup):

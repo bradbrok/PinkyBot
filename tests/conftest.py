@@ -230,10 +230,15 @@ def _isolate_legacy_tmux_reap(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _guard_default_tmux_socket(monkeypatch):
+def _guard_default_tmux_socket(monkeypatch, tmp_path):
     """Never let an unpatched test spawn reach the operator's default server."""
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.delenv("TMUX_PANE", raising=False)
+    routing_root = tmp_path / "tmux-route"
+    routing_root.mkdir(mode=0o700)
+    # Contain read-only absence checks too. Real clients still need a route
+    # registered by their owning fixture; this root grants no exec permission.
+    monkeypatch.setenv("TMUX_TMPDIR", str(routing_root))
     original = subprocess.Popen
     original_async = asyncio.create_subprocess_exec
 
