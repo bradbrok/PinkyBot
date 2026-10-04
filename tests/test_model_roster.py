@@ -21,11 +21,24 @@ BASELINE_SHA256 = "f209d414c1743d4793328de97ace1f882861dae8e969abe500b3dd5de158b
 MAX_BYTES = 256 * 1024
 PRICE_FIELDS = ("input", "output", "cached_input", "cache_write_5m", "cache_write_1h")
 ROW_FIELDS = (
-    "provider", "model_id", "display_name", "description", "tier", "context_window",
-    "is_1m", "pricing", "supports_thinking", "active", "sort_order",
+    "provider",
+    "model_id",
+    "display_name",
+    "description",
+    "tier",
+    "context_window",
+    "is_1m",
+    "pricing",
+    "supports_thinking",
+    "active",
+    "sort_order",
 )
 LEGACY_IDS = (
-    "claude-haiku-3-5", "claude-opus-4", "claude-opus-4-1", "claude-sonnet-4", "gpt-5.3-codex",
+    "claude-haiku-3-5",
+    "claude-opus-4",
+    "claude-opus-4-1",
+    "claude-sonnet-4",
+    "gpt-5.3-codex",
 )
 
 
@@ -138,11 +151,55 @@ def test_recorded_generator_reproduces_revision_one(tmp_path):
     root = Path(__file__).resolve().parents[1]
     generator = root / "scripts" / "generate_model_roster.py"
     assert generator.is_file(), "The revision-one generation record is missing"
+    checkout = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if checkout.returncode != 0 or checkout.stdout.strip() != "true":
+        pytest.skip("not a git checkout; the revision-one generator needs repository history")
+    shallow = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if shallow.stdout.strip() == "true":
+        base = subprocess.run(
+            ["git", "cat-file", "-e", f"{BASE_REVISION}^{{commit}}"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if base.returncode != 0:
+            pytest.skip(
+                f"revision-one base {BASE_REVISION[:12]} is not in this shallow checkout; "
+                "the frozen-literal equality tests pin the same values"
+            )
     output = tmp_path / "generated.json"
     result = subprocess.run(
-        [sys.executable, str(generator), "--base", BASE_REVISION,
-         "--updated", "2026-10-04", "--output", str(output)],
-        cwd=root, capture_output=True, text=True, timeout=15, check=False,
+        [
+            sys.executable,
+            str(generator),
+            "--base",
+            BASE_REVISION,
+            "--updated",
+            "2026-10-04",
+            "--output",
+            str(output),
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     assert output.read_bytes() == (FIXTURES / "model_roster_revision1.json").read_bytes()
@@ -193,20 +250,40 @@ def _probe(tmp_path, module_name, blob, *, inspect=False):
     (catalog / "models.json").write_bytes(blob)
     package = importlib.import_module("pinky_daemon")
     source_root = Path(package.__file__).resolve().parent.parent
-    env = {key: value for key, value in os.environ.items()
-           if key in {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"}}
-    env.update(PYTHONPATH=str(source_root), PYTHONDONTWRITEBYTECODE="1",
-               PINKY_TEST_TRANSPORT_GUARD="1")
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"}
+    }
+    env.update(
+        PYTHONPATH=str(source_root), PYTHONDONTWRITEBYTECODE="1", PINKY_TEST_TRANSPORT_GUARD="1"
+    )
     return subprocess.run(
-        [sys.executable, "-c", IMPORT_PROBE, str(resource_root), module_name,
-         "inspect" if inspect else "import"],
-        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=15, check=False,
+        [
+            sys.executable,
+            "-c",
+            IMPORT_PROBE,
+            str(resource_root),
+            module_name,
+            "inspect" if inspect else "import",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
     )
 
 
-@pytest.mark.parametrize("module_name", [
-    "pinky_daemon.agent_registry", "pinky_daemon.pricing", "pinky_daemon.streaming_session",
-])
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "pinky_daemon.agent_registry",
+        "pinky_daemon.pricing",
+        "pinky_daemon.streaming_session",
+    ],
+)
 def test_corrupt_bundled_file_fails_at_import(tmp_path, module_name):
     control = _probe(tmp_path, module_name, _bytes(_revision_one()))
     assert control.returncode == 0, control.stdout + control.stderr
@@ -229,9 +306,14 @@ def test_legacy_rate_id_in_roster_fails_at_import(tmp_path, legacy_id):
     assert "ROSTER_IMPORT_REJECTED:" in rejected.stdout
 
 
-@pytest.mark.parametrize("module_name", [
-    "pinky_daemon.agent_registry", "pinky_daemon.pricing", "pinky_daemon.streaming_session",
-])
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "pinky_daemon.agent_registry",
+        "pinky_daemon.pricing",
+        "pinky_daemon.streaming_session",
+    ],
+)
 def test_static_collections_read_the_bundled_file(tmp_path, module_name):
     document = _revision_one()
     control = _probe(tmp_path, module_name, _bytes(document), inspect=True)
@@ -246,7 +328,10 @@ def test_static_collections_read_the_bundled_file(tmp_path, module_name):
     if module_name.endswith("agent_registry"):
         expected = frozen["model_seeds"]
         expected[0][2], expected[0][5], expected[0][6], expected[0][7] = (
-            "Roster Display Name", 8192, 0, 11,
+            "Roster Display Name",
+            8192,
+            0,
+            11,
         )
     elif module_name.endswith("pricing"):
         expected = frozen["rate_table"]
@@ -259,30 +344,69 @@ def test_static_collections_read_the_bundled_file(tmp_path, module_name):
 BAD_FIELDS = [
     pytest.param(("schema",), "pinky-model-roster/2", id="unknown-schema"),
     pytest.param(("schema",), 1, id="schema-type"),
-    *[pytest.param(("revision",), value, id=f"revision-{label}") for label, value in
-      [("zero", 0), ("negative", -1), ("bool", True), ("float", 1.0),
-       ("string", "1"), ("null", None)]],
-    *[pytest.param(("updated",), value, id=f"updated-{label}") for label, value in
-      [("calendar", "2026-02-29"), ("datetime", "2026-10-04T00:00:00Z"),
-       ("basic", "20261004"), ("nonpadded", "2026-1-4"), ("null", None)]],
-    *[pytest.param(("models", 1, "provider"), value, id=f"provider-{label}")
-      for label, value in [("unknown", "other"), ("case", "Anthropic"), ("type", 1)]],
-    *[pytest.param(("models", 1, "model_id"), value, id=f"id-{label}") for label, value in
-      [("empty", ""), ("uppercase", "Model"), ("tier", "model[1m]"),
-       ("slash", "anthropic/model"), ("space", "model id"), ("newline", "model\n"),
-       ("start", "_model"), ("long", "m" * 101), ("type", 1)]],
-    *[pytest.param(("models", 1, "context_window"), value, id=f"context-{label}")
-      for label, value in [("low", 8191), ("bool", True), ("float", 8192.0),
-                           ("string", "8192")]],
-    *[pytest.param(("models", 1, "sort_order"), value, id=f"sort-{label}")
-      for label, value in [("low", -1), ("high", 10001), ("bool", True),
-                           ("float", 1.0), ("string", "1")]],
-    *[pytest.param(("models", 1, field), value, id=f"{field}-{label}")
-      for field in ["is_1m", "supports_thinking", "active"]
-      for label, value in [("integer", 0), ("string", "false"), ("null", None)]],
-    *[pytest.param(("models", 1, field), value, id=f"{field}-{label}")
-      for field, maximum in [("display_name", 100), ("description", 500), ("tier", 40)]
-      for label, value in [("long", "x" * (maximum + 1)), ("type", 1)]],
+    *[
+        pytest.param(("revision",), value, id=f"revision-{label}")
+        for label, value in [
+            ("zero", 0),
+            ("negative", -1),
+            ("bool", True),
+            ("float", 1.0),
+            ("string", "1"),
+            ("null", None),
+        ]
+    ],
+    *[
+        pytest.param(("updated",), value, id=f"updated-{label}")
+        for label, value in [
+            ("calendar", "2026-02-29"),
+            ("datetime", "2026-10-04T00:00:00Z"),
+            ("basic", "20261004"),
+            ("nonpadded", "2026-1-4"),
+            ("null", None),
+        ]
+    ],
+    *[
+        pytest.param(("models", 1, "provider"), value, id=f"provider-{label}")
+        for label, value in [("unknown", "other"), ("case", "Anthropic"), ("type", 1)]
+    ],
+    *[
+        pytest.param(("models", 1, "model_id"), value, id=f"id-{label}")
+        for label, value in [
+            ("empty", ""),
+            ("uppercase", "Model"),
+            ("tier", "model[1m]"),
+            ("slash", "anthropic/model"),
+            ("space", "model id"),
+            ("newline", "model\n"),
+            ("start", "_model"),
+            ("long", "m" * 101),
+            ("type", 1),
+        ]
+    ],
+    *[
+        pytest.param(("models", 1, "context_window"), value, id=f"context-{label}")
+        for label, value in [("low", 8191), ("bool", True), ("float", 8192.0), ("string", "8192")]
+    ],
+    *[
+        pytest.param(("models", 1, "sort_order"), value, id=f"sort-{label}")
+        for label, value in [
+            ("low", -1),
+            ("high", 10001),
+            ("bool", True),
+            ("float", 1.0),
+            ("string", "1"),
+        ]
+    ],
+    *[
+        pytest.param(("models", 1, field), value, id=f"{field}-{label}")
+        for field in ["is_1m", "supports_thinking", "active"]
+        for label, value in [("integer", 0), ("string", "false"), ("null", None)]
+    ],
+    *[
+        pytest.param(("models", 1, field), value, id=f"{field}-{label}")
+        for field, maximum in [("display_name", 100), ("description", 500), ("tier", 40)]
+        for label, value in [("long", "x" * (maximum + 1)), ("type", 1)]
+    ],
     pytest.param(("models", 1, "display_name"), "", id="display-empty"),
     pytest.param(("models",), {}, id="models-not-array"),
     pytest.param(("models", 1), [], id="row-not-object"),
@@ -298,19 +422,23 @@ def test_invalid_field_rejects_whole_document(path, value):
 
 
 @pytest.mark.parametrize("field", PRICE_FIELDS)
-@pytest.mark.parametrize("value", [True, "1", None, -0.001, 1000.001,
-                                  float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "value", [True, "1", None, -0.001, 1000.001, float("nan"), float("inf"), float("-inf")]
+)
 def test_invalid_price_rejects_whole_document(field, value):
     document = _document()
     document["models"][1]["pricing"][field] = value
     _assert_rejected(_bytes(document))
 
 
-@pytest.mark.parametrize("level,key", [
-    *[((), key) for key in ("schema", "revision", "updated", "models")],
-    *[(("models", 1), key) for key in ROW_FIELDS],
-    *[(("models", 1, "pricing"), key) for key in PRICE_FIELDS],
-])
+@pytest.mark.parametrize(
+    "level,key",
+    [
+        *[((), key) for key in ("schema", "revision", "updated", "models")],
+        *[(("models", 1), key) for key in ROW_FIELDS],
+        *[(("models", 1, "pricing"), key) for key in PRICE_FIELDS],
+    ],
+)
 def test_missing_required_key_rejects_whole_document(level, key):
     document = _document()
     target = document
@@ -373,12 +501,16 @@ def test_empty_model_roster_is_rejected():
     _assert_rejected(_bytes(_document(0)))
 
 
-@pytest.mark.parametrize("original,duplicate", [
-    pytest.param(b'"revision":1', b'"revision":1,"revision":2', id="document"),
-    pytest.param(b'"display_name":"Model"',
-                 b'"display_name":"Before","display_name":"After"', id="model"),
-    pytest.param(b'"input":0', b'"input":999,"input":1', id="pricing"),
-])
+@pytest.mark.parametrize(
+    "original,duplicate",
+    [
+        pytest.param(b'"revision":1', b'"revision":1,"revision":2', id="document"),
+        pytest.param(
+            b'"display_name":"Model"', b'"display_name":"Before","display_name":"After"', id="model"
+        ),
+        pytest.param(b'"input":0', b'"input":999,"input":1', id="pricing"),
+    ],
+)
 def test_duplicate_json_key_is_rejected_at_every_level(original, duplicate):
     loader = _loader()
     blob = _bytes(_document())
@@ -408,8 +540,9 @@ def test_exact_document_byte_limit_is_accepted():
     assert len(roster.models) == 2
 
 
-@pytest.mark.parametrize("context,is_1m", [(8192, False), (999999, False),
-                                          (1000000, True), (10000000, True)])
+@pytest.mark.parametrize(
+    "context,is_1m", [(8192, False), (999999, False), (1000000, True), (10000000, True)]
+)
 def test_valid_context_boundaries_are_accepted(context, is_1m):
     document = _document()
     document["models"][1].update(context_window=context, is_1m=is_1m)
@@ -430,9 +563,14 @@ def test_string_and_sort_boundaries_are_accepted():
     document = _document()
     document["updated"] = "2024-02-29"
     document["models"][1].update(
-        provider="openai", model_id="m" * 100, display_name="界" * 100,
-        description="界" * 500, tier="界" * 40, sort_order=10000,
-        supports_thinking=True, active=False,
+        provider="openai",
+        model_id="m" * 100,
+        display_name="界" * 100,
+        description="界" * 500,
+        tier="界" * 40,
+        sort_order=10000,
+        supports_thinking=True,
+        active=False,
     )
     roster = _loader().parse(_bytes(document))
     assert json.loads(json.dumps(dataclasses.asdict(roster))) == document
@@ -449,18 +587,29 @@ def test_schema_is_draft_2020_12_and_accepts_revision_one():
     )
 
 
-@pytest.mark.parametrize("path,value", [
-    (("schema",), "unknown"), (("revision",), 0), (("updated",), "2026-02-29"),
-    (("models", 1, "provider"), "other"), (("models", 1, "model_id"), "model[1m]"),
-    (("models", 1, "context_window"), 8191), (("models", 1, "is_1m"), True),
-    (("models", 1, "pricing", "input"), True), (("models", 1, "pricing", "output"), -1),
-    (("models", 1, "pricing", "cached_input"), 1001),
-    (("models", 1, "pricing", "cache_write_5m"), "1"),
-    (("models", 1, "pricing", "cache_write_1h"), None),
-    (("models", 1, "display_name"), ""), (("models", 1, "description"), "x" * 501),
-    (("models", 1, "tier"), "x" * 41), (("models", 1, "sort_order"), 10001),
-    (("models", 1, "supports_thinking"), 1), (("models", 1, "active"), 1),
-])
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        (("schema",), "unknown"),
+        (("revision",), 0),
+        (("updated",), "2026-02-29"),
+        (("models", 1, "provider"), "other"),
+        (("models", 1, "model_id"), "model[1m]"),
+        (("models", 1, "context_window"), 8191),
+        (("models", 1, "is_1m"), True),
+        (("models", 1, "pricing", "input"), True),
+        (("models", 1, "pricing", "output"), -1),
+        (("models", 1, "pricing", "cached_input"), 1001),
+        (("models", 1, "pricing", "cache_write_5m"), "1"),
+        (("models", 1, "pricing", "cache_write_1h"), None),
+        (("models", 1, "display_name"), ""),
+        (("models", 1, "description"), "x" * 501),
+        (("models", 1, "tier"), "x" * 41),
+        (("models", 1, "sort_order"), 10001),
+        (("models", 1, "supports_thinking"), 1),
+        (("models", 1, "active"), 1),
+    ],
+)
 def test_schema_rejects_representable_field_violations(path, value):
     from jsonschema import Draft202012Validator
 
