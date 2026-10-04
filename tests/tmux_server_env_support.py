@@ -42,7 +42,8 @@ def owner(kind, root, *, agent="test-agent", registry=None):
         with patch.object(CodexAppServerSupervisor, "_resolve_sock_dir",
                           return_value=(str(root / "app-server"), False)):
             return CodexAppServerSupervisor(agent, working_dir=str(root), registry=registry)
-    return TmuxDreamRunner(TmuxDreamConfig(working_dir=str(root)), agent_name=agent)
+    return TmuxDreamRunner(TmuxDreamConfig(working_dir=str(root)), agent_name=agent,
+                           setting_provider=getattr(registry, "get_setting", None))
 
 
 def control(owner):

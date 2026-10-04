@@ -15,13 +15,46 @@ from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.dream_runner import DreamRunner
 from pinky_daemon.isolated_launch_env import LaunchEnvError
 from pinky_daemon.tmux_dream_runner import TmuxDreamRunner
-from tests.test_tmux_legacy_socket_reap import Registry
+from tests.test_tmux_legacy_socket_reap import Registry, launch_probe
 from tests.tmux_isolated_env_support import LaunchProbe
-from tests.tmux_server_env_support import CANARY, no_values, seed
+from tests.tmux_server_env_support import CANARY, FAMILIES, no_values, seed
 from tests.tmux_socket_support import private_labels
 
 pytestmark = pytest.mark.legacy_tmux_reap
 REFUSAL = "legacy tmux cleanup has not completed; start the daemon once"
+
+
+@pytest.mark.parametrize("kind", FAMILIES)
+async def test_marker_is_checked_at_each_launch_without_opening_process_gate(tmp_path, monkeypatch, kind):
+    seed(monkeypatch, tmp_path)
+    registry = Registry(tmp_path / "settings.sqlite")
+    try:
+        launch = launch_probe(kind, tmp_path, monkeypatch, registry)
+        await launch(allowed=False)
+        registry.set_setting(tmux_session._LEGACY_TMUX_COMPLETE, "1")
+        await launch(allowed=True)
+        assert tmux_session._LEGACY_TMUX_BLOCK_ALL
+        registry.set_setting(tmux_session._LEGACY_TMUX_COMPLETE, "")
+        await launch(allowed=False)
+    finally:
+        registry.db.close()
+
+
+@pytest.mark.parametrize("kind", FAMILIES)
+async def test_no_settings_provider_refuses_managed_launch(tmp_path, monkeypatch, kind):
+    seed(monkeypatch, tmp_path)
+    launch = launch_probe(kind, tmp_path, monkeypatch, None)
+    await launch(allowed=False)
+
+
+@pytest.mark.parametrize("kind", FAMILIES)
+@pytest.mark.parametrize("compat", [False, True])
+async def test_compatibility_gate_uses_captured_launch_route(tmp_path, monkeypatch, kind, compat):
+    seed(monkeypatch, tmp_path)
+    monkeypatch.setenv("PINKY_TMUX_SOCKET", "" if compat else "test-managed")
+    launch = launch_probe(kind, tmp_path, monkeypatch, None)
+    monkeypatch.setenv("PINKY_TMUX_SOCKET", "test-later" if compat else "")
+    await launch(allowed=compat)
 
 
 @pytest.mark.parametrize("transport_source", ["environment", "settings"])

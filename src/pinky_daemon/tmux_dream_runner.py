@@ -23,11 +23,13 @@ import shlex
 import shutil
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from pinky_daemon.claude_runner import RunResult
+from pinky_daemon.isolated_launch_env import LaunchEnvError
 
 # Reuse the rails' first-run gate pre-seed (#112): without it a fresh
 # project dir wedges the REPL at the trust dialog / bypass-permissions
@@ -121,9 +123,11 @@ class TmuxDreamRunner:
     dream_runner can swap transports behind a flag.
     """
 
-    def __init__(self, config: TmuxDreamConfig | None = None, *, agent_name: str = "") -> None:
+    def __init__(self, config: TmuxDreamConfig | None = None, *, agent_name: str = "",
+                 setting_provider: Callable[[str], str] | None = None) -> None:
         self._config = config or TmuxDreamConfig()
         self._agent_name = agent_name or "agent"
+        self._setting_provider = setting_provider
         self._control = production_tmux_control(self.session_name)
 
     @property
@@ -172,9 +176,11 @@ class TmuxDreamRunner:
     async def run(self, prompt: str, *, system_prompt: str = "") -> RunResult:
         start = time.time()
         try:
-            require_legacy_tmux_reaped(self._agent_name)
-        except PermissionError:
-            return RunResult(output="", exit_code=1, error="legacy tmux cleanup has not completed", duration_ms=0)
+            require_legacy_tmux_reaped(self._agent_name,
+                setting_provider=self._setting_provider,
+                server_config=self._control.server_config)
+        except LaunchEnvError as exc:
+            return RunResult(output="", exit_code=1, error=str(exc), duration_ms=0)
         work_dir = Path(self._config.working_dir).resolve()
         dreams_dir = work_dir / "dreams"
         dreams_dir.mkdir(parents=True, exist_ok=True)

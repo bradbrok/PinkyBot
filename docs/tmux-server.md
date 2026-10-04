@@ -6,6 +6,9 @@ to list them and `tmux -L pinkybot attach -t <session>` to attach. Set
 server. On the first start after upgrading, the daemon closes its exact registered
 `pinky-*` sessions on the shared server once and relaunches active agents on the
 dedicated server. Other sessions and preserved login sessions are left alone.
+Managed launches, including standalone dreams, require that startup pass or its
+durable completion marker. Start the daemon once before using standalone tmux
+entries after upgrading; standalone entries never perform the migration.
 
 `PINKY_TMUX_PANE_PATH` overrides the pane PATH with an ordered, colon-separated
 list of absolute directories. Otherwise the daemon PATH is extended with standard

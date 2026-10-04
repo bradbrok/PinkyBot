@@ -162,7 +162,7 @@ class SpawnReachedError(RuntimeError):
     pass
 
 
-REFUSAL = "legacy tmux cleanup has not completed"
+REFUSAL = "legacy tmux cleanup has not completed; start the daemon once"
 
 
 def launch_probe(kind, root, monkeypatch, registry, *, agent="test-agent"):
@@ -181,9 +181,9 @@ def launch_probe(kind, root, monkeypatch, registry, *, agent="test-agent"):
     if kind == "dream":
         from pinky_daemon import tmux_dream_runner
 
-        def check(name):
+        def check(name, **kwargs):
             try:
-                tmux_session.require_legacy_tmux_reaped(name)
+                tmux_session.require_legacy_tmux_reaped(name, **kwargs)
             except LaunchEnvError as exc:
                 gate_errors.append(exc)
                 raise
@@ -213,11 +213,13 @@ def launch_probe(kind, root, monkeypatch, registry, *, agent="test-agent"):
 
     async def assert_launch(*, allowed):
         before = len(attempted)
+        gate_options = {"setting_provider": getattr(registry, "get_setting", None),
+                        "server_config": ctrl.server_config}
         if allowed:
-            tmux_session.require_legacy_tmux_reaped(agent)
+            tmux_session.require_legacy_tmux_reaped(agent, **gate_options)
         else:
             with pytest.raises(LaunchEnvError, match="^" + REFUSAL + "$"):
-                tmux_session.require_legacy_tmux_reaped(agent)
+                tmux_session.require_legacy_tmux_reaped(agent, **gate_options)
         if kind == "dream":
             result = await obj.run("synthetic prompt")
             assert not result.ok

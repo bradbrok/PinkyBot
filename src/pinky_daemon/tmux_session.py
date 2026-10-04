@@ -1226,24 +1226,38 @@ def production_tmux_control(
 
 _LEGACY_TMUX_COMPLETE = "tmux_dedicated_server_migration_complete"
 _LEGACY_TMUX_BLOCKED: set[str] = set()
-_LEGACY_TMUX_BLOCK_ALL = False
+_LEGACY_TMUX_BLOCK_ALL = True
+_LEGACY_TMUX_REFUSAL = "legacy tmux cleanup has not completed; start the daemon once"
 
 
-def require_legacy_tmux_reaped(agent_name):
-    if _LEGACY_TMUX_BLOCK_ALL or agent_name in _LEGACY_TMUX_BLOCKED:
-        raise isolated_launch_env.LaunchEnvError("legacy tmux cleanup has not completed")
+def require_legacy_tmux_reaped(agent_name, *, setting_provider=None, server_config=None):
+    label = (server_config.label if isinstance(server_config, tmux_server_env.ServerConfig)
+             else os.environ.get("PINKY_TMUX_SOCKET", "pinkybot") or "default")
+    if label == "default":
+        return
+    if agent_name not in _LEGACY_TMUX_BLOCKED:
+        if not _LEGACY_TMUX_BLOCK_ALL:
+            return
+        try:
+            if setting_provider is not None and setting_provider(_LEGACY_TMUX_COMPLETE):
+                return
+        except Exception:
+            # A settings failure can contain private values; refuse silently.
+            pass
+    raise isolated_launch_env.LaunchEnvError(_LEGACY_TMUX_REFUSAL)
 
 
 async def reap_legacy_tmux_sessions(registry, *, log=_log):
     """One startup pass over exact registered names on the pinned old route."""
+    global _LEGACY_TMUX_BLOCK_ALL
+    _LEGACY_TMUX_BLOCK_ALL = True
+
     from types import SimpleNamespace
 
     from pinky_daemon.codex_app_server_tmux import CodexAppServerSupervisor
     from pinky_daemon.codex_tmux_session import CodexTmuxSession
     from pinky_daemon.tmux_dream_runner import TmuxDreamRunner
 
-    global _LEGACY_TMUX_BLOCK_ALL
-    _LEGACY_TMUX_BLOCK_ALL = True
     config = tmux_server_env.ServerConfig.capture()
     if config.label == "default" or registry.get_setting(_LEGACY_TMUX_COMPLETE):
         _LEGACY_TMUX_BLOCK_ALL = False
@@ -4212,7 +4226,9 @@ class TmuxSession(TransportReplacementMixin):
         """
         self._check_startup_owner()
         cwd = self._config.working_dir or "."
-        require_legacy_tmux_reaped(self.agent_name)
+        require_legacy_tmux_reaped(self.agent_name,
+            setting_provider=getattr(self._registry, "get_setting", None),
+            server_config=getattr(self._tmux, "server_config", None))
         # Ensure cwd exists — claude --continue needs it.
         Path(cwd).mkdir(parents=True, exist_ok=True)
 

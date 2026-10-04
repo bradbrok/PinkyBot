@@ -173,7 +173,9 @@ class CodexAppServerSupervisor:
         timeout. The caller (CodexSession) performs the single ``initialize``."""
         self._kill_requested = False
         launch_policy = self._launch_env_policy()
-        require_legacy_tmux_reaped(self.agent_name)
+        require_legacy_tmux_reaped(self.agent_name,
+            setting_provider=getattr(self._registry, "get_setting", None),
+            server_config=getattr(self._tmux, "server_config", None))
         if per_agent_codex_home_enabled():
             if self._agent_config is None:
                 raise RuntimeError(
