@@ -57,6 +57,21 @@ async def test_compatibility_gate_uses_captured_launch_route(tmp_path, monkeypat
     await launch(allowed=compat)
 
 
+@pytest.mark.parametrize("kind", FAMILIES)
+async def test_compatibility_reap_skip_does_not_open_later_managed_launch(tmp_path, monkeypatch, kind):
+    seed(monkeypatch, tmp_path)
+    registry = Registry(tmp_path / "settings.sqlite")
+    try:
+        monkeypatch.setenv("PINKY_TMUX_SOCKET", "")
+        assert await tmux_session.reap_legacy_tmux_sessions(registry, log=lambda _: None) == set()
+        assert not registry.writes
+        monkeypatch.setenv("PINKY_TMUX_SOCKET", "test-managed")
+        launch = launch_probe(kind, tmp_path, monkeypatch, registry)
+        await launch(allowed=False)
+    finally:
+        registry.db.close()
+
+
 @pytest.mark.parametrize("transport_source", ["environment", "settings"])
 @pytest.mark.parametrize("state", ["unmigrated", "marker", "compat", "read_error"])
 async def test_public_standalone_dream_observes_gate(tmp_path, monkeypatch, transport_source, state):
