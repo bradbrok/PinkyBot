@@ -707,6 +707,7 @@ class _TmuxControl:
         socket_path: str = "",
         command_runner: CommandRunner | None = None,
         server_config: tmux_server_env.ServerConfig | None = None,
+        cleanup_only: bool = False,
     ) -> None:
         self.session_name = session_name
         self.tmux_binary = tmux_binary
@@ -718,6 +719,7 @@ class _TmuxControl:
         # target a different server. Ordinary controls leave this empty.
         self.socket_path = socket_path
         self.server_config = server_config
+        self.cleanup_only = cleanup_only
         # #149 phase-3 execution seam: who runs the tmux subprocess. Default
         # LocalCommandRunner reproduces the prior inline create_subprocess_exec
         # verbatim (daemon's own user). An isolation_mode='unix_user' tenant is
@@ -898,6 +900,8 @@ class _TmuxControl:
         codex_headers: bool = False,
     ) -> TmuxCommandResult:
         """Spawn using isolated Python to consume private JSON before shell exec."""
+        if self.cleanup_only:
+            raise isolated_launch_env.LaunchEnvError("cleanup-only tmux control cannot launch")
         if self.server_config is not None and type(self._runner) is LocalCommandRunner:
             await self.server_config.verify(self, clean=inherit == "none", log=_log)
         env = env or {}
@@ -1213,7 +1217,7 @@ def production_tmux_control(
             server_config = tmux_server_env.ServerConfig.capture(label=socket_name)
     return control_type(session_name, tmux_binary=tmux_binary,
                         socket_name=server_config.label, socket_path=socket_path,
-                        command_runner=command_runner, server_config=server_config)
+                        command_runner=command_runner, server_config=server_config, cleanup_only=cleanup)
 
 
 _LEGACY_TMUX_COMPLETE = "tmux_dedicated_server_migration_complete"
@@ -1253,7 +1257,7 @@ async def reap_legacy_tmux_sessions(registry, *, log=_log):
             TmuxDreamRunner.session_name.fget(identity),
         )
         for name in names:
-            control = production_tmux_control(name, server_config=legacy)
+            control = production_tmux_control(name, server_config=legacy, cleanup=True)
             try:
                 if not await control.has_session():
                     continue

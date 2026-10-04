@@ -127,8 +127,13 @@ class LocalCommandRunner(CommandRunner):
                 async def discard(stream):
                     while await stream.read(8192):
                         pass
-                await asyncio.gather(discard(proc.stdout), discard(proc.stderr))
-            await proc.wait()
+                try:
+                    await asyncio.wait_for(asyncio.gather(discard(proc.stdout), discard(proc.stderr)), 1.0)
+                except TimeoutError:
+                    # A descendant may retain a pipe after the client dies.
+                    # Close our transports rather than extend the read deadline.
+                    proc._transport.close()
+                await asyncio.wait_for(proc.wait(), 1.0)
             raise
         return CommandResult(
             returncode=proc.returncode or 0,

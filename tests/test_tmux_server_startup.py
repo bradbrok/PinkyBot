@@ -2,11 +2,14 @@
 
 import asyncio
 import sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from pinky_daemon import tmux_session
 from pinky_daemon.command_runner import CommandResult, LocalCommandRunner
+from pinky_daemon.isolated_launch_env import LaunchEnvError
 from tests.test_tmux_legacy_socket_reap import Registry
 from tests.tmux_server_env_support import seed
 
@@ -67,6 +70,16 @@ async def test_cleanup_keeps_base_path_and_recorded_socket_despite_new_config(tm
     assert seen["env"]["TMUX_TMPDIR"] == str(tmp_path)
 
 
+async def test_recorded_cleanup_control_cannot_start_old_server(tmp_path, monkeypatch):
+    seed(monkeypatch, tmp_path)
+    calls = AsyncMock(side_effect=AssertionError("cleanup-only control executed a launch"))
+    monkeypatch.setattr(LocalCommandRunner, "run", calls)
+    ctrl = tmux_session.production_tmux_control("pinky-test-agent", socket_path=str(tmp_path / "recorded.sock"), cleanup=True)
+    with pytest.raises(LaunchEnvError, match="cleanup-only"):
+        await ctrl.new_session(cwd=str(tmp_path), command="true", env={})
+    calls.assert_not_awaited()
+
+
 @pytest.mark.parametrize("stream", ["stdout", "stderr"])
 async def test_bounded_client_read_refuses_oversize(stream):
     with pytest.raises(ExceptionGroup):
@@ -78,3 +91,18 @@ async def test_bounded_client_read_has_deadline():
     with pytest.raises(asyncio.TimeoutError):
         await LocalCommandRunner().run([sys.executable, "-I", "-c", "import time;time.sleep(60)"],
                                       max_output_bytes=1024, timeout=0.05)
+
+
+async def test_client_cleanup_is_bounded_when_pipe_stays_open(monkeypatch):
+    async def never_eof(*args):
+        await asyncio.Event().wait()
+
+    pipe = SimpleNamespace(read=never_eof)
+    transport = SimpleNamespace(close=Mock())
+    proc = SimpleNamespace(stdout=pipe, stderr=pipe, kill=Mock(), wait=AsyncMock(return_value=0), _transport=transport)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=proc))
+    with pytest.raises(asyncio.TimeoutError):
+        async with asyncio.timeout(2):
+            await LocalCommandRunner().run(["synthetic-client"], max_output_bytes=1024, timeout=0.01)
+    proc.kill.assert_called_once()
+    transport.close.assert_called_once()
