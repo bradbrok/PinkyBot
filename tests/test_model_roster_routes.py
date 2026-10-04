@@ -246,12 +246,15 @@ def test_verified_key_with_unavailable_caller_fails_closed(apps, monkeypatch, lo
     assert response.status_code == 403 and "caller-private-marker" not in response.text
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["/models/rosterish", "/models/%2572oster", "/models"])
-def test_sibling_and_double_encoded_paths_keep_baseline_access(apps, path):
+async def test_sibling_and_double_encoded_paths_keep_baseline_access(apps, path):
     d = apps(mode="off")
     scope_path = urllib.parse.unquote(path)
-    with client_for(d.app) as client:
-        response = client.get(path, headers=signed(d, "GET", scope_path))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=d.app), base_url="http://testserver",
+    ) as client:
+        response = await client.get(path, headers=signed(d, "GET", scope_path))
     assert response.status_code == (200 if path == "/models" else 404)
 
 

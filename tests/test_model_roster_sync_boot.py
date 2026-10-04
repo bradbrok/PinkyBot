@@ -163,10 +163,11 @@ def test_shutdown_marks_closing_before_its_first_await(boot_run, tmp_path, monke
     close = gate.close
     observed = []
 
-    async def gate_close():
-        observed.append(service.closing)
+    async def gate_close(reason="daemon shutdown"):
+        if reason == "daemon shutdown":
+            observed.append(service.closing)
         assert service.closing, "Closing must precede readiness.close's first suspension"
-        return await close()
+        return await close(reason)
 
     monkeypatch.setattr(gate, "close", gate_close)
     _run_boot(boot_run, tmp_path, monkeypatch, "claude-sdk")
