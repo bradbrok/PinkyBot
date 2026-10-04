@@ -62,3 +62,28 @@ last-applied metadata unchanged; malformed saved data refuses the entire release
 Committed changes invalidate runtime price and 1M snapshots. Analytics reprices
 recorded tokens using current runtime rates; the stored lifetime cost ledger is
 unchanged. Static bundled fallback tables retain their import-time values.
+
+In API mode, remote synchronization uses
+`https://raw.githubusercontent.com/bradbrok/PinkyBot/main/src/pinky_daemon/catalog/models.json`
+by default. Set `PINKY_MODEL_ROSTER_URL` to override it with an HTTPS URL on
+`raw.githubusercontent.com` or `pinkybot.ai`. Configuration is captured when the
+application is constructed. The first remote attempt follows listener readiness
+and startup replay by 60 seconds; subsequent scheduled starts are roughly 24 hours
+apart (23.5 hours plus up to 30 minutes of jitter). Manual requests do not reset
+that schedule. Each API install makes one daily GET to the roster host unless
+`PINKY_MODEL_ROSTER_SYNC=off` is set. This switch disables both scheduled and manual
+fetches; local bundled updates, status, and ownership release remain available.
+
+GET `/models/roster` returns read-only sync status, configured URL, enabled flag,
+and bundled revision. POST `/models/roster/sync` requires an explicit boolean
+`dry_run`; previews change no rows, status, or caches. POST
+`/models/roster/release` requires a full model `id` and managed `fields` list or
+`"all"`, and uses the saved document without fetching. Isolated callers cannot
+access this roster subtree. Existing `/models` operations keep their behavior.
+
+Remote failures retain the last good roster, prices, and ownership. Fetches accept
+only a validated single redirect, HTTP 200, identity encoding, and a bounded body
+of at most 256 KiB. A 10-second async fetch deadline also covers executor wait;
+late results are discarded and another fetch is refused while its worker is
+pending. Cancelling a request or shutting down prevents later registry writes,
+but cannot forcibly terminate an already-running network thread.

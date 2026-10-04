@@ -5493,6 +5493,7 @@ def create_api(
         path = re.sub(r"/+", "/", get_route_path(request.scope))
         admin_action = path == "/admin" or path.startswith("/admin/")
         admin_action = admin_action or (request.method == "POST" and path.rstrip("/") == "/agents")
+        admin_action = admin_action or path == "/models/roster" or path.startswith("/models/roster/")
         if admin_action:
             try:
                 caller = agents.get(caller_name)
@@ -9364,6 +9365,10 @@ npm run build</pre>
     from pinky_daemon.routes.providers import set_dependencies as _providers_set_deps
 
     _providers_set_deps(agents=agents)
+    from pinky_daemon.model_roster_sync import ModelRosterSync
+
+    app.state.model_roster_sync = ModelRosterSync(agents)
+    app.state.model_roster_sync_task = None
     app.include_router(_providers_router)
 
     @app.post("/agents/{name}/claude-md/rebuild")
@@ -13922,6 +13927,12 @@ npm run build</pre>
             finally:
                 initial_replay_done = True
                 if not listener_readiness.closed:
+                    roster_sync = getattr(app.state, "model_roster_sync", None)
+                    if roster_sync is not None and not roster_sync.closing:
+                        try:
+                            app.state.model_roster_sync_task = roster_sync.start()
+                        except Exception:
+                            _log("ERROR model roster: start_failed")
                     app.state.approval_notification_retry_task = (
                         broker.start_approval_notification_retries()
                     )
@@ -14225,8 +14236,17 @@ npm run build</pre>
     @app.on_event("shutdown")
     async def on_shutdown():
         """Stop scheduler, autonomy, broker pollers, and streaming sessions on shutdown."""
+        roster_sync = getattr(app.state, "model_roster_sync", None)
+        if roster_sync is not None:
+            roster_sync.mark_closing()
         if app.state.api_readiness.attached:
             await app.state.api_readiness.close()
+        if roster_sync is not None:
+            await roster_sync.close()
+        roster_task = getattr(app.state, "model_roster_sync_task", None)
+        if roster_task is not None:
+            roster_task.cancel()
+            await asyncio.gather(roster_task, return_exceptions=True)
         import json as _json
         from datetime import datetime, timezone
 

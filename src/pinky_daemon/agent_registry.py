@@ -8683,6 +8683,10 @@ except Exception as exc:
         except Exception as metadata_error:
             _log(f"WARNING model roster: error metadata unavailable: {metadata_error}")
 
+    def record_model_roster_sync_error(self, exc: Exception) -> None:
+        """Delegate a sanitized remote failure to the local metadata recorder."""
+        self._record_model_roster_error(exc)
+
     def get_model_roster_status(self) -> dict:
         """Read the last accepted document's metadata without changing attempt state."""
         with self._rmw_lock:
