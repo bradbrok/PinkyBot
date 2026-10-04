@@ -373,6 +373,27 @@ def test_empty_model_roster_is_rejected():
     _assert_rejected(_bytes(_document(0)))
 
 
+@pytest.mark.parametrize("original,duplicate", [
+    pytest.param(b'"revision":1', b'"revision":1,"revision":2', id="document"),
+    pytest.param(b'"display_name":"Model"',
+                 b'"display_name":"Before","display_name":"After"', id="model"),
+    pytest.param(b'"input":0', b'"input":999,"input":1', id="pricing"),
+])
+def test_duplicate_json_key_is_rejected_at_every_level(original, duplicate):
+    loader = _loader()
+    blob = _bytes(_document())
+    assert loader.parse(blob).models
+    assert original in blob
+    with pytest.raises(ValueError, match="duplicate"):
+        loader.parse(blob.replace(original, duplicate, 1))
+
+
+def test_excessive_json_nesting_raises_value_error():
+    blob = b"[" * 100000 + b"]" * 100000
+    assert len(blob) <= MAX_BYTES
+    _assert_rejected(blob)
+
+
 @pytest.mark.parametrize("count", [1, 500])
 def test_model_count_boundaries_are_accepted(count):
     document = _document(count)
