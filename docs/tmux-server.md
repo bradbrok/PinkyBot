@@ -14,6 +14,11 @@ configuration files. Isolated clean launches refuse a polluted server; other
 launches warn without changing its global environment. The shared-server option
 does not support isolated clean launches.
 
+Local managed launches set pane HOME and PATH from the daemon's constructed
+client environment, including when the server was started by an earlier daemon.
+Warnings report only the unexpected-name count and a command for inspecting the
+server; parsed names can contain fragments of multiline values and are not logged.
+
 Don't start the dedicated server by hand: a server started outside the daemon
 inherits that shell's environment, and isolated launches refuse it until it is
 restarted.

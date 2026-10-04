@@ -902,9 +902,13 @@ class _TmuxControl:
         """Spawn using isolated Python to consume private JSON before shell exec."""
         if self.cleanup_only:
             raise isolated_launch_env.LaunchEnvError("cleanup-only tmux control cannot launch")
+        env = env or {}
         if self.server_config is not None and type(self._runner) is LocalCommandRunner:
             await self.server_config.verify(self, clean=inherit == "none", log=_log)
-        env = env or {}
+            # A retained server can have older base values than the client.
+            # Match the captured HOME used for trust seeding on every launch.
+            env = {**env, "HOME": self.server_config.client_env["HOME"],
+                   "PATH": self.server_config.client_env["PATH"]}
         tmux_launch_env.validate_env(env)
         try:
             tmux_launch_env.validate_inherit(env, inherit)

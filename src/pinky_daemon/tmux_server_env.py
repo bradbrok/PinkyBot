@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import pwd
 import re
@@ -137,14 +136,16 @@ class ServerConfig:
         if foreign:
             if clean:
                 raise LaunchEnvError("tmux server environment refused")
-            self._warn(key, "tmux server environment names", tuple(sorted(foreign)), log)
+            self._warn(key, "tmux server environment", tuple(sorted(foreign)), log)
 
-    @staticmethod
-    def _warn(key, reason, names, log):
+    def _warn(self, key, reason, names, log):
         identity = (key, reason, names)
         if identity not in _WARNED:
             _WARNED.add(identity)
-            log("WARNING " + reason + (": " + json.dumps(names) if names else ""))
+            # Parsed names can be fragments of multiline values. Retain them
+            # only for deduplication; diagnostics expose the count and route.
+            log(f"WARNING {reason}: unexpected names: {len(names)}; "
+                f"inspect with tmux -L {self.label} show-environment -g")
 
 
 def normalize_codex_path(env, control):
