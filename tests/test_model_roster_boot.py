@@ -231,8 +231,11 @@ finally:
 
 
 def test_poll_mode_constructor_uses_the_same_local_bundle(tmp_path, monkeypatch):
+    from pinky_daemon import claude_runner
     from pinky_daemon.daemon import Daemon, DaemonConfig
 
+    # The runner only records the binary path here; CI hosts have no Claude CLI.
+    monkeypatch.setattr(claude_runner, "_find_claude_binary", lambda: "/usr/bin/claude")
     calls = []
 
     def apply_spy(self, blob, *, source, dry_run=False):
