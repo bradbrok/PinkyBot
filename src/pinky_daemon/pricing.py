@@ -38,7 +38,7 @@ from pinky_daemon.runtime_model_catalog import (
 
 _M = 1_000_000
 
-# Historical identifiers absent from the bundled catalog have a separate owner.
+# Preserve historical pricing for identifiers absent from the bundled catalog.
 _LEGACY_RATES = {
     "claude-haiku-3-5": {
         "input": 0.80, "output": 4.00, "cache_read": 0.08,

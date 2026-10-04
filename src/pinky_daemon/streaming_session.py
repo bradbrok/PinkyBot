@@ -41,10 +41,8 @@ from pinky_daemon.wake_prompt import (
     wake_reason_from_runtime,
 )
 
-# Models with native 1M context (SDK reports 200k incorrectly).
-# INVARIANT: must contain every model the registry flags is_1m=1
-# (agent_registry._MODEL_SEEDS) — pinned by
-# test_1m_models_set_matches_registry_is_1m so this can't drift again (#839).
+# Native 1M-context fallback derived from the shipped catalog.
+# Used when no runtime model catalog is bound; the registry derives the same flags.
 _1M_MODELS = {row.model_id for row in load_bundled().models if row.is_1m}
 
 

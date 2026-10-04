@@ -88,14 +88,25 @@ def _price(value: object, path: str) -> float:
     return value
 
 
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
+
+
 def parse(blob: bytes) -> Roster:
     """Validate the whole document or raise ValueError without returning partial rows."""
     if not isinstance(blob, bytes) or len(blob) > MAX_BYTES:
         raise ValueError(f"roster must be UTF-8 bytes, at most {MAX_BYTES} bytes")
     try:
-        document = json.loads(blob.decode("utf-8"))
+        document = json.loads(blob.decode("utf-8"), object_pairs_hook=_unique_object)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("roster must be a valid UTF-8 JSON document") from exc
+    except RecursionError as exc:
+        raise ValueError("roster JSON nesting exceeds the parser limit") from exc
     document = _object(document, _DOCUMENT_FIELDS, "roster")
     if document["schema"] != SCHEMA:
         raise ValueError(f"roster.schema must be {SCHEMA!r}")
