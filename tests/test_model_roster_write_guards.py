@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import json
+import sqlite3
+from contextlib import closing
+
 import pytest
 
 from pinky_daemon import runtime_model_catalog
 from pinky_daemon.agent_registry import AgentRegistry
 from tests._model_roster_local import (
     DOCUMENT_KEY,
+    FIELDS,
     SONNET,
     add,
     document,
+    flat,
+    legacy_db,
     model_row,
     new_model,
     owned,
@@ -155,3 +162,51 @@ def test_frozen_correction_only_targets_exact_baseline_row(registry):
     assert [row for row in snapshot(registry)["models"] if row[id_index] != SONNET] == [
         row for row in before if row[id_index] != SONNET
     ]
+
+
+def test_constructor_corrects_only_baseline_after_lower_rowid_custom_alias(tmp_path):
+    path = legacy_db(tmp_path / "agents.db")
+    baseline = model_row(document())
+    stale_prices = {
+        "input_price": 3.0,
+        "output_price": 15.0,
+        "cached_input_price": 0.3,
+        "cache_write_5m_price": 3.75,
+        "cache_write_1h_price": 6.0,
+    }
+    custom = new_model(SONNET)
+    custom_id = f"openai/{SONNET}"
+    with closing(sqlite3.connect(path)) as connection, connection:
+        connection.execute("ALTER TABLE models ADD COLUMN operator_fields TEXT NOT NULL DEFAULT '[]'")
+        connection.execute("ALTER TABLE models ADD COLUMN roster_revision INTEGER")
+        connection.execute("DELETE FROM models")
+        # Insert the custom alias first, as on a store predating the baseline model.
+        for row, fields in ((custom, FIELDS), (baseline, set())):
+            values = {
+                **flat(row), **stale_prices,
+                "id": f"{row['provider']}/{row['model_id']}",
+                "provider": row["provider"], "model_id": row["model_id"],
+                "created_at": 11.0, "updated_at": 12.0,
+                "operator_fields": json.dumps(sorted(fields)), "roster_revision": None,
+            }
+            columns = list(values)
+            connection.execute(
+                f"INSERT INTO models ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                tuple(values[column] for column in columns),
+            )
+        rowids = dict(connection.execute("SELECT id, rowid FROM models"))
+        assert rowids[custom_id] < rowids[SONNET]
+        before = connection.execute("SELECT * FROM models WHERE id=?", (custom_id,)).fetchone()
+    instance = AgentRegistry(db_path=str(path))
+    try:
+        assert instance._db.execute(
+            "SELECT * FROM models WHERE id=?", (custom_id,)
+        ).fetchone() == before
+        cursor = instance._db.execute("SELECT * FROM models WHERE id=?", (SONNET,))
+        actual = dict(zip((entry[0] for entry in cursor.description), cursor.fetchone()))
+        expected = flat(baseline)
+        assert {field: actual[field] for field in stale_prices} == {
+            field: expected[field] for field in stale_prices
+        }
+    finally:
+        instance.close()
