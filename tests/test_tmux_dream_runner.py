@@ -426,9 +426,9 @@ class TestTmuxDreamRunner:
         captured = {}
         orig_init = dr_mod.TmuxDreamRunner.__init__
 
-        def spy_init(self, config=None, *, agent_name=""):
+        def spy_init(self, config=None, *, agent_name="", setting_provider=None):
             captured["allowed"] = list(config.allowed_tools)
-            orig_init(self, config, agent_name=agent_name)
+            orig_init(self, config, agent_name=agent_name, setting_provider=setting_provider)
 
         monkeypatch.setattr(dr_mod.TmuxDreamRunner, "__init__", spy_init)
         monkeypatch.setenv("PINKY_DREAM_TRANSPORT", "tmux")

@@ -449,7 +449,7 @@ class HostPinky:
         )
 
         try:
-            await self._broker.dispatch_pre_authorized(agent_name, broker_msg)
+            accepted = await self._broker.dispatch_pre_authorized(agent_name, broker_msg)
         except Exception as e:
             _log(
                 f"broker.dispatch_pre_authorized failed for ferry envelope "
@@ -458,6 +458,10 @@ class HostPinky:
             # Operational failure, not a policy denial -- the broker should
             # replay rather than terminally drop an ACL-allowed message.
             return self._transient("broker_error", str(e))
+
+        if accepted is False:
+            _log(f"ERROR ferry: streaming send refused for envelope {envelope.id}; not delivered")
+            return self._transient("broker_unavailable", "streaming handoff refused; retry later")
 
         self._stats["delivered"] += 1
         self._stats["messages_routed"] += 1

@@ -242,6 +242,7 @@ class AnalyticsStore:
             self._migrate_opus_haiku_seed_pricing(conn)
             self._migrate_legacy_dotted_model_ids(conn)
             self._ensure_pricing_rows(conn)
+            self._ensure_sonnet_5_seed_pricing(conn)
             self._migrate_codex_provider_attribution(conn)
             # Schema migration: add user_message_snippet to turn_usage
             cols = {
@@ -485,6 +486,21 @@ class AnalyticsStore:
                 """,
                 (*row, row[0], row[1]),
             )
+
+    def _ensure_sonnet_5_seed_pricing(self, conn) -> None:
+        """Correct the stale current seed without changing historical or custom rows."""
+        rate = RATE_TABLE["claude-sonnet-5"]
+        conn.execute(
+            """UPDATE analytics_model_pricing
+               SET input_usd_per_mtok=?, output_usd_per_mtok=?, cached_input_usd_per_mtok=?
+               WHERE provider='anthropic' AND model='claude-sonnet-5'
+                 AND notes='seed' AND effective_from='2020-01-01T00:00:00Z'
+                 AND effective_to IS NULL
+                 AND input_usd_per_mtok=3.0 AND output_usd_per_mtok=15.0
+                 AND cached_input_usd_per_mtok=0.3""",
+            (rate["input"], rate["output"], rate["cache_read"]),
+        )
+        self._pricing_cache = None
 
     def _migrate_codex_provider_attribution(self, conn) -> None:
         """Reattribute + reprice codex turns mislogged as ``anthropic`` (#860).

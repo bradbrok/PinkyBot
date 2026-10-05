@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pinkybot.ai/schemas/model-roster-1.json",
+  "title": "Model roster version 1",
+  "$comment": "Python model_roster.parse is authoritative. Document byte size (256 KiB), model count (1..500), global model_id uniqueness, exact integer types, and finite prices are parser checks. The schema describes structural constraints; date validation requires format assertions.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "revision",
+    "updated",
+    "models"
+  ],
+  "properties": {
+    "schema": {
+      "const": "pinky-model-roster/1"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Python requires an integer value and rejects booleans and float values such as 1.0."
+    },
+    "updated": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "format": "date"
+    },
+    "models": {
+      "type": "array",
+      "description": "The Python parser requires 1..500 rows with globally unique bare model_id values.",
+      "items": {
+        "$ref": "#/$defs/model"
+      }
+    }
+  },
+  "$defs": {
+    "price": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1000
+    },
+    "pricing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input",
+        "output",
+        "cached_input",
+        "cache_write_5m",
+        "cache_write_1h"
+      ],
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/price"
+        },
+        "output": {
+          "$ref": "#/$defs/price"
+        },
+        "cached_input": {
+          "$ref": "#/$defs/price"
+        },
+        "cache_write_5m": {
+          "$ref": "#/$defs/price"
+        },
+        "cache_write_1h": {
+          "$ref": "#/$defs/price"
+        }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "model_id",
+        "display_name",
+        "description",
+        "tier",
+        "context_window",
+        "is_1m",
+        "pricing",
+        "supports_thinking",
+        "active",
+        "sort_order"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": [
+            "anthropic",
+            "openai"
+          ]
+        },
+        "model_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._:-]{0,99}$",
+          "not": {
+            "pattern": "[\\r\\n]"
+          }
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "tier": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "context_window": {
+          "type": "integer",
+          "minimum": 8192,
+          "maximum": 10000000
+        },
+        "is_1m": {
+          "type": "boolean"
+        },
+        "pricing": {
+          "$ref": "#/$defs/pricing"
+        },
+        "supports_thinking": {
+          "type": "boolean"
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "sort_order": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "is_1m": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "context_window": {
+                "minimum": 1000000
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "context_window": {
+                "maximum": 999999
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

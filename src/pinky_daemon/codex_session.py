@@ -26,6 +26,12 @@ import time
 from dataclasses import dataclass, field
 
 from pinky_daemon import codex_launch_env, resume_recovery
+from pinky_daemon.api_readiness import (
+    api_allows_submission,
+    defer_wake,
+    render_prompt,
+    wait_for_api,
+)
 from pinky_daemon.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
@@ -477,40 +483,46 @@ class CodexSession(TransportReplacementMixin):
         # only — relying on it here would re-emit a stale manifest on
         # warm Codex resumes. TypeError fallback keeps legacy 1-arg
         # builders working.
-        wake_context_body = self._config.wake_context or ""
-        if self._config.wake_context_builder:
-            try:
-                wake_context_body = self._config.wake_context_builder(
-                    self.agent_name, wake_reason
-                )
-            except TypeError:
-                pass
-            except Exception as e:
-                _log(
-                    f"codex[{self.agent_name}]: wake context rebuild failed: {e} "
-                    "— using stored body"
-                )
-        ctx_block = ""
-        if wake_context_body:
-            ctx_block = f"\n\n── Saved State ──\n{wake_context_body}\n──────────────────"
+        def _build_initial_prompt():
+            wake_context_body = self._config.wake_context or ""
+            if self._config.wake_context_builder:
+                try:
+                    wake_context_body = self._config.wake_context_builder(
+                        self.agent_name, wake_reason
+                    )
+                except TypeError:
+                    pass
+                except Exception as e:
+                    _log(
+                        f"codex[{self.agent_name}]: wake context rebuild failed: {e} "
+                        "— using stored body"
+                    )
+            ctx_block = ""
+            if wake_context_body:
+                ctx_block = f"\n\n── Saved State ──\n{wake_context_body}\n──────────────────"
 
-        tools_hint = (
-            "You have explicit pinky-messaging outreach tools: "
-            "send, thread, react, send_gif, send_voice, send_photo, send_document, send_video, broadcast."
-        )
-        wake_prompt = (
-            f"Session resumed after daemon restart.{ctx_block}\n\n"
-            "Pick up where you left off. Users will message you through Telegram. "
-            "Use send(chat_id, platform, text) for normal responses. "
-            "Use thread(message_id, text) only when you want to quote/thread a specific message. "
-            f"{tools_hint}"
-            if is_resume else
-            f"New session started.{ctx_block}\n\n"
-            "You're connected via Pinky's message broker. Users will message you through Telegram. "
-            "Use send(chat_id, platform, text) for normal responses. "
-            "Use thread(message_id, text) only when you want to quote/thread a specific message. "
-            f"{tools_hint}"
-        )
+            tools_hint = (
+                "You have explicit pinky-messaging outreach tools: "
+                "send, thread, react, send_gif, send_voice, send_photo, send_document, send_video, broadcast."
+            )
+            wake_prompt = (
+                f"Session resumed after daemon restart.{ctx_block}\n\n"
+                "Pick up where you left off. Users will message you through Telegram. "
+                "Use send(chat_id, platform, text) for normal responses. "
+                "Use thread(message_id, text) only when you want to quote/thread a specific message. "
+                f"{tools_hint}"
+                if is_resume else
+                f"New session started.{ctx_block}\n\n"
+                "You're connected via Pinky's message broker. Users will message you through Telegram. "
+                "Use send(chat_id, platform, text) for normal responses. "
+                "Use thread(message_id, text) only when you want to quote/thread a specific message. "
+                f"{tools_hint}"
+            )
+
+            self._record_internal_context_text(wake_prompt)
+            return wake_prompt
+
+        wake_prompt = defer_wake(self._config, _build_initial_prompt)
 
         # #591 P1#2 (Murzik round-2): arm the post-delivery callback
         # BEFORE the put so the worker can fire it after _exec_codex
@@ -529,7 +541,6 @@ class CodexSession(TransportReplacementMixin):
             self._pending_wake_callback = _wake_delivered_cb
 
         # Queue wake prompt (no chat routing — internal)
-        self._record_internal_context_text(wake_prompt)
         await self._message_queue.put((wake_prompt, "", "", ""))
 
     async def send(
@@ -1060,6 +1071,10 @@ class CodexSession(TransportReplacementMixin):
 
         Streams stdout line-by-line for real-time activity tracking.
         """
+        if not await wait_for_api(self._config, "codex-turn"):
+            self._resolve_scheduler_delivery(scheduler_delivery, False)
+            return CodexTurnResult(failed=True, errors=["API listener unavailable"])
+
         if self._use_app_server:
             if scheduler_delivery is None:
                 return await self._exec_codex_app_server(prompt)
@@ -1108,6 +1123,9 @@ class CodexSession(TransportReplacementMixin):
                 )
 
             # Feed prompt via stdin, then close stdin to signal EOF
+            if not api_allows_submission(self._config, "codex-exec"):
+                raise RuntimeError("API listener stopped; exec prompt refused")
+            prompt = render_prompt(prompt)
             proc.stdin.write(prompt.encode())
             await proc.stdin.drain()
             proc.stdin.close()
@@ -1570,6 +1588,9 @@ class CodexSession(TransportReplacementMixin):
                 result.thread_id = thread_id
                 self._pending_resume_handle_update = thread_id
 
+            if not api_allows_submission(self._config, "codex-app-server"):
+                raise RuntimeError("API listener stopped; app-server prompt refused")
+            prompt = render_prompt(prompt)
             turn_params: dict = {
                 "threadId": self.codex_session_id,
                 "input": [{"type": "text", "text": prompt}],

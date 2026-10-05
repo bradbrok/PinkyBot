@@ -1,0 +1,406 @@
+{
+  "schema": "pinky-model-roster/1",
+  "revision": 1,
+  "updated": "2026-10-04",
+  "models": [
+    {
+      "provider": "anthropic",
+      "model_id": "claude-fable-5-1",
+      "display_name": "Claude Fable 5.1",
+      "description": "Anthropic's most capable model (2026-09-01). Extends Fable 5 at the same $10/$50 price with stronger long-horizon agentic coding, multistep research, and document work; cache reads 4× cheaper. 1M context; adaptive thinking always on (use effort to control depth).",
+      "tier": "fable",
+      "context_window": 1000000,
+      "is_1m": true,
+      "pricing": {
+        "input": 10.0,
+        "output": 50.0,
+        "cached_input": 0.25,
+        "cache_write_5m": 12.5,
+        "cache_write_1h": 20.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 1
+    },
+    {
+      "provider": "anthropic",
+      "model_id": "claude-mythos-5-1",
+      "display_name": "Claude Mythos 5.1",
+      "description": "Claude Fable 5.1 capabilities without the safety classifiers. Limited availability via Project Glasswing (approved customers only).",
+      "tier": "fable",
+      "context_window": 1000000,
+      "is_1m": true,
+      "pricing": {
+        "input": 10.0,
+        "output": 50.0,
+        "cached_input": 0.25,
+        "cache_write_5m": 12.5,
+        "cache_write_1h": 20.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 2
+    },
+    {
+      "provider": "anthropic",
+      "model_id": "claude-fable-5",
+      "display_name": "Claude Fable 5",
+      "description": "Anthropic's most capable widely-released model (2026-06-09). Demanding reasoning + long-horizon agentic work. 1M context; adaptive thinking always on (use effort to control depth).",
+      "tier": "fable",
+      "context_window": 1000000,
+      "is_1m": true,
+      "pricing": {
+        "input": 10.0,
+        "output": 50.0,
+        "cached_input": 1.0,
+        "cache_write_5m": 12.5,
+        "cache_write_1h": 20.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 1
+    },
+    {
+      "provider": "anthropic",
+      "model_id": "claude-mythos-5",
+      "display_name": "Claude Mythos 5",
+      "description": "Claude Fable 5 capabilities without the safety classifiers. Limited availability via Project Glasswing (approved customers only).",
+      "tier": "fable",
+      "context_window": 1000000,
+      "is_1m": true,
+      "pricing": {
+        "input": 10.0,
+        "output": 50.0,
+        "cached_input": 1.0,
+        "cache_write_5m": 12.5,
+        "cache_write_1h": 20.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 2
+    },
+    {
+      "provider": "anthropic",
+      "model_id": "claude-opus-5-5",
+      "display_name": "Claude Opus 5.5",
+      "description": "Current Opus (2026-09-22). Built for long-running agentic coding and knowledge work at $4/$20 per MTok with a 5% cache read; 1M context, 128K output; adaptive thinking always on, effort defaults to medium. Knowledge cutoff Jun 2026.",
+      "tier": "opus",
+      "context_window": 1000000,
+      "is_1m": true,
+      "pricing": {
+        "input": 4.0,
+        "output": 20.0,
+        "cached_input": 0.2,
+        "cache_write_5m": 5.0,
+        "cache_write_1h": 8.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 2
+    },
+    {
+      "provider": "anthropic",
+      "model_id": "claude-opus-5",
+      "display_name": "Claude Opus 5",
+      "description": "For complex agentic coding + enterprise work. 1M context; effort defaults high; adaptive thinking. Knowledge cutoff May 2026.",
+      "tier": "opus",
+      "context_window": 1000000,
+      "is_1m": true,
+      "pricing": {
+        "input": 5.0,
+        "output": 25.0,
+        "cached_input": 0.5,
+        "cache_write_5m": 6.25,
+        "cache_write_1h": 10.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 2
+    },
+    {
+      "provider": "anthropic",
+      "model_id": "claude-opus-4-8",
+      "display_name": "Claude Opus 4.8",
+      "description": "Newest Opus (2026-05-28). Sharper judgement, more honest progress reporting, longer independent runs. Effort defaults to high; adaptive thinking triggers only when needed.",
+      "tier": "opus",
+      "context_window": 1000000,
+      "is_1m": true,
+      "pricing": {
+        "input": 5.0,
+        "output": 25.0,
+        "cached_input": 0.5,
+        "cache_write_5m": 6.25,
+        "cache_write_1h": 10.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 3
+    },
+    {
+      "provider": "anthropic",
+      "model_id": "claude-opus-4-7",
+      "display_name": "Claude Opus 4.7",
+      "description": "Stricter instruction-following, xhigh effort, larger vision.",
+      "tier": "opus",
+      "context_window": 1000000,
+      "is_1m": true,
+      "pricing": {
+        "input": 5.0,
+        "output": 25.0,
+        "cached_input": 0.5,
+        "cache_write_5m": 6.25,
+        "cache_write_1h": 10.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 5
+    },
+    {
+      "provider": "anthropic",
+      "model_id": "claude-opus-4-6",
+      "display_name": "Claude Opus 4.6",
+      "description": "Maximum intelligence. Deep reasoning.",
+      "tier": "opus",
+      "context_window": 1000000,
+      "is_1m": true,
+      "pricing": {
+        "input": 5.0,
+        "output": 25.0,
+        "cached_input": 0.5,
+        "cache_write_5m": 6.25,
+        "cache_write_1h": 10.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 10
+    },
+    {
+      "provider": "anthropic",
+      "model_id": "claude-sonnet-5-5",
+      "display_name": "Claude Sonnet 5.5",
+      "description": "Current Sonnet. Fast reasoning and coding at $2/$10 per MTok. 1M context at standard pricing, 128K output; adaptive thinking, effort defaults to high.",
+      "tier": "sonnet",
+      "context_window": 1000000,
+      "is_1m": true,
+      "pricing": {
+        "input": 2.0,
+        "output": 10.0,
+        "cached_input": 0.2,
+        "cache_write_5m": 2.5,
+        "cache_write_1h": 4.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 14
+    },
+    {
+      "provider": "anthropic",
+      "model_id": "claude-sonnet-5",
+      "display_name": "Claude Sonnet 5",
+      "description": "Sonnet 5 (2026-06). Speed and intelligence for daily work at $2/$10 per MTok. 1M context; adaptive thinking, effort defaults to high.",
+      "tier": "sonnet",
+      "context_window": 1000000,
+      "is_1m": true,
+      "pricing": {
+        "input": 2.0,
+        "output": 10.0,
+        "cached_input": 0.2,
+        "cache_write_5m": 2.5,
+        "cache_write_1h": 4.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 15
+    },
+    {
+      "provider": "anthropic",
+      "model_id": "claude-sonnet-4-6",
+      "display_name": "Claude Sonnet 4.6",
+      "description": "Fast + smart. Daily driver.",
+      "tier": "sonnet",
+      "context_window": 1000000,
+      "is_1m": true,
+      "pricing": {
+        "input": 3.0,
+        "output": 15.0,
+        "cached_input": 0.3,
+        "cache_write_5m": 3.75,
+        "cache_write_1h": 6.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 20
+    },
+    {
+      "provider": "anthropic",
+      "model_id": "claude-haiku-4-5",
+      "display_name": "Claude Haiku 4.5",
+      "description": "Lightning fast. Simple tasks.",
+      "tier": "haiku",
+      "context_window": 200000,
+      "is_1m": false,
+      "pricing": {
+        "input": 1.0,
+        "output": 5.0,
+        "cached_input": 0.1,
+        "cache_write_5m": 1.25,
+        "cache_write_1h": 2.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 30
+    },
+    {
+      "provider": "anthropic",
+      "model_id": "claude-opus-4-5",
+      "display_name": "Claude Opus 4.5",
+      "description": "Previous-gen Opus.",
+      "tier": "opus",
+      "context_window": 200000,
+      "is_1m": false,
+      "pricing": {
+        "input": 5.0,
+        "output": 25.0,
+        "cached_input": 0.5,
+        "cache_write_5m": 6.25,
+        "cache_write_1h": 10.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 40
+    },
+    {
+      "provider": "anthropic",
+      "model_id": "claude-sonnet-4-5",
+      "display_name": "Claude Sonnet 4.5",
+      "description": "Previous-gen Sonnet.",
+      "tier": "sonnet",
+      "context_window": 200000,
+      "is_1m": false,
+      "pricing": {
+        "input": 3.0,
+        "output": 15.0,
+        "cached_input": 0.3,
+        "cache_write_5m": 3.75,
+        "cache_write_1h": 6.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 50
+    },
+    {
+      "provider": "openai",
+      "model_id": "gpt-daybreak-blue-latest",
+      "display_name": "Daybreak Blue",
+      "description": "Daybreak Access alias — currently gpt-5.6-sol with safeguards tuned for authorized defensive-security work. Tracks the newest Daybreak Blue model; pricing follows the underlying model. 200k-class context. Codex sign-in auth.",
+      "tier": "flagship",
+      "context_window": 200000,
+      "is_1m": false,
+      "pricing": {
+        "input": 5.0,
+        "output": 30.0,
+        "cached_input": 0.5,
+        "cache_write_5m": 6.25,
+        "cache_write_1h": 6.25
+      },
+      "supports_thinking": false,
+      "active": true,
+      "sort_order": 53
+    },
+    {
+      "provider": "openai",
+      "model_id": "gpt-5.6-sol",
+      "display_name": "GPT-5.6 Sol",
+      "description": "200k-class context; backend window observed near 167k. Codex sign-in auth only (API pending).",
+      "tier": "flagship",
+      "context_window": 200000,
+      "is_1m": false,
+      "pricing": {
+        "input": 5.0,
+        "output": 30.0,
+        "cached_input": 0.5,
+        "cache_write_5m": 6.25,
+        "cache_write_1h": 6.25
+      },
+      "supports_thinking": false,
+      "active": true,
+      "sort_order": 54
+    },
+    {
+      "provider": "openai",
+      "model_id": "gpt-5.5",
+      "display_name": "GPT-5.5",
+      "description": "Previous frontier. Coding + reasoning. Codex sign-in auth only (API pending).",
+      "tier": "flagship",
+      "context_window": 200000,
+      "is_1m": false,
+      "pricing": {
+        "input": 5.0,
+        "output": 30.0,
+        "cached_input": 0.5,
+        "cache_write_5m": 0.0,
+        "cache_write_1h": 0.0
+      },
+      "supports_thinking": false,
+      "active": true,
+      "sort_order": 55
+    },
+    {
+      "provider": "openai",
+      "model_id": "gpt-5.4",
+      "display_name": "GPT-5.4",
+      "description": "Flagship. Complex reasoning & coding.",
+      "tier": "flagship",
+      "context_window": 200000,
+      "is_1m": false,
+      "pricing": {
+        "input": 1.75,
+        "output": 14.0,
+        "cached_input": 0.175,
+        "cache_write_5m": 0.0,
+        "cache_write_1h": 0.0
+      },
+      "supports_thinking": false,
+      "active": true,
+      "sort_order": 60
+    },
+    {
+      "provider": "openai",
+      "model_id": "gpt-5.4-mini",
+      "display_name": "GPT-5.4 Mini",
+      "description": "Fast + capable. Daily driver.",
+      "tier": "mid",
+      "context_window": 200000,
+      "is_1m": false,
+      "pricing": {
+        "input": 0.25,
+        "output": 2.0,
+        "cached_input": 0.025,
+        "cache_write_5m": 0.0,
+        "cache_write_1h": 0.0
+      },
+      "supports_thinking": false,
+      "active": true,
+      "sort_order": 70
+    },
+    {
+      "provider": "openai",
+      "model_id": "gpt-5.4-nano",
+      "display_name": "GPT-5.4 Nano",
+      "description": "Cheapest. High-volume tasks.",
+      "tier": "low",
+      "context_window": 200000,
+      "is_1m": false,
+      "pricing": {
+        "input": 0.05,
+        "output": 0.4,
+        "cached_input": 0.005,
+        "cache_write_5m": 0.0,
+        "cache_write_1h": 0.0
+      },
+      "supports_thinking": false,
+      "active": true,
+      "sort_order": 80
+    }
+  ]
+}

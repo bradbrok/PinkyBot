@@ -24,6 +24,7 @@ opt out via the ``real_auth`` pytest marker (set as a module-level
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import logging
 import os
@@ -31,12 +32,14 @@ import shutil
 import stat
 import subprocess
 import tempfile
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from pinky_daemon.tmux_launch_env_loader import DAEMON_ONLY
 from tests._tmp_hygiene import restore_tree_readability
+from tests.tmux_socket_support import check_tmux_argv
 
 # Test session secret. Long-enough random-looking value; never used in
 # production. Tests that need to override (e.g. test_auth.py) do so via
@@ -83,6 +86,7 @@ _PINNED_TEST_ENV = {
     "PINKY_ACCESS_LOG": "off",
     "PINKY_AUTH_DENY_DEFAULT": "shadow",
     "PINKY_DREAM_TRANSPORT": "sdk",
+    "PINKY_MODEL_ROSTER_SYNC": "off",
     "PINKY_SESSION_SECRET": TEST_SESSION_SECRET,
     "PINKY_TEST_TRANSPORT_GUARD": "1",
 }
@@ -115,6 +119,7 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "real_transport: test intentionally uses a real external transport",
     )
+    config.addinivalue_line("markers", "legacy_tmux_reap: exercise startup reap on test-owned routes")
     # When the system temp dir is world-writable (e.g. /tmp at mode 1777 in a
     # root-owned container) and no explicit --basetemp was given, redirect
     # pytest's basetemp under the home dir so tmp_path fixtures produce
@@ -224,41 +229,56 @@ def _isolate_test_env(request, monkeypatch):
         _scrub_test_env()
 
 
+@pytest.fixture(scope="session")
+def _initial_legacy_tmux_gate():
+    from pinky_daemon.tmux_session import _LEGACY_TMUX_BLOCK_ALL
+
+    return _LEGACY_TMUX_BLOCK_ALL
+
+
 @pytest.fixture(autouse=True)
-def _guard_default_tmux_socket(monkeypatch):
+def _isolate_legacy_tmux_reap(request, monkeypatch, _initial_legacy_tmux_gate):
+    """Boot tests record migration calls without inspecting any real socket."""
+    from pinky_daemon import tmux_server_env, tmux_session
+
+    monkeypatch.setattr(tmux_server_env, "_CAPABILITIES", {})
+    monkeypatch.setattr(tmux_server_env, "_WARNED", set())
+    monkeypatch.setattr(tmux_session, "_LEGACY_TMUX_BLOCKED", set())
+    # Gate contracts start from the actual module default on every test.
+    # Unrelated tests explicitly simulate an already completed startup pass.
+    gate_contract = request.node.get_closest_marker("legacy_tmux_reap")
+    monkeypatch.setattr(tmux_session, "_LEGACY_TMUX_BLOCK_ALL",
+                        _initial_legacy_tmux_gate if gate_contract else False)
+    recording = AsyncMock(return_value=set())
+    if not gate_contract:
+        monkeypatch.setattr(tmux_session, "reap_legacy_tmux_sessions", recording)
+    return recording
+
+
+@pytest.fixture(autouse=True)
+def _guard_default_tmux_socket(monkeypatch, tmp_path):
     """Never let an unpatched test spawn reach the operator's default server."""
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.delenv("TMUX_PANE", raising=False)
+    routing_root = tmp_path / "tmux-route"
+    routing_root.mkdir(mode=0o700)
+    # Contain read-only absence checks too. Real clients still need a route
+    # registered by their owning fixture; this root grants no exec permission.
+    monkeypatch.setenv("TMUX_TMPDIR", str(routing_root))
     original = subprocess.Popen
+    original_async = asyncio.create_subprocess_exec
+
+    async def private_async(*args, **kwargs):
+        check_tmux_argv(args, kwargs.get("env"))
+        return await original_async(*args, **kwargs)
 
     class PrivatePopen(original):
         def __init__(self, args, *positional, **kwargs):
-            if (
-                isinstance(args, (list, tuple)) and args
-                and os.path.basename(os.fsdecode(args[0])) == "tmux"
-            ):
-                argv = [os.fsdecode(arg) for arg in args[1:]]
-                if argv != ["-V"]:
-                    selected = None
-                    index = 0
-                    while index < len(argv) and argv[index].startswith("-"):
-                        flag = argv[index]
-                        if flag in {"-L", "-S", "-f"}:
-                            if index + 1 >= len(argv):
-                                break
-                            if flag in {"-L", "-S"}:
-                                selected = argv[index + 1]
-                            index += 2
-                        elif flag.startswith(("-L", "-S")):
-                            selected = flag[2:]
-                            index += 1
-                        else:
-                            index += 1
-                    if not selected or os.path.basename(selected) == "default":
-                        raise RuntimeError("test tmux command requires an explicit private socket")
+            check_tmux_argv(args, kwargs.get("env"), shell=kwargs.get("shell", False))
             super().__init__(args, *positional, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", PrivatePopen)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", private_async)
 
 
 @pytest.fixture(autouse=True)
@@ -398,3 +418,66 @@ def stub_sdk_transport(monkeypatch):
         claude_agent_sdk, "ClaudeSDKClient", ConnectingFakeSDKClient
     )
     yield
+
+
+@pytest.fixture
+def historical_registry(tmp_path):
+    """Opt-in real registry boot with the immutable reference catalog as input."""
+    from tests._model_roster_local import reference_registry
+
+    registry = reference_registry(tmp_path / "historical-models.db")
+    try:
+        yield registry
+    finally:
+        registry.close()
+
+
+@pytest.fixture
+def reference_pricing(tmp_path, monkeypatch):
+    """Run production pricing derivation on frozen input for arithmetic tests."""
+    import importlib.util
+
+    from pinky_daemon import pricing
+    from tests._model_roster_local import (
+        bundled_revision,
+        reference_bundle,
+        reference_table_captures,
+    )
+
+    revision = bundled_revision()
+    with reference_bundle(tmp_path, revision):
+        spec = importlib.util.spec_from_file_location("reference_pricing", pricing.__file__)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    with reference_table_captures(pricing.RATE_TABLE, module.RATE_TABLE):
+        # These named anchors can share an object in live input but have
+        # different historical rates, so replace them by name, not identity.
+        for name in ("_FABLE_51", "_OPUS_55", "_OPUS_STD"):
+            monkeypatch.setattr(pricing, name, getattr(module, name))
+        yield module.RATE_TABLE
+
+
+@pytest.fixture(scope="session")
+def reference_one_million_models(tmp_path_factory):
+    """Derive historical membership through a real isolated production import."""
+    import json
+
+    from tests._model_roster_local import encode, fixture_document
+    from tests.test_model_roster import _probe
+
+    result = _probe(
+        tmp_path_factory.mktemp("reference-context"), "pinky_daemon.streaming_session",
+        encode(fixture_document(1)), inspect=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return set(json.loads(result.stdout))
+
+
+@pytest.fixture
+def reference_static_context(reference_one_million_models):
+    """Opt-in historical context input; runtime registry binding still takes precedence."""
+    from pinky_daemon import streaming_session
+    from tests._model_roster_local import reference_table_captures
+
+    with reference_table_captures(streaming_session._1M_MODELS, reference_one_million_models):
+        yield

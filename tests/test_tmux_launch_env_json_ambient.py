@@ -7,7 +7,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +18,7 @@ from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import _TmuxControl
 from tests.tmux_env_r3_support import SECRET, probe_command
 from tests.tmux_env_support import LaunchRecorder, secret_files
+from tests.tmux_socket_support import private_socket
 
 SHELL_NAMES = (
     "PWD", "OLDPWD", "SHLVL", "_", "BASHOPTS", "BASH_VERSINFO", "EUID", "PPID",
@@ -111,8 +111,8 @@ async def test_real_tmux_child_runs_with_shell_owned_daemon_environment(home, mo
     binary = TMUX_BINARY
     if binary is None:
         pytest.skip("real tmux is unavailable")
-    socket_root = Path(tempfile.mkdtemp(prefix="json-tmux-", dir="/tmp"))
-    socket = socket_root / "test.sock"
+    socket_owner = private_socket()
+    socket = Path(socket_owner.__enter__())
     output = home / "child.json"
     control = _TmuxControl("real-ambient", tmux_binary=binary, socket_path=str(socket))
     for name in SHELL_NAMES:
@@ -137,4 +137,4 @@ async def test_real_tmux_child_runs_with_shell_owned_daemon_environment(home, mo
         finally:
             subprocess.run([binary, "-S", str(socket), "kill-server"], capture_output=True, timeout=5,
                            env={"HOME": str(home), "PATH": os.defpath})
-            shutil.rmtree(socket_root)
+            socket_owner.__exit__(None, None, None)

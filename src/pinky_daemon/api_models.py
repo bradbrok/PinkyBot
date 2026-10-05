@@ -13,6 +13,36 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from pinky_daemon.agent_registry import validate_restart_tokens_cap
+from pinky_daemon.model_roster_state import MANAGED_FIELDS
+
+
+class ModelRosterSyncRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    dry_run: bool
+
+
+class ModelRosterReleaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    id: str
+    fields: list[str] | Literal["all"]
+
+    @field_validator("id")
+    @classmethod
+    def full_id(cls, value):
+        if value.count("/") != 1 or not all(value.split("/")) or any(
+            char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value
+        ):
+            raise ValueError("full_model_id_required")
+        return value
+
+    @field_validator("fields")
+    @classmethod
+    def managed_fields(cls, value):
+        if isinstance(value, list) and not set(value) <= set(MANAGED_FIELDS):
+            raise ValueError("managed_fields_required")
+        return value
 
 # Agent names appear in filesystem paths (data/agents/{name}/, hook scripts,
 # settings.json, .mcp.json) and database queries. Restrict to a safe character

@@ -65,6 +65,11 @@ def test_runtime_env_is_deterministic():
     assert "PINKY_CONTAINER_RUNTIME" not in os.environ
 
 
+def test_model_roster_remote_sync_is_pinned_off():
+    assert suite_conftest._PINNED_TEST_ENV["PINKY_MODEL_ROSTER_SYNC"] == "off"
+    assert os.environ["PINKY_MODEL_ROSTER_SYNC"] == "off"
+
+
 def test_query_entrypoint_is_blocked_before_spawn():
     """The public query() path — used by SDKRunner — hits the guard.
 

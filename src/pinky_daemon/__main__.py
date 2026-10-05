@@ -135,6 +135,7 @@ def _run_api_with_authority(args) -> None:
     import uvicorn
 
     from pinky_daemon.api import create_api
+    from pinky_daemon.api_readiness import ApiReadiness
     from pinky_daemon.routes.triggers import uvicorn_log_config
 
     # The access log prints raw request paths; /hooks/<token> carries a
@@ -157,6 +158,36 @@ def _run_api_with_authority(args) -> None:
         db_path=args.db_path,
     )
 
+    readiness = getattr(app.state, "api_readiness", None)
+    if not isinstance(readiness, ApiReadiness):
+        message = "daemon API readiness barrier missing; refusing to start"
+        print(f"ERROR {message}", file=sys.stderr)
+        raise RuntimeError(message)
+
+    main_server = uvicorn.Server(
+        uvicorn.Config(app, host=args.host, port=args.port, log_config=log_config)
+    )
+    readiness.attach(main_server)
+    original_serve = main_server.serve
+
+    async def _serve_main(*args, **kwargs):
+        try:
+            await original_serve(*args, **kwargs)
+        finally:
+            await readiness.close("main server stopped")
+
+    main_server.serve = _serve_main
+
+    def _run_single_listener():
+        from uvicorn.main import STARTUP_FAILURE
+
+        try:
+            main_server.run()
+        except KeyboardInterrupt:
+            pass
+        if not main_server.started:
+            sys.exit(STARTUP_FAILURE)
+
     from pinky_daemon.ferry.config import FerryConfig
     from pinky_daemon.ferry.listener import FerryListenerState, serve_ferry_with_retry
 
@@ -171,7 +202,7 @@ def _run_api_with_authority(args) -> None:
         else ""
     )
     if not ferry_cfg.enabled:
-        # Default / current prod: single server, unchanged behavior. If the
+        # Default: one listener. If the
         # operator tried to turn ferry ON but the config is incomplete or the
         # bind host is unsafe, say why (fail-closed — we never bind publicly).
         enabled_requested = (
@@ -188,7 +219,7 @@ def _run_api_with_authority(args) -> None:
         )
         if enabled_requested:
             print(f"[pinky] Ferry disabled: {ferry_cfg.why_disabled()}", file=sys.stderr)
-        uvicorn.run(app, host=args.host, port=args.port, log_config=log_config)
+        _run_single_listener()
         return
 
     # Ferry enabled: run the main API + a dedicated ferry listener bound to the
@@ -209,7 +240,7 @@ def _run_api_with_authority(args) -> None:
             "[pinky] ferry enabled but host_pinky missing — starting API only",
             file=sys.stderr,
         )
-        uvicorn.run(app, host=args.host, port=args.port, log_config=log_config)
+        _run_single_listener()
         return
 
     ferry_app = build_ferry_app(host_pinky=host_pinky, config=ferry_cfg)
@@ -219,9 +250,6 @@ def _run_api_with_authority(args) -> None:
         file=sys.stderr,
     )
 
-    main_server = uvicorn.Server(
-        uvicorn.Config(app, host=args.host, port=args.port, log_config=log_config)
-    )
     ferry_server = uvicorn.Server(
         uvicorn.Config(
             ferry_app,

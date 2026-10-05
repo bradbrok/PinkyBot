@@ -80,10 +80,18 @@ from pinky_daemon import (
     launch_env_authority,
     tmux_launch_env,
     tmux_launch_env_loader,
+    tmux_server_env,
 )
 from pinky_daemon.agent_registry import (
     CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS,
     validate_restart_tokens_cap,
+)
+from pinky_daemon.api_readiness import (
+    DeferredPrompt,
+    api_allows_submission,
+    defer_wake,
+    render_prompt,
+    wait_for_api,
 )
 from pinky_daemon.auth_relay import coordinator as _auth_relay
 from pinky_daemon.auth_relay import extract_relay_oauth_url, looks_like_login_wall
@@ -351,10 +359,9 @@ def _resolve_claude_config_path(env: dict[str, str] | None = None) -> Path:
 
     Mirrors the CLI's resolution: ``$CLAUDE_CONFIG_DIR/.claude.json`` when
     ``CLAUDE_CONFIG_DIR`` is set, else ``$HOME/.claude.json``. ``env``
-    defaults to the daemon process environment, which the tmux REPL
-    inherits (``_build_repl_env`` only adds ``-e`` overrides on top, so
-    the effective HOME/CLAUDE_CONFIG_DIR the launched ``claude`` sees is
-    the daemon's unless explicitly overridden). Injectable for tests.
+    defaults to the daemon process environment. Managed launch callers supply
+    the captured pane HOME and explicit configuration-directory selection so
+    trust seeding and the child resolve the same file. Injectable for tests.
     """
     e = env if env is not None else os.environ
     cfg_dir = (e.get("CLAUDE_CONFIG_DIR") or "").strip()
@@ -699,6 +706,8 @@ class _TmuxControl:
         socket_name: str = "",
         socket_path: str = "",
         command_runner: CommandRunner | None = None,
+        server_config: tmux_server_env.ServerConfig | None = None,
+        cleanup_only: bool = False,
     ) -> None:
         self.session_name = session_name
         self.tmux_binary = tmux_binary
@@ -709,6 +718,8 @@ class _TmuxControl:
         # a daemon restart under a changed TMUX/TMUX_TMPDIR cannot silently
         # target a different server. Ordinary controls leave this empty.
         self.socket_path = socket_path
+        self.server_config = server_config
+        self.cleanup_only = cleanup_only
         # #149 phase-3 execution seam: who runs the tmux subprocess. Default
         # LocalCommandRunner reproduces the prior inline create_subprocess_exec
         # verbatim (daemon's own user). An isolation_mode='unix_user' tenant is
@@ -734,7 +745,21 @@ class _TmuxControl:
             cmd.extend(["-S", self.socket_path])
         elif self.socket_name:
             cmd.extend(["-L", self.socket_name])
+        if self.server_config is not None:
+            cmd.extend(["-f", "/dev/null"])
         return cmd
+
+    def client_env_options(self) -> dict:
+        if self.server_config is not None and type(self._runner) is LocalCommandRunner:
+            return {"env": dict(self.server_config.client_env)}
+        return {}
+
+    async def _run_raw(self, *args, timeout=5.0, stdin_data=None, max_output_bytes=None):
+        options = self.client_env_options()
+        if max_output_bytes is not None:
+            options["max_output_bytes"] = max_output_bytes
+        return await self._runner.run(self._base_cmd() + list(args), timeout=timeout,
+                                      stdin_data=stdin_data, **options)
 
     async def _run(
         self,
@@ -756,15 +781,14 @@ class _TmuxControl:
         # _run calls plus the new-session command (which spawns the REPL).
         # 5s here defends a hung tmux server; 60s up there defends a hung
         # REPL bootstrap (auth flow, CLAUDE.md load, etc.).
-        cmd = self._base_cmd() + list(args)
         # Delegate the actual exec to the injected CommandRunner. For local
         # agents this is LocalCommandRunner — identical to the prior inline
         # create_subprocess_exec. For unix_user tenants the runner wraps the
         # argv in ``runuser -u pinky-<agent> --`` so tmux runs under the
         # agent's uid. Timeout/kill semantics live in the runner; a timeout
         # still raises asyncio.TimeoutError for the caller to handle.
-        result = await self._runner.run(
-            cmd,
+        result = await self._run_raw(
+            *args,
             timeout=timeout,
             stdin_data=stdin_data,
         )
@@ -808,6 +832,8 @@ class _TmuxControl:
             return None
         if self.socket_path:
             return Path(self.socket_path)
+        if self.server_config is not None:
+            return Path(self.server_config.client_env.get("TMUX_TMPDIR", "/tmp")) / f"tmux-{os.getuid()}" / self.socket_name
         if not self.socket_name:
             inherited = os.environ.get("TMUX", "")
             inherited_parts = inherited.rsplit(",", 2)
@@ -874,7 +900,15 @@ class _TmuxControl:
         codex_headers: bool = False,
     ) -> TmuxCommandResult:
         """Spawn using isolated Python to consume private JSON before shell exec."""
+        if self.cleanup_only:
+            raise isolated_launch_env.LaunchEnvError("cleanup-only tmux control cannot launch")
         env = env or {}
+        if self.server_config is not None and type(self._runner) is LocalCommandRunner:
+            await self.server_config.verify(self, clean=inherit == "none", log=_log)
+            # A retained server can have older base values than the client.
+            # Match the captured HOME used for trust seeding on every launch.
+            env = {**env, "HOME": self.server_config.client_env["HOME"],
+                   "PATH": self.server_config.client_env["PATH"]}
         tmux_launch_env.validate_env(env)
         try:
             tmux_launch_env.validate_inherit(env, inherit)
@@ -1171,6 +1205,102 @@ _TMUX_SPAWN_CLEANUP_DEBT_DIR = "tmux-spawn-cleanup-debt"
 _TMUX_SPAWN_CLEANUP_DEBT_VERSION = 1
 
 
+def production_tmux_control(
+    session_name, *, command_runner=None, tmux_binary="tmux", socket_name=None,
+    socket_path="", server_config=None, control_type=_TmuxControl, cleanup=False,
+):
+    """Create a managed control, or retain a recorded cleanup-only route."""
+    if server_config is None:
+        if cleanup:
+            base = {name: value for name, value in os.environ.items()
+                    if tmux_launch_env_loader.is_base_name(name) or name == "TMUX_TMPDIR"}
+            server_config = tmux_server_env.ServerConfig(
+                socket_name or "default", tmux_server_env.client_environment(base),
+            )
+        else:
+            server_config = tmux_server_env.ServerConfig.capture(label=socket_name)
+    return control_type(session_name, tmux_binary=tmux_binary,
+                        socket_name=server_config.label, socket_path=socket_path,
+                        command_runner=command_runner, server_config=server_config, cleanup_only=cleanup)
+
+
+_LEGACY_TMUX_COMPLETE = "tmux_dedicated_server_migration_complete"
+_LEGACY_TMUX_BLOCKED: set[str] = set()
+_LEGACY_TMUX_BLOCK_ALL = True
+_LEGACY_TMUX_REFUSAL = "legacy tmux cleanup has not completed; start the daemon once"
+
+
+def require_legacy_tmux_reaped(agent_name, *, setting_provider=None, server_config=None):
+    label = (server_config.label if isinstance(server_config, tmux_server_env.ServerConfig)
+             else os.environ.get("PINKY_TMUX_SOCKET", "pinkybot") or "default")
+    if label == "default":
+        return
+    if agent_name not in _LEGACY_TMUX_BLOCKED:
+        if not _LEGACY_TMUX_BLOCK_ALL:
+            return
+        try:
+            if setting_provider is not None and setting_provider(_LEGACY_TMUX_COMPLETE):
+                return
+        except Exception:
+            # A settings failure can contain private values; refuse silently.
+            pass
+    raise isolated_launch_env.LaunchEnvError(_LEGACY_TMUX_REFUSAL)
+
+
+async def reap_legacy_tmux_sessions(registry, *, log=_log):
+    """One startup pass over exact registered names on the pinned old route."""
+    global _LEGACY_TMUX_BLOCK_ALL
+    _LEGACY_TMUX_BLOCK_ALL = True
+
+    from types import SimpleNamespace
+
+    from pinky_daemon.codex_app_server_tmux import CodexAppServerSupervisor
+    from pinky_daemon.codex_tmux_session import CodexTmuxSession
+    from pinky_daemon.tmux_dream_runner import TmuxDreamRunner
+
+    config = tmux_server_env.ServerConfig.capture()
+    if config.label == "default":
+        # Compatibility authorizes only that route, not a later managed launch.
+        return set()
+    if registry.get_setting(_LEGACY_TMUX_COMPLETE):
+        _LEGACY_TMUX_BLOCK_ALL = False
+        _LEGACY_TMUX_BLOCKED.clear()
+        return set()
+    legacy = replace(config, label="default")
+    agents = registry.list(include_retired=True)
+    blocked = set()
+    for agent in agents:
+        identity = SimpleNamespace(agent_name=agent.name, _agent_name=agent.name)
+        names = (
+            TmuxSession._build_session_name(identity),
+            CodexTmuxSession._build_session_name(identity),
+            CodexAppServerSupervisor.session_name.fget(identity),
+            TmuxDreamRunner.session_name.fget(identity),
+        )
+        for name in names:
+            control = production_tmux_control(name, server_config=legacy, cleanup=True)
+            try:
+                if not await control.has_session():
+                    continue
+                failure = await _strict_owned_tmux_cleanup(
+                    control, agent_name=agent.name, action="legacy tmux cleanup",
+                )
+                if failure is not None or await control.has_session():
+                    blocked.add(agent.name)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                blocked.add(agent.name)
+        if agent.name in blocked:
+            log("WARNING legacy tmux cleanup failed: " + agent.name)
+    if not blocked:
+        registry.set_setting(_LEGACY_TMUX_COMPLETE, "1")
+    _LEGACY_TMUX_BLOCKED.clear()
+    _LEGACY_TMUX_BLOCKED.update(blocked)
+    _LEGACY_TMUX_BLOCK_ALL = False
+    return blocked
+
+
 def _tmux_spawn_cleanup_identity_key(
     *,
     agent_name: str,
@@ -1404,7 +1534,7 @@ async def _strict_owned_tmux_cleanup(
                     kill_result = await control.kill_session()
             except Exception as exc:
                 diagnostics.append(
-                    f"attempt {attempt} kill raised {type(exc).__name__}: {exc}"
+                    f"attempt {attempt} kill raised {type(exc).__name__}"
                 )
             else:
                 if kill_result.ok:
@@ -1414,8 +1544,7 @@ async def _strict_owned_tmux_cleanup(
                     )
                     return None
                 diagnostics.append(
-                    f"attempt {attempt} kill returned rc={kill_result.returncode} "
-                    f"stderr={kill_result.stderr.strip()!r}"
+                    f"attempt {attempt} kill returned rc={kill_result.returncode}"
                 )
 
             try:
@@ -1424,7 +1553,7 @@ async def _strict_owned_tmux_cleanup(
             except Exception as exc:
                 diagnostics.append(
                     f"attempt {attempt} verify couldn't answer "
-                    f"({type(exc).__name__}: {exc})"
+                    f"({type(exc).__name__})"
                 )
             else:
                 if not live:
@@ -1453,7 +1582,7 @@ async def _strict_owned_tmux_cleanup(
         message = (
             f"tmux[{agent_name}]: {action} could not prove teardown within "
             f"{_SPAWN_ROLLBACK_TIMEOUT_SEC}s; owned session is possibly live "
-            f"({type(exc).__name__}: {exc})"
+            f"({type(exc).__name__})"
         )
         _log(f"ERROR {message}")
         return message
@@ -1481,12 +1610,13 @@ async def reconcile_tmux_spawn_cleanup_debts(
             control = (
                 _control_factory(debt)
                 if _control_factory is not None
-                else _TmuxControl(
+                else production_tmux_control(
                     debt.session_name,
                     tmux_binary=debt.tmux_binary,
                     socket_name=debt.socket_name,
                     socket_path=debt.socket_path,
                     command_runner=_tmux_cleanup_runner_from_spec(debt.runner),
+                    cleanup=True,
                 )
             )
             failure = await _strict_owned_tmux_cleanup(
@@ -2317,8 +2447,8 @@ class TmuxSession(TransportReplacementMixin):
         # ``_TmuxControl`` rather than monkeypatching subprocess primitives).
         # For an isolation_mode="container" agent (runtime gate ON), the tmux
         # server + REPL run INSIDE its container via a ContainerCommandRunner;
-        # otherwise the default LocalCommandRunner reproduces today's behavior.
-        self._tmux = tmux_control or _TmuxControl(
+        # Local clients use a constructed environment on the managed server.
+        self._tmux = tmux_control or production_tmux_control(
             self._session_name, command_runner=self._select_command_runner()
         )
 
@@ -3847,26 +3977,31 @@ class TmuxSession(TransportReplacementMixin):
         # the exact symptom #591 was filed for. Falls back to the stored
         # body when no builder is wired (tests). Trailing positional
         # kwarg keeps legacy 1-arg builders working.
-        wake_context_body = self._config.wake_context or ""
-        if self._config.wake_context_builder:
-            try:
-                wake_context_body = self._config.wake_context_builder(
-                    self.agent_name, reason
+        def _build_initial_prompt():
+            wake_context_body = self._config.wake_context or ""
+            if self._config.wake_context_builder:
+                try:
+                    wake_context_body = self._config.wake_context_builder(
+                        self.agent_name, reason
+                    )
+                except TypeError:
+                    pass
+                except Exception as e:
+                    _log(
+                        f"tmux[{self.agent_name}]: wake context rebuild failed: {e} "
+                        "— using stored body"
+                    )
+            wake_prompt = build_wake_prompt(
+                WakePromptInput(
+                    reason=reason,
+                    context_body=wake_context_body,
+                    timezone=self._config.timezone or "America/Los_Angeles",
                 )
-            except TypeError:
-                pass
-            except Exception as e:
-                _log(
-                    f"tmux[{self.agent_name}]: wake context rebuild failed: {e} "
-                    "— using stored body"
-                )
-        wake_prompt = build_wake_prompt(
-            WakePromptInput(
-                reason=reason,
-                context_body=wake_context_body,
-                timezone=self._config.timezone or "America/Los_Angeles",
             )
-        )
+            return wake_prompt
+
+        wake_prompt = defer_wake(self._config, _build_initial_prompt)
+
         # #591 P1#2 (Murzik round-2): defer on_wake_delivered until actual
         # delivery, not enqueue success. #953 now makes that proof an exact
         # transcript turn-start receipt; a successful paste/Enter command is
@@ -3957,12 +4092,13 @@ class TmuxSession(TransportReplacementMixin):
         ):
             control = self._tmux
         else:
-            control = _TmuxControl(
+            control = production_tmux_control(
                 debt.session_name,
                 tmux_binary=debt.tmux_binary,
                 socket_name=debt.socket_name,
                 socket_path=debt.socket_path,
                 command_runner=_tmux_cleanup_runner_from_spec(debt.runner),
+                cleanup=True,
             )
         failure = await _strict_owned_tmux_cleanup(
             control,
@@ -4093,6 +4229,9 @@ class TmuxSession(TransportReplacementMixin):
         """
         self._check_startup_owner()
         cwd = self._config.working_dir or "."
+        require_legacy_tmux_reaped(self.agent_name,
+            setting_provider=getattr(self._registry, "get_setting", None),
+            server_config=getattr(self._tmux, "server_config", None))
         # Ensure cwd exists — claude --continue needs it.
         Path(cwd).mkdir(parents=True, exist_ok=True)
 
@@ -4160,7 +4299,7 @@ class TmuxSession(TransportReplacementMixin):
         # NOT auto-accept. Idempotent + best-effort: a failure here must
         # never block the spawn (worst case is the pre-existing wedge, not
         # a regression). Resolve the config path against the effective env
-        # the launched claude inherits (daemon env + our -e overrides).
+        # the launched child receives (captured base plus explicit payload).
         # Local agents seed the host's ~/.claude.json here. A container
         # agent's trust file is seeded in-container via `podman exec` inside
         # ``_spawn()`` below (the container is running by now).
@@ -4170,7 +4309,7 @@ class TmuxSession(TransportReplacementMixin):
                 if launch_policy.clean:
                     effective_env = {
                         k: v for k, v in effective_env.items()
-                        if k in isolated_launch_env.BASE_ALLOWLIST or k.startswith(("LC_", "XDG_"))
+                        if tmux_launch_env_loader.is_base_name(k)
                     }
                 effective_env.update(self._build_repl_env(
                     **policy_args,
@@ -4178,6 +4317,9 @@ class TmuxSession(TransportReplacementMixin):
                         self._scrub_codex_headers or self._uses_claude_host_payload(launch_policy)
                     ) else {}),
                 ))
+                config = getattr(self._tmux, "server_config", None)
+                if isinstance(config, tmux_server_env.ServerConfig):
+                    effective_env["HOME"] = config.client_env["HOME"]
                 cfg_path = _resolve_claude_config_path(effective_env)
                 if _seed_claude_trust_file(cfg_path, cwd):
                     _log(
@@ -5478,6 +5620,20 @@ class TmuxSession(TransportReplacementMixin):
                 receipt.set_result(False)
             raise
 
+    async def _emit_internal_prompt_marker(self, prompt, reason, wait_for_completion):
+        import hashlib
+
+        prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+        _log(
+            f"tmux[{self.agent_name}]: wake_prompt_sent reason={reason} "
+            f"prompt_chars={len(prompt)} prompt_hash={prompt_hash} wait={wait_for_completion}"
+        )
+        await self._emit_stream_event({
+            "type": "wake_prompt_sent", "agent_name": self.agent_name, "reason": reason,
+            "prompt_chars": len(prompt), "prompt_hash": prompt_hash,
+            "wait_for_completion": wait_for_completion,
+        })
+
     async def _enqueue_internal_prompt(
         self,
         prompt: str,
@@ -5568,29 +5724,8 @@ class TmuxSession(TransportReplacementMixin):
             return None
 
         self.last_active = time.time()
-        # Audit log — the diagnostic marker validation tooling greps for.
-        # Hash gives a stable identity per prompt body without leaking the
-        # text into operator log streams.
-        import hashlib as _hashlib
-
-        _prompt_hash = _hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
-        _log(
-            f"tmux[{self.agent_name}]: wake_prompt_sent "
-            f"reason={reason} "
-            f"prompt_chars={len(prompt)} "
-            f"prompt_hash={_prompt_hash} "
-            f"wait={wait_for_completion}"
-        )
-        await self._emit_stream_event(
-            {
-                "type": "wake_prompt_sent",
-                "agent_name": self.agent_name,
-                "reason": reason,
-                "prompt_chars": len(prompt),
-                "prompt_hash": _prompt_hash,
-                "wait_for_completion": wait_for_completion,
-            }
-        )
+        if not isinstance(prompt, DeferredPrompt):
+            await self._emit_internal_prompt_marker(prompt, reason, wait_for_completion)
 
         completion = asyncio.Event() if wait_for_completion else None
         submission_receipt = (
@@ -11593,6 +11728,14 @@ class TmuxSession(TransportReplacementMixin):
             "transcript receipt after bounded Enter retries"
         )
 
+    def _refuse_api_turn(self, turn: _QueuedTurn) -> None:
+        self._resolve_submission_receipt(turn, False)
+        if turn.scheduler_delivery is not None and not turn.scheduler_delivery.done():
+            turn.scheduler_delivery.set_result(False)
+        if turn.completion_event is not None:
+            turn.completion_event.set()
+        self._turn_done.set()
+
     async def _deliver_turn(self, turn: _QueuedTurn) -> None:
         """Push one turn through to the tmux pane.
 
@@ -11658,6 +11801,10 @@ class TmuxSession(TransportReplacementMixin):
         the wake prompt (broker calls ``send`` the moment ``state ==
         CONNECTED``, which fires before this wait would have ended).
         """
+        if not await wait_for_api(self._config, "tmux-turn"):
+            self._refuse_api_turn(turn)
+            return
+
         # #931: scheduled prompts are not steering messages. Mid-turn pastes
         # can vanish after a successful tmux command, so wait for the pane's
         # prior FIFO turn to complete before injecting this one. Do this before
@@ -11852,6 +11999,11 @@ class TmuxSession(TransportReplacementMixin):
                     retry_scheduler_gate = True
                 else:
                     retry_scheduler_gate = False
+                    if not api_allows_submission(self._config, "tmux-turn"):
+                        self._refuse_api_turn(turn)
+                        return
+                    deferred = isinstance(turn.prompt, DeferredPrompt)
+                    turn.prompt = render_prompt(turn.prompt)
                     transcript_ticket = (
                         self._capture_transcript_occurrence_ticket()
                     )
@@ -11917,6 +12069,10 @@ class TmuxSession(TransportReplacementMixin):
                 f"stderr={result.stderr.strip()!r}"
             )
 
+        if deferred and turn.internal:
+            await self._emit_internal_prompt_marker(
+                turn.prompt, turn.reason, turn.completion_event is not None,
+            )
         await self._finish_submitted_turn(turn)
 
     def _fire_on_delivered(self, turn: _QueuedTurn) -> None:

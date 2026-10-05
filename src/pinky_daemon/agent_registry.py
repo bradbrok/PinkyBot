@@ -22,6 +22,7 @@ Hierarchy:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -33,7 +34,9 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import Path
 from uuid import UUID
 
@@ -43,6 +46,17 @@ from pinky_daemon.agent_signing_key_store import (
 )
 from pinky_daemon.cron_utils import _field_matches
 from pinky_daemon.effort import is_ultracode
+from pinky_daemon.model_roster import load_bundled
+from pinky_daemon.model_roster import parse as parse_model_roster
+from pinky_daemon.model_roster_state import (
+    CLASSIFICATION_MARKER,
+    MANAGED_FIELDS,
+    context_unit,
+    empty_counts,
+    model_values,
+    operator_fields,
+    plan_fields,
+)
 from pinky_daemon.schedule_fire_trace import ScheduleFireTrace, trace_event
 from pinky_daemon.store_catalog import (
     StoreCatalog,
@@ -1581,6 +1595,14 @@ class AgentRegistry:
         # different entries, and one write loses.
         self._rmw_lock = threading.RLock()
         self._init_tables()
+        self._classify_model_roster()
+        self._model_roster_errors = 0
+        try:
+            document = resources.files("pinky_daemon.catalog").joinpath("models.json").read_bytes()
+            self.apply_model_roster(document, source="bundled")
+        except Exception as exc:
+            if not self._model_roster_errors:
+                self._record_model_roster_error(exc)
         self._fire_trace = ScheduleFireTrace(self._db_path, self._db, catalog=catalog)
 
     def _init_tables(self) -> None:
@@ -1947,6 +1969,8 @@ class AgentRegistry:
                 sort_order INTEGER NOT NULL DEFAULT 100,
                 created_at REAL NOT NULL DEFAULT 0,
                 updated_at REAL NOT NULL DEFAULT 0,
+                operator_fields TEXT NOT NULL DEFAULT '[]',
+                roster_revision INTEGER,
                 UNIQUE(provider, model_id)
             );
 
@@ -2397,7 +2421,7 @@ class AgentRegistry:
             "ON buzz_identities(tos_receipt) WHERE tos_receipt != ''"
         )
 
-        self._migrate_model_catalog_schema()
+        added_write_columns = self._migrate_model_catalog_schema()
         self._migrate_agent_costs_schema()
 
         # Deployment seed for the explicitly verified owner principal in #545.
@@ -2422,7 +2446,7 @@ class AgentRegistry:
         self._db.commit()
 
         # Seed default models
-        self._seed_models()
+        self._seed_models(added_write_columns=added_write_columns)
         self._validate_model_catalog()
 
     def _seed_verified_contacts(self, *, _commit: bool = True) -> None:
@@ -8342,39 +8366,26 @@ except Exception as exc:
 
     # ── Model Registry ──────────────────────────────────────
 
+    # Startup repairs and classification always use the immutable revision-one values.
+    _BASELINE_MODELS = {
+        f"{row.provider}/{row.model_id}": (row, model_values(row))
+        for row in parse_model_roster(
+            resources.files("pinky_daemon.catalog").joinpath("models.baseline.json").read_bytes()
+        ).models
+    }
+    _SONNET_5_DESCRIPTION = _BASELINE_MODELS["anthropic/claude-sonnet-5"][1]["description"]
+
     _MODEL_SEEDS = [
-        # Anthropic
-        ("anthropic", "claude-fable-5-1", "Claude Fable 5.1", "Anthropic's most capable model (2026-09-01). Extends Fable 5 at the same $10/$50 price with stronger long-horizon agentic coding, multistep research, and document work; cache reads 4× cheaper. 1M context; adaptive thinking always on (use effort to control depth).", "fable", 1_000_000, 1, 10.0, 50.0, 0.25, 1, 1),
-        ("anthropic", "claude-mythos-5-1", "Claude Mythos 5.1", "Claude Fable 5.1 capabilities without the safety classifiers. Limited availability via Project Glasswing (approved customers only).", "fable", 1_000_000, 1, 10.0, 50.0, 0.25, 1, 2),
-        ("anthropic", "claude-fable-5", "Claude Fable 5", "Anthropic's most capable widely-released model (2026-06-09). Demanding reasoning + long-horizon agentic work. 1M context; adaptive thinking always on (use effort to control depth).", "fable", 1_000_000, 1, 10.0, 50.0, 1.0, 1, 1),
-        ("anthropic", "claude-mythos-5", "Claude Mythos 5", "Claude Fable 5 capabilities without the safety classifiers. Limited availability via Project Glasswing (approved customers only).", "fable", 1_000_000, 1, 10.0, 50.0, 1.0, 1, 2),
-        ("anthropic", "claude-opus-5-5", "Claude Opus 5.5", "Current Opus (2026-09-22). Built for long-running agentic coding and knowledge work at $4/$20 per MTok with a 5% cache read; 1M context, 128K output; adaptive thinking always on, effort defaults to medium. Knowledge cutoff Jun 2026.", "opus", 1_000_000, 1, 4.0, 20.0, 0.2, 1, 2),
-        ("anthropic", "claude-opus-5", "Claude Opus 5", "For complex agentic coding + enterprise work. 1M context; effort defaults high; adaptive thinking. Knowledge cutoff May 2026.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 2),
-        ("anthropic", "claude-opus-4-8", "Claude Opus 4.8", "Newest Opus (2026-05-28). Sharper judgement, more honest progress reporting, longer independent runs. Effort defaults to high; adaptive thinking triggers only when needed.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 3),
-        ("anthropic", "claude-opus-4-7", "Claude Opus 4.7", "Stricter instruction-following, xhigh effort, larger vision.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 5),
-        ("anthropic", "claude-opus-4-6", "Claude Opus 4.6", "Maximum intelligence. Deep reasoning.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 10),
-        ("anthropic", "claude-sonnet-5", "Claude Sonnet 5", "Current Sonnet (2026-06). Best speed+intelligence balance — daily driver. 1M context; adaptive thinking, effort defaults to high. Intro pricing $2/$10 through Aug 2026.", "sonnet", 1_000_000, 1, 3.0, 15.0, 0.3, 1, 15),
-        ("anthropic", "claude-sonnet-4-6", "Claude Sonnet 4.6", "Fast + smart. Daily driver.", "sonnet", 1_000_000, 1, 3.0, 15.0, 0.3, 1, 20),
-        ("anthropic", "claude-haiku-4-5", "Claude Haiku 4.5", "Lightning fast. Simple tasks.", "haiku", 200_000, 0, 1.0, 5.0, 0.1, 1, 30),
-        ("anthropic", "claude-opus-4-5", "Claude Opus 4.5", "Previous-gen Opus.", "opus", 200_000, 0, 5.0, 25.0, 0.5, 1, 40),
-        ("anthropic", "claude-sonnet-4-5", "Claude Sonnet 4.5", "Previous-gen Sonnet.", "sonnet", 200_000, 0, 3.0, 15.0, 0.3, 1, 50),
-        # OpenAI / Codex CLI
-        # gpt-daybreak-blue-latest: OpenAI Daybreak Access alias (enrollment-
-        # gated tier for authorized defensive-security work). Officially "an
-        # alias that currently points to gpt-5.6-sol"; OpenAI repoints it as
-        # new Daybreak models release, "with pricing adjusted to match each
-        # underlying model" (developers.openai.com/api/docs/pricing, verified
-        # 2026-09-01). Seeded at sol parity on every inherited axis — prices
-        # and 200k-class window — so revisit all three tables (catalog /
-        # RATE_TABLE / analytics seeds) together when the alias moves.
-        ("openai", "gpt-daybreak-blue-latest", "Daybreak Blue", "Daybreak Access alias — currently gpt-5.6-sol with safeguards tuned for authorized defensive-security work. Tracks the newest Daybreak Blue model; pricing follows the underlying model. 200k-class context. Codex sign-in auth.", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 53),
-        ("openai", "gpt-5.6-sol", "GPT-5.6 Sol", "200k-class context; backend window observed near 167k. Codex sign-in auth only (API pending).", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 54),
-        ("openai", "gpt-5.5", "GPT-5.5", "Previous frontier. Coding + reasoning. Codex sign-in auth only (API pending).", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 55),
-        ("openai", "gpt-5.4", "GPT-5.4", "Flagship. Complex reasoning & coding.", "flagship", 200_000, 0, 1.75, 14.0, 0.175, 0, 60),
-        ("openai", "gpt-5.4-mini", "GPT-5.4 Mini", "Fast + capable. Daily driver.", "mid", 200_000, 0, 0.25, 2.0, 0.025, 0, 70),
-        ("openai", "gpt-5.4-nano", "GPT-5.4 Nano", "Cheapest. High-volume tasks.", "low", 200_000, 0, 0.05, 0.4, 0.005, 0, 80),
+        (
+            row.provider, row.model_id, row.display_name, row.description, row.tier,
+            row.context_window, int(row.is_1m), row.pricing.input, row.pricing.output,
+            row.pricing.cached_input, int(row.supports_thinking), row.sort_order,
+        )
+        for row in load_bundled().models
     ]
 
+    # Frozen legacy repairs; future corrections are higher roster revisions.
+    # Targets come from the immutable baseline, with owned fields/tracked rows skipped.
     # One-time data corrections for rows already seeded with wrong values.
     # ``_seed_models`` is INSERT OR IGNORE, so fixing ``_MODEL_SEEDS`` alone
     # never reaches an existing install. Each entry rewrites the prices of one
@@ -8410,9 +8421,9 @@ except Exception as exc:
         ("openai/gpt-5.6-sol", (1_000_000, 1), (200_000, 0)),
     ]
 
-    def _migrate_model_catalog_schema(self) -> None:
-        """Add nullable write-rate columns and fill only known static gaps."""
-        from pinky_daemon.pricing import RATE_TABLE
+    def _migrate_model_catalog_schema(self) -> frozenset[str]:
+        """Add provenance independently of write rates; backfill frozen known prices."""
+        from pinky_daemon.pricing import _LEGACY_RATES
 
         columns = {
             row[1] for row in self._db.execute("PRAGMA table_info(models)").fetchall()
@@ -8426,19 +8437,29 @@ except Exception as exc:
                 added_columns.append(column_name)
                 _log(f"agent_registry: migrated — added column {column_name}")
 
+        for column_name, declaration in (
+            ("operator_fields", "TEXT NOT NULL DEFAULT '[]'"),
+            ("roster_revision", "INTEGER"),
+        ):
+            if column_name not in columns:
+                self._db.execute(f"ALTER TABLE models ADD COLUMN {column_name} {declaration}")
+
         if not added_columns:
-            return
-        rate_keys = {
-            "cache_write_5m_price": "cache_write_5m",
-            "cache_write_1h_price": "cache_write_1h",
-        }
-        for model_id, rate in RATE_TABLE.items():
-            assignments = ", ".join(f"{column_name}=?" for column_name in added_columns)
-            self._db.execute(
-                f"UPDATE models SET {assignments} WHERE model_id=?",
-                tuple(rate[rate_keys[column_name]] for column_name in added_columns)
-                + (model_id,),
-            )
+            return frozenset()
+        frozen_rates = {row.model_id: values for row, values in self._BASELINE_MODELS.values()}
+        frozen_rates.update({model_id: {
+            "cache_write_5m_price": rate["cache_write_5m"],
+            "cache_write_1h_price": rate["cache_write_1h"],
+        } for model_id, rate in _LEGACY_RATES.items()})
+        for row in self.list_models(active_only=False):
+            rates = frozen_rates.get(row["model_id"])
+            if rates is None or row["roster_revision"] is not None:
+                continue
+            owned = operator_fields(row["operator_fields"])
+            updates = {name: rates[name] for name in added_columns if name not in owned}
+            if updates:
+                self._update_roster_model(row["id"], updates)
+        return frozenset(added_columns)
 
     def _migrate_agent_costs_schema(self) -> None:
         """Rebuild the usage ledger with nullable costs and an error marker."""
@@ -8522,68 +8543,326 @@ except Exception as exc:
                     f"{row['id']}: {column_name}"
                 )
 
-    def _seed_models(self) -> None:
-        """Ensure default models exist (idempotent).
+    def _correct_model_fields(self, full_id: str, stale: dict, desired: dict, now: float) -> int:
+        row = self._get_model_by_id(full_id)
+        if row is None or row["roster_revision"] is not None:
+            return 0
+        if any(row[field] != value for field, value in stale.items()):
+            return 0
+        owned = operator_fields(row["operator_fields"])
+        updates = {field: value for field, value in desired.items()
+                   if field not in owned and row[field] != value}
+        if not updates:
+            return 0
+        self._update_roster_model(full_id, {**updates, "updated_at": now})
+        return 1
 
-        Per-row ``INSERT OR IGNORE`` adds any missing model and never
-        overwrites an existing row, so new entries in ``_MODEL_SEEDS``
-        propagate to existing installs on the next startup — not only to a
-        fresh DB. (Previously this early-returned when the table was
-        non-empty, so a newly-added model never reached running deployments.)
-        """
-        from pinky_daemon.pricing import RATE_TABLE
+    def _ensure_sonnet_5_catalog(
+        self, now: float, added_write_columns: frozenset[str],
+    ) -> int:
+        """Repair recognized stale values using only immutable baseline targets."""
+        full_id = "anthropic/claude-sonnet-5"
+        row = self._get_model_by_id(full_id)
+        target = self._BASELINE_MODELS[full_id][1]
+        stale = dict(input_price=3.0, output_price=15.0, cached_input_price=0.3,
+                     cache_write_5m_price=3.75, cache_write_1h_price=6.0)
+        if row is not None:
+            for field in added_write_columns:
+                if row[field] == target[field]:
+                    stale[field] = target[field]
+        corrected = self._correct_model_fields(
+            full_id, stale, {field: target[field] for field in stale}, now,
+        )
+        stale_description = (
+            "Current Sonnet (2026-06). Best speed+intelligence balance — daily driver. "
+            "1M context; adaptive thinking, effort defaults to high. "
+            "Intro pricing $2/$10 through Aug 2026."
+        )
+        self._correct_model_fields(full_id, {"description": stale_description},
+                                   {"description": self._SONNET_5_DESCRIPTION}, now)
+        return corrected
 
+    def _seed_models(self, *, added_write_columns: frozenset[str] = frozenset()) -> None:
+        """Seed the immutable baseline idempotently; revisions alone add later models."""
         now = time.time()
         added = 0
-        for (provider, model_id, display, desc, tier, ctx, is_1m,
-             inp, out, cached, thinking, sort) in self._MODEL_SEEDS:
-            mid = f"{provider}/{model_id}"
-            rate = RATE_TABLE[model_id]
-            cur = self._db.execute(
-                """INSERT OR IGNORE INTO models
-                   (id, provider, model_id, display_name, description, tier,
-                    context_window, is_1m, input_price, output_price,
-                    cached_input_price, cache_write_5m_price,
-                    cache_write_1h_price, supports_thinking, sort_order,
-                    created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (mid, provider, model_id, display, desc, tier, ctx, is_1m,
-                 inp, out, cached, rate["cache_write_5m"],
-                 rate["cache_write_1h"], thinking, sort, now, now),
+        for full_id, (row, values) in self._BASELINE_MODELS.items():
+            added += self._insert_roster_model(row.provider, row.model_id, values, now,
+                                               ignore=True)
+        corrected = self._ensure_sonnet_5_catalog(now, added_write_columns)
+        for full_id, old, _ in self._PRICE_CORRECTIONS:
+            fields = ("input_price", "output_price", "cached_input_price")
+            baseline = self._BASELINE_MODELS[full_id][1]
+            corrected += self._correct_model_fields(
+                full_id, dict(zip(fields, old)), {f: baseline[f] for f in fields}, now,
             )
-            added += cur.rowcount
-        corrected = 0
-        for mid, (old_in, old_out, old_cached), (new_in, new_out, new_cached) \
-                in self._PRICE_CORRECTIONS:
-            cur = self._db.execute(
-                """UPDATE models
-                   SET input_price=?, output_price=?, cached_input_price=?,
-                       updated_at=?
-                   WHERE id=? AND input_price=? AND output_price=?
-                     AND cached_input_price=?""",
-                (new_in, new_out, new_cached, now,
-                 mid, old_in, old_out, old_cached),
-            )
-            corrected += cur.rowcount
         ctx_corrected = 0
-        for mid, (old_ctx, old_1m), (new_ctx, new_1m) in self._CONTEXT_CORRECTIONS:
-            cur = self._db.execute(
-                """UPDATE models
-                   SET context_window=?, is_1m=?, updated_at=?
-                   WHERE id=? AND context_window=? AND is_1m=?""",
-                (new_ctx, new_1m, now, mid, old_ctx, old_1m),
+        for full_id, old, _ in self._CONTEXT_CORRECTIONS:
+            fields = ("context_window", "is_1m")
+            baseline = self._BASELINE_MODELS[full_id][1]
+            ctx_corrected += self._correct_model_fields(
+                full_id, dict(zip(fields, old)), {f: baseline[f] for f in fields}, now,
             )
-            ctx_corrected += cur.rowcount
         self._db.commit()
         if added:
             _log(f"agent_registry: seeded {added} model(s)")
         if corrected:
             _log(f"agent_registry: corrected stale prices on {corrected} model(s)")
         if ctx_corrected:
-            _log(
-                "agent_registry: corrected stale context windows on "
-                f"{ctx_corrected} model(s)"
-            )
+            _log(f"agent_registry: corrected stale context windows on {ctx_corrected} model(s)")
+
+    def _insert_roster_model(self, provider, model_id, values, now, *, revision=None,
+                             owned=(), ignore=False) -> int:
+        columns = ("id", "provider", "model_id", *MANAGED_FIELDS,
+                   "created_at", "updated_at", "operator_fields", "roster_revision")
+        params = (f"{provider}/{model_id}", provider, model_id,
+                  *(values[field] for field in MANAGED_FIELDS), now, now,
+                  json.dumps(sorted(owned)), revision)
+        cursor = self._db.execute(
+            f"INSERT {'OR IGNORE ' if ignore else ''}INTO models ({','.join(columns)}) "
+            f"VALUES ({','.join('?' for _ in columns)})", params,
+        )
+        return cursor.rowcount
+
+    def _update_roster_model(self, full_id: str, values: dict) -> None:
+        allowed = {*MANAGED_FIELDS, "updated_at", "operator_fields", "roster_revision"}
+        if not values or not values.keys() <= allowed:
+            raise ValueError("invalid managed model update")
+        self._db.execute(
+            f"UPDATE models SET {','.join(field + '=?' for field in values)} WHERE id=?",
+            (*values.values(), full_id),
+        )
+
+    @contextmanager
+    def _model_roster_transaction(self):
+        with self._rmw_lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
+
+    def _classify_model_roster(self) -> None:
+        """Commit all initial field ownership and its marker together, exactly once."""
+        if self.get_setting(CLASSIFICATION_MARKER) == "1":
+            return
+        with self._model_roster_transaction():
+            if self.get_setting(CLASSIFICATION_MARKER) == "1":
+                return
+            for row in self.list_models(active_only=False):
+                baseline = self._BASELINE_MODELS.get(row["id"])
+                fields = set(MANAGED_FIELDS) if baseline is None else {
+                    field for field in MANAGED_FIELDS if row[field] != baseline[1][field]
+                }
+                self._update_roster_model(row["id"], {
+                    "operator_fields": json.dumps(sorted(context_unit(fields))),
+                })
+            self._write_model_roster_settings({CLASSIFICATION_MARKER: "1"})
+
+    def _write_model_roster_settings(self, values: dict) -> None:
+        self._db.executemany(
+            "INSERT INTO system_settings (key,value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", values.items(),
+        )
+
+    def _record_model_roster_error(self, exc: Exception) -> None:
+        """Keep error metadata best-effort, separate from a failed apply transaction."""
+        self._model_roster_errors = getattr(self, "_model_roster_errors", 0) + 1
+        _log(f"ERROR model roster: {exc}")
+        try:
+            with self._rmw_lock:
+                if self._db.in_transaction:
+                    return
+                with self._model_roster_transaction():
+                    self._write_model_roster_settings({
+                        "model_roster.last_attempt_at": str(time.time()),
+                        "model_roster.last_error": str(exc),
+                    })
+        except Exception as metadata_error:
+            _log(f"WARNING model roster: error metadata unavailable: {metadata_error}")
+
+    def record_model_roster_sync_error(self, exc: Exception) -> None:
+        """Delegate a sanitized remote failure to the local metadata recorder."""
+        self._record_model_roster_error(exc)
+
+    def get_model_roster_status(self) -> dict:
+        """Read the last accepted document's metadata without changing attempt state."""
+        with self._rmw_lock:
+            values = dict(self._db.execute(
+                "SELECT key,value FROM system_settings WHERE key LIKE 'model_roster.%'"
+            ).fetchall())
+        return {
+            "last_applied_revision": int(values.get("model_roster.last_applied_revision", "0")),
+            "sha256": values.get("model_roster.sha256", ""),
+            "source": values.get("model_roster.source", ""),
+            "applied_at": float(values.get("model_roster.applied_at", "0")),
+            "last_attempt_at": float(values.get("model_roster.last_attempt_at", "0")),
+            "last_error": values.get("model_roster.last_error", ""),
+            "counts": json.loads(values.get("model_roster.counts", "{}")),
+        }
+
+    def _plan_model_roster(self, roster) -> dict:
+        existing = {row["id"]: row for row in self.list_models(active_only=False)}
+        providers = {}
+        for row in existing.values():
+            providers.setdefault(row["model_id"], set()).add(row["provider"])
+        counts = empty_counts()
+        field_counts = dict(inserted=0, updated=0, skipped_operator=0, skipped_deactivation=0)
+        rows = []
+        for model in roster.models:
+            full_id = f"{model.provider}/{model.model_id}"
+            if providers.get(model.model_id, set()) - {model.provider}:
+                raise ValueError(f"cross-provider model_id collision: {model.model_id}")
+            incoming = model_values(model)
+            row = existing.get(full_id)
+            if row is None:
+                if not incoming["active"]:
+                    counts["skipped_inactive"] += 1
+                    rows.append(dict(id=full_id, action="skipped", updates={},
+                                     reason="inactive_row_not_inserted", skipped=[]))
+                else:
+                    counts["inserted"] += 1
+                    field_counts["inserted"] += len(MANAGED_FIELDS)
+                    rows.append(dict(id=full_id, action="inserted", updates=incoming, skipped=[]))
+                continue
+            plan = plan_fields(row, incoming, operator_fields(row["operator_fields"]))
+            action = "updated" if plan["updates"] else "unchanged"
+            counts[action] += 1
+            field_counts["updated"] += len(plan["updates"])
+            for reason, category in (("operator_owned", "skipped_operator"),
+                                     ("deactivation_not_automatic", "skipped_deactivation")):
+                skipped = [entry for entry in plan["skipped"] if entry["reason"] == reason]
+                counts[category] += bool(skipped)
+                field_counts[category] += len(skipped)
+            changes = {field: {"old": row[field], "new": value}
+                       for field, value in plan["updates"].items()}
+            rows.append(dict(id=full_id, action=action, changes=changes, **plan))
+        return dict(counts=counts, field_counts=field_counts, rows=rows)
+
+    @staticmethod
+    def _log_roster_changes(report: dict) -> None:
+        for row in report["rows"]:
+            if row["action"] in {"inserted", "updated"}:
+                detail = "; ".join(f"{field} {change['old']!r} -> {change['new']!r}"
+                                   for field, change in row.get("changes", {}).items())
+                _log(f"INFO model roster: {row['id']} {row['action']} {detail}".rstrip())
+        _log(f"INFO model roster: {report['counts']}")
+
+    def apply_model_roster(self, document: bytes, *, source: str, dry_run: bool = False) -> dict:
+        """Apply validated bytes atomically; previews include the real revision gate."""
+        try:
+            roster = parse_model_roster(document)
+            digest = hashlib.sha256(document).hexdigest()
+            with self._rmw_lock:
+                if dry_run:
+                    current = self.get_model_roster_status()["last_applied_revision"]
+                    report = self._plan_model_roster(roster)
+                else:
+                    with self._model_roster_transaction():
+                        current = self.get_model_roster_status()["last_applied_revision"]
+                        report = self._plan_model_roster(roster)
+                        gate = ("accepted" if roster.revision > current else
+                                "equal" if roster.revision == current else "lower")
+                        if gate == "accepted":
+                            now = time.time()
+                            for row in report["rows"]:
+                                if row["action"] == "inserted":
+                                    provider, model_id = row["id"].split("/", 1)
+                                    self._insert_roster_model(provider, model_id, row["updates"], now,
+                                                               revision=roster.revision)
+                                elif row["action"] == "updated":
+                                    self._update_roster_model(row["id"], {
+                                        **row["updates"], "updated_at": now,
+                                        "roster_revision": roster.revision,
+                                    })
+                            self._write_model_roster_settings({
+                                "model_roster.last_applied_document": document.decode("utf-8"),
+                                "model_roster.last_applied_revision": str(roster.revision),
+                                "model_roster.sha256": digest, "model_roster.source": source,
+                                "model_roster.applied_at": str(now),
+                                "model_roster.last_attempt_at": str(now),
+                                "model_roster.last_error": "",
+                                "model_roster.counts": json.dumps(report["counts"], sort_keys=True),
+                            })
+                        elif source != "bundled":
+                            self._write_model_roster_settings({
+                                "model_roster.last_attempt_at": str(time.time()),
+                                "model_roster.last_error": "",
+                            })
+                    if gate == "accepted":
+                        from pinky_daemon import runtime_model_catalog
+
+                        runtime_model_catalog.invalidate()
+                        self._log_roster_changes(report)
+                    else:
+                        report = dict(counts=empty_counts(), field_counts={}, rows=[])
+                        _log(f"INFO model roster: revision {roster.revision} {gate}; unchanged")
+                report.update(revision=roster.revision, dry_run=dry_run,
+                              revision_gate=("accepted" if roster.revision > current else
+                                             "equal" if roster.revision == current else "lower"))
+                return report
+        except Exception as exc:
+            if not dry_run:
+                self._record_model_roster_error(exc)
+            raise
+
+    def release_model_roster_fields(self, full_id: str, fields) -> dict:
+        """Release an ownership unit and reapply only it from the exact saved document."""
+        if not isinstance(full_id, str) or full_id.count("/") != 1:
+            raise ValueError("release requires a full provider/model_id")
+        if fields == "all":
+            selected = set(MANAGED_FIELDS)
+        elif isinstance(fields, list) and all(isinstance(f, str) for f in fields):
+            selected = set(fields)
+            if not selected <= set(MANAGED_FIELDS):
+                raise ValueError("invalid roster release fields")
+        else:
+            raise ValueError("release fields must be a list or all")
+        selected = context_unit(selected)
+        with self._model_roster_transaction():
+            existing = self._get_model_by_id(full_id)
+            if existing is None or existing["id"] != full_id:
+                raise ValueError(f"unknown full model id: {full_id}")
+            saved = self.get_setting("model_roster.last_applied_document")
+            if not saved and (
+                int(self.get_setting("model_roster.last_applied_revision") or "0") > 0
+                or self.get_setting("model_roster.sha256")
+            ):
+                raise ValueError("saved model roster document is missing or empty")
+            roster = None
+            incoming = None
+            if saved:
+                blob = saved.encode("utf-8")
+                roster = parse_model_roster(blob)
+                if hashlib.sha256(blob).hexdigest() != self.get_setting("model_roster.sha256"):
+                    raise ValueError("saved model roster digest mismatch")
+                incoming = next((row for row in roster.models
+                                 if f"{row.provider}/{row.model_id}" == full_id), None)
+            owned = operator_fields(existing["operator_fields"])
+            remaining = owned - selected
+            plan = dict(updates={}, skipped=[])
+            if incoming is not None:
+                plan = plan_fields(existing, model_values(incoming), remaining, fields=selected)
+            changed = remaining != owned or bool(plan["updates"])
+            if changed:
+                updates = {**plan["updates"], "operator_fields": json.dumps(sorted(remaining)),
+                           "updated_at": time.time()}
+                if plan["updates"]:
+                    updates["roster_revision"] = roster.revision
+                self._update_roster_model(full_id, updates)
+            row = dict(id=full_id, action="updated" if changed else "unchanged", **plan,
+                       fields_released=sorted(owned & selected))
+            if incoming is None:
+                row["reason"] = "row_not_in_roster" if saved else "no_applied_document"
+            report = dict(rows=[row], counts={"updated": int(changed)})
+        if changed:
+            from pinky_daemon import runtime_model_catalog
+
+            runtime_model_catalog.invalidate()
+            self._log_roster_changes(report)
+        return report
 
     def list_models(self, *, provider: str = "", active_only: bool = True) -> list[dict]:
         """List available models, optionally filtered by provider."""
@@ -8605,6 +8884,15 @@ except Exception as exc:
         cols = [d[0] for d in cursor.description]
         return [self._with_pricing_status(dict(zip(cols, row))) for row in rows]
 
+    def _get_model_by_id(self, full_id: str) -> dict | None:
+        """Resolve a write target by primary key, without bare model-id aliases."""
+        cursor = self._db.execute("SELECT * FROM models WHERE id=?", (full_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        cols = [entry[0] for entry in cursor.description]
+        return self._with_pricing_status(dict(zip(cols, row)))
+
     def get_model(self, model_id: str) -> dict | None:
         """Get a model by its full ID (provider/model_id) or just model_id."""
         row = self._db.execute(
@@ -8617,74 +8905,62 @@ except Exception as exc:
         return self._with_pricing_status(dict(zip(cols, row)))
 
     def add_model(
-        self,
-        *,
-        provider: str,
-        model_id: str,
-        display_name: str = "",
-        description: str = "",
-        tier: str = "",
-        context_window: int = 200_000,
-        is_1m: bool = False,
-        input_price: float = 0,
-        output_price: float = 0,
-        cached_input_price: float = 0,
-        cache_write_5m_price: float | None = None,
-        cache_write_1h_price: float | None = None,
-        supports_thinking: bool = True,
-        sort_order: int = 100,
+        self, *, provider: str, model_id: str, display_name: str = "",
+        description: str = "", tier: str = "", context_window: int = 200_000,
+        is_1m: bool = False, input_price: float = 0, output_price: float = 0,
+        cached_input_price: float = 0, cache_write_5m_price: float | None = None,
+        cache_write_1h_price: float | None = None, supports_thinking: bool = True,
+        sort_order: int = 100, operator: bool = True,
     ) -> dict:
-        """Add or update a model in the registry."""
+        """Track effective operator edits; automated updates preserve every owned field."""
         full_id = f"{provider}/{model_id}"
-        now = time.time()
-        self._db.execute(
-            """INSERT INTO models
-               (id, provider, model_id, display_name, description, tier,
-                context_window, is_1m, input_price, output_price,
-                cached_input_price, cache_write_5m_price,
-                cache_write_1h_price, supports_thinking, sort_order,
-                created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(id) DO UPDATE SET
-                display_name=excluded.display_name,
-                description=excluded.description,
-                tier=excluded.tier,
-                context_window=excluded.context_window,
-                is_1m=excluded.is_1m,
-                input_price=excluded.input_price,
-                output_price=excluded.output_price,
-                cached_input_price=excluded.cached_input_price,
-                cache_write_5m_price=excluded.cache_write_5m_price,
-                cache_write_1h_price=excluded.cache_write_1h_price,
-                supports_thinking=excluded.supports_thinking,
-                sort_order=excluded.sort_order,
-                active=1,
-                updated_at=excluded.updated_at""",
-            (full_id, provider, model_id,
-             display_name or model_id, description, tier,
-             context_window, int(is_1m), input_price, output_price,
-             cached_input_price, cache_write_5m_price, cache_write_1h_price,
-             int(supports_thinking), sort_order,
-             now, now),
-        )
-        self._db.commit()
+        values = dict(display_name=display_name or model_id, description=description, tier=tier,
+                      context_window=context_window, is_1m=int(is_1m), input_price=input_price,
+                      output_price=output_price, cached_input_price=cached_input_price,
+                      cache_write_5m_price=cache_write_5m_price,
+                      cache_write_1h_price=cache_write_1h_price,
+                      supports_thinking=int(supports_thinking), active=1, sort_order=sort_order)
+        with self._model_roster_transaction():
+            now = time.time()
+            row = self._get_model_by_id(full_id)
+            if row is None:
+                self._insert_roster_model(provider, model_id, values, now,
+                                           owned=MANAGED_FIELDS if operator else ())
+            else:
+                owned = operator_fields(row["operator_fields"])
+                differences = {field for field in MANAGED_FIELDS if row[field] != values[field]}
+                if operator:
+                    owned.update(context_unit(differences))
+                    updates = values
+                else:
+                    updates = {field: value for field, value in values.items() if field not in owned}
+                self._update_roster_model(full_id, {**updates, "updated_at": now,
+                                                   "operator_fields": json.dumps(sorted(owned))})
         from pinky_daemon import runtime_model_catalog
 
         runtime_model_catalog.invalidate()
         _log(f"agent_registry: added/updated model {full_id}")
-        return self.get_model(full_id) or {}
+        return self._get_model_by_id(full_id) or {}
 
-    def delete_model(self, model_id: str) -> bool:
-        """Soft-delete a model (set active=0)."""
-        cursor = self._db.execute(
-            "UPDATE models SET active=0, updated_at=? WHERE id=? OR model_id=?",
-            (time.time(), model_id, model_id),
-        )
-        self._db.commit()
+    def delete_model(self, model_id: str, *, operator: bool = True) -> bool:
+        """Soft deletion is an operator action and permanently owns the active field."""
+        if not operator:
+            raise ValueError("model deactivation requires an operator")
+        with self._model_roster_transaction():
+            cursor = self._db.execute("SELECT * FROM models WHERE id=? OR model_id=?",
+                                      (model_id, model_id))
+            columns = [entry[0] for entry in cursor.description]
+            rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+            now = time.time()
+            for row in rows:
+                owned = operator_fields(row["operator_fields"]) | {"active"}
+                self._update_roster_model(row["id"], {
+                    "active": 0, "updated_at": now, "operator_fields": json.dumps(sorted(owned)),
+                })
         from pinky_daemon import runtime_model_catalog
 
         runtime_model_catalog.invalidate()
-        return cursor.rowcount > 0
+        return bool(rows)
 
     def get_1m_models(self) -> set[str]:
         """Return set of model_ids that have 1M context windows."""

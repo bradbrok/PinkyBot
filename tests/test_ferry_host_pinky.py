@@ -1001,7 +1001,7 @@ class TestBrokerIntegrationFerryInbound:
         )
 
         result = await host.deliver(envelope)
-        assert result.status == "delivered"
+        assert result.status == "transient_failure"
 
         # 1. ferry sender NOT in approved_users (the human-identity table)
         ferry_user_id = "ferry:misha@pinky.local"

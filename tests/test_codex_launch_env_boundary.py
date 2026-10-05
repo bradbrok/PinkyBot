@@ -352,7 +352,12 @@ def test_path_and_explicit_api_key_control(harness, kind):
     h.patch.setenv("OPENAI_API_KEY", SENTINEL + "ambient")
     _, build = h.make(kind)
     env = build()
-    path_matches = env.get("PATH") == os.environ["PATH"]
+    expected_path = os.environ["PATH"]
+    if kind in {"repl", "tmux_app_server"}:
+        standard = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin",
+                    "/usr/local/sbin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        expected_path = os.pathsep.join(dict.fromkeys([*expected_path.split(os.pathsep), *standard]))
+    path_matches = env.get("PATH") == expected_path
     key_matches = env.get("OPENAI_API_KEY") == SENTINEL + "provider"
     assert path_matches and key_matches
 
