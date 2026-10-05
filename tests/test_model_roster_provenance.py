@@ -244,7 +244,9 @@ async def test_management_delete_route_explicitly_marks_operator_action(registry
     assert owned(registry) == {"active"}
 
 
-async def test_discovery_route_is_insert_only_and_marks_automation(registry, monkeypatch):
+async def test_discovery_route_is_insert_only_and_marks_automation(
+    registry, monkeypatch, reference_pricing,
+):
     import httpx
 
     from pinky_daemon.routes import providers

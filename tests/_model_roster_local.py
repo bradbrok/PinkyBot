@@ -6,6 +6,7 @@ import copy
 import inspect
 import json
 import sqlite3
+import sys
 from contextlib import closing, contextmanager
 from importlib import resources
 from pathlib import Path
@@ -42,6 +43,32 @@ PRICE_FIELDS = {
     "cache_write_5m_price": "cache_write_5m",
     "cache_write_1h_price": "cache_write_1h",
 }
+
+
+@contextmanager
+def reference_table_captures(live, reference):
+    """Temporarily replace production module aliases, including later imports."""
+    from pytest import MonkeyPatch
+
+    def captures(table):
+        return [
+            (module, attribute)
+            for name, module in list(sys.modules.items())
+            if name.startswith("pinky_daemon.") and module is not None
+            for attribute, value in list(vars(module).items())
+            if value is table
+        ]
+
+    with MonkeyPatch.context() as patch:
+        for module, attribute in captures(live):
+            patch.setattr(module, attribute, reference)
+        try:
+            yield
+        finally:
+            # A consumer first imported inside the fixture captured reference.
+            # Restore it too; MonkeyPatch handles the aliases present on entry.
+            for module, attribute in captures(reference):
+                setattr(module, attribute, live)
 
 
 def bundled_bytes(name="models.json"):
