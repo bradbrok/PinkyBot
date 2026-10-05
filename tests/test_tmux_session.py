@@ -7692,7 +7692,7 @@ async def test_turn_complete_logs_analytics_row() -> None:
 
 
 @pytest.mark.asyncio
-async def test_turn_complete_fires_cost_callback_with_computed_cost() -> None:
+async def test_turn_complete_fires_cost_callback_with_computed_cost(reference_pricing) -> None:
     """tmux has no per-turn dollar figure from the transcript, so the
     cost must be COMPUTED from token counts and forwarded via
     ``cost_callback`` (signature: agent, cost, input, output, handle)."""
@@ -7729,7 +7729,7 @@ async def test_turn_seq_increments_across_turns() -> None:
 
 
 @pytest.mark.asyncio
-async def test_model_falls_back_to_config_when_transcript_blank() -> None:
+async def test_model_falls_back_to_config_when_transcript_blank(reference_pricing) -> None:
     """If the transcript carried no model field, price under the
     configured model rather than dropping the cost to zero."""
     cost_cb = MagicMock()
@@ -7910,7 +7910,7 @@ def test_base_normalize_turn_usage_is_identity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_normalize_hook_runs_before_all_consumers() -> None:
+async def test_normalize_hook_runs_before_all_consumers(reference_pricing) -> None:
     """#860: _normalize_turn_usage must rewrite response.usage ONCE, before
     ANY consumer — accumulation (SessionUsage), pricing, and analytics all
     see the normalized dict. A partial conversion spread across consumers is

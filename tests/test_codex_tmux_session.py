@@ -1152,7 +1152,7 @@ def _seed_inflight(ss: CodexTmuxSession) -> None:
 
 
 @pytest.mark.asyncio
-async def test_turn_complete_prices_codex_turn_correctly():
+async def test_turn_complete_prices_codex_turn_correctly(reference_pricing):
     """#860 end-to-end: a codex-schema turn (usage exactly as the tailer
     snapshots token_count.info.last_token_usage) must log provider=codex_cli,
     the DISJOINT token split, and the openai-rate dollar figure. Pre-#860 this
