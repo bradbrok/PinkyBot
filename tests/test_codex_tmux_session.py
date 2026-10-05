@@ -1201,8 +1201,8 @@ async def test_turn_complete_prices_codex_turn_correctly():
     assert kwargs["cached_input_tokens"] == 90_000  # cache-READ column
     assert kwargs["output_tokens"] == 1_000
 
-    # 10k uncached @ $5 + 1k out @ $30 + 90k cached @ $0.50 (per Mtok).
-    expected = 10_000 / 1e6 * 5 + 1_000 / 1e6 * 30 + 90_000 / 1e6 * 0.5
+    # 10k uncached @ $4 + 1k out @ $20 + 90k cached @ $0.40 (per Mtok).
+    expected = 10_000 / 1e6 * 4 + 1_000 / 1e6 * 20 + 90_000 / 1e6 * 0.4
     assert cost_cb.call_args.args[1] == pytest.approx(expected)
     assert ss.usage.total_cost_usd == pytest.approx(expected)
     # Accumulation saw the disjoint split too (context gauge correctness).
