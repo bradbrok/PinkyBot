@@ -19,9 +19,10 @@ from pinky_daemon.pricing import (
     lookup_rate,
 )
 from tests._gc_quiet import gc_quiet
+from tests._model_roster_local import unused_model_id
 
 
-def test_pure_input_output_opus() -> None:
+def test_pure_input_output_opus(reference_pricing) -> None:
     # 1M input @ $5 + 1M output @ $25 = $30.00
     cost = compute_turn_cost_usd(
         "claude-opus-4-8",
@@ -34,7 +35,7 @@ def test_pure_input_output_opus() -> None:
     assert cost == pytest.approx(30.0)
 
 
-def test_split_cache_write_rates_opus() -> None:
+def test_split_cache_write_rates_opus(reference_pricing) -> None:
     # cache_read 1M @ $0.50 + cw5m 1M @ $6.25 + cw1h 1M @ $10 = $16.75
     cost = compute_turn_cost_usd(
         "claude-opus-4-8",
@@ -47,7 +48,7 @@ def test_split_cache_write_rates_opus() -> None:
     assert cost == pytest.approx(16.75)
 
 
-def test_sonnet_rates() -> None:
+def test_sonnet_rates(reference_pricing) -> None:
     # 2M input @ $3 + 1M output @ $15 = $21.00
     cost = compute_turn_cost_usd(
         "claude-sonnet-4-6",
@@ -60,7 +61,7 @@ def test_sonnet_rates() -> None:
     assert cost == pytest.approx(21.0)
 
 
-def test_haiku_rates() -> None:
+def test_haiku_rates(reference_pricing) -> None:
     cost = compute_turn_cost_usd(
         "claude-haiku-4-5",
         input_tokens=1_000_000,
@@ -72,7 +73,7 @@ def test_haiku_rates() -> None:
     assert cost == pytest.approx(1.0)
 
 
-def test_legacy_opus_is_three_x() -> None:
+def test_legacy_opus_is_three_x(reference_pricing) -> None:
     # Pre-4.5 Opus billed at the 3x tier: 1M input @ $15.
     cost = compute_turn_cost_usd(
         "claude-opus-4-1",
@@ -86,9 +87,10 @@ def test_legacy_opus_is_three_x() -> None:
 
 
 def test_unknown_model_costs_zero() -> None:
-    assert lookup_rate("gpt-5-turbo") is None
+    model_id = unused_model_id("gpt-5-turbo")
+    assert lookup_rate(model_id) is None
     cost = compute_turn_cost_usd(
-        "gpt-5-turbo",
+        model_id,
         input_tokens=1_000_000,
         output_tokens=1_000_000,
         cache_read_tokens=0,
@@ -98,7 +100,7 @@ def test_unknown_model_costs_zero() -> None:
     assert cost == 0.0
 
 
-def test_tier_suffix_is_stripped() -> None:
+def test_tier_suffix_is_stripped(reference_pricing) -> None:
     # A tiered id ("...[1m]") must resolve to the same rate as the bare id.
     assert lookup_rate("claude-opus-4-8[1m]") is lookup_rate("claude-opus-4-8")
     cost = compute_cost_from_usage(
@@ -108,7 +110,7 @@ def test_tier_suffix_is_stripped() -> None:
     assert cost == pytest.approx(5.0)
 
 
-def test_fable_and_mythos_5_rates() -> None:
+def test_fable_and_mythos_5_rates(reference_pricing) -> None:
     # Claude Fable 5 / Mythos 5 (2026-06-09): $10 in / $50 out per Mtok.
     for model in ("claude-fable-5", "claude-mythos-5"):
         cost = compute_turn_cost_usd(
@@ -128,7 +130,7 @@ def test_fable_and_mythos_5_rates() -> None:
     assert rate["cache_write_1h"] == 20.0  # 2x input
 
 
-def test_cost_from_usage_with_transcript_split() -> None:
+def test_cost_from_usage_with_transcript_split(reference_pricing) -> None:
     """Transcript-shape usage with the nested 5m/1h breakdown."""
     usage = {
         "input_tokens": 10_000,
@@ -151,7 +153,7 @@ def test_cost_from_usage_with_transcript_split() -> None:
     assert compute_cost_from_usage("claude-opus-4-8", usage) == pytest.approx(expected)
 
 
-def test_cost_from_usage_falls_back_to_1h_without_split() -> None:
+def test_cost_from_usage_falls_back_to_1h_without_split(reference_pricing) -> None:
     """No nested split ⇒ bill the whole cache_creation aggregate at 1h."""
     usage = {
         "input_tokens": 0,
@@ -163,7 +165,7 @@ def test_cost_from_usage_falls_back_to_1h_without_split() -> None:
     assert compute_cost_from_usage("claude-opus-4-8", usage) == pytest.approx(10.0)
 
 
-def test_cost_from_usage_accepts_sdk_short_keys() -> None:
+def test_cost_from_usage_accepts_sdk_short_keys(reference_pricing) -> None:
     """SDK shortened key shape (cache_write_tokens / cache_read_tokens)."""
     usage = {
         "input_tokens": 1_000_000,
@@ -195,7 +197,7 @@ def test_zero_usage_is_zero_cost() -> None:
 # the gpt-5.5 and gpt-5.3-codex pages list no write tariff (murzik #861 P2).
 
 
-def test_gpt_frontier_rates() -> None:
+def test_gpt_frontier_rates(reference_pricing) -> None:
     # 1M input @ $5 + 1M output @ $30 + 1M cached-read @ $0.50 = $35.50
     for model in ("gpt-5.6-sol", "gpt-5.5"):
         cost = compute_turn_cost_usd(
@@ -222,7 +224,7 @@ def test_gpt_53_codex_rates() -> None:
     assert cost == pytest.approx(15.925)
 
 
-def test_gpt_56_sol_cache_write_billed_at_1_25x_input() -> None:
+def test_gpt_56_sol_cache_write_billed_at_1_25x_input(reference_pricing) -> None:
     """The sol model page documents cache writes at 1.25x the uncached input
     rate ($6.25/Mtok). OpenAI has no 5m/1h TTL split, so both positions carry
     the same tariff (murzik #861 P2 — was wrongly $0)."""
@@ -244,7 +246,7 @@ def test_gpt_56_sol_cache_write_billed_at_1_25x_input() -> None:
     assert compute_cost_from_usage("gpt-5.6-sol", usage) == pytest.approx(6.25)
 
 
-def test_gpt_55_and_codex_cache_write_bills_zero() -> None:
+def test_gpt_55_and_codex_cache_write_bills_zero(reference_pricing) -> None:
     """The gpt-5.5 and gpt-5.3-codex model pages list no cache-write tariff —
     cache_creation tokens contribute $0 at both positions."""
     for model in ("gpt-5.5", "gpt-5.3-codex"):
@@ -388,14 +390,15 @@ def test_truly_unknown_model_stays_zero_with_registry_bound(
     tmp_path,
     bound_runtime_catalog,
 ) -> None:
+    model_id = unused_model_id("runtime-unknown-model")
     from pinky_daemon.agent_registry import AgentRegistry
 
     registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
     try:
         bound_runtime_catalog.bind_registry(registry)
-        assert lookup_rate("runtime-unknown-model") is None
+        assert lookup_rate(model_id) is None
         assert compute_turn_cost_usd(
-            "runtime-unknown-model",
+            model_id,
             input_tokens=1_000_000,
             output_tokens=1_000_000,
             cache_read_tokens=0,
@@ -411,7 +414,7 @@ def test_unbound_or_unavailable_registry_uses_static_fallback(
     capsys,
 ) -> None:
     static = lookup_rate("claude-opus-4-8")
-    assert static is not None and static["input"] == 5.0
+    assert static is not None
 
     class UnavailableRegistry:
         def get_model(self, _model_id):
@@ -419,7 +422,7 @@ def test_unbound_or_unavailable_registry_uses_static_fallback(
 
     bound_runtime_catalog.bind_registry(UnavailableRegistry())
     fallback = lookup_rate("claude-opus-4-8")
-    assert fallback is not None and fallback["input"] == 5.0
+    assert fallback == static
     stderr = capsys.readouterr().err
     assert "ERROR" in stderr
     assert "claude-opus-4-8" in stderr
@@ -429,6 +432,7 @@ def test_unbound_or_unavailable_registry_uses_static_fallback(
 def test_unavailable_registry_without_static_rate_raises_catalog_error(
     bound_runtime_catalog,
 ) -> None:
+    model_id = unused_model_id("runtime-only-unreachable-model")
     class UnavailableRegistry:
         def get_model(self, _model_id):
             raise RuntimeError("registry unavailable")
@@ -436,14 +440,15 @@ def test_unavailable_registry_without_static_rate_raises_catalog_error(
     bound_runtime_catalog.bind_registry(UnavailableRegistry())
     with pytest.raises(
         bound_runtime_catalog.ModelCatalogError,
-        match="runtime-only-unreachable-model.*registry unavailable",
+        match=rf"{model_id}.*registry unavailable",
     ):
-        lookup_rate("runtime-only-unreachable-model")
+        lookup_rate(model_id)
 
 
 def test_registry_read_failure_does_not_poison_rate_cache(
     bound_runtime_catalog,
 ) -> None:
+    model_id = unused_model_id("runtime-only-unreachable-model")
     class RecoveringRegistry:
         calls = 0
 
@@ -466,8 +471,8 @@ def test_registry_read_failure_does_not_poison_rate_cache(
     registry = RecoveringRegistry()
     bound_runtime_catalog.bind_registry(registry)
     with pytest.raises(bound_runtime_catalog.ModelCatalogError):
-        lookup_rate("runtime-only-unreachable-model")
-    recovered = lookup_rate("runtime-only-unreachable-model")
+        lookup_rate(model_id)
+    recovered = lookup_rate(model_id)
     assert recovered is not None and recovered["input"] == 7.0
     assert registry.calls == 2
 
@@ -528,6 +533,7 @@ def test_bound_absent_model_keeps_static_or_unknown_fallback(
     tmp_path,
     bound_runtime_catalog,
 ) -> None:
+    model_id = unused_model_id("runtime-never-known-model")
     from pinky_daemon.agent_registry import AgentRegistry
     from pinky_daemon.pricing import RATE_TABLE
 
@@ -536,9 +542,9 @@ def test_bound_absent_model_keeps_static_or_unknown_fallback(
         bound_runtime_catalog.bind_registry(registry)
         assert registry.get_model("gpt-5.3-codex") is None
         assert lookup_rate("gpt-5.3-codex") == RATE_TABLE["gpt-5.3-codex"]
-        assert lookup_rate("runtime-never-known-model") is None
+        assert lookup_rate(model_id) is None
         assert compute_turn_cost_usd(
-            "runtime-never-known-model",
+            model_id,
             input_tokens=1_000_000,
             output_tokens=1_000_000,
             cache_read_tokens=0,

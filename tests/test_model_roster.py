@@ -121,26 +121,38 @@ def _assert_rejected(blob):
         loader.parse(blob)
 
 
-def test_seed_tuples_equal_frozen_literals():
-    from pinky_daemon.agent_registry import AgentRegistry
-
-    expected = [tuple(row) for row in _frozen()["model_seeds"]]
-    assert isinstance(AgentRegistry._MODEL_SEEDS, list)
-    assert AgentRegistry._MODEL_SEEDS == expected
-    assert all(type(row[6]) is int and type(row[10]) is int for row in AgentRegistry._MODEL_SEEDS)
+def test_seed_tuples_equal_frozen_literals(tmp_path):
+    result = _probe(tmp_path, "pinky_daemon.agent_registry", _bytes(_revision_one()), inspect=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout) == _frozen()["model_seeds"]
 
 
-def test_rate_table_equals_frozen_literals():
-    from pinky_daemon.pricing import RATE_TABLE
+def test_rate_table_equals_frozen_literals(tmp_path):
+    result = _probe(tmp_path, "pinky_daemon.pricing", _bytes(_revision_one()), inspect=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout) == _frozen()["rate_table"]
 
-    assert RATE_TABLE == _frozen()["rate_table"]
+
+def test_one_million_set_equals_frozen_literals(tmp_path):
+    result = _probe(tmp_path, "pinky_daemon.streaming_session", _bytes(_revision_one()), inspect=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert set(json.loads(result.stdout)) == set(_frozen()["one_million_models"])
 
 
-def test_one_million_set_equals_frozen_literals():
-    from pinky_daemon.streaming_session import _1M_MODELS
-
-    assert isinstance(_1M_MODELS, set)
-    assert _1M_MODELS == set(_frozen()["one_million_models"])
+@pytest.mark.parametrize("module_name,attribute", [
+    ("pinky_daemon.agent_registry", "_MODEL_SEEDS"),
+    ("pinky_daemon.pricing", "RATE_TABLE"),
+    ("pinky_daemon.streaming_session", "_1M_MODELS"),
+])
+def test_imported_tables_follow_live_bundle(tmp_path, module_name, attribute):
+    module = importlib.import_module(module_name)
+    owner = module.AgentRegistry if attribute == "_MODEL_SEEDS" else module
+    actual = getattr(owner, attribute)
+    if isinstance(actual, set):
+        actual = sorted(actual)
+    result = _probe(tmp_path, module_name, _resource("models.json"), inspect=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout) == json.loads(json.dumps(actual))
 
 
 @pytest.mark.parametrize("name", ["models.json", "models.schema.json", "models.baseline.json"])
@@ -152,7 +164,6 @@ def test_baseline_is_pinned_revision_one_bytes():
     baseline = _resource("models.baseline.json")
     assert hashlib.sha256(baseline).hexdigest() == BASELINE_SHA256
     assert baseline == (FIXTURES / "model_roster_revision1.json").read_bytes()
-    assert baseline == _resource("models.json")
     assert json.loads(baseline) == _revision_one()
 
 
@@ -162,7 +173,35 @@ def test_load_bundled_returns_roster_dataclasses():
     assert isinstance(roster, loader.Roster)
     assert dataclasses.is_dataclass(roster)
     assert all(dataclasses.is_dataclass(row) for row in roster.models)
-    assert json.loads(json.dumps(dataclasses.asdict(roster))) == _revision_one()
+    assert json.loads(json.dumps(dataclasses.asdict(roster))) == json.loads(_resource("models.json"))
+
+
+def test_live_bundle_passes_strict_parser():
+    assert _loader().parse(_resource("models.json")) == _loader().load_bundled()
+
+
+def test_live_bundle_revision_is_not_below_baseline():
+    live = _loader().parse(_resource("models.json"))
+    baseline = _loader().parse(_resource("models.baseline.json"))
+    assert live.revision >= baseline.revision
+
+
+def test_live_bundle_retains_every_baseline_id():
+    live = _loader().parse(_resource("models.json"))
+    baseline = _loader().parse(_resource("models.baseline.json"))
+    assert {(row.provider, row.model_id) for row in baseline.models} <= {
+        (row.provider, row.model_id) for row in live.models
+    }
+
+
+def test_live_bundle_satisfies_packaged_schema():
+    from jsonschema import Draft202012Validator
+
+    schema = json.loads(_resource("models.schema.json"))
+    Draft202012Validator.check_schema(schema)
+    Draft202012Validator(schema, format_checker=Draft202012Validator.FORMAT_CHECKER).validate(
+        json.loads(_resource("models.json"))
+    )
 
 
 def test_recorded_generator_reproduces_revision_one(tmp_path):
@@ -202,9 +241,18 @@ def test_recorded_generator_reproduces_revision_one(tmp_path):
                 "the frozen-literal equality tests pin the same values"
             )
     output = tmp_path / "generated.json"
+    home = tmp_path / "generator-home"
+    home.mkdir()
+    env = {key: value for key, value in os.environ.items() if key in {"PATH", "LANG", "TMPDIR"}}
+    env["HOME"] = str(home)
     result = subprocess.run(
         [
+            "/usr/bin/env", "-i", *[f"{key}={value}" for key, value in env.items()],
             sys.executable,
+            "-c",
+            "import importlib.util, sys; p=sys.argv.pop(1); "
+            "s=importlib.util.spec_from_file_location('roster_generation_record',p); "
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); m.main()",
             str(generator),
             "--base",
             BASE_REVISION,
@@ -249,9 +297,13 @@ except Exception as error:
 if mode == 'inspect':
     if module_name.endswith('agent_registry'):
         result = module.AgentRegistry._MODEL_SEEDS
+        assert isinstance(result, list)
+        assert all(isinstance(row, tuple) for row in result)
+        assert all(type(row[6]) is int and type(row[10]) is int for row in result)
     elif module_name.endswith('pricing'):
         result = module.RATE_TABLE
     else:
+        assert isinstance(module._1M_MODELS, set)
         result = sorted(module._1M_MODELS)
     print(json.dumps(result))
 """
@@ -268,16 +320,16 @@ def _probe(tmp_path, module_name, blob, *, inspect=False):
     (catalog / "models.json").write_bytes(blob)
     package = importlib.import_module("pinky_daemon")
     source_root = Path(package.__file__).resolve().parent.parent
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key in {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"}
-    }
+    home = tmp_path / "empty-home"
+    home.mkdir(exist_ok=True)
+    env = {key: value for key, value in os.environ.items() if key in {"PATH", "LANG", "LC_ALL", "TMPDIR"}}
+    env["HOME"] = str(home)
     env.update(
         PYTHONPATH=str(source_root), PYTHONDONTWRITEBYTECODE="1", PINKY_TEST_TRANSPORT_GUARD="1"
     )
     return subprocess.run(
         [
+            "/usr/bin/env", "-i", *[f"{key}={value}" for key, value in env.items()],
             sys.executable,
             "-c",
             IMPORT_PROBE,
@@ -286,7 +338,6 @@ def _probe(tmp_path, module_name, blob, *, inspect=False):
             "inspect" if inspect else "import",
         ],
         cwd=tmp_path,
-        env=env,
         capture_output=True,
         text=True,
         timeout=15,

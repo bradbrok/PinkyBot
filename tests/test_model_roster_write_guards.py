@@ -9,18 +9,19 @@ from contextlib import closing
 import pytest
 
 from pinky_daemon import runtime_model_catalog
-from pinky_daemon.agent_registry import AgentRegistry
 from tests._model_roster_local import (
     DOCUMENT_KEY,
     FIELDS,
     SONNET,
     add,
-    document,
+    bundled_revision,
+    fixture_document,
     flat,
     legacy_db,
     model_row,
     new_model,
     owned,
+    reference_registry,
     release,
     snapshot,
     status,
@@ -29,7 +30,7 @@ from tests._model_roster_local import (
 
 @pytest.fixture
 def registry(tmp_path):
-    instance = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+    instance = reference_registry(tmp_path / "agents.db")
     try:
         yield instance
     finally:
@@ -41,10 +42,10 @@ def registry(tmp_path):
 def test_applied_document_evidence_refuses_missing_or_empty_release(
     registry, monkeypatch, saved, evidence
 ):
-    edited = model_row(document())
+    edited = model_row(fixture_document())
     edited["pricing"]["input"] = 7.0
     add(registry, edited)
-    registry.set_setting("model_roster.last_applied_revision", "1" if evidence != "digest" else "0")
+    registry.set_setting("model_roster.last_applied_revision", str(bundled_revision()) if evidence != "digest" else "0")
     if evidence == "revision":
         registry.delete_setting("model_roster.sha256")
     if saved is None:
@@ -69,7 +70,7 @@ def test_applied_document_evidence_refuses_missing_or_empty_release(
 
 @pytest.mark.parametrize("saved", ["", None], ids=["empty", "missing"])
 def test_never_applied_release_clears_ownership_without_repricing(registry, saved):
-    edited = model_row(document())
+    edited = model_row(fixture_document())
     edited["pricing"]["input"] = 7.0
     add(registry, edited)
     for key, _ in snapshot(registry)["settings"]:
@@ -166,7 +167,7 @@ def test_frozen_correction_only_targets_exact_baseline_row(registry):
 
 def test_constructor_corrects_only_baseline_after_lower_rowid_custom_alias(tmp_path):
     path = legacy_db(tmp_path / "agents.db")
-    baseline = model_row(document())
+    baseline = model_row(fixture_document())
     stale_prices = {
         "input_price": 3.0,
         "output_price": 15.0,
@@ -197,7 +198,7 @@ def test_constructor_corrects_only_baseline_after_lower_rowid_custom_alias(tmp_p
         rowids = dict(connection.execute("SELECT id, rowid FROM models"))
         assert rowids[custom_id] < rowids[SONNET]
         before = connection.execute("SELECT * FROM models WHERE id=?", (custom_id,)).fetchone()
-    instance = AgentRegistry(db_path=str(path))
+    instance = reference_registry(path)
     try:
         assert instance._db.execute(
             "SELECT * FROM models WHERE id=?", (custom_id,)

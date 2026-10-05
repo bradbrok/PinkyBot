@@ -66,6 +66,7 @@ def _set_total_tokens(ss: TmuxSession, total: int) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.usefixtures("reference_static_context")
 def test_effective_threshold_caps_at_400k_on_1m_model(monkeypatch) -> None:
     # Clear the env var so the default 33k-token buffer is used, not any
     # ambient CLAUDE_AUTOCOMPACT_PCT_OVERRIDE (e.g. set by Claude Code).
@@ -78,6 +79,7 @@ def test_effective_threshold_caps_at_400k_on_1m_model(monkeypatch) -> None:
     )
 
 
+@pytest.mark.usefixtures("reference_static_context")
 def test_effective_threshold_unchanged_on_200k_model() -> None:
     ss = _make_session(model=_MODEL_200K)
     # 400k cap exceeds the whole 200k window, so min() yields the
@@ -85,6 +87,7 @@ def test_effective_threshold_unchanged_on_200k_model() -> None:
     assert ss._effective_restart_threshold_pct() == pytest.approx(80.0)
 
 
+@pytest.mark.usefixtures("reference_static_context")
 def test_400k_cap_fires_well_before_the_old_80pct_point() -> None:
     """Regression intent: the cap must trigger earlier than 80% on 1M."""
     ss = _make_session(model=_MODEL_1M)
@@ -96,6 +99,7 @@ def test_400k_cap_fires_well_before_the_old_80pct_point() -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.usefixtures("reference_static_context")
 @pytest.mark.asyncio
 async def test_crossing_enqueues_nudge_once() -> None:
     ss = _make_session(model=_MODEL_1M)
@@ -110,6 +114,7 @@ async def test_crossing_enqueues_nudge_once() -> None:
     assert kwargs.get("reason") == "context_autorestart_nudge"
 
 
+@pytest.mark.usefixtures("reference_static_context")
 @pytest.mark.asyncio
 async def test_nudge_is_tail_enqueued_not_front() -> None:
     """Lock the tail-vs-front decision (Dymok #618 review, Q1).
@@ -128,6 +133,7 @@ async def test_nudge_is_tail_enqueued_not_front() -> None:
     assert kwargs.get("front", False) is False
 
 
+@pytest.mark.usefixtures("reference_static_context")
 @pytest.mark.asyncio
 async def test_no_nudge_below_threshold() -> None:
     ss = _make_session(model=_MODEL_1M)
@@ -138,6 +144,7 @@ async def test_no_nudge_below_threshold() -> None:
     ss._enqueue_internal_prompt.assert_not_called()
 
 
+@pytest.mark.usefixtures("reference_static_context")
 @pytest.mark.asyncio
 async def test_latch_rearms_after_total_drops() -> None:
     ss = _make_session(model=_MODEL_1M)
@@ -155,6 +162,7 @@ async def test_latch_rearms_after_total_drops() -> None:
     assert ss._enqueue_internal_prompt.await_count == 2
 
 
+@pytest.mark.usefixtures("reference_static_context")
 @pytest.mark.asyncio
 async def test_kill_switch_keeps_sse_but_suppresses_nudge(monkeypatch) -> None:
     monkeypatch.setenv("PINKY_CONTEXT_AUTORESTART_NUDGE", "0")
@@ -185,6 +193,7 @@ async def test_kill_switch_keeps_sse_but_suppresses_nudge(monkeypatch) -> None:
 _MODEL_SOL_SUFFIXED = "gpt-5.6-sol[1m]"
 
 
+@pytest.mark.usefixtures("reference_static_context")
 def test_is_1m_model_strips_tier_suffix() -> None:
     from pinky_daemon.streaming_session import is_1m_model
 
@@ -202,12 +211,14 @@ def test_is_1m_model_strips_tier_suffix() -> None:
     assert is_1m_model("gpt-5.6-sol", set()) is False
 
 
+@pytest.mark.usefixtures("reference_static_context")
 def test_sol_suffix_stays_200k_class() -> None:
     ss = _make_session(model=_MODEL_SOL_SUFFIXED)
     assert ss._raw_max_tokens_for_model() == 200_000
     assert ss._effective_restart_threshold_pct() == pytest.approx(80.0)
 
 
+@pytest.mark.usefixtures("reference_static_context")
 def test_sol_never_uses_the_400k_1m_restart_class(monkeypatch) -> None:
     monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
     suffixed = _make_session(model=_MODEL_SOL_SUFFIXED)
@@ -220,6 +231,7 @@ def test_sol_never_uses_the_400k_1m_restart_class(monkeypatch) -> None:
     assert suffixed._effective_restart_threshold_pct() == pytest.approx(80.0)
 
 
+@pytest.mark.usefixtures("reference_static_context")
 def test_non_1m_model_with_tier_suffix_stays_200k() -> None:
     """The tier tag does not fabricate a 1M window for a non-1M base model:
     gpt-5.5[1m] strips to gpt-5.5, which is not in _1M_MODELS → 200k."""
@@ -228,6 +240,7 @@ def test_non_1m_model_with_tier_suffix_stays_200k() -> None:
     assert ss._effective_restart_threshold_pct() == pytest.approx(80.0)
 
 
+@pytest.mark.usefixtures("reference_static_context")
 def test_gpt56_luna_uses_272k_window() -> None:
     """#531: gpt-5.6-luna's real context window is 272k, not the 200k
     default. Codex tmux sessions have no harness-reported window, so the
@@ -237,12 +250,14 @@ def test_gpt56_luna_uses_272k_window() -> None:
     assert ss._raw_max_tokens_for_model() == 272_000
 
 
+@pytest.mark.usefixtures("reference_static_context")
 def test_gpt56_luna_variant_suffix_also_272k() -> None:
     """Substring match: a tier/variant suffix on luna still resolves 272k."""
     ss = _make_session(model="gpt-5.6-luna-max-fast")
     assert ss._raw_max_tokens_for_model() == 272_000
 
 
+@pytest.mark.usefixtures("reference_static_context")
 def test_unlisted_codex_model_stays_200k() -> None:
     """Blast-radius guard: codex models NOT in MODEL_CONTEXT_SIZES (e.g.
     gpt-5.6-terra) still fall to the 200k default until their real window
@@ -251,6 +266,7 @@ def test_unlisted_codex_model_stays_200k() -> None:
     assert ss._raw_max_tokens_for_model() == 200_000
 
 
+@pytest.mark.usefixtures("reference_static_context")
 def test_bound_empty_1m_set_is_authoritative_and_read_failure_uses_fallback(
     capsys,
 ) -> None:
@@ -324,6 +340,7 @@ def test_long_lived_session_observes_1m_add_flip_and_delete(tmp_path) -> None:
         registry.close()
 
 
+@pytest.mark.usefixtures("reference_static_context")
 @pytest.mark.parametrize(
     "model,cap,pct,expected",
     [
@@ -346,6 +363,7 @@ def test_restart_tokens_cap_threshold(model, cap, pct, expected, monkeypatch):
     ss._registry.get.assert_called_with(ss.agent_name)
 
 
+@pytest.mark.usefixtures("reference_static_context")
 @pytest.mark.parametrize("failure", ["unwired", "missing", "raises", "cap_read_raises"])
 def test_restart_tokens_cap_registry_fallback(failure, monkeypatch):
     monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
@@ -367,6 +385,7 @@ def test_restart_tokens_cap_registry_fallback(failure, monkeypatch):
     )
 
 
+@pytest.mark.usefixtures("reference_static_context")
 @pytest.mark.parametrize("cap", [1, True, False, -5, 10**12, "550000", 550_000.0, None])
 def test_restart_tokens_cap_tmux_invalid_warns_once(cap, capsys):
     ss = _make_session(model=_MODEL_1M)
@@ -383,6 +402,7 @@ def test_restart_tokens_cap_tmux_invalid_warns_once(cap, capsys):
     assert len(warnings) == 1
 
 
+@pytest.mark.usefixtures("reference_static_context")
 def test_restart_tokens_cap_tmux_corrupt_row(tmp_path, capsys):
     from pinky_daemon.agent_registry import AgentRegistry
 

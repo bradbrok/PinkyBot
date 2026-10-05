@@ -395,7 +395,7 @@ class TestPricingLookup:
         assert row["input_usd_per_mtok"] == 3.00
         assert store._lookup_pricing(provider="anthropic", model="no-such-model", ts=ts) is None
 
-    def test_gpt55_priced_via_codex_alias(self, tmp_path):
+    def test_gpt55_priced_via_codex_alias(self, tmp_path, reference_pricing):
         # #206: Codex agents (Murzik runs gpt-5.5) showed $0 because the
         # pricing seed stopped at gpt-5.2. gpt-5.5 must resolve through the
         # codex_cli -> openai alias at the verified $5/$30/$0.50 rates.
@@ -407,7 +407,7 @@ class TestPricingLookup:
         assert row["output_usd_per_mtok"] == 30.00
         assert row["cached_input_usd_per_mtok"] == 0.50
 
-    def test_codex_turn_cost_nonzero(self, tmp_path):
+    def test_codex_turn_cost_nonzero(self, tmp_path, reference_pricing):
         # End-to-end: a codex_cli/gpt-5.5 turn lands in the overview cost
         # (regression guard for the $0-Codex bug).
         store = _store(tmp_path)
@@ -433,7 +433,7 @@ class TestPricingLookup:
             ).fetchone()["c"]
         assert n == 1
 
-    def test_categories_includes_codex_cost(self, tmp_path):
+    def test_categories_includes_codex_cost(self, tmp_path, reference_pricing):
         # #206 P1: the per-category cost view was hard-gated to Anthropic
         # providers, so Codex turns never appeared. A codex_cli/gpt-5.5 turn
         # must now show up with non-zero cost in get_categories().
@@ -451,10 +451,10 @@ class TestPricingLookup:
 
 
 class TestSeedRateTableParity:
-    """#669: the Analytics seed and pinky_daemon.pricing.RATE_TABLE are two
-    hand-maintained rate tables that feed two cost paths (dashboard vs live
-    per-turn). They must agree for the same model, or the same usage reports
-    different dollar figures. This pins them together as a drift guard."""
+    """Historical analytics seeds match production derivation of revision one.
+
+    Current runtime pricing is covered separately with a live registry binding.
+    """
 
     # RATE_TABLE keys are bare model ids; the Analytics seed keys on
     # (provider, model). #860 added the OpenAI/codex family to RATE_TABLE, so
@@ -465,7 +465,7 @@ class TestSeedRateTableParity:
     def _expected_provider(model: str) -> str:
         return "anthropic" if model.startswith("claude-") else "openai"
 
-    def test_seed_pricing_matches_rate_table(self, tmp_path):
+    def test_seed_pricing_matches_rate_table(self, tmp_path, reference_pricing):
         store = _store(tmp_path)
         with store._connect() as conn:
             rows = conn.execute(
@@ -478,7 +478,7 @@ class TestSeedRateTableParity:
         seeded = {(r["provider"], r["model"]): r for r in rows}
 
         missing = [
-            m for m in RATE_TABLE if (self._expected_provider(m), m) not in seeded
+            m for m in reference_pricing if (self._expected_provider(m), m) not in seeded
         ]
         assert not missing, (
             f"models in RATE_TABLE but absent from the Analytics seed "
@@ -486,7 +486,7 @@ class TestSeedRateTableParity:
         )
 
         mismatches = []
-        for model, rates in RATE_TABLE.items():
+        for model, rates in reference_pricing.items():
             row = seeded[(self._expected_provider(model), model)]
             if (
                 row["input_usd_per_mtok"] != rates["input"]
@@ -624,7 +624,7 @@ class TestCodexProviderAttributionMigration:
             input_tokens=1_000_000, output_tokens=0, cached_input_tokens=0,
         )
 
-    def test_heals_both_tables_and_restores_pricing(self, tmp_path):
+    def test_heals_both_tables_and_restores_pricing(self, tmp_path, reference_pricing):
         db = str(tmp_path / "analytics.db")
         store = AnalyticsStore(db)
         self._log_mislogged_codex_turn(store)
@@ -821,6 +821,29 @@ class TestLegacyDottedIdMigration:
 
 
 class TestRuntimeCatalogPricing:
+    def test_live_bundle_rates_drive_bound_analytics(self, tmp_path):
+        from pinky_daemon import runtime_model_catalog
+        from pinky_daemon.agent_registry import AgentRegistry
+        from pinky_daemon.model_roster import load_bundled
+
+        registry = AgentRegistry(db_path=str(tmp_path / "live-models.db"))
+        try:
+            runtime_model_catalog.bind_registry(registry)
+            store = _store(tmp_path)
+            for row in load_bundled().models:
+                if registry.get_model(f"{row.provider}/{row.model_id}") is None:
+                    assert not row.active
+                    continue
+                usage = {
+                    "provider": row.provider, "model": row.model_id,
+                    "input_tokens": 1_000_000, "output_tokens": 100_000,
+                    "cached_input_tokens": 10_000, "ts": "2026-10-04T00:00:00Z",
+                }
+                expected = row.pricing.input + row.pricing.output * 0.1 + row.pricing.cached_input * 0.01
+                assert store._compute_usage_cost(usage) == pytest.approx(expected), row.model_id
+        finally:
+            registry.close()
+
     def test_runtime_rate_add_and_edit_reprice_without_store_recreation(self, tmp_path):
         from pinky_daemon import runtime_model_catalog
         from pinky_daemon.agent_registry import AgentRegistry

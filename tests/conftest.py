@@ -404,3 +404,66 @@ def stub_sdk_transport(monkeypatch):
         claude_agent_sdk, "ClaudeSDKClient", ConnectingFakeSDKClient
     )
     yield
+
+
+@pytest.fixture
+def historical_registry(tmp_path):
+    """Opt-in real registry boot with the immutable reference catalog as input."""
+    from tests._model_roster_local import reference_registry
+
+    registry = reference_registry(tmp_path / "historical-models.db")
+    try:
+        yield registry
+    finally:
+        registry.close()
+
+
+@pytest.fixture
+def reference_pricing(tmp_path, monkeypatch):
+    """Run production pricing derivation on frozen input for arithmetic tests."""
+    import importlib.util
+
+    from pinky_daemon import pricing
+    from tests._model_roster_local import (
+        bundled_revision,
+        reference_bundle,
+        reference_table_captures,
+    )
+
+    revision = bundled_revision()
+    with reference_bundle(tmp_path, revision):
+        spec = importlib.util.spec_from_file_location("reference_pricing", pricing.__file__)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    with reference_table_captures(pricing.RATE_TABLE, module.RATE_TABLE):
+        # These named anchors can share an object in live input but have
+        # different historical rates, so replace them by name, not identity.
+        for name in ("_FABLE_51", "_OPUS_55", "_OPUS_STD"):
+            monkeypatch.setattr(pricing, name, getattr(module, name))
+        yield module.RATE_TABLE
+
+
+@pytest.fixture(scope="session")
+def reference_one_million_models(tmp_path_factory):
+    """Derive historical membership through a real isolated production import."""
+    import json
+
+    from tests._model_roster_local import encode, fixture_document
+    from tests.test_model_roster import _probe
+
+    result = _probe(
+        tmp_path_factory.mktemp("reference-context"), "pinky_daemon.streaming_session",
+        encode(fixture_document(1)), inspect=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return set(json.loads(result.stdout))
+
+
+@pytest.fixture
+def reference_static_context(reference_one_million_models):
+    """Opt-in historical context input; runtime registry binding still takes precedence."""
+    from pinky_daemon import streaming_session
+    from tests._model_roster_local import reference_table_captures
+
+    with reference_table_captures(streaming_session._1M_MODELS, reference_one_million_models):
+        yield

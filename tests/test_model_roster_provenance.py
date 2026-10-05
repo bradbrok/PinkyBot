@@ -16,12 +16,14 @@ from tests._model_roster_local import (
     SONNET,
     add,
     apply,
-    document,
+    bundled_revision,
+    fixture_document,
     flat,
     legacy_db,
     model_row,
     new_model,
     owned,
+    reference_registry,
     release,
     snapshot,
 )
@@ -29,7 +31,7 @@ from tests._model_roster_local import (
 
 @pytest.fixture
 def registry(tmp_path):
-    instance = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+    instance = reference_registry(tmp_path / "agents.db")
     try:
         yield instance
     finally:
@@ -38,7 +40,7 @@ def registry(tmp_path):
 
 def test_columns_are_added_even_when_write_rate_columns_already_exist(tmp_path):
     path = legacy_db(tmp_path / "legacy.db")
-    instance = AgentRegistry(db_path=str(path))
+    instance = reference_registry(path)
     try:
         columns = {row[1]: row for row in instance._db.execute("PRAGMA table_info(models)")}
         assert "operator_fields" in columns and "roster_revision" in columns
@@ -51,9 +53,9 @@ def test_columns_are_added_even_when_write_rate_columns_already_exist(tmp_path):
 
 
 def test_missing_write_rates_backfill_before_classification(tmp_path):
-    instance = AgentRegistry(db_path=str(legacy_db(tmp_path / "legacy.db", write_columns=False)))
+    instance = reference_registry(legacy_db(tmp_path / "legacy.db", write_columns=False))
     try:
-        expected = flat(model_row(document()))
+        expected = flat(model_row(fixture_document()))
         actual = instance.get_model(SONNET)
         assert actual["cache_write_5m_price"] == expected["cache_write_5m_price"]
         assert actual["cache_write_1h_price"] == expected["cache_write_1h_price"]
@@ -81,9 +83,7 @@ def test_missing_write_rates_backfill_before_classification(tmp_path):
     ],
 )
 def test_classification_preserves_each_existing_difference(tmp_path, field, value):
-    instance = AgentRegistry(
-        db_path=str(legacy_db(tmp_path / "legacy.db", overrides={SONNET: {field: value}}))
-    )
+    instance = reference_registry(legacy_db(tmp_path / "legacy.db", overrides={SONNET: {field: value}}))
     try:
         expected_owned = CONTEXT_FIELDS if field in CONTEXT_FIELDS else {field}
         assert owned(instance) == expected_owned
@@ -94,7 +94,7 @@ def test_classification_preserves_each_existing_difference(tmp_path, field, valu
 
 def test_nonbaseline_row_is_fully_owned(tmp_path):
     custom = new_model()
-    instance = AgentRegistry(db_path=str(legacy_db(tmp_path / "legacy.db", extra_rows=[custom])))
+    instance = reference_registry(legacy_db(tmp_path / "legacy.db", extra_rows=[custom]))
     try:
         assert owned(instance, "openai/roster-added-model") == FIELDS
         assert instance.get_model("openai/roster-added-model")["roster_revision"] is None
@@ -111,11 +111,11 @@ def test_legacy_price_and_context_corrections_precede_classification(tmp_path):
         },
         "openai/gpt-5.6-sol": {"context_window": 1_000_000, "is_1m": 1},
     }
-    instance = AgentRegistry(db_path=str(legacy_db(tmp_path / "legacy.db", overrides=overrides)))
+    instance = reference_registry(legacy_db(tmp_path / "legacy.db", overrides=overrides))
     try:
         for full_id in overrides:
             assert owned(instance, full_id) == set()
-            expected = flat(model_row(document(), full_id))
+            expected = flat(model_row(fixture_document(), full_id))
             assert all(
                 instance.get_model(full_id)[field] == expected[field]
                 for field in overrides[full_id]
@@ -126,13 +126,13 @@ def test_legacy_price_and_context_corrections_precede_classification(tmp_path):
 
 def test_second_constructor_keeps_classification_and_state_unchanged(tmp_path):
     path = tmp_path / "agents.db"
-    instance = AgentRegistry(db_path=str(path))
+    instance = reference_registry(path)
     try:
         assert instance.get_setting(MARKER) == "1"
         original = snapshot(instance)
     finally:
         instance.close()
-    reopened = AgentRegistry(db_path=str(path))
+    reopened = reference_registry(path)
     try:
         assert snapshot(reopened) == original
     finally:
@@ -178,12 +178,12 @@ def test_default_operator_insert_owns_all_fields(registry):
 
 
 def test_identical_operator_update_acquires_no_fields(registry):
-    add(registry, model_row(document()))
+    add(registry, model_row(fixture_document()))
     assert owned(registry) == set()
 
 
 def test_operator_price_edit_owns_only_changed_fields(registry):
-    row = model_row(document())
+    row = model_row(fixture_document())
     row["pricing"]["input"] = 7.0
     add(registry, row)
     assert owned(registry) == {"input_price"}
@@ -191,7 +191,7 @@ def test_operator_price_edit_owns_only_changed_fields(registry):
 
 @pytest.mark.parametrize("changed", ["context_window", "is_1m"])
 def test_operator_context_edit_owns_the_whole_pair(registry, changed):
-    row = model_row(document())
+    row = model_row(fixture_document())
     row[changed] = 800_000 if changed == "context_window" else False
     add(registry, row)
     assert owned(registry) == CONTEXT_FIELDS
@@ -200,7 +200,7 @@ def test_operator_context_edit_owns_the_whole_pair(registry, changed):
 def test_delete_and_operator_reactivation_track_active(registry):
     assert registry.delete_model(SONNET)
     assert owned(registry) == {"active"}
-    add(registry, model_row(document()))
+    add(registry, model_row(fixture_document()))
     assert registry.get_model(SONNET)["active"] == 1
     assert owned(registry) == {"active"}
 
@@ -217,7 +217,7 @@ async def test_management_add_route_explicitly_marks_operator_edit(registry, mon
 
     monkeypatch.setattr(providers, "_agents", registry)
     monkeypatch.setattr(registry, "add_model", add_spy)
-    row = model_row(document())
+    row = model_row(fixture_document())
     row["pricing"]["input"] = 7.0
     request = flat(row)
     request.pop("active")
@@ -244,7 +244,9 @@ async def test_management_delete_route_explicitly_marks_operator_action(registry
     assert owned(registry) == {"active"}
 
 
-async def test_discovery_route_is_insert_only_and_marks_automation(registry, monkeypatch):
+async def test_discovery_route_is_insert_only_and_marks_automation(
+    registry, monkeypatch, reference_pricing,
+):
     import httpx
 
     from pinky_daemon.routes import providers
@@ -299,11 +301,11 @@ def test_automation_insert_remains_roster_managed(registry):
 
 
 def test_automation_update_skips_owned_fields_and_context_pair(registry):
-    operator_row = model_row(document())
+    operator_row = model_row(fixture_document())
     operator_row["pricing"]["input"] = 7.0
     operator_row.update(context_window=800_000, is_1m=False)
     add(registry, operator_row)
-    automated = model_row(document())
+    automated = model_row(fixture_document())
     automated["pricing"]["input"] = 9.0
     automated["description"] = "Automated description"
     add(registry, automated, operator=False)
@@ -316,8 +318,8 @@ def test_automation_update_skips_owned_fields_and_context_pair(registry):
 
 def test_higher_revision_rollback_survives_next_constructor(tmp_path):
     path = tmp_path / "agents.db"
-    instance = AgentRegistry(db_path=str(path))
-    value = document(10)
+    instance = reference_registry(path)
+    value = fixture_document(bundled_revision() + 9)
     row = model_row(value)
     row["pricing"].update(
         input=3.0, output=15.0, cached_input=0.3, cache_write_5m=3.75, cache_write_1h=6.0
@@ -334,7 +336,7 @@ def test_higher_revision_rollback_survives_next_constructor(tmp_path):
         before = snapshot(instance)
     finally:
         instance.close()
-    reopened = AgentRegistry(db_path=str(path))
+    reopened = reference_registry(path)
     try:
         assert snapshot(reopened) == before
         assert reopened.get_model(SONNET)["input_price"] == 3.0
@@ -347,8 +349,8 @@ def test_higher_revision_rollback_survives_next_constructor(tmp_path):
 @pytest.mark.parametrize("full_id", [SONNET, "anthropic/claude-opus-4-8", "openai/gpt-5.6-sol"])
 def test_frozen_corrections_skip_operator_owned_values_on_next_boot(tmp_path, full_id):
     path = tmp_path / "agents.db"
-    instance = AgentRegistry(db_path=str(path))
-    row = model_row(document(), full_id)
+    instance = reference_registry(path)
+    row = model_row(fixture_document(), full_id)
     if full_id == SONNET:
         row["pricing"].update(
             input=3.0, output=15.0, cached_input=0.3, cache_write_5m=3.75, cache_write_1h=6.0
@@ -363,7 +365,7 @@ def test_frozen_corrections_skip_operator_owned_values_on_next_boot(tmp_path, fu
         before = snapshot(instance)
     finally:
         instance.close()
-    reopened = AgentRegistry(db_path=str(path))
+    reopened = reference_registry(path)
     try:
         assert snapshot(reopened) == before
     finally:
@@ -371,7 +373,7 @@ def test_frozen_corrections_skip_operator_owned_values_on_next_boot(tmp_path, fu
 
 
 def test_release_either_context_field_clears_both(registry):
-    row = model_row(document())
+    row = model_row(fixture_document())
     row.update(context_window=800_000, is_1m=False)
     add(registry, row)
     release(registry, SONNET, ["is_1m"])

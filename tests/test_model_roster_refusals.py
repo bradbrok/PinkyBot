@@ -5,15 +5,15 @@ from __future__ import annotations
 import pytest
 
 from pinky_daemon import runtime_model_catalog
-from pinky_daemon.agent_registry import AgentRegistry
 from tests._model_roster_local import (
     SONNET,
     add,
     apply,
-    document,
+    fixture_document,
     last_good,
     model_row,
     new_model,
+    reference_registry,
     release,
     snapshot,
     status,
@@ -25,9 +25,9 @@ from tests._model_roster_local import (
     ids=["invalid-json", "object", "string", "non-string-field", "unknown-field"],
 )
 def corrupt_registry(request, tmp_path, monkeypatch):
-    instance = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+    instance = reference_registry(tmp_path / "agents.db")
     try:
-        edited = model_row(document())
+        edited = model_row(fixture_document())
         edited["pricing"]["input"] = 7.0
         add(instance, edited)
         instance._db.execute(
@@ -44,7 +44,7 @@ def corrupt_registry(request, tmp_path, monkeypatch):
 @pytest.mark.parametrize("dry_run", [False, True], ids=["apply", "dry-run"])
 def test_corrupt_ownership_rejects_whole_roster(corrupt_registry, dry_run):
     registry, invalidations = corrupt_registry
-    value = document()
+    value = fixture_document()
     damaged = model_row(value)
     damaged["pricing"]["input"] = 9.0
     model_row(value, "openai/gpt-5.6-sol")["pricing"]["input"] = 17.0
@@ -92,7 +92,7 @@ def test_corrupt_ownership_refuses_release_without_changes(corrupt_registry):
 
 def test_corrupt_ownership_refuses_automated_add_without_changes(corrupt_registry):
     registry, invalidations = corrupt_registry
-    automated = model_row(document())
+    automated = model_row(fixture_document())
     automated["pricing"]["input"] = 9.0
     before = snapshot(registry)
     changes = registry._db.total_changes

@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import urllib.error
 import urllib.request
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -28,12 +28,15 @@ from tests._model_roster_local import (
     DOCUMENT_KEY,
     SONNET,
     add,
+    bundled_revision,
     document,
     encode,
+    fixture_document,
     last_good,
     model_row,
     new_model,
     owned,
+    reference_bundle,
     snapshot,
     status,
 )
@@ -59,13 +62,15 @@ def apps(tmp_path, monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", no_network)
     monkeypatch.setattr(socket, "create_connection", no_network)
 
-    def build(*, mode="shadow", enabled=False, getter=None, url=URL):
+    def build(*, mode="shadow", enabled=False, getter=None, url=URL, reference=False):
         monkeypatch.setenv("PINKY_ISOLATED_POLICY_MODE", mode)
         monkeypatch.setenv("PINKY_MODEL_ROSTER_SYNC", "on" if enabled else "off")
         monkeypatch.setenv("PINKY_MODEL_ROSTER_URL", url)
         root = tmp_path / f"app-{len(built)}"
         root.mkdir()
-        app = api.create_api(db_path=str(root / "agents.db"), default_working_dir=str(root))
+        revision = bundled_revision()
+        with reference_bundle(root, revision) if reference else nullcontext():
+            app = api.create_api(db_path=str(root / "agents.db"), default_working_dir=str(root))
         built.append(app)
         registry = app.state.agents
         for name, isolated in (("tenant", True), ("normal", False)):
@@ -341,17 +346,17 @@ def test_legacy_discovery_and_full_id_lookup_keep_their_existing_routes(apps):
 
 @pytest.mark.parametrize("dry_run", [False, True])
 def test_sync_returns_real_apply_or_preview_report(apps, dry_run):
-    value = document()
+    value = fixture_document()
     model_row(value)["pricing"]["input"] = 7.0
     getter = Mock(return_value=result(encode(value) + b"\n", FINAL))
-    d = apps(enabled=True, getter=getter)
+    d = apps(enabled=True, getter=getter, reference=True)
     runtime_model_catalog.bind_registry(d.registry)
     before = snapshot(d.registry)
     with browser(d.app) as client:
         response = client.post("/models/roster/sync", json={"dry_run": dry_run})
     assert response.status_code == 200
     report = response.json()
-    assert report["revision"] == 2 and report["dry_run"] is dry_run
+    assert report["revision"] == value["revision"] and report["dry_run"] is dry_run
     assert report["revision_gate"] == "accepted" and "rows" in report
     getter.assert_called_once()
     if dry_run:
@@ -366,7 +371,7 @@ def test_sync_returns_real_apply_or_preview_report(apps, dry_run):
 def test_unstorable_revision_route_has_fixed_parse_refused_502(
     apps, monkeypatch, capsys, operation, dry_run
 ):
-    value = document(2**63)
+    value = fixture_document(2**63)
     model_row(value)["pricing"]["input"] = 7.0
     if operation == "insert":
         value["models"].append(new_model("signed-limit-insert"))
@@ -412,7 +417,7 @@ def test_unstorable_revision_route_has_fixed_parse_refused_502(
 def test_http_failures_have_fixed_bodies_and_apply_is_recorded_once(
     apps, monkeypatch, capsys, fault, expected
 ):
-    value = document()
+    value = fixture_document()
 
     def getter(url, **kwargs):
         if fault == "network":
@@ -506,8 +511,8 @@ def test_unexpected_worker_route_has_fixed_502_and_can_sync_again(apps, capsys, 
 
 @pytest.mark.parametrize("saved", [None, "", "not-json", " \n\t", "{}"])
 def test_release_refuses_bad_saved_provenance_without_any_write(apps, monkeypatch, saved):
-    d = apps()
-    row = model_row(document())
+    d = apps(reference=True)
+    row = model_row(fixture_document())
     row["pricing"]["input"] = 7.0
     add(d.registry, row)
     if saved is None:
@@ -541,8 +546,8 @@ def test_release_refuses_malformed_ownership_without_any_write(apps, ownership):
 
 @pytest.mark.parametrize("fields", [[], ["context_window", "context_window"], "all"])
 def test_release_is_local_off_and_expands_context_ownership_once(apps, fields):
-    d = apps()
-    row = model_row(document())
+    d = apps(reference=True)
+    row = model_row(fixture_document())
     row.update(context_window=800_000, is_1m=False)
     add(d.registry, row)
     before = snapshot(d.registry)
@@ -598,19 +603,19 @@ def test_release_uses_exact_target_despite_lower_rowid_alias(apps, target_exists
 
 
 def test_two_apps_keep_configuration_and_apply_ownership_separate(apps):
-    first = apps(enabled=True, getter=lambda url, **kw: result(encode(document(2))), url=URL)
+    first = apps(enabled=True, getter=lambda url, **kw: result(encode(document(bundled_revision() + 1))), url=URL)
     second = apps(
-        enabled=True, getter=lambda url, **kw: result(encode(document(3)), FINAL), url=FINAL
+        enabled=True, getter=lambda url, **kw: result(encode(document(bundled_revision() + 2)), FINAL), url=FINAL
     )
     with browser(first.app) as one, browser(second.app) as two:
         assert one.get("/models/roster").json()["url"] == URL
         assert two.get("/models/roster").json()["url"] == FINAL
         assert one.post("/models/roster/sync", json={"dry_run": False}).status_code == 200
-        assert status(first.registry)["last_applied_revision"] == 2
-        assert status(second.registry)["last_applied_revision"] == 1
+        assert status(first.registry)["last_applied_revision"] == bundled_revision() + 1
+        assert status(second.registry)["last_applied_revision"] == bundled_revision()
         assert two.post("/models/roster/sync", json={"dry_run": False}).status_code == 200
-        assert status(first.registry)["last_applied_revision"] == 2
-        assert status(second.registry)["last_applied_revision"] == 3
+        assert status(first.registry)["last_applied_revision"] == bundled_revision() + 1
+        assert status(second.registry)["last_applied_revision"] == bundled_revision() + 2
 
 
 @pytest.mark.asyncio

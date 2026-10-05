@@ -8,11 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 from pinky_daemon import runtime_model_catalog
-from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.analytics_store import AnalyticsStore
 from pinky_daemon.pricing import compute_turn_cost_usd, lookup_rate
 from pinky_daemon.streaming_session import is_1m_model
 from pinky_daemon.tmux_session import TmuxSession
+from tests._model_roster_local import reference_registry
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 _SONNET_5_RATES = {
@@ -66,27 +66,27 @@ def _analytics_rows(store, model):
 
 
 @pytest.mark.parametrize("model", ["claude-sonnet-5-5", "claude-sonnet-5-5[1m]"])
-def test_sonnet_55_tmux_raw_context_is_one_million(model):
+def test_sonnet_55_tmux_raw_context_is_one_million(model, reference_static_context):
     assert _raw_window(model) == 1_000_000
 
 
 @pytest.mark.parametrize("model", ["claude-sonnet-5-5", "claude-sonnet-5-5[1m]"])
-def test_sonnet_55_static_one_million_membership(model):
+def test_sonnet_55_static_one_million_membership(model, reference_static_context):
     assert is_1m_model(model) is True
 
 
 @pytest.mark.parametrize("model", ["claude-sonnet-5-5", "claude-sonnet-5-5[1m]"])
-def test_sonnet_55_static_rates(model):
+def test_sonnet_55_static_rates(model, reference_pricing):
     assert lookup_rate(model) == _SONNET_5_RATES
 
 
 @pytest.mark.parametrize("model", ["claude-sonnet-5", "claude-sonnet-5[1m]"])
-def test_sonnet_5_standard_rates(model):
+def test_sonnet_5_standard_rates(model, reference_pricing):
     assert lookup_rate(model) == _SONNET_5_RATES
 
 
 @pytest.mark.parametrize("model", _MODEL_IDS)
-def test_sonnet_5_mixed_usage_cost(model):
+def test_sonnet_5_mixed_usage_cost(model, reference_pricing):
     cost = compute_turn_cost_usd(
         model,
         input_tokens=1_000_000,
@@ -99,7 +99,7 @@ def test_sonnet_5_mixed_usage_cost(model):
 
 
 @pytest.mark.parametrize("model", ["claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4"])
-def test_sonnet_4_rates_remain_unchanged(model):
+def test_sonnet_4_rates_remain_unchanged(model, reference_pricing):
     assert lookup_rate(model) == {
         "input": 3.0,
         "output": 15.0,
@@ -110,7 +110,7 @@ def test_sonnet_4_rates_remain_unchanged(model):
 
 
 def test_fresh_catalog_has_current_sonnet_55(tmp_path):
-    with closing(AgentRegistry(str(tmp_path / "registry.db"))) as registry:
+    with closing(reference_registry(str(tmp_path / "registry.db"))) as registry:
         row = registry.get_model("claude-sonnet-5-5")
         assert row is not None
         assert row["display_name"] == "Claude Sonnet 5.5"
@@ -129,7 +129,7 @@ def test_fresh_catalog_has_current_sonnet_55(tmp_path):
 
 
 def test_fresh_catalog_sonnet_5_has_standard_rates_and_description(tmp_path):
-    with closing(AgentRegistry(str(tmp_path / "registry.db"))) as registry:
+    with closing(reference_registry(str(tmp_path / "registry.db"))) as registry:
         row = registry.get_model("claude-sonnet-5")
         assert _prices(row) == _NEW_PRICES
         assert "Current Sonnet" not in row["description"]
@@ -139,7 +139,7 @@ def test_fresh_catalog_sonnet_5_has_standard_rates_and_description(tmp_path):
 
 def test_pre_update_registry_gains_sonnet_55_on_open(tmp_path):
     path = _pre_update_db(tmp_path, "sonnet_registry_pre_update")
-    with closing(AgentRegistry(str(path))) as registry:
+    with closing(reference_registry(str(path))) as registry:
         row = registry.get_model("claude-sonnet-5-5")
         assert row is not None
         assert row["is_1m"] == 1
@@ -149,14 +149,14 @@ def test_pre_update_registry_gains_sonnet_55_on_open(tmp_path):
 
 def test_pre_update_registry_corrects_all_sonnet_5_prices_on_open(tmp_path):
     path = _pre_update_db(tmp_path, "sonnet_registry_pre_update")
-    with closing(AgentRegistry(str(path))) as registry:
+    with closing(reference_registry(str(path))) as registry:
         assert _prices(registry.get_model("claude-sonnet-5")) == _NEW_PRICES
         assert _prices(registry.get_model("claude-sonnet-4-6")) == _OLD_PRICES
 
 
 def test_pre_update_registry_corrects_sonnet_5_description_on_open(tmp_path):
     path = _pre_update_db(tmp_path, "sonnet_registry_pre_update")
-    with closing(AgentRegistry(str(path))) as registry:
+    with closing(reference_registry(str(path))) as registry:
         row = registry.get_model("claude-sonnet-5")
         assert "Current Sonnet" not in row["description"]
         assert "intro" not in row["description"].lower()
@@ -169,14 +169,14 @@ def test_pre_update_registry_without_write_columns_gets_all_correct_rates(tmp_pa
         conn.execute("ALTER TABLE models DROP COLUMN cache_write_5m_price")
         conn.execute("ALTER TABLE models DROP COLUMN cache_write_1h_price")
         conn.commit()
-    with closing(AgentRegistry(str(path))) as registry:
+    with closing(reference_registry(str(path))) as registry:
         assert _prices(registry.get_model("claude-sonnet-5")) == _NEW_PRICES
 
 
 def test_operator_current_write_prices_survive_second_and_third_startup(tmp_path):
     path = tmp_path / "registry.db"
     expected_prices = (3.0, 15.0, 0.3, 2.5, 4.0)
-    with closing(AgentRegistry(str(path))) as registry:
+    with closing(reference_registry(str(path))) as registry:
         expected = registry.add_model(
             provider="anthropic", model_id="claude-sonnet-5",
             display_name="Custom Sonnet", description="Custom catalog note", tier="sonnet",
@@ -185,7 +185,7 @@ def test_operator_current_write_prices_survive_second_and_third_startup(tmp_path
         )
         assert _prices(expected) == expected_prices
     for _ in range(2):
-        with closing(AgentRegistry(str(path))) as registry:
+        with closing(reference_registry(str(path))) as registry:
             actual = registry.get_model("claude-sonnet-5")
             assert _prices(actual) == expected_prices
             assert actual == expected
@@ -199,11 +199,11 @@ def test_single_missing_write_column_corrects_stale_seed_and_is_idempotent(
     with closing(sqlite3.connect(path)) as conn:
         conn.execute(f"ALTER TABLE models DROP COLUMN {missing_column}")
         conn.commit()
-    with closing(AgentRegistry(str(path))) as registry:
+    with closing(reference_registry(str(path))) as registry:
         assert _prices(registry.get_model("claude-sonnet-5")) == _NEW_PRICES
         expected_rows = registry.list_models(active_only=False)
     for _ in range(2):
-        with closing(AgentRegistry(str(path))) as registry:
+        with closing(reference_registry(str(path))) as registry:
             assert _prices(registry.get_model("claude-sonnet-5")) == _NEW_PRICES
             assert registry.list_models(active_only=False) == expected_rows
 
@@ -214,7 +214,7 @@ def test_single_missing_write_column_preserves_existing_operator_write_value(
 ):
     path = tmp_path / "registry.db"
     expected_prices = (3.0, 15.0, 0.3, 2.5, 4.0)
-    with closing(AgentRegistry(str(path))) as registry:
+    with closing(reference_registry(str(path))) as registry:
         registry.add_model(
             provider="anthropic", model_id="claude-sonnet-5",
             description="Custom catalog note", input_price=3.0, output_price=15.0,
@@ -223,13 +223,13 @@ def test_single_missing_write_column_preserves_existing_operator_write_value(
     with closing(sqlite3.connect(path)) as conn:
         conn.execute(f"ALTER TABLE models DROP COLUMN {missing_column}")
         conn.commit()
-    with closing(AgentRegistry(str(path))) as registry:
+    with closing(reference_registry(str(path))) as registry:
         row = registry.get_model("claude-sonnet-5")
         assert _prices(row) == expected_prices
         assert row["description"] == "Custom catalog note"
         expected_rows = registry.list_models(active_only=False)
     for _ in range(2):
-        with closing(AgentRegistry(str(path))) as registry:
+        with closing(reference_registry(str(path))) as registry:
             assert registry.list_models(active_only=False) == expected_rows
 
 
@@ -241,7 +241,7 @@ def test_pre_update_registry_preserves_custom_price_rows(tmp_path, column):
     with closing(sqlite3.connect(path)) as conn:
         conn.execute(f"UPDATE models SET {column}=? WHERE model_id='claude-sonnet-5'", (9.0,))
         conn.commit()
-    with closing(AgentRegistry(str(path))) as registry:
+    with closing(reference_registry(str(path))) as registry:
         assert _prices(registry.get_model("claude-sonnet-5")) == tuple(expected)
 
 
@@ -252,23 +252,23 @@ def test_pre_update_registry_preserves_custom_description(tmp_path):
             "UPDATE models SET description='Custom catalog note' WHERE model_id='claude-sonnet-5'"
         )
         conn.commit()
-    with closing(AgentRegistry(str(path))) as registry:
+    with closing(reference_registry(str(path))) as registry:
         assert registry.get_model("claude-sonnet-5")["description"] == "Custom catalog note"
         assert _prices(registry.get_model("claude-sonnet-5")) == _NEW_PRICES
 
 
 def test_pre_update_registry_second_startup_leaves_all_model_rows_unchanged(tmp_path):
     path = _pre_update_db(tmp_path, "sonnet_registry_pre_update")
-    with closing(AgentRegistry(str(path))) as registry:
+    with closing(reference_registry(str(path))) as registry:
         before = registry.list_models(active_only=False)
-    with closing(AgentRegistry(str(path))) as registry:
+    with closing(reference_registry(str(path))) as registry:
         assert registry.list_models(active_only=False) == before
 
 
 @pytest.mark.parametrize("model", _MODEL_IDS)
 def test_upgraded_registry_drives_runtime_rates_and_context(tmp_path, model):
     path = _pre_update_db(tmp_path, "sonnet_registry_pre_update")
-    with closing(AgentRegistry(str(path))) as registry:
+    with closing(reference_registry(str(path))) as registry:
         runtime_model_catalog.bind_registry(registry)
         assert lookup_rate(model) == _SONNET_5_RATES
         assert is_1m_model(model) is True
@@ -276,7 +276,7 @@ def test_upgraded_registry_drives_runtime_rates_and_context(tmp_path, model):
 
 
 @pytest.mark.parametrize("model", _MODEL_IDS)
-def test_fresh_analytics_sonnet_5_rates(tmp_path, model):
+def test_fresh_analytics_sonnet_5_rates(tmp_path, model, reference_pricing):
     store = AnalyticsStore(str(tmp_path / "analytics.db"))
     rows = _analytics_rows(store, model)
     assert len(rows) == 1
@@ -286,7 +286,7 @@ def test_fresh_analytics_sonnet_5_rates(tmp_path, model):
     ) == (2.0, 10.0, 0.2)
 
 
-def test_pre_update_analytics_adds_sonnet_55(tmp_path):
+def test_pre_update_analytics_adds_sonnet_55(tmp_path, reference_pricing):
     path = _pre_update_db(tmp_path, "sonnet_analytics_pre_update")
     store = AnalyticsStore(str(path))
     rows = _analytics_rows(store, "claude-sonnet-5-5")
@@ -296,7 +296,7 @@ def test_pre_update_analytics_adds_sonnet_55(tmp_path):
     assert rows[0]["cached_input_usd_per_mtok"] == 0.2
 
 
-def test_pre_update_analytics_corrects_sonnet_5_seed(tmp_path):
+def test_pre_update_analytics_corrects_sonnet_5_seed(tmp_path, reference_pricing):
     path = _pre_update_db(tmp_path, "sonnet_analytics_pre_update")
     store = AnalyticsStore(str(path))
     rows = _analytics_rows(store, "claude-sonnet-5")
