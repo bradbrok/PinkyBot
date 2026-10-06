@@ -2577,6 +2577,7 @@ class TmuxSession(TransportReplacementMixin):
         # on every ``stop_hook_summary`` entry — which routes to
         # ``_response_callback`` to deliver the response upstream.
         self._tailer: TmuxTranscriptTailer | None = None
+        self._transcript_ownership: frozenset[Path] | None = None
         # FIFO of in-flight turn routing metadata. Issue #560 replaces
         # PR #496 round-2's single ``_inflight_meta`` dict (which forced
         # strictly serial dispatch via a worker gate, breaking mid-turn
@@ -5782,6 +5783,12 @@ class TmuxSession(TransportReplacementMixin):
         if self._tailer is not None:
             self._tailer.wake()
 
+    def set_transcript_ownership(self, projects: set[Path]) -> None:
+        """Apply caller-derived ownership to current and future Claude tailers."""
+        self._transcript_ownership = frozenset(projects)
+        if isinstance(self._tailer, TmuxTranscriptTailer):
+            self._tailer.set_owned_projects(self._transcript_ownership)
+
     def set_transcript_path(
         self,
         path: Path | str,
@@ -7200,6 +7207,7 @@ class TmuxSession(TransportReplacementMixin):
                 # internal turn instead of waiting unboundedly for a receipt
                 # source that cannot exist yet.
                 on_bound_path_wedge=self._on_bound_path_wedge,
+                owned_projects=self._transcript_ownership,
             )
             await self._tailer.start()
             if guessed is None:

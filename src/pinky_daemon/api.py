@@ -4188,6 +4188,8 @@ def create_api(
             init_kwargs["prepare_spawn_callback"] = lambda cwd: _publish_missing_claude_prompt(agent_name, cwd)
 
         ss = SessionClass(config, **init_kwargs)
+        if is_tmux and isolation_flag(agents, agent_name) is True:
+            ss.set_transcript_ownership(_claude_owned_projects(agent))
         ss._launch_runtime = runtime
         ss._launch_transport = transport
         ss._launch_snapshot = copy.deepcopy(_launch_fingerprint(agent))
@@ -5733,6 +5735,13 @@ def create_api(
         if config_dir is not None and wd and Path(wd).is_absolute():
             roots.append((Path(config_dir(str(Path(wd).resolve()))) / "projects").resolve())
         return roots
+
+    def _claude_owned_projects(agent: Agent) -> set[Path]:
+        return {
+            (root / claude_project_slug(cwd)).resolve()
+            for root in _claude_transcript_roots(agent)
+            for cwd in (agent.working_dir, Path(agent.working_dir).resolve())
+        }
 
     def _has_valid_session(request: Request) -> bool:
         secret = _session_secret()
@@ -8361,18 +8370,18 @@ npm run build</pre>
             )
 
         if caller_agent is not None:
-            working_dir = caller_agent.working_dir
-            own_projects = {
-                (root / claude_project_slug(cwd)).resolve()
-                for root in claude_roots
-                for cwd in (working_dir, Path(working_dir).resolve())
-            }
+            own_projects = _claude_owned_projects(caller_agent)
             if normalised.parent not in own_projects:
                 raise HTTPException(403, "transcript_path must be in the caller's own project directory")
 
         session = broker.get_streaming_session(name, label=req.label)
         if session is None:
             return {"ok": True, "agent": name, "session": None}
+
+        if caller_agent is not None:
+            restrict = getattr(session, "set_transcript_ownership", None)
+            if callable(restrict):
+                restrict(own_projects)
 
         update = getattr(session, "set_transcript_path", None)
         if callable(update):
@@ -10953,24 +10962,41 @@ npm run build</pre>
                 raise HTTPException(403, "file_path must be inside the caller's working directory")
             file_path = str(resolved)
 
+        from contextlib import nullcontext
+
+        from pinky_daemon.isolated_files import IsolatedFileError, media_snapshot
         from pinky_identity.live_sqlite import LiveSQLiteFileError, refuse_sqlite_attachment
 
-        try:
-            refuse_sqlite_attachment(file_path)
-        except LiveSQLiteFileError as exc:
-            raise HTTPException(400, str(exc)) from exc
+        if caller_agent is None:
+            try:
+                refuse_sqlite_attachment(file_path)
+            except LiveSQLiteFileError as exc:
+                raise HTTPException(400, str(exc)) from exc
 
         loop = asyncio.get_running_loop()
         try:
-            msg = await loop.run_in_executor(
-                None,
-                lambda: _send_file_message(
-                    agent_name, platform, chat_id, file_path,
-                    caption=caption, reply_to=reply_to, kind=kind,
-                    has_spoiler=has_spoiler,
-                    show_caption_above_media=show_caption_above_media,
-                ),
+            attachment = (
+                media_snapshot(resolved, Path(working_dir).resolve(), _data_dir / "tmp")
+                if caller_agent is not None else nullcontext(file_path)
             )
+            with attachment as send_path:
+                msg = await loop.run_in_executor(
+                    None,
+                    lambda: _send_file_message(
+                        agent_name, platform, chat_id, str(send_path),
+                        caption=caption, reply_to=reply_to, kind=kind,
+                        has_spoiler=has_spoiler,
+                        show_caption_above_media=show_caption_above_media,
+                    ),
+                )
+        except IsolatedFileError as e:
+            error_repr = f"{type(e).__name__}: {e}"
+            _outreach_attempt_log(
+                agent_name=agent_name, platform=platform, method=method,
+                chat_id=chat_id, file_path=file_path, caption_len=len(caption),
+                outcome="rejected", error=error_repr,
+            )
+            raise HTTPException(400, f"Failed to {method}: {error_repr}") from e
         except HTTPException:
             # Already structured — let FastAPI render it. Still stop typing.
             # HTTPExceptions reachable here come from _send_file_message's

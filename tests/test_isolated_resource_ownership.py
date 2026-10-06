@@ -107,7 +107,12 @@ def test_media_attachment_requires_caller_ownership(daemon, monkeypatch, kind, t
     client.close()
     if target in {"own", "own-symlink"}:
         assert response.status_code == 200, response.text
-        assert opened == [(own.resolve(), "own harmless fixture")]
+        assert len(opened) == 1
+        snapshot, payload = opened[0]
+        assert payload == "own harmless fixture"
+        assert snapshot.name == own.name
+        assert not snapshot.is_relative_to(d.root / "tenant")
+        assert not snapshot.parent.exists()
     else:
         assert (response.status_code, opened) == (403, []), (response.status_code, opened)
         assert reads == []
@@ -294,7 +299,13 @@ def test_symlinked_working_dir_owns_only_its_resolved_resources(
         client.close()
     if owner == "tenant":
         assert response.status_code == 200, response.text
-        assert effects == [selected.resolve()]
+        if resource == "media":
+            assert len(effects) == 1
+            assert effects[0].name == selected.name
+            assert not effects[0].is_relative_to(work["tenant"][1])
+            assert not effects[0].parent.exists()
+        else:
+            assert effects == [selected.resolve()]
     else:
         assert (response.status_code, effects) == (403, []), response.text
 

@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from pinky_daemon.codex_home import codex_home_for
+from pinky_daemon.isolated_files import path_for_fd
 from pinky_daemon.turn_response import TurnResponse
 
 
@@ -357,8 +358,12 @@ class CodexTmuxTranscriptTailer:
         active_poll_sec: float = _ACTIVE_POLL_SEC,
         path_discovery: Callable[[], Path | None] | None = None,
         on_entry: Callable[[dict], None] | None = None,
+        owned_root: Path | None = None,
     ) -> None:
         self._path = Path(transcript_path)
+        self._owned_root = owned_root
+        self._owned_path = self._path.resolve() if owned_root is not None else None
+        self._ownership_rejection_logged = False
         self._on_turn_complete = on_turn_complete
         self._model = model
         self._agent_name = agent_name or self._path.stem[:12]
@@ -462,6 +467,8 @@ class CodexTmuxTranscriptTailer:
         """
         if Path(path) != self._path:
             self._path = Path(path)
+            self._owned_path = self._path.resolve() if self._owned_root is not None else None
+            self._ownership_rejection_logged = False
             self._swap_generation += 1
             try:
                 bind_size = (
@@ -647,7 +654,25 @@ class CodexTmuxTranscriptTailer:
 
         generation = self._swap_generation
 
-        size = self._path.stat().st_size
+        handle = None
+        if self._owned_root is not None:
+            fd = None
+            try:
+                fd = os.open(self._path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                opened_path = path_for_fd(fd)
+                if opened_path != self._owned_path or not opened_path.is_relative_to(self._owned_root):
+                    raise OSError("opened rollout does not match its owned discovery path")
+                handle = os.fdopen(fd, "rb")
+                fd = None
+            except OSError as error:
+                if not self._ownership_rejection_logged:
+                    _log(f"codex_tailer[{self._agent_name}]: transcript ownership rejected: {error}")
+                    self._ownership_rejection_logged = True
+                return 0
+            finally:
+                if fd is not None:
+                    os.close(fd)
+        size = os.fstat(handle.fileno()).st_size if handle is not None else self._path.stat().st_size
         if size < self._offset or size < self._historical_high_water:
             # File truncated / replaced. Reset and consume from 0; every byte
             # in the replacement is live because this process has not read it.
@@ -664,11 +689,13 @@ class CodexTmuxTranscriptTailer:
             self._stats["rotations"] += 1
 
         if size == self._offset:
+            if handle is not None:
+                handle.close()
             return 0
 
         bytes_read = 0
 
-        with self._path.open("rb") as fh:
+        with handle if handle is not None else self._path.open("rb") as fh:
             source_stat = os.fstat(fh.fileno())
             identity = (source_stat.st_dev, source_stat.st_ino)
             fh.seek(self._offset)

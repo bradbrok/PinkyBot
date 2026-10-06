@@ -415,6 +415,10 @@ class CodexTmuxSession(TmuxSession):
                 # event_msg/user_message entry instead of Claude's user or
                 # queue-operation rows.
                 on_entry=self._on_transcript_entry,
+                owned_root=(
+                    self._project_dir().resolve()
+                    if self._isolation_status() == "isolated" else None
+                ),
             )
             if guessed is not None:
                 # Warm-wake / resume: seek to EOF so we don't replay history.

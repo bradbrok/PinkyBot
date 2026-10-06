@@ -118,7 +118,14 @@ def prepared(d, monkeypatch, method, template):
                          "_get_platform_adapter", lambda *args: adapter)
 
             def check(result):
-                return effects == [("1", own.resolve(), b"harmless fixture")]
+                return (
+                    len(effects) == 1
+                    and effects[0][0] == "1"
+                    and effects[0][2] == b"harmless fixture"
+                    and effects[0][1].name == own.name
+                    and not effects[0][1].is_relative_to(d.root / "tenant")
+                    and not effects[0][1].parent.exists()
+                )
         elif template.endswith("send-gif"):
 
             def send_animation(chat, path, **kwargs):
