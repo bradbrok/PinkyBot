@@ -63,6 +63,7 @@ from pinky_daemon import schedule_fire_trace as _schedule_fire_trace
 from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import (
+    Agent,
     AgentAlreadyExistsError,
     AgentPathContainmentError,
     AgentRegistrationIncompleteError,
@@ -5700,7 +5701,7 @@ def create_api(
                 hint=_isolation_denial_hint(request),
             )
 
-    def _isolated_resource_working_dir(request: Request) -> str | None:
+    def _isolated_resource_agent(request: Request) -> Agent | None:
         """Use only the verified caller; registry uncertainty cannot grant access."""
         caller = getattr(request.state, "internal_caller", "")
         if not caller:
@@ -5714,8 +5715,24 @@ def create_api(
             except Exception:
                 agent = None
             if agent and agent.working_dir:
-                return agent.working_dir
+                return agent
         raise HTTPException(403, "caller isolation could not be verified")
+
+    def _claude_transcript_roots(agent: Agent) -> list[Path]:
+        """Share the agent's applicable Claude roots between both path checks."""
+        from pinky_daemon.provisioning import container_config_dir, local_config_dir
+
+        roots = [(Path.home() / ".claude" / "projects").resolve()]
+        mode = getattr(agent, "isolation_mode", "local")
+        config_dir = None
+        if mode == "container":
+            config_dir = container_config_dir
+        elif getattr(agent, "dedicated_config_dir", False) and mode in ("", "local"):
+            config_dir = local_config_dir
+        wd = (agent.working_dir or "").strip()
+        if config_dir is not None and wd and Path(wd).is_absolute():
+            roots.append((Path(config_dir(str(Path(wd).resolve()))) / "projects").resolve())
+        return roots
 
     def _has_valid_session(request: Request) -> bool:
         secret = _session_secret()
@@ -8317,7 +8334,7 @@ npm run build</pre>
         it on first append); the tailer's ``read_once`` handles the
         missing-file path gracefully, so we don't insist on existence.
         """
-        working_dir = _isolated_resource_working_dir(request)
+        caller_agent = _isolated_resource_agent(request)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -8325,44 +8342,9 @@ npm run build</pre>
         path = Path(req.transcript_path)
         if not path.is_absolute():
             raise HTTPException(400, "transcript_path must be absolute")
-        # Restrict to the agent's legitimate transcript roots. Resolve
-        # symlinks before the prefix check so a symlinked attack path is
-        # normalised. Local agents: ``~/.claude/projects/``. Container
-        # agents (#638): claude runs with CLAUDE_CONFIG_DIR =
-        # <working_dir>/.claude-container, so its SessionStart hook
-        # legitimately reports <working_dir>/.claude-container/projects/...
-        # — without this root the report 403s and the tailer never repoints
-        # off its cold-start guess.
-        allowed_roots = [(Path.home() / ".claude" / "projects").resolve()]
-        # #215: codex tmux agents tail rollouts under the codex session store
-        # (``$CODEX_HOME/sessions`` or ``~/.codex/sessions``), not ~/.claude.
-        allowed_roots.append((codex_home_for(agent) / "sessions").resolve())
-        if getattr(agent, "isolation_mode", "local") == "container":
-            wd = (agent.working_dir or "").strip()
-            if wd and Path(wd).is_absolute():
-                from pinky_daemon.provisioning import container_config_dir
-
-                allowed_roots.append(
-                    (Path(container_config_dir(str(Path(wd).resolve()))) / "projects")
-                    .resolve()
-                )
-        # Dedicated-config-dir LOCAL agent (#550/Picard): claude runs with
-        # CLAUDE_CONFIG_DIR=<working_dir>/.claude-local, so its SessionStart hook
-        # legitimately reports transcripts under <working_dir>/.claude-local/
-        # projects/... — without this root the report 403s and the tailer never
-        # repoints off its cold-start guess.
-        if (
-            getattr(agent, "dedicated_config_dir", False)
-            and getattr(agent, "isolation_mode", "local") in ("", "local")
-        ):
-            wd = (agent.working_dir or "").strip()
-            if wd and Path(wd).is_absolute():
-                from pinky_daemon.provisioning import local_config_dir
-
-                allowed_roots.append(
-                    (Path(local_config_dir(str(Path(wd).resolve()))) / "projects")
-                    .resolve()
-                )
+        # Isolated bindings use the verified caller's record, even in off mode.
+        claude_roots = _claude_transcript_roots(caller_agent or agent)
+        allowed_roots = [*claude_roots, (codex_home_for(agent) / "sessions").resolve()]
         try:
             normalised = path.resolve(strict=False)
         except (OSError, RuntimeError) as e:
@@ -8378,10 +8360,11 @@ npm run build</pre>
                 f"{', '.join(str(r) for r in allowed_roots)}",
             )
 
-        if working_dir is not None:
-            projects = (Path.home() / ".claude" / "projects").resolve()
+        if caller_agent is not None:
+            working_dir = caller_agent.working_dir
             own_projects = {
-                (projects / claude_project_slug(cwd)).resolve()
+                (root / claude_project_slug(cwd)).resolve()
+                for root in claude_roots
                 for cwd in (working_dir, Path(working_dir).resolve())
             }
             if normalised.parent not in own_projects:
@@ -10952,11 +10935,12 @@ npm run build</pre>
         if not agent_name or not chat_id or not file_path:
             raise HTTPException(400, "agent_name, chat_id, and file_path are required")
 
-        working_dir = _isolated_resource_working_dir(request)
-        if working_dir is not None:
+        caller_agent = _isolated_resource_agent(request)
+        if caller_agent is not None:
+            working_dir = caller_agent.working_dir
             try:
                 resolved = Path(file_path).resolve(strict=True)
-            except FileNotFoundError as e:
+            except (OSError, RuntimeError) as e:
                 error_repr = f"{type(e).__name__}: {e}"
                 _outreach_attempt_log(
                     agent_name=agent_name, platform=platform, method=method,

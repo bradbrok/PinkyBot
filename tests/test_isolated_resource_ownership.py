@@ -1,5 +1,6 @@
 """Object and file ownership expectations, without live files or adapters."""
 
+import asyncio
 import io
 import os
 import re
@@ -421,3 +422,170 @@ def test_unverified_agent_header_does_not_restrict_browser_media(daemon, monkeyp
         client.close()
     assert response.status_code == 200, response.text
     assert effects == [peer]
+
+
+def _config_workdirs(d, config):
+    work = {}
+    for name in ("tenant", "peer"):
+        real = d.root / f"real-{name}"
+        real.mkdir()
+        registered = d.root / f"alias-{name}"
+        registered.symlink_to(real, target_is_directory=True)
+        d.agents.update(
+            name, isolation_mode="container" if config == "container" else "local",
+            dedicated_config_dir=config == "local",
+        )
+        # Seed the legacy registered alias only in the owned synthetic registry.
+        assert Path(d.agents._db_path).is_relative_to(d.root)
+        d.agents._db.execute("UPDATE agents SET working_dir=? WHERE name=?", (str(registered), name))
+        d.agents._db.commit()
+        assert d.agents.get(name).working_dir == str(registered)
+        work[name] = (registered, real)
+    return work
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("config", ["container", "local"])
+@pytest.mark.parametrize("encoding", ["registered", "realpath"])
+@pytest.mark.parametrize("owner", ["tenant", "peer", "nested"])
+def test_isolated_config_transcript_owns_exact_project(daemon, mode, config, encoding, owner):
+    d = daemon(mode)
+    work = _config_workdirs(d, config)
+    selected_owner = "peer" if owner == "peer" else "tenant"
+    registered, real = work[selected_owner]
+    cwd = registered if encoding == "registered" else real
+    encoded = re.sub(r"[^a-zA-Z0-9]", "-", str(cwd))
+    selected = real / f".claude-{config}" / "projects" / encoded
+    if owner == "nested":
+        selected /= "nested"
+    selected /= "fixture.jsonl"
+    selected.parent.mkdir(parents=True)
+    selected.write_text("{}\n")
+    effects = []
+    session = TmuxSession(StreamingSessionConfig(
+        agent_name="tenant", working_dir=str(work["tenant"][0])))
+    session._tailer = SimpleNamespace(set_transcript_path=lambda file, **kw: effects.append(file))
+    session._tailer_first_bind_pending = True
+    session._last_launch_used_continue = False
+    d.app.state.broker.register_streaming("tenant", session, label="main")
+    path = "/agents/tenant/transport/transcript-path"
+    client = TestClient(d.app)
+    try:
+        response = client.post(path, headers=signed(d, "POST", path), json={
+            "transcript_path": str(selected), "session_id": "fixture", "label": "main"})
+    finally:
+        client.close()
+    if owner == "tenant":
+        assert response.status_code == 200, response.text
+        assert effects == [selected.resolve()]
+    else:
+        assert (response.status_code, effects) == (403, []), response.text
+
+
+def test_off_transcript_roots_come_from_container_caller_not_path_agent(daemon):
+    from fastapi import HTTPException, Request
+
+    from pinky_daemon.api_models import TransportTranscriptPathRequest
+
+    d = daemon("off")
+    work = _config_workdirs(d, "container")
+    registered, real = work["tenant"]
+    encoded = re.sub(r"[^a-zA-Z0-9]", "-", str(registered))
+    selected = real / ".claude-container" / "projects" / encoded / "fixture.jsonl"
+    selected.parent.mkdir(parents=True)
+    selected.write_text("{}\n")
+    effects = []
+    session = SimpleNamespace(set_transcript_path=lambda file, **kw: effects.append(file))
+    d.app.state.broker.register_streaming("normal", session, label="main")
+    assert d.agents.get("normal").isolation_mode == "local"
+    path = "/agents/normal/transport/transcript-path"
+    body = {"transcript_path": str(selected), "session_id": "fixture", "label": "main"}
+    client = TestClient(d.app)
+    try:
+        response = client.post(path, headers=signed(d, "POST", path), json=body)
+    finally:
+        client.close()
+    # The legacy cross-agent guard denies this request even in off mode.
+    assert (response.status_code, effects) == (403, []), response.text
+    request = Request({
+        "type": "http", "method": "POST", "path": path, "headers": [],
+        "state": {"internal_caller": "tenant"},
+    })
+    handler = closure(d.app, "transport_transcript_path")
+    try:
+        result = asyncio.run(handler(
+            "normal", TransportTranscriptPathRequest(**body), request))
+    except HTTPException as exc:
+        pytest.fail(f"Handler rejected the caller's config root: {exc.status_code}: {exc.detail}")
+    assert result["ok"] is True
+    assert effects == [selected.resolve()]
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("per_agent", [False, True])
+def test_isolated_transcript_never_owns_codex_sessions(daemon, monkeypatch, mode, per_agent):
+    from pinky_daemon.codex_home import codex_home_for
+
+    d = daemon(mode)
+    monkeypatch.setenv("PINKY_CODEX_PER_AGENT_HOME", "1" if per_agent else "0")
+    encoded = re.sub(r"[^a-zA-Z0-9]", "-", d.agents.get("tenant").working_dir)
+    selected = codex_home_for(d.agents.get("tenant")) / "sessions" / encoded / "fixture.jsonl"
+    selected.parent.mkdir(parents=True)
+    selected.write_text("{}\n")
+    effects = []
+    session = SimpleNamespace(set_transcript_path=lambda file, **kw: effects.append(file))
+    d.app.state.broker.register_streaming("tenant", session, label="main")
+    path = "/agents/tenant/transport/transcript-path"
+    client = TestClient(d.app)
+    try:
+        response = client.post(path, headers=signed(d, "POST", path), json={
+            "transcript_path": str(selected), "session_id": "fixture", "label": "main"})
+    finally:
+        client.close()
+    assert (response.status_code, effects) == (403, []), response.text
+    assert "caller's own project" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("kind", ["photo", "document", "video"])
+@pytest.mark.parametrize("failure", ["broken-symlink", "not-directory", "loop", "permission", "runtime"])
+def test_isolated_media_resolve_errors_are_rejected(daemon, monkeypatch, mode, kind, failure):
+    d = daemon(mode)
+    selected = d.root / "tenant" / "invalid"
+    if failure == "broken-symlink":
+        selected.symlink_to(selected.with_name("missing"))
+    elif failure == "not-directory":
+        selected.write_text("fixture")
+        selected /= "child"
+    elif failure == "loop":
+        other = selected.with_name("other")
+        selected.symlink_to(other)
+        other.symlink_to(selected)
+    else:
+        selected.write_text("fixture")
+        original_resolve = Path.resolve
+
+        def resolve(path, *args, **kwargs):
+            if path == selected and kwargs.get("strict") is True:
+                error = PermissionError if failure == "permission" else RuntimeError
+                raise error("fixture resolve error")
+            return original_resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", resolve)
+    adapters, attempts, stopped = [], [], []
+    replace_cell(monkeypatch, closure(d.app, "_send_file_message"),
+                 "_get_platform_adapter", lambda *args: adapters.append(args))
+    replace_cell(monkeypatch, closure(d.app, "_broker_send_file_route"),
+                 "_outreach_attempt_log", lambda **kwargs: attempts.append(kwargs))
+    monkeypatch.setattr(d.app.state.broker, "_stop_typing", lambda *args: stopped.append(args))
+    path = f"/broker/send-{kind}"
+    client = TestClient(d.app, raise_server_exceptions=False)
+    try:
+        response = client.post(path, headers=signed(d, "POST", path), json={
+            "agent_name": "tenant", "chat_id": "fixture", "file_path": str(selected)})
+    finally:
+        client.close()
+    assert response.status_code == 400, response.text
+    assert adapters == []
+    assert len(attempts) == 1 and attempts[0]["outcome"] == "rejected"
+    assert stopped == [("tenant", "fixture")]
