@@ -68,7 +68,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -103,6 +103,7 @@ from pinky_daemon.command_runner import (
     RunuserCommandRunner,
 )
 from pinky_daemon.effort import EFFORT_LEVELS, is_ultracode, resolve_cli_effort
+from pinky_daemon.isolated_files import open_owned_transcript
 from pinky_daemon.pricing import compute_cost_from_usage
 from pinky_daemon.runtime_model_catalog import ModelCatalogError
 from pinky_daemon.scheduler_delivery import scheduler_busy_delay
@@ -1652,10 +1653,14 @@ def _snapshot_transcript_boundary(
     *,
     expected_identity: tuple[int, int] | None = None,
     expected_offset: int | None = None,
+    owned_predicate: Callable[[Path], bool] | None = None,
 ) -> tuple[tuple[int, int], int, int, bytes, int] | None:
     """Read one descriptor-bound EOF and its exact bounded suffix."""
     try:
-        with path.open("rb") as handle:
+        handle = open_owned_transcript(path, owned_predicate) if owned_predicate else path.open("rb")
+        if handle is None:
+            return None
+        with handle:
             opened = os.fstat(handle.fileno())
             identity = (opened.st_dev, opened.st_ino)
             offset = opened.st_size
@@ -1986,6 +1991,7 @@ class _InflightMeta:
     transcript_anchor_start_at_paste: int | None = None
     transcript_anchor_at_paste: bytes | None = None
     transcript_ticket_captured_at_ns: int | None = None
+    transcript_owned_predicate: Callable[[Path], bool] | None = None
     # Non-zero only for turns delivered during the active post-fresh lineage.
     # A completion may end ``_fresh_context_respawn_grace_until`` only when
     # this epoch matches the session's active epoch.  This prevents an
@@ -2006,6 +2012,7 @@ class _InflightMeta:
             self.transcript_path_at_paste,
             expected_identity=self.transcript_file_identity_at_paste,
             expected_offset=self.transcript_offset_at_paste,
+            owned_predicate=self.transcript_owned_predicate,
         )
         if snapshot is None:
             return
@@ -8122,7 +8129,10 @@ class TmuxSession(TransportReplacementMixin):
         except OSError:
             return _TranscriptOccurrenceTicket(path, None, None)
 
-        snapshot = _snapshot_transcript_boundary(path)
+        snapshot = _snapshot_transcript_boundary(
+            path, owned_predicate=self._transcript_predicate(),
+            expected_identity=self._transcript_expected_identity(path),
+        )
         if snapshot is None:
             return _TranscriptOccurrenceTicket(path, None, None)
         identity, offset, anchor_start, anchor, captured_at_ns = snapshot
@@ -8134,6 +8144,17 @@ class TmuxSession(TransportReplacementMixin):
             anchor=anchor,
             captured_at_ns=captured_at_ns,
         )
+
+    def _transcript_predicate(self):
+        projects = self._transcript_ownership
+        return (lambda opened: opened.parent in projects) if projects is not None else None
+
+    def _transcript_expected_identity(self, path: Path):
+        return None
+
+    def _open_transcript(self, path: Path, identity=None):
+        predicate = self._transcript_predicate()
+        return open_owned_transcript(path, predicate) if predicate else path.open("rb")
 
     def _phantom_consumption_verdicts(
         self, candidates: list[_InflightMeta]
@@ -8194,7 +8215,13 @@ class TmuxSession(TransportReplacementMixin):
                     continue
 
                 try:
-                    handle = stack.enter_context(transcript.open("rb"))
+                    opened_handle = self._open_transcript(
+                        transcript, entry.transcript_file_identity_at_paste,
+                    )
+                    if opened_handle is None:
+                        sources.append(None)
+                        continue
+                    handle = stack.enter_context(opened_handle)
                     descriptor = _descriptor(handle)
                     opened = os.fstat(descriptor)
                 except (AttributeError, OSError, TypeError, ValueError):
@@ -12170,6 +12197,7 @@ class TmuxSession(TransportReplacementMixin):
             transcript_ticket_captured_at_ns=(
                 turn.transcript_ticket_captured_at_ns
             ),
+            transcript_owned_predicate=self._transcript_predicate(),
             fresh_context_epoch=self._fresh_context_respawn_epoch,
         ))
         self._trace_scheduler_turn(turn, "paste", at=_paste_succeeded_at,

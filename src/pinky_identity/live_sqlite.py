@@ -70,6 +70,12 @@ def is_live_sqlite_file(path: str | Path) -> bool:
         return identity is not None and identity in _refresh()
 
 
+def live_sqlite_identities() -> set[tuple[int, int]]:
+    """Snapshot registered database and sidecar identities without opening them."""
+    with _lock:
+        return _refresh().copy()
+
+
 def refuse_live_sqlite_file(path: str | Path) -> None:
     if is_live_sqlite_file(path):
         raise LiveSQLiteFileError(f"Refusing raw file access to a live SQLite store: {path}")

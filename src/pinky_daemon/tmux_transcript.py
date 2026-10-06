@@ -55,7 +55,7 @@ import time
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from pinky_daemon.isolated_files import path_for_fd
+from pinky_daemon.isolated_files import open_owned_transcript
 from pinky_daemon.turn_response import TurnResponse
 
 
@@ -794,14 +794,11 @@ class TmuxTranscriptTailer:
             if self._owned_projects is None:
                 handle = self._path.open("rb")
             else:
-                fd = os.open(self._path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-                try:
-                    if path_for_fd(fd).parent not in self._owned_projects:
-                        raise OSError("opened transcript is outside the caller's project directory")
-                    handle = os.fdopen(fd, "rb")
-                except BaseException:
-                    os.close(fd)
-                    raise
+                handle = open_owned_transcript(
+                    self._path, lambda opened: opened.parent in self._owned_projects,
+                )
+                if handle is None:
+                    raise OSError("opened transcript is outside the caller's project directory")
         except FileNotFoundError:
             return 0
         except OSError as error:

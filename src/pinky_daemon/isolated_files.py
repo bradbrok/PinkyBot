@@ -1,20 +1,28 @@
-"""Read isolated attachments from the same descriptor that was validated."""
+"""Validate transcript descriptors and copy attachments outside this process."""
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
+import json
 import os
 import shutil
 import stat
 import sys
 import tempfile
-from contextlib import contextmanager
+from collections.abc import Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
+
+import anyio
 
 from pinky_identity import live_sqlite
 
 # Slack accepts the largest upload among the supported adapters: 1 GB.
 MAX_MEDIA_BYTES = 1_000_000_000
+# Bound filesystem stalls while allowing a local 1 GB copy to finish.
+MEDIA_COPY_TIMEOUT_SEC = 30.0
+_COPY_CHILD = Path(__file__).with_name("isolated_media_copy.py")
 
 
 class IsolatedFileError(OSError):
@@ -31,40 +39,82 @@ def path_for_fd(fd: int) -> Path:
     raise OSError("opened file path lookup is unavailable")
 
 
-@contextmanager
-def media_snapshot(path: Path, working_dir: Path, tmp_parent: Path):
-    """Yield a private bounded copy and remove it after the adapter finishes."""
+def open_owned_transcript(path: Path, predicate: Callable[[Path], bool]):
+    """Open one regular transcript and validate the path of that descriptor."""
     fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        if not stat.S_ISREG(os.fstat(fd).st_mode) or not predicate(path_for_fd(fd)):
+            return None
+        handle = os.fdopen(fd, "rb")
+        fd = None
+        return handle
+    except (OSError, RuntimeError, ValueError):
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+async def _copy_media(payload: dict) -> dict:
+    child = await asyncio.create_subprocess_exec(
+        sys.executable, "-I", str(_COPY_CHILD), stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, _stderr = await asyncio.wait_for(
+            child.communicate(json.dumps(payload).encode()), MEDIA_COPY_TIMEOUT_SEC,
+        )
+        result = json.loads(stdout)
+        if child.returncode or not isinstance(result, dict) or result.get("ok") is not True:
+            reason = result.get("reason", "invalid child output") if isinstance(result, dict) else "invalid child output"
+            raise IsolatedFileError(f"attachment copy refused: {str(reason)[:500]}")
+        if any(type(result.get(key)) is not int or result[key] < 0 for key in ("size", "dev", "ino")):
+            raise IsolatedFileError("invalid attachment copy metadata")
+        return result
+    except IsolatedFileError:
+        raise
+    except (OSError, ValueError, asyncio.TimeoutError) as error:
+        raise IsolatedFileError("attachment copy refused or timed out") from error
+    finally:
+        with anyio.CancelScope(shield=True):
+            if child.returncode is None:
+                try:
+                    child.kill()
+                except ProcessLookupError:
+                    pass
+            await child.wait()
+
+
+@asynccontextmanager
+async def media_snapshot(path: Path, working_dir: Path, tmp_parent: Path):
+    """Await a private bounded child-process copy and remove it after sending."""
     directory = None
     try:
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-            metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                raise ValueError("attachment must be a regular file with one link")
-            opened_path = path_for_fd(fd)
-            if not opened_path.is_relative_to(working_dir):
-                raise ValueError("opened attachment is outside the caller's working directory")
-            live_sqlite.refuse_sqlite_attachment(opened_path)
-            if metadata.st_size > MAX_MEDIA_BYTES:
-                raise ValueError("attachment exceeds the upload size limit")
+            await asyncio.to_thread(live_sqlite.refuse_sqlite_attachment, path)
+            if (await asyncio.to_thread(path.stat)).st_size > MAX_MEDIA_BYTES:
+                raise IsolatedFileError("attachment exceeds the upload size limit")
+            identities = await asyncio.to_thread(live_sqlite.live_sqlite_identities)
             tmp_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             directory = Path(tempfile.mkdtemp(prefix="media-", dir=tmp_parent))
             snapshot = directory / path.name
-            copied = 0
-            with snapshot.open("xb") as output:
-                while chunk := os.read(fd, min(65536, MAX_MEDIA_BYTES - copied + 1)):
-                    copied += len(chunk)
-                    if copied > MAX_MEDIA_BYTES:
-                        raise ValueError("attachment exceeds the upload size limit")
-                    output.write(chunk)
+            result = await _copy_media({
+                "path": str(path), "working_dir": str(working_dir), "target": str(snapshot),
+                "size_cap": MAX_MEDIA_BYTES, "live_sqlite": sorted(identities),
+            })
+            info = await asyncio.to_thread(snapshot.lstat)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or type(result.get("size")) is not int
+                or info.st_size != result["size"]
+                or not 0 <= info.st_size <= MAX_MEDIA_BYTES
+            ):
+                raise IsolatedFileError("attachment snapshot size does not match the copy")
         except (OSError, RuntimeError, ValueError) as error:
             raise IsolatedFileError(str(error)) from error
         yield snapshot
     finally:
-        try:
-            if directory is not None:
-                shutil.rmtree(directory)
-        finally:
-            if fd is not None:
-                os.close(fd)
+        if directory is not None:
+            with anyio.CancelScope(shield=True):
+                await asyncio.to_thread(shutil.rmtree, directory)

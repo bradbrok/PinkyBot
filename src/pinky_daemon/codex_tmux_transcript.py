@@ -46,12 +46,13 @@ import asyncio
 import json
 import os
 import sys
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
 from pinky_daemon.codex_home import codex_home_for
-from pinky_daemon.isolated_files import path_for_fd
+from pinky_daemon.isolated_files import open_owned_transcript
 from pinky_daemon.turn_response import TurnResponse
 
 
@@ -262,11 +263,32 @@ class _CodexTurnBuffer:
 # ──────────────────────────────────────────────────────────────────────────
 
 
+def _read_owned_codex_rollout(
+    path: Path, working_dir: str | Path, owned_root: Path,
+) -> tuple[Path, tuple[int, int]] | None:
+    """Bind the cwd metadata and file identity to one owned descriptor."""
+    handle = open_owned_transcript(path, lambda opened: opened.is_relative_to(owned_root))
+    if handle is None:
+        return None
+    try:
+        with handle:
+            info = os.fstat(handle.fileno())
+            metadata = json.loads(handle.readline())
+        if metadata.get("type") == "session_meta" and os.path.realpath(
+            metadata.get("payload", {}).get("cwd", "")
+        ) == os.path.realpath(str(working_dir)):
+            return path, (info.st_dev, info.st_ino)
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return None
+
+
 def _discover_codex_rollout(
     working_dir: str | Path,
     *,
     agent: object | None = None,
-) -> Path | None:
+    owned_root: Path | None = None,
+) -> Path | tuple[Path, tuple[int, int]] | None:
     """Scan ``~/.codex/sessions/**/rollout-*.jsonl`` and return the
     newest file whose ``session_meta.payload.cwd`` equals
     ``os.path.realpath(working_dir)``.
@@ -283,8 +305,7 @@ def _discover_codex_rollout(
     # Discovery MUST scan the same store the Codex process writes to. An
     # agent-scoped caller supplies its config so the helper applies the same
     # flag, explicit override, and fallback as every launch transport.
-    codex_home = codex_home_for(agent)
-    sessions_root = codex_home / "sessions"
+    sessions_root = owned_root if owned_root is not None else codex_home_for(agent) / "sessions"
     if not sessions_root.exists():
         return None
 
@@ -296,6 +317,11 @@ def _discover_codex_rollout(
     )[:_DISCOVERY_SCAN_LIMIT]
 
     for candidate in candidates:
+        if owned_root is not None:
+            binding = _read_owned_codex_rollout(candidate, working_dir, owned_root)
+            if binding is not None:
+                return binding
+            continue
         try:
             with candidate.open("r", encoding="utf-8", errors="replace") as fh:
                 first_line = fh.readline()
@@ -356,13 +382,16 @@ class CodexTmuxTranscriptTailer:
         model: str = "",
         fallback_poll_sec: float = _FALLBACK_POLL_SEC,
         active_poll_sec: float = _ACTIVE_POLL_SEC,
-        path_discovery: Callable[[], Path | None] | None = None,
+        path_discovery: Callable[[], Path | tuple[Path, tuple[int, int]] | None] | None = None,
         on_entry: Callable[[dict], None] | None = None,
         owned_root: Path | None = None,
+        owned_identity: tuple[int, int] | None = None,
+        owned_discovery: Callable[[Path], tuple[Path, tuple[int, int]] | None] | None = None,
     ) -> None:
         self._path = Path(transcript_path)
         self._owned_root = owned_root
-        self._owned_path = self._path.resolve() if owned_root is not None else None
+        self._owned_identity = owned_identity
+        self._owned_discovery = owned_discovery
         self._ownership_rejection_logged = False
         self._on_turn_complete = on_turn_complete
         self._model = model
@@ -380,9 +409,12 @@ class CodexTmuxTranscriptTailer:
         # take the same snapshot, while unseen self-heal/truncation bytes are
         # live and reset their boundary to zero.
         try:
-            self._historical_high_water: int = (
-                self._path.stat().st_size if self._path.exists() else 0
-            )
+            if owned_root is not None:
+                handle = self._open_owned(self._path, owned_identity)
+                with handle if handle is not None else nullcontext():
+                    self._historical_high_water = os.fstat(handle.fileno()).st_size if handle else 0
+            else:
+                self._historical_high_water = self._path.stat().st_size if self._path.exists() else 0
         except OSError:
             self._historical_high_water = 0
         # Bumped on every path-changing ``set_transcript_path``. Lets
@@ -430,6 +462,22 @@ class CodexTmuxTranscriptTailer:
     def transcript_path(self) -> Path:
         return self._path
 
+    def _open_owned(self, path: Path, identity: tuple[int, int] | None):
+        if identity is None:
+            return None
+        handle = open_owned_transcript(path, lambda opened: opened.is_relative_to(self._owned_root))
+        if handle is not None:
+            info = os.fstat(handle.fileno())
+            if (info.st_dev, info.st_ino) == identity:
+                return handle
+            handle.close()
+        return None
+
+    @property
+    def bound_size(self) -> int:
+        """Size sampled from the descriptor used for the current binding."""
+        return self._historical_high_water
+
     @property
     def stats(self) -> dict:
         return {
@@ -450,6 +498,7 @@ class CodexTmuxTranscriptTailer:
 
     def set_transcript_path(
         self, path: Path, *, seek_to_start: bool = False,
+        owned_identity: tuple[int, int] | None = None,
     ) -> None:
         """Swap the watched rollout file.
 
@@ -466,16 +515,26 @@ class CodexTmuxTranscriptTailer:
         prevent partial text from a killed session leaking into a fresh one.
         """
         if Path(path) != self._path:
+            if self._owned_root is not None:
+                if owned_identity is None:
+                    binding = self._owned_discovery(Path(path)) if self._owned_discovery else None
+                    if binding is None:
+                        return
+                    _path, owned_identity = binding
+                handle = self._open_owned(Path(path), owned_identity)
+                if handle is None:
+                    return
+                with handle:
+                    bind_size = os.fstat(handle.fileno()).st_size
+            else:
+                try:
+                    bind_size = Path(path).stat().st_size if Path(path).exists() else 0
+                except OSError:
+                    bind_size = 0
             self._path = Path(path)
-            self._owned_path = self._path.resolve() if self._owned_root is not None else None
+            self._owned_identity = owned_identity
             self._ownership_rejection_logged = False
             self._swap_generation += 1
-            try:
-                bind_size = (
-                    self._path.stat().st_size if self._path.exists() else 0
-                )
-            except OSError:
-                bind_size = 0
             self.model_context_window = 0
             if seek_to_start:
                 self._offset = 0
@@ -615,6 +674,11 @@ class CodexTmuxTranscriptTailer:
             return
         if discovered is None:
             return
+        owned_identity = None
+        if self._owned_root is not None:
+            if not isinstance(discovered, tuple):
+                return
+            discovered, owned_identity = discovered
         discovered = Path(discovered)
         if discovered == self._path:
             return
@@ -640,7 +704,7 @@ class CodexTmuxTranscriptTailer:
             f"rollout {self._path} (mtime={bound_mtime}) → {discovered} "
             f"(mtime={discovered_mtime})"
         )
-        self.set_transcript_path(discovered, seek_to_start=True)
+        self.set_transcript_path(discovered, seek_to_start=True, owned_identity=owned_identity)
         self._stats["self_heal_repoints"] += 1
 
     async def _read_and_dispatch(self) -> int:
@@ -656,22 +720,12 @@ class CodexTmuxTranscriptTailer:
 
         handle = None
         if self._owned_root is not None:
-            fd = None
-            try:
-                fd = os.open(self._path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-                opened_path = path_for_fd(fd)
-                if opened_path != self._owned_path or not opened_path.is_relative_to(self._owned_root):
-                    raise OSError("opened rollout does not match its owned discovery path")
-                handle = os.fdopen(fd, "rb")
-                fd = None
-            except OSError as error:
+            handle = self._open_owned(self._path, self._owned_identity)
+            if handle is None:
                 if not self._ownership_rejection_logged:
-                    _log(f"codex_tailer[{self._agent_name}]: transcript ownership rejected: {error}")
+                    _log(f"codex_tailer[{self._agent_name}]: transcript ownership rejected")
                     self._ownership_rejection_logged = True
                 return 0
-            finally:
-                if fd is not None:
-                    os.close(fd)
         size = os.fstat(handle.fileno()).st_size if handle is not None else self._path.stat().st_size
         if size < self._offset or size < self._historical_high_water:
             # File truncated / replaced. Reset and consume from 0; every byte

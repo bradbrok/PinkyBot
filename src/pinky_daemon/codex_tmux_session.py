@@ -60,14 +60,17 @@ from pinky_daemon.codex_home import (
     codex_home_for,
     per_agent_codex_home_enabled,
     prepare_agent_codex_home,
+    shared_codex_home,
     validate_agent_codex_home,
 )
 from pinky_daemon.codex_mcp_env import mcp_cli_config
 from pinky_daemon.codex_tmux_transcript import (
     CodexTmuxTranscriptTailer,
     _discover_codex_rollout,
+    _read_owned_codex_rollout,
 )
 from pinky_daemon.context_window import resolve_context_window
+from pinky_daemon.isolated_files import open_owned_transcript
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import (
     _PLACEHOLDER_TRANSCRIPT_PATH,
@@ -363,28 +366,86 @@ class CodexTmuxSession(TmuxSession):
     def _has_prior_transcript(self) -> bool:
         """True iff a codex rollout for this agent's cwd already exists (gates
         ``codex resume --last``)."""
-        return (
-            _discover_codex_rollout(
-                self._config.working_dir or ".",
-                agent=self._config,
-            )
-            is not None
-        )
+        return self._discover_transcript_path() is not None
 
     def _discover_transcript_path(self) -> Path | None:
         """Newest rollout whose ``session_meta.cwd`` == this agent's cwd, or None
         (cold start before the first turn writes a rollout)."""
-        return _discover_codex_rollout(
-            self._config.working_dir or ".",
-            agent=self._config,
+        owned_root = self._owned_rollout_root()
+        if owned_root is None:
+            return _discover_codex_rollout(self._config.working_dir or ".", agent=self._config)
+        discovered = _discover_codex_rollout(
+            self._config.working_dir or ".", agent=self._config, owned_root=owned_root,
         )
+        if isinstance(discovered, tuple):
+            self._codex_discovered_binding = discovered
+            return discovered[0]
+        return discovered
+
+    def _owned_rollout_root(self) -> Path | None:
+        """Freeze the managed root without following its writable literal tail."""
+        if self._isolation_status() != "isolated":
+            return None
+        root = getattr(self, "_codex_owned_root", None)
+        if root is None:
+            if per_agent_codex_home_enabled():
+                override = (self._config.codex_home or "").strip()
+                home = Path(override).expanduser().resolve() if override else (
+                    Path(self._config.working_dir).expanduser().resolve() / ".codex"
+                )
+            else:
+                home = shared_codex_home().expanduser().resolve()
+            root = self._codex_owned_root = home / "sessions"
+        return root
+
+    def _owned_rollout_binding(self, path: Path):
+        return _read_owned_codex_rollout(
+            path, self._config.working_dir or ".", self._owned_rollout_root(),
+        )
+
+    def _discover_bound_rollout(self):
+        path = self._discover_transcript_path()
+        if self._owned_rollout_root() is None:
+            return path
+        binding = getattr(self, "_codex_discovered_binding", None)
+        return binding if binding is not None and binding[0] == path else None
+
+    def _transcript_predicate(self):
+        root = self._owned_rollout_root()
+        return (lambda opened: opened.is_relative_to(root)) if root is not None else None
+
+    def _transcript_expected_identity(self, path: Path):
+        if self._owned_rollout_root() is None:
+            return None
+        tailer = self._tailer
+        if tailer is not None and tailer.transcript_path == path:
+            return tailer._owned_identity
+        binding = getattr(self, "_codex_discovered_binding", None)
+        return binding[1] if binding is not None and binding[0] == path else None
+
+    def _open_transcript(self, path: Path, identity=None):
+        predicate = self._transcript_predicate()
+        if predicate is None:
+            return path.open("rb")
+        identity = identity or self._transcript_expected_identity(path)
+        if identity is None:
+            return None
+        handle = open_owned_transcript(path, predicate)
+        if handle is not None:
+            info = os.fstat(handle.fileno())
+            if (info.st_dev, info.st_ino) == identity:
+                return handle
+            handle.close()
+        return None
 
     def _transcript_candidates(self) -> Iterator[tuple[Path, float]]:
         """Enumerate rollout paths without opening historical session content."""
         yield from _regular_transcript_candidates(self._project_dir().glob("**/rollout-*.jsonl"))
 
-    def _is_own_transcript(self, path: Path) -> bool:
+    def _is_own_transcript(self, path: Path) -> bool | tuple[Path, tuple[int, int]] | None:
         """Inspect ownership only for a bounded set of post-launch rollouts."""
+        if self._owned_rollout_root() is not None:
+            return self._owned_rollout_binding(path)
         try:
             with path.open("r", encoding="utf-8", errors="replace") as handle:
                 metadata = json.loads(handle.readline())
@@ -404,26 +465,32 @@ class CodexTmuxSession(TmuxSession):
         if self._tailer is None:
             guessed = self._discover_transcript_path()
             path = guessed or _PLACEHOLDER_TRANSCRIPT_PATH
+            binding = getattr(self, "_codex_discovered_binding", None)
+            owned_root = self._owned_rollout_root()
             self._tailer = CodexTmuxTranscriptTailer(
                 transcript_path=path,
                 on_turn_complete=self._handle_turn_complete,
                 agent_name=self.agent_name,
                 model=self._codex_model,
-                path_discovery=self._discover_transcript_path,
+                path_discovery=(
+                    self._discover_bound_rollout if owned_root is not None
+                    else self._discover_transcript_path
+                ),
                 # Scheduler receipts use the same exact transcript-observation
                 # contract as Claude tmux.  Codex records acceptance as an
                 # event_msg/user_message entry instead of Claude's user or
                 # queue-operation rows.
                 on_entry=self._on_transcript_entry,
-                owned_root=(
-                    self._project_dir().resolve()
-                    if self._isolation_status() == "isolated" else None
-                ),
+                owned_root=owned_root,
+                owned_identity=(binding[1] if binding is not None and binding[0] == path else None),
+                owned_discovery=self._owned_rollout_binding if owned_root is not None else None,
             )
             if guessed is not None:
                 # Warm-wake / resume: seek to EOF so we don't replay history.
                 try:
-                    self._tailer.set_offset(guessed.stat().st_size)
+                    self._tailer.set_offset(
+                        self._tailer.bound_size if owned_root is not None else guessed.stat().st_size
+                    )
                 except OSError:
                     pass
         await super()._start_tailer()

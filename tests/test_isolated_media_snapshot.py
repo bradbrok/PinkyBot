@@ -11,6 +11,7 @@ from anyio.from_thread import start_blocking_portal
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from tests.isolated_file_support import before_child, child_hook
 from tests.isolated_policy_support import closure, replace_cell, signed
 from tests.isolated_policy_support import daemon as daemon
 
@@ -139,11 +140,10 @@ def test_opened_attachment_is_revalidated_after_path_replacement(daemon, monkeyp
     other_dir.mkdir()
     other = other_dir / own.name
     other.write_bytes(b"replacement fixture")
-    original_open = os.open
     replaced = []
 
-    def replace_before_open(path, flags, *args, **kwargs):
-        if Path(path) == own and not replaced:
+    def replace_before_open(payload):
+        if Path(payload["path"]) == own and not replaced:
             replaced.append(True)
             if swap == "file":
                 own.unlink()
@@ -151,9 +151,8 @@ def test_opened_attachment_is_revalidated_after_path_replacement(daemon, monkeyp
             else:
                 directory.rename(d.root / "tenant" / "parked")
                 directory.symlink_to(other_dir, target_is_directory=True)
-        return original_open(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(os, "open", replace_before_open)
+    before_child(monkeypatch, replace_before_open)
     effects = []
     adapter(d, monkeypatch, lambda *args, **kwargs: effects.append(args))
     response = post(d, own)
@@ -183,22 +182,22 @@ def test_overcap_attachment_is_rejected_without_reading_it(daemon, monkeypatch):
     assert not (d.root / "tmp").exists()
 
 
-def test_attachment_growth_is_bounded_and_partial_snapshot_is_removed(daemon, monkeypatch):
+def test_attachment_growth_is_bounded_and_partial_snapshot_is_removed(daemon, monkeypatch, tmp_path):
     from pinky_daemon import isolated_files
 
     d = daemon()
     own = d.root / "tenant" / "fixture.txt"
     own.write_bytes(b"tiny")
     monkeypatch.setattr(isolated_files, "MAX_MEDIA_BYTES", 8)
-    original_path = isolated_files.path_for_fd
-
-    def grow(fd):
-        path = original_path(fd)
-        with own.open("ab") as file:
-            file.write(b"extra bytes beyond the limit")
-        return path
-
-    monkeypatch.setattr(isolated_files, "path_for_fd", grow)
+    child_hook(monkeypatch, tmp_path, f"""
+original_path = env['path_for_fd']
+def grow(fd):
+    path = original_path(fd)
+    with open({str(own)!r}, 'ab') as file:
+        file.write(b'extra bytes beyond the limit')
+    return path
+env['path_for_fd'] = grow
+""")
     effects = []
     adapter(d, monkeypatch, lambda *args, **kwargs: effects.append(args))
     response = post(d, own)
@@ -206,17 +205,16 @@ def test_attachment_growth_is_bounded_and_partial_snapshot_is_removed(daemon, mo
     assert list((d.root / "tmp").iterdir()) == []
 
 
-def test_unavailable_opened_path_lookup_fails_closed(daemon, monkeypatch):
-    from pinky_daemon import isolated_files
-
+def test_unavailable_opened_path_lookup_fails_closed(daemon, monkeypatch, tmp_path):
     d = daemon()
     own = d.root / "tenant" / "fixture.txt"
     own.write_bytes(b"owned fixture")
 
-    def unavailable(fd):
-        raise OSError("fixture lookup unavailable")
-
-    monkeypatch.setattr(isolated_files, "path_for_fd", unavailable)
+    child_hook(monkeypatch, tmp_path, """
+def unavailable(fd):
+    raise OSError('fixture lookup unavailable')
+env['path_for_fd'] = unavailable
+""")
     effects = []
     adapter(d, monkeypatch, lambda *args, **kwargs: effects.append(args))
     response = post(d, own)

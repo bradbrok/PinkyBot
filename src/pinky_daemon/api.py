@@ -10962,7 +10962,7 @@ npm run build</pre>
                 raise HTTPException(403, "file_path must be inside the caller's working directory")
             file_path = str(resolved)
 
-        from contextlib import nullcontext
+        from contextlib import asynccontextmanager
 
         from pinky_daemon.isolated_files import IsolatedFileError, media_snapshot
         from pinky_identity.live_sqlite import LiveSQLiteFileError, refuse_sqlite_attachment
@@ -10975,11 +10975,15 @@ npm run build</pre>
 
         loop = asyncio.get_running_loop()
         try:
+            @asynccontextmanager
+            async def original_attachment():
+                yield file_path
+
             attachment = (
                 media_snapshot(resolved, Path(working_dir).resolve(), _data_dir / "tmp")
-                if caller_agent is not None else nullcontext(file_path)
+                if caller_agent is not None else original_attachment()
             )
-            with attachment as send_path:
+            async with attachment as send_path:
                 msg = await loop.run_in_executor(
                     None,
                     lambda: _send_file_message(
