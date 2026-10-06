@@ -246,3 +246,117 @@ def test_child_never_follows_final_link_to_otherwise_allowed_file(daemon, monkey
     adapter(d, monkeypatch, lambda *args, **kwargs: effects.append(args))
     response = post(d, own)
     assert (response.status_code, effects) == (400, []), response.text
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+def test_sqlite_registered_after_identity_snapshot_is_refused(daemon, monkeypatch, mode):
+    d = daemon(mode)
+    own = d.root / "tenant" / "owned.txt"
+    own.write_bytes(b"ordinary harmless fixture")
+    store = d.root / "peer" / "new-store.data"
+    connections = []
+    registered = []
+
+    def register_and_replace(payload):
+        connection = sqlite3.connect(
+            store, factory=live_sqlite.LiveSQLiteConnection, check_same_thread=False,
+        )
+        connections.append(connection)
+        live_sqlite.track_sqlite_connection(connection, store)
+        connection.execute("CREATE TABLE fixture(value TEXT)").close()
+        connection.execute("INSERT INTO fixture VALUES ('harmless new database fixture')").close()
+        connection.commit()
+        info = store.stat()
+        identity = (info.st_dev, info.st_ino)
+        assert identity in live_sqlite.live_sqlite_identities()
+        assert identity not in {tuple(pair) for pair in payload["live_sqlite"]}
+        registered.append(identity)
+        store.replace(own)
+        assert identity in live_sqlite.live_sqlite_identities()
+
+    before_child(monkeypatch, register_and_replace)
+    copied = []
+
+    def send(chat, path, **kwargs):
+        copied.append(Path(path).read_bytes())
+        return {"message_id": "fixture"}
+
+    adapter(d, monkeypatch, send)
+    try:
+        response = post(d, own)
+        assert len(registered) == 1
+        assert (response.status_code, copied) == (400, []), response.text
+        assert not list((d.root / "tmp").glob("media-*"))
+    finally:
+        for connection in connections:
+            connection.close()
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+def test_unrelated_sqlite_registered_during_copy_still_allows_send(daemon, monkeypatch, mode):
+    d = daemon(mode)
+    own = d.root / "tenant" / "owned.txt"
+    own.write_bytes(b"ordinary harmless fixture")
+    connections = []
+    registered = []
+
+    def register_unrelated(payload):
+        store = d.root / "peer" / "unrelated.data"
+        connection = sqlite3.connect(
+            store, factory=live_sqlite.LiveSQLiteConnection, check_same_thread=False,
+        )
+        connections.append(connection)
+        live_sqlite.track_sqlite_connection(connection, store)
+        connection.execute("CREATE TABLE fixture(value TEXT)").close()
+        connection.commit()
+        info = store.stat()
+        identity = (info.st_dev, info.st_ino)
+        assert identity not in {tuple(pair) for pair in payload["live_sqlite"]}
+        registered.append(identity)
+
+    before_child(monkeypatch, register_unrelated)
+    copied = []
+
+    def send(chat, path, **kwargs):
+        copied.append(Path(path).read_bytes())
+        return {"message_id": "fixture"}
+
+    adapter(d, monkeypatch, send)
+    try:
+        response = post(d, own)
+        assert response.status_code == 200, response.text
+        assert len(registered) == 1
+        assert registered[0] in live_sqlite.live_sqlite_identities()
+        assert copied == [b"ordinary harmless fixture"]
+        assert not list((d.root / "tmp").glob("media-*"))
+    finally:
+        for connection in connections:
+            connection.close()
+
+
+@pytest.mark.asyncio
+async def test_copy_child_uses_explicit_empty_environment(daemon, monkeypatch):
+    d = daemon()
+    own = d.root / "tenant" / "owned.txt"
+    own.write_bytes(b"harmless own fixture")
+    monkeypatch.setenv("PINKY_COPY_DAEMON_ONLY", "parent-only fixture")
+    environments = []
+    original = asyncio.create_subprocess_exec
+
+    async def create(*args, **kwargs):
+        environments.append(kwargs.get("env"))
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    copied = []
+
+    def send(chat, path, **kwargs):
+        copied.append(Path(path).read_bytes())
+        return {"message_id": "fixture"}
+
+    adapter(d, monkeypatch, send)
+    response = await async_post(d, own)
+    assert response.status_code == 200, response.text
+    assert copied == [b"harmless own fixture"]
+    assert environments == [{}]
+    assert not list((d.root / "tmp").glob("media-*"))

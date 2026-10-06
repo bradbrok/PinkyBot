@@ -5913,14 +5913,15 @@ class TmuxSession(TransportReplacementMixin):
             )
             return False
 
+        if self._set_transcript_path_internal(path) is False:
+            return False
         self._bound_transcript_session_id = requested_session_id
-        self._set_transcript_path_internal(path)
         if not self._session_ready_event.is_set():
             self._session_ready_event.set()
             _log(f"tmux[{self.agent_name}]: session-ready gate opened (SessionStart hook)")
         return True
 
-    def _set_transcript_path_internal(self, path: Path | str) -> None:
+    def _set_transcript_path_internal(self, path: Path | str) -> bool | None:
         """Trusted call-site-only transcript rebind for daemon discovery.
 
         This is intentionally a separate method rather than a flag on the
@@ -5933,12 +5934,14 @@ class TmuxSession(TransportReplacementMixin):
             self._tailer_first_bind_pending
             and not self._last_launch_used_continue
         )
-        # Consume the first-bind flag now — even if the tailer's
-        # internal equality guard short-circuits the actual swap.
-        self._tailer_first_bind_pending = False
-        self._tailer.set_transcript_path(
+        accepted = self._tailer.set_transcript_path(
             Path(path), seek_to_start=seek_to_start,
         )
+        if accepted is False:
+            return False
+        # Consume the first-bind flag only after an accepted attempt, including
+        # a path equality no-op. A refusal must leave the window available.
+        self._tailer_first_bind_pending = False
         _log(
             f"tmux[{self.agent_name}]: transcript path updated to {path}"
             + (" (first-bind — seek_to_start)" if seek_to_start else "")

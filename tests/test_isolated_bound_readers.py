@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 
+import httpx
 import pytest
 
 from pinky_daemon import isolated_files
@@ -12,7 +13,7 @@ from pinky_daemon.codex_tmux_session import CodexTmuxSession
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import _InflightMeta, _QueuedTurn
 from pinky_daemon.tmux_transcript import TmuxTranscriptTailer, claude_project_slug
-from tests.isolated_policy_support import closure
+from tests.isolated_policy_support import closure, signed
 from tests.isolated_policy_support import daemon as daemon
 from tests.test_isolated_codex_descriptor import discovered
 from tests.test_isolated_review_boundaries import replace_path
@@ -193,3 +194,135 @@ async def test_claude_reconciliation_never_reads_replaced_peer(daemon, monkeypat
     monkeypatch.setattr(Path, "open", opened)
     assert session._phantom_consumption_verdicts([entry]) == [None]
     assert reads == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+async def test_missing_owned_transcript_does_not_consume_refusal_log(
+    daemon, monkeypatch, runtime, capsys,
+):
+    d = daemon()
+    if runtime == "claude":
+        session, own = await claude(d)
+        tailer = session._tailer
+    else:
+        own, root, tailer, entries = await discovered(d, monkeypatch, True)
+    original = os.open
+
+    def disappear(selected, *args, **kwargs):
+        if not isinstance(selected, int) and Path(selected) == own:
+            raise FileNotFoundError("fixture vanished between exists and open")
+        return original(selected, *args, **kwargs)
+
+    capsys.readouterr()
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", disappear)
+        assert await tailer.read_once() == 0
+    assert capsys.readouterr().err.count("transcript ownership rejected") == 0
+    assert tailer._ownership_rejection_logged is False
+    parked = own.with_name("parked.jsonl")
+    own.rename(parked)
+    own.symlink_to(parked)
+    assert await tailer.read_once() == 0
+    assert await tailer.read_once() == 0
+    assert tailer.offset == 0
+    assert capsys.readouterr().err.count("transcript ownership rejected") == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_owned_rebind_returns_false_and_logs_once_per_path(
+    daemon, monkeypatch, capsys,
+):
+    d = daemon()
+    own, root, tailer, entries = await discovered(d, monkeypatch, True)
+    refused = rollout(own.with_name("rollout-foreign.jsonl"), d.root / "peer")
+    other = rollout(own.with_name("rollout-other-foreign.jsonl"), d.root / "peer")
+    original = (tailer.transcript_path, tailer.offset, tailer._owned_identity,
+                tailer._swap_generation, tailer.bound_size)
+    capsys.readouterr()
+    for candidate in (refused, refused, other, other):
+        assert tailer.set_transcript_path(candidate) is False
+        assert (tailer.transcript_path, tailer.offset, tailer._owned_identity,
+                tailer._swap_generation, tailer.bound_size) == original
+    assert capsys.readouterr().err.count("transcript ownership rejected") == 2
+    valid = rollout(own.with_name("rollout-valid.jsonl"), d.root / "tenant")
+    assert tailer.set_transcript_path(valid) is not False
+    assert tailer.transcript_path == valid
+    assert tailer.offset == valid.stat().st_size
+    assert tailer._owned_identity == (valid.stat().st_dev, valid.stat().st_ino)
+
+
+async def codex_session(d, monkeypatch):
+    own, root, tailer, entries = await discovered(d, monkeypatch, True)
+    session = CodexTmuxSession(
+        StreamingSessionConfig(agent_name="tenant", working_dir=str(d.root / "tenant")),
+        registry=d.agents,
+    )
+    session._tailer = tailer
+    session._tailer_first_bind_pending = True
+    session._last_launch_used_continue = False
+    session._bound_transcript_session_id = "fixture"
+    session._session_ready_event.clear()
+    return session, own
+
+
+@pytest.mark.asyncio
+async def test_codex_discovery_ignores_candidate_missing_at_owned_open(daemon, monkeypatch):
+    d = daemon()
+    session, own = await codex_session(d, monkeypatch)
+    original = os.open
+
+    def disappear(selected, *args, **kwargs):
+        if not isinstance(selected, int) and Path(selected) == own:
+            raise FileNotFoundError("fixture vanished before metadata discovery")
+        return original(selected, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", disappear)
+    assert session._discover_transcript_path() is None
+    assert session._is_own_transcript(own) is None
+
+
+@pytest.mark.asyncio
+async def test_codex_session_propagates_owned_rebind_refusal_without_consuming_window(
+    daemon, monkeypatch,
+):
+    d = daemon()
+    session, own = await codex_session(d, monkeypatch)
+    refused = rollout(own.with_name("rollout-foreign.jsonl"), d.root / "peer")
+    assert session.set_transcript_path(refused, session_id="new-fixture") is False
+    assert session._tailer.transcript_path == own
+    assert session._tailer_first_bind_pending is True
+    assert session._bound_transcript_session_id == "fixture"
+    assert not session._session_ready_event.is_set()
+    valid = rollout(own.with_name("rollout-valid.jsonl"), d.root / "tenant")
+    assert session.set_transcript_path(valid, session_id="new-fixture") is True
+    assert session._tailer.transcript_path == valid
+    assert session._tailer.offset == 0
+    assert session._tailer_first_bind_pending is False
+    assert session._bound_transcript_session_id == "new-fixture"
+    assert session._session_ready_event.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("owned", [False, True])
+async def test_controller_route_reports_owned_codex_bind_result(
+    daemon, monkeypatch, mode, owned,
+):
+    d = daemon(mode)
+    session, own = await codex_session(d, monkeypatch)
+    selected = rollout(own.with_name("rollout-selected.jsonl"), d.root / ("tenant" if owned else "peer"))
+    d.app.state.broker.register_streaming("tenant", session, label="main")
+    route = "/agents/tenant/transport/transcript-path"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=d.app), base_url="http://fixture",
+    ) as client:
+        response = await client.post(route, headers=signed(d, "POST", route, name="normal"), json={
+            "transcript_path": str(selected), "session_id": "new-fixture", "label": "main",
+        })
+    assert response.status_code == (200 if owned else 409), response.text
+    assert session._tailer.transcript_path == (selected if owned else own)
+    if not owned:
+        assert response.json()["detail"] == "transcript bind rejected"
+        assert session._tailer_first_bind_pending is True
+        assert session._bound_transcript_session_id == "fixture"

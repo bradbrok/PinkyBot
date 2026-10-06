@@ -267,10 +267,10 @@ def _read_owned_codex_rollout(
     path: Path, working_dir: str | Path, owned_root: Path,
 ) -> tuple[Path, tuple[int, int]] | None:
     """Bind the cwd metadata and file identity to one owned descriptor."""
-    handle = open_owned_transcript(path, lambda opened: opened.is_relative_to(owned_root))
-    if handle is None:
-        return None
     try:
+        handle = open_owned_transcript(path, lambda opened: opened.is_relative_to(owned_root))
+        if handle is None:
+            return None
         with handle:
             info = os.fstat(handle.fileno())
             metadata = json.loads(handle.readline())
@@ -393,6 +393,7 @@ class CodexTmuxTranscriptTailer:
         self._owned_identity = owned_identity
         self._owned_discovery = owned_discovery
         self._ownership_rejection_logged = False
+        self._rejected_bind_paths: set[Path] = set()
         self._on_turn_complete = on_turn_complete
         self._model = model
         self._agent_name = agent_name or self._path.stem[:12]
@@ -499,7 +500,7 @@ class CodexTmuxTranscriptTailer:
     def set_transcript_path(
         self, path: Path, *, seek_to_start: bool = False,
         owned_identity: tuple[int, int] | None = None,
-    ) -> None:
+    ) -> bool | None:
         """Swap the watched rollout file.
 
         Default behaviour: seek to EOF on swap (mirrors the claude tailer's
@@ -519,11 +520,14 @@ class CodexTmuxTranscriptTailer:
                 if owned_identity is None:
                     binding = self._owned_discovery(Path(path)) if self._owned_discovery else None
                     if binding is None:
-                        return
+                        return self._reject_owned_bind(Path(path))
                     _path, owned_identity = binding
-                handle = self._open_owned(Path(path), owned_identity)
+                try:
+                    handle = self._open_owned(Path(path), owned_identity)
+                except FileNotFoundError:
+                    return False
                 if handle is None:
-                    return
+                    return self._reject_owned_bind(Path(path))
                 with handle:
                     bind_size = os.fstat(handle.fileno()).st_size
             else:
@@ -534,6 +538,7 @@ class CodexTmuxTranscriptTailer:
             self._path = Path(path)
             self._owned_identity = owned_identity
             self._ownership_rejection_logged = False
+            self._rejected_bind_paths.clear()
             self._swap_generation += 1
             self.model_context_window = 0
             if seek_to_start:
@@ -545,6 +550,12 @@ class CodexTmuxTranscriptTailer:
             self.drain_buffer()    # silent drain; we're not at a boundary
             self._stats["rotations"] += 1
             self._wake_event.set()
+
+    def _reject_owned_bind(self, path: Path) -> bool:
+        if path not in self._rejected_bind_paths:
+            _log(f"codex_tailer[{self._agent_name}]: transcript ownership rejected on bind: {path}")
+            self._rejected_bind_paths.add(path)
+        return False
 
     def wake(self) -> None:
         """Signal the tail loop that new data is available.
@@ -720,7 +731,10 @@ class CodexTmuxTranscriptTailer:
 
         handle = None
         if self._owned_root is not None:
-            handle = self._open_owned(self._path, self._owned_identity)
+            try:
+                handle = self._open_owned(self._path, self._owned_identity)
+            except FileNotFoundError:
+                return 0
             if handle is None:
                 if not self._ownership_rejection_logged:
                     _log(f"codex_tailer[{self._agent_name}]: transcript ownership rejected")

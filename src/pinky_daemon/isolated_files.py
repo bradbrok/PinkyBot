@@ -40,7 +40,7 @@ def path_for_fd(fd: int) -> Path:
 
 
 def open_owned_transcript(path: Path, predicate: Callable[[Path], bool]):
-    """Open one regular transcript and validate the path of that descriptor."""
+    """Validate one regular transcript; raise for missing files, refuse others."""
     fd = None
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
@@ -49,6 +49,8 @@ def open_owned_transcript(path: Path, predicate: Callable[[Path], bool]):
         handle = os.fdopen(fd, "rb")
         fd = None
         return handle
+    except FileNotFoundError:
+        raise
     except (OSError, RuntimeError, ValueError):
         return None
     finally:
@@ -59,7 +61,7 @@ def open_owned_transcript(path: Path, predicate: Callable[[Path], bool]):
 async def _copy_media(payload: dict) -> dict:
     child = await asyncio.create_subprocess_exec(
         sys.executable, "-I", str(_COPY_CHILD), stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env={},
     )
     try:
         stdout, _stderr = await asyncio.wait_for(
@@ -111,6 +113,9 @@ async def media_snapshot(path: Path, working_dir: Path, tmp_parent: Path):
                 or not 0 <= info.st_size <= MAX_MEDIA_BYTES
             ):
                 raise IsolatedFileError("attachment snapshot size does not match the copy")
+            current_identities = await asyncio.to_thread(live_sqlite.live_sqlite_identities)
+            if (result["dev"], result["ino"]) in current_identities:
+                raise IsolatedFileError("attachment copy is a live SQLite inode")
         except (OSError, RuntimeError, ValueError) as error:
             raise IsolatedFileError(str(error)) from error
         yield snapshot
