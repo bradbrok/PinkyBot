@@ -1,9 +1,11 @@
-"""One real-handler positive and a scope negative for each of the 25 draft allows."""
+"""One real-handler positive and a scope negative for each of the 29 route grants."""
 
 import io
 import json
+import re
 import time
 import urllib.request
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -12,19 +14,24 @@ from fastapi.testclient import TestClient
 from pinky_daemon import voice_routes
 from pinky_daemon.broker import BrokerMessage
 from pinky_daemon.routes import triggers
+from pinky_daemon.streaming_session import StreamingSessionConfig
+from pinky_daemon.tmux_session import TmuxSession
 from pinky_daemon.transport_state import SessionState
 from tests.isolated_policy_support import closure, replace_cell, signed
 from tests.isolated_policy_support import daemon as daemon
 
 pytestmark = pytest.mark.real_auth
 
-# Independent review keys: the initial 30 minus the five explicit resource HOLDs.
+# Independent review keys: 29 grants; trigger creation remains held.
 ALLOW_PAIRS = [
     ("POST", "/broker/thread"),
     ("POST", "/broker/send"),
     ("POST", "/broker/react"),
     ("POST", "/broker/send-voice"),
     ("POST", "/broker/send-gif"),
+    ("POST", "/broker/send-photo"),
+    ("POST", "/broker/send-document"),
+    ("POST", "/broker/send-video"),
     ("POST", "/broker/broadcast"),
     ("POST", "/agents/{agent_name}/schedules"),
     ("PATCH", "/agents/{agent_name}/schedules/{schedule_id}"),
@@ -40,6 +47,7 @@ ALLOW_PAIRS = [
     ("POST", "/api/voice/request"),
     ("POST", "/agents/{name}/effort-drift"),
     ("POST", "/agents/{name}/transport/wake"),
+    ("POST", "/agents/{name}/transport/transcript-path"),
     ("POST", "/agents/{name}/transport/tool-use"),
     ("POST", "/agents/{name}/transport/tool-result"),
     ("POST", "/agents/{name}/transport/stop-failure"),
@@ -71,7 +79,7 @@ def prepared(d, monkeypatch, method, template):
             text="fixture",
             query="fixture",
         )
-        if template.endswith(("thread", "send-voice", "send-gif")):
+        if template.endswith(("thread", "send-voice", "send-gif", "send-photo", "send-document", "send-video")):
             d.app.state.broker.remember_message_context(
                 BrokerMessage(
                     platform="telegram",
@@ -93,7 +101,25 @@ def prepared(d, monkeypatch, method, template):
             else "_broker_send"
         )
         endpoint = next(r.endpoint for r in d.app.routes if getattr(r, "path", "") == template)
-        if template.endswith("send-gif"):
+        if template.endswith(("send-photo", "send-document", "send-video")):
+            own = d.root / "tenant" / "fixture.txt"
+            own.write_bytes(b"harmless fixture")
+            alias = own.with_name("alias.txt")
+            alias.symlink_to(own)
+            body["file_path"] = str(alias)
+
+            def send_file(chat, file, **kwargs):
+                effects.append((chat, Path(file), Path(file).read_bytes()))
+                return {"message_id": "201"}
+
+            adapter = SimpleNamespace(send_photo=send_file, send_document=send_file,
+                                      send_video=send_file)
+            replace_cell(monkeypatch, closure(d.app, "_send_file_message"),
+                         "_get_platform_adapter", lambda *args: adapter)
+
+            def check(result):
+                return effects == [("1", own.resolve(), b"harmless fixture")]
+        elif template.endswith("send-gif"):
 
             def send_animation(chat, path, **kwargs):
                 from pathlib import Path
@@ -258,6 +284,24 @@ def prepared(d, monkeypatch, method, template):
 
         def check(result):
             return bool(d.app.state.tool_policy_store.list_decisions("tenant", 0, 10))
+    elif template.endswith("/transport/transcript-path"):
+        own_dir = Path.home() / ".claude/projects" / re.sub(
+            r"[^a-zA-Z0-9]", "-", str(d.root / "tenant"))
+        own = own_dir / "fixture-session.jsonl"
+        own_dir.mkdir(parents=True, exist_ok=True)
+        own.write_text("{}\n")
+        alias = own_dir / "alias.jsonl"
+        alias.symlink_to(own)
+        session = TmuxSession(StreamingSessionConfig(
+            agent_name="tenant", working_dir=str(d.root / "tenant")))
+        session._tailer = SimpleNamespace(set_transcript_path=lambda file, **kw: effects.append(file))
+        session._tailer_first_bind_pending = True
+        session._last_launch_used_continue = False
+        d.app.state.broker.register_streaming("tenant", session, label="main")
+        body = {"transcript_path": str(alias), "session_id": "fixture-session", "label": "main"}
+
+        def check(result):
+            return effects == [own.resolve()] and result["transcript_path"] == str(own.resolve())
     else:
         session = SimpleNamespace(
             state=SessionState.CONNECTED,

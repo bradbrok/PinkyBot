@@ -264,6 +264,7 @@ from pinky_daemon.store_snapshot import (
 )
 from pinky_daemon.streaming_session import is_1m_model
 from pinky_daemon.task_store import TaskStore
+from pinky_daemon.tmux_transcript import claude_project_slug
 from pinky_daemon.tool_policy import (
     DEFAULT_RULES,
     STATIC_ALLOW_TOOLS,
@@ -5699,6 +5700,23 @@ def create_api(
                 hint=_isolation_denial_hint(request),
             )
 
+    def _isolated_resource_working_dir(request: Request) -> str | None:
+        """Use only the verified caller; registry uncertainty cannot grant access."""
+        caller = getattr(request.state, "internal_caller", "")
+        if not caller:
+            return None
+        flag = isolation_flag(agents, caller)
+        if flag is False:
+            return None
+        if flag is True:
+            try:
+                agent = agents.get(caller)
+            except Exception:
+                agent = None
+            if agent and agent.working_dir:
+                return agent.working_dir
+        raise HTTPException(403, "caller isolation could not be verified")
+
     def _has_valid_session(request: Request) -> bool:
         secret = _session_secret()
         if not secret:
@@ -8278,7 +8296,7 @@ npm run build</pre>
 
     @app.post("/agents/{name}/transport/transcript-path")
     async def transport_transcript_path(
-        name: str, req: TransportTranscriptPathRequest,
+        name: str, req: TransportTranscriptPathRequest, request: Request,
     ):
         """Update the Transport's watched transcript path — called by
         the SessionStart hook (PR8b).
@@ -8299,6 +8317,7 @@ npm run build</pre>
         it on first append); the tailer's ``read_once`` handles the
         missing-file path gracefully, so we don't insist on existence.
         """
+        working_dir = _isolated_resource_working_dir(request)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -8358,6 +8377,15 @@ npm run build</pre>
                 f"transcript_path must be under one of "
                 f"{', '.join(str(r) for r in allowed_roots)}",
             )
+
+        if working_dir is not None:
+            projects = (Path.home() / ".claude" / "projects").resolve()
+            own_projects = {
+                (projects / claude_project_slug(cwd)).resolve()
+                for cwd in (working_dir, Path(working_dir).resolve())
+            }
+            if normalised.parent not in own_projects:
+                raise HTTPException(403, "transcript_path must be in the caller's own project directory")
 
         session = broker.get_streaming_session(name, label=req.label)
         if session is None:
@@ -10923,6 +10951,23 @@ npm run build</pre>
         )
         if not agent_name or not chat_id or not file_path:
             raise HTTPException(400, "agent_name, chat_id, and file_path are required")
+
+        working_dir = _isolated_resource_working_dir(request)
+        if working_dir is not None:
+            try:
+                resolved = Path(file_path).resolve(strict=True)
+            except FileNotFoundError as e:
+                error_repr = f"{type(e).__name__}: {e}"
+                _outreach_attempt_log(
+                    agent_name=agent_name, platform=platform, method=method,
+                    chat_id=chat_id, file_path=file_path, caption_len=len(caption),
+                    outcome="rejected", error=error_repr,
+                )
+                broker._stop_typing(agent_name, chat_id)
+                raise HTTPException(400, f"Failed to {method}: {error_repr}") from e
+            if not resolved.is_relative_to(Path(working_dir).resolve()):
+                raise HTTPException(403, "file_path must be inside the caller's working directory")
+            file_path = str(resolved)
 
         from pinky_identity.live_sqlite import LiveSQLiteFileError, refuse_sqlite_attachment
 

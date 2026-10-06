@@ -122,6 +122,7 @@ from pinky_daemon.tmux_targets import (
 from pinky_daemon.tmux_transcript import (
     TmuxTranscriptTailer,
     TurnResponse,
+    claude_project_slug,
 )
 from pinky_daemon.transport import TransportReplacementMixin
 from pinky_daemon.transport_state import (
@@ -7516,7 +7517,7 @@ class TmuxSession(TransportReplacementMixin):
         # Match Claude Code's encoder exactly: every non-alphanumeric char
         # → '-'. For an absolute path the leading '/' yields the leading
         # '-' on its own; do NOT prepend an extra dash (that was the bug).
-        encoded = re.sub(r"[^a-zA-Z0-9]", "-", str(cwd))
+        encoded = claude_project_slug(cwd)
         # Container agents (#638): claude runs with CLAUDE_CONFIG_DIR set to
         # <working_dir>/.claude-container INSIDE the container — and because
         # the working_dir is bind-mounted at the SAME absolute path, that

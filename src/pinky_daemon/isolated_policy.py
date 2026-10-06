@@ -189,6 +189,9 @@ ISOLATED_MUTATION_ALLOW = frozenset(
         ("POST", "/broker/react"),  # Verified body sender
         ("POST", "/broker/send-voice"),  # Verified body sender
         ("POST", "/broker/send-gif"),  # Server-selected GIF; verified body sender
+        ("POST", "/broker/send-photo"),  # Verified body sender; file inside own working dir
+        ("POST", "/broker/send-document"),  # Verified body sender; file inside own working dir
+        ("POST", "/broker/send-video"),  # Verified body sender; file inside own working dir
         ("POST", "/broker/broadcast"),  # Approved recipients and verified body sender
         ("POST", "/agents/{agent_name}/schedules"),  # New row bound to path agent
         ("PATCH", "/agents/{agent_name}/schedules/{schedule_id}"),  # Owned schedule lookup
@@ -222,6 +225,10 @@ ISOLATED_MUTATION_ALLOW = frozenset(
         ),  # Requester derived from verified caller
         ("POST", "/agents/{name}/effort-drift"),  # Own drift telemetry
         ("POST", "/agents/{name}/transport/wake"),  # Own transport notification
+        (
+            "POST",
+            "/agents/{name}/transport/transcript-path",
+        ),  # Own transport notification; own project dir
         ("POST", "/agents/{name}/transport/tool-use"),  # Own transport notification
         (
             "POST",

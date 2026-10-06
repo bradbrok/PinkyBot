@@ -1,5 +1,8 @@
 """Object and file ownership expectations, without live files or adapters."""
 
+import io
+import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,16 +13,6 @@ from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import TmuxSession
 from tests.isolated_policy_support import closure, replace_cell, signed
 from tests.isolated_policy_support import daemon as daemon
-
-# Mode-off resource ownership for these handlers is follow-up work; enforce mode
-# already denies the routes (test_held_resource_routes_are_denied_before_handlers).
-# strict=True turns the repair into a visible XPASS failure so the marks are removed.
-HELD_MEDIA = pytest.mark.xfail(
-    raises=AssertionError, strict=True, reason="mode-off media file containment is held"
-)
-HELD_TRANSCRIPT = pytest.mark.xfail(
-    raises=AssertionError, strict=True, reason="mode-off transcript ownership is held"
-)
 
 pytestmark = pytest.mark.real_auth
 
@@ -53,26 +46,42 @@ def test_schedule_row_owner_matches_path(daemon, operation, owner):
             assert after[0].enabled == (operation == "enable")
 
 
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
 @pytest.mark.parametrize("kind", ["photo", "document", "video"])
 @pytest.mark.parametrize(
     "target",
-    ["own", pytest.param("peer", marks=HELD_MEDIA), pytest.param("symlink", marks=HELD_MEDIA)],
+    ["own", "own-symlink", "peer", "symlink", "sibling-prefix"],
 )
-def test_media_attachment_requires_caller_ownership(daemon, monkeypatch, kind, target):
-    d = daemon("off")
+def test_media_attachment_requires_caller_ownership(daemon, monkeypatch, kind, target, mode):
+    d = daemon(mode)
     own = d.root / "tenant" / "own.txt"
     peer = d.root / "peer" / "peer.txt"
     own.write_text("own harmless fixture")
     peer.write_text("peer harmless fixture")
     link = d.root / "tenant" / "alias.txt"
     link.symlink_to(peer)
-    selected = {"own": own, "peer": peer, "symlink": link}[target]
+    own_link = d.root / "tenant" / "own-alias.txt"
+    own_link.symlink_to(own)
+    sibling = d.root / "tenant2" / "sibling.txt"
+    sibling.parent.mkdir()
+    sibling.write_text("sibling harmless fixture")
+    selected = {"own": own, "own-symlink": own_link, "peer": peer,
+                "symlink": link, "sibling-prefix": sibling}[target]
     opened = []
+    reads = []
+    original_open = io.open
+
+    def track_open(file, *args, **kwargs):
+        if isinstance(file, (str, os.PathLike)) and Path(file).resolve() == selected.resolve():
+            reads.append(Path(file))
+        return original_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(io, "open", track_open)
 
     def send_file(*args, **kwargs):
         del kwargs
         path = Path(args[1])
-        opened.append((path.resolve(), path.read_text()))
+        opened.append((path, path.read_text()))
         return {"message_id": "fixture-message"}
 
     adapter = SimpleNamespace(send_photo=send_file, send_document=send_file, send_video=send_file)
@@ -95,15 +104,17 @@ def test_media_attachment_requires_caller_ownership(daemon, monkeypatch, kind, t
         },
     )
     client.close()
-    if target == "own":
+    if target in {"own", "own-symlink"}:
         assert response.status_code == 200, response.text
         assert opened == [(own.resolve(), "own harmless fixture")]
     else:
         assert (response.status_code, opened) == (403, []), (response.status_code, opened)
+        assert reads == []
 
 
-def test_nonisolated_media_foreign_file_baseline_observation(daemon, monkeypatch):
-    d = daemon("off")
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+def test_nonisolated_media_foreign_file_baseline_observation(daemon, monkeypatch, mode):
+    d = daemon(mode)
     peer = d.root / "peer" / "observation.txt"
     peer.write_text("harmless baseline")
     opened = []
@@ -137,16 +148,28 @@ def test_nonisolated_media_foreign_file_baseline_observation(daemon, monkeypatch
 
 
 @pytest.mark.parametrize("initial", [False, True], ids=["accepted-own-id", "fresh-bind"])
-@pytest.mark.parametrize("owner", ["tenant", pytest.param("peer", marks=HELD_TRANSCRIPT)])
-def test_transcript_path_belongs_to_agent_and_session(daemon, initial, owner):
-    d = daemon("off")
+@pytest.mark.parametrize("owner", ["tenant", "peer", "own-subdir", "sibling-prefix", "symlink"])
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+def test_transcript_path_belongs_to_agent_and_session(daemon, initial, owner, mode):
+    d = daemon(mode)
     session = TmuxSession(
         StreamingSessionConfig(agent_name="tenant", working_dir=str(d.root / "tenant"))
     )
-    selected_dir = Path.home() / ".claude/projects" / str(d.root / owner).replace("/", "-")
+    project = Path.home() / ".claude/projects"
+    own_dir = project / re.sub(r"[^a-zA-Z0-9]", "-", str(d.root / "tenant"))
+    peer_dir = project / re.sub(r"[^a-zA-Z0-9]", "-", str(d.root / "peer"))
+    selected_dir = {"tenant": own_dir, "peer": peer_dir, "symlink": own_dir,
+                    "own-subdir": own_dir / "nested",
+                    "sibling-prefix": own_dir.with_name(own_dir.name + "2")}[owner]
     selected_dir.mkdir(parents=True, exist_ok=True)
     selected = selected_dir / f"{owner}-session.jsonl"
-    selected.write_text("{}\n")
+    if owner == "symlink":
+        peer_dir.mkdir(parents=True, exist_ok=True)
+        peer_file = peer_dir / "peer.jsonl"
+        peer_file.write_text("{}\n")
+        selected.symlink_to(peer_file)
+    else:
+        selected.write_text("{}\n")
     repointed = []
     session._tailer = SimpleNamespace(set_transcript_path=lambda path, **kw: repointed.append(path))
     session._tailer_first_bind_pending = initial
@@ -175,13 +198,7 @@ def test_transcript_path_belongs_to_agent_and_session(daemon, initial, owner):
 
 @pytest.mark.parametrize(
     "path",
-    [
-        "/broker/send-photo",
-        "/broker/send-document",
-        "/broker/send-video",
-        "/agents/tenant/transport/transcript-path",
-        "/agents/tenant/triggers",
-    ],
+    ["/agents/tenant/triggers"],
 )
 def test_held_resource_routes_are_denied_before_handlers(daemon, monkeypatch, path):
     d = daemon()
@@ -221,3 +238,186 @@ def test_held_resource_routes_are_denied_before_handlers(daemon, monkeypatch, pa
     response = client.post(path, headers=signed(d, "POST", path), json=body)
     client.close()
     assert (response.status_code, effects) == (403, []), (response.status_code, response.text)
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("resource", ["media", "transcript-registered", "transcript-realpath"])
+@pytest.mark.parametrize("owner", ["tenant", "peer"])
+def test_symlinked_working_dir_owns_only_its_resolved_resources(
+    daemon, monkeypatch, mode, resource, owner
+):
+    d = daemon(mode)
+    work = {}
+    for name in ("tenant", "peer"):
+        real = d.root / f"real.{name}_work"
+        real.mkdir()
+        registered = d.root / f"linked-{name}"
+        registered.symlink_to(real, target_is_directory=True)
+        # Model a stored symlink path from before workspace canonicalization.
+        assert Path(d.agents._db_path).is_relative_to(d.root)
+        d.agents._db.execute("UPDATE agents SET working_dir=? WHERE name=?", (str(registered), name))
+        d.agents._db.commit()
+        assert d.agents.get(name).working_dir == str(registered)
+        work[name] = (registered, real)
+    effects = []
+    if resource == "media":
+        selected = work[owner][0] / "own.txt"
+        selected.write_text("harmless fixture")
+
+        def send_file(chat, file, **kwargs):
+            effects.append(Path(file))
+            return {"message_id": "fixture"}
+
+        replace_cell(monkeypatch, closure(d.app, "_send_file_message"),
+                     "_get_platform_adapter", lambda *args: SimpleNamespace(send_photo=send_file))
+        path = "/broker/send-photo"
+        body = {"agent_name": "tenant", "chat_id": "fixture", "file_path": str(selected)}
+    else:
+        index = 0 if resource == "transcript-registered" else 1
+        encoded = re.sub(r"[^a-zA-Z0-9]", "-", str(work[owner][index]))
+        selected = Path.home() / ".claude/projects" / encoded / "fixture.jsonl"
+        selected.parent.mkdir(parents=True, exist_ok=True)
+        selected.write_text("{}\n")
+        session = TmuxSession(StreamingSessionConfig(
+            agent_name="tenant", working_dir=str(work["tenant"][0])))
+        session._tailer = SimpleNamespace(set_transcript_path=lambda file, **kw: effects.append(file))
+        session._tailer_first_bind_pending = True
+        session._last_launch_used_continue = False
+        d.app.state.broker.register_streaming("tenant", session, label="main")
+        path = "/agents/tenant/transport/transcript-path"
+        body = {"transcript_path": str(selected), "session_id": "fixture", "label": "main"}
+    client = TestClient(d.app)
+    try:
+        response = client.post(path, headers=signed(d, "POST", path), json=body)
+    finally:
+        client.close()
+    if owner == "tenant":
+        assert response.status_code == 200, response.text
+        assert effects == [selected.resolve()]
+    else:
+        assert (response.status_code, effects) == (403, []), response.text
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("resource", ["photo", "document", "video", "transcript-path"])
+def test_resource_registry_uncertainty_fails_closed(daemon, monkeypatch, mode, resource):
+    from pinky_daemon import api
+
+    d = daemon(mode)
+    effects = []
+    monkeypatch.setattr(api, "isolation_flag", lambda *args: None)
+    if resource == "transcript-path":
+        path = "/agents/tenant/transport/transcript-path"
+        session = SimpleNamespace(set_transcript_path=lambda *args, **kw: effects.append(args))
+        d.app.state.broker.register_streaming("tenant", session, label="main")
+        own = Path.home() / ".claude/projects" / "fixture" / "session.jsonl"
+        body = {"transcript_path": str(own), "session_id": "fixture"}
+    else:
+        path = f"/broker/send-{resource}"
+        own = d.root / "tenant" / "own.txt"
+        own.write_text("harmless fixture")
+
+        def send_file(*args, **kwargs):
+            effects.append(args)
+            return {"message_id": "fixture"}
+
+        adapter = SimpleNamespace(send_photo=send_file, send_document=send_file, send_video=send_file)
+        replace_cell(monkeypatch, closure(d.app, "_send_file_message"),
+                     "_get_platform_adapter", lambda *args: adapter)
+        body = {"agent_name": "tenant", "chat_id": "fixture", "file_path": str(own)}
+    client = TestClient(d.app)
+    try:
+        response = client.post(path, headers=signed(d, "POST", path), json=body)
+    finally:
+        client.close()
+    assert (response.status_code, effects) == (403, []), response.text
+
+
+def test_isolated_missing_media_remains_bad_input_without_adapter(daemon, monkeypatch):
+    d = daemon("off")
+    effects = []
+
+    def send_file(*args, **kwargs):
+        effects.append(args)
+        raise FileNotFoundError("missing fixture")
+
+    replace_cell(monkeypatch, closure(d.app, "_send_file_message"),
+                 "_get_platform_adapter", lambda *args: SimpleNamespace(send_photo=send_file))
+    path = "/broker/send-photo"
+    client = TestClient(d.app)
+    try:
+        response = client.post(path, headers=signed(d, "POST", path), json={
+            "agent_name": "tenant", "chat_id": "fixture",
+            "file_path": str(d.root / "tenant" / "missing.txt")})
+    finally:
+        client.close()
+    assert response.status_code == 400, response.text
+    assert "FileNotFoundError" in response.json()["detail"]
+    assert effects == []
+
+
+def test_send_animation_stays_unlisted(daemon, monkeypatch):
+    d = daemon()
+    effects = []
+    own = d.root / "tenant" / "own.gif"
+    own.write_bytes(b"GIF89a fixture")
+    replace_cell(monkeypatch, closure(d.app, "_send_file_message"),
+                 "_get_platform_adapter", lambda *args: effects.append(args))
+    path = "/broker/send-animation"
+    client = TestClient(d.app)
+    try:
+        response = client.post(path, headers=signed(d, "POST", path), json={
+            "agent_name": "tenant", "chat_id": "fixture", "file_path": str(own)})
+    finally:
+        client.close()
+    assert (response.status_code, effects) == (403, []), response.text
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("isolated", [True, False])
+def test_transcript_binding_preserves_missing_own_and_nonisolated_peer_paths(
+    daemon, mode, isolated
+):
+    d = daemon(mode)
+    actor = "tenant" if isolated else "normal"
+    owner = actor if isolated else "peer"
+    own = Path.home() / ".claude/projects" / re.sub(
+        r"[^a-zA-Z0-9]", "-", str(d.root / owner)) / "missing.jsonl"
+    assert not own.exists()
+    effects = []
+    session = SimpleNamespace(set_transcript_path=lambda file, **kw: effects.append(file))
+    d.app.state.broker.register_streaming(actor, session, label="main")
+    path = f"/agents/{actor}/transport/transcript-path"
+    client = TestClient(d.app)
+    try:
+        response = client.post(path, headers=signed(d, "POST", path, actor), json={
+            "transcript_path": str(own), "session_id": "fixture"})
+    finally:
+        client.close()
+    assert response.status_code == 200, response.text
+    assert effects == [own.resolve()]
+
+
+def test_unverified_agent_header_does_not_restrict_browser_media(daemon, monkeypatch):
+    from pinky_daemon.auth import INTERNAL_AGENT_HEADER, SESSION_COOKIE_NAME, create_session_cookie
+
+    d = daemon("enforce")
+    peer = d.root / "peer" / "fixture.txt"
+    peer.write_text("harmless fixture")
+    effects = []
+
+    def send_file(chat, file, **kwargs):
+        effects.append(Path(file))
+        return {"message_id": "fixture"}
+
+    replace_cell(monkeypatch, closure(d.app, "_send_file_message"),
+                 "_get_platform_adapter", lambda *args: SimpleNamespace(send_photo=send_file))
+    client = TestClient(d.app)
+    try:
+        client.cookies.set(SESSION_COOKIE_NAME, create_session_cookie(os.environ["PINKY_SESSION_SECRET"]))
+        response = client.post("/broker/send-photo", headers={INTERNAL_AGENT_HEADER: "tenant"}, json={
+            "agent_name": "tenant", "chat_id": "fixture", "file_path": str(peer)})
+    finally:
+        client.close()
+    assert response.status_code == 200, response.text
+    assert effects == [peer]

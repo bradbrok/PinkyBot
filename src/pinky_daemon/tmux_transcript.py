@@ -49,6 +49,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -72,6 +73,12 @@ _FALLBACK_POLL_SEC = 2.0
 # still want sub-second response. Bounded below by what stat()/read are happy
 # to do on a hot file.
 _ACTIVE_POLL_SEC = 0.2
+
+
+def claude_project_slug(working_dir: str | Path) -> str:
+    """Encode a working directory with the transcript discovery slug algorithm."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", str(working_dir))
+
 
 # A freshly-bound transcript path may be reported before Claude Code creates
 # the JSONL.  During that brief gap discovery keeps returning the previous
