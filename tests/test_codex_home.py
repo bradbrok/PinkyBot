@@ -2641,10 +2641,25 @@ async def test_tmux_app_server_first_start_with_absent_server_proceeds(
     ]
 
 
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        pytest.param("no server running on /tmp/tmux-1000/default\n", id="no-server"),
+        pytest.param(
+            "error connecting to /tmp/tmux-501/pinkybot (No such file or directory)",
+            id="missing-socket",
+        ),
+        pytest.param(
+            "error connecting to /tmp/tmux-501/pinkybot (No such file or directory)\n",
+            id="missing-socket-newline",
+        ),
+    ],
+)
 @pytest.mark.asyncio
 async def test_tmux_has_session_accepts_exact_reported_server_absence(
     tmp_path,
     monkeypatch,
+    stderr,
 ):
     """The canonical tmux no-server result positively proves no target exists."""
     control = _TmuxControl("pinky-test-agent")
@@ -2653,11 +2668,11 @@ async def test_tmux_has_session_accepts_exact_reported_server_absence(
 
     async def _tmux_run(*args, timeout=5.0, stdin_data=None):
         tmux_calls.append(args)
-        if args[0] == "has-session":
+        if args[0] in {"has-session", "list-sessions"}:
             return TmuxCommandResult(
                 returncode=1,
                 stdout="",
-                stderr="no server running on /tmp/tmux-1000/default\n",
+                stderr=stderr,
             )
         raise AssertionError(f"unexpected tmux call: {args}")
 
@@ -2677,6 +2692,15 @@ async def test_tmux_has_session_accepts_exact_reported_server_absence(
         (1, "", "tmux: no server running on /tmp/tmux-1000/default"),
         (1, "", "no server running on /tmp/tmux-1000/default (ambiguous)"),
         (1, "", "couldn't create directory /blocked/tmux-501 (Permission denied)"),
+        (1, "", "error connecting to /tmp/tmux-501/pinkybot (Permission denied)"),
+        (1, "", "error connecting to /tmp/tmux-501/pinkybot (File name too long)"),
+        (1, "", "error connecting to /tmp/tmux-501/pinkybot (Connection refused)"),
+        (1, "", "error connecting to /tmp/tmux-501/pinkybot (Not a directory)"),
+        (1, "", "tmux: error connecting to /tmp/tmux-501/pinkybot (No such file or directory)"),
+        (1, "", "error connecting to  (No such file or directory)"),
+        (2, "", "error connecting to /tmp/tmux-501/pinkybot (No such file or directory)"),
+        (1, "unexpected", "error connecting to /tmp/tmux-501/pinkybot (No such file or directory)"),
+        (1, "", "error connecting to /tmp/tmux-501/pinkybot (No such file or directory) extra"),
     ],
 )
 @pytest.mark.asyncio

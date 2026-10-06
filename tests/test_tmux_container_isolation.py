@@ -33,6 +33,7 @@ from pinky_daemon.tmux_session import (
     _credential_fingerprint,
     _is_dead_runtime_stderr,
     _TmuxControl,
+    production_tmux_control,
 )
 
 
@@ -1207,6 +1208,43 @@ class TestSpawnRebindsCommandRunner:
         runner = ss._tmux.set_command_runner.call_args[0][0]
         assert isinstance(runner, LocalCommandRunner)
         assert seen["ensure_started"] == [None]  # no container agent snapshot
+
+    async def test_container_cold_start_with_missing_socket_proceeds(self, monkeypatch, tmp_path):
+        """Wrapped ENOENT permits the spawn hook and later liveness check."""
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        agent = _FakeAgent("agentx", "container", working_dir=str(tmp_path))
+        ss, seen = self._spawnable_session(monkeypatch, tmp_path, agent)
+
+        class ColdInner(_RecordingInner):
+            probes = 0
+
+            async def run(self, argv, *, timeout=None, stdin_data=None):
+                self.calls.append(list(argv))
+                if "has-session" in argv:
+                    self.probes += 1
+                    if self.probes > 1:
+                        return CommandResult(0, b"", b"")
+                return CommandResult(
+                    1, b"", b"error connecting to /tmp/tmux-501/pinkybot (No such file or directory)\n"
+                )
+
+        inner = ColdInner()
+        runner = ContainerCommandRunner("test-container", workdir=str(tmp_path), inner=inner)
+        ss._tmux = production_tmux_control(ss._session_name, command_runner=runner)
+        new_session = AsyncMock(return_value=TmuxCommandResult(0, "", ""))
+        monkeypatch.setattr(ss._tmux, "new_session", new_session)
+        monkeypatch.setattr(ss, "_select_command_runner", lambda *_args: runner)
+        monkeypatch.setattr(ss, "_seed_container_home_creds", AsyncMock())
+
+        await ss._spawn_tmux_repl()
+
+        new_session.assert_awaited_once()
+        assert seen["ensure_started"] == [agent]
+        assert ss._tmux._local_socket_path() is None
+        assert inner.calls == [[
+            "podman", "exec", "-w", str(tmp_path), "--", "test-container", "tmux",
+            "-L", "pinkybot", "-f", "/dev/null", "has-session", "-t", f"={ss._session_name}",
+        ]] * 2
 
     async def test_spawn_fails_closed_when_registry_breaks(self, monkeypatch, tmp_path):
         # A registry failure at spawn raises (-> BOOT_FAILED) instead of

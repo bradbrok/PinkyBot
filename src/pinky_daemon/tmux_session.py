@@ -858,12 +858,13 @@ class _TmuxControl:
 
     @staticmethod
     def _server_absence_is_reported(result: TmuxCommandResult) -> bool:
-        """Recognize only tmux's canonical, unambiguous no-server result."""
+        """Recognize tmux's canonical no-server or missing-socket result."""
         return (
             result.returncode == 1
             and result.stdout == ""
             and re.fullmatch(
-                r"no server running on \S+",
+                r"no server running on \S+"
+                r"|error connecting to \S+ \(No such file or directory\)",
                 result.stderr.strip(),
             )
             is not None
