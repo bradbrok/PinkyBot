@@ -25,6 +25,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -32,6 +33,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -163,7 +165,7 @@ from pinky_daemon.auth import (
 )
 from pinky_daemon.autonomy import AgentEvent, AutonomyEngine, EventType
 from pinky_daemon.broker import BrokerMessage, MessageBroker
-from pinky_daemon.codex_home import codex_home_for
+from pinky_daemon.codex_home import codex_home_for, per_agent_codex_home_enabled
 from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.dream_runner import DreamRunner
@@ -310,6 +312,75 @@ def _log(msg: str) -> None:
 
 
 _STATUS_HOOK_RECEIPT_LOG_INTERVAL_SEC = 60.0
+
+
+def _validate_path(path: str) -> None:
+    """Reject an unrepresentable path before any filesystem lookup."""
+    if "\x00" in path:
+        raise ValueError("embedded null byte")
+
+
+def _path_within(path: str, root: str) -> bool:
+    """Compare normalized absolute paths without touching the filesystem."""
+    if root in (os.sep, os.sep * 2):
+        return path.startswith(root)
+    return path == root or path.startswith(root + os.sep)
+
+
+def _resolve_path_within(candidate: str, registered_root: str, resolved_root: str) -> str | None:
+    """Resolve inside links only after checking each target's lexical containment.
+
+    Both trusted root spellings map onto the canonical root before lookup. A
+    missing suffix is valid for a fresh transcript; media checks regular-file
+    existence afterwards. Leaving the root or exceeding forty link hops refuses
+    the path without following that target.
+    """
+    _validate_path(candidate)
+
+    def map_root(path: str) -> str | None:
+        for root in (registered_root, resolved_root):
+            if _path_within(path, root):
+                suffix = path[len(root):].lstrip(os.sep)
+                return os.path.normpath(os.path.join(resolved_root, suffix))
+        return None
+
+    mapped = map_root(os.path.normpath(candidate))
+    if mapped is None:
+        return None
+    current = resolved_root
+    pending = deque(mapped[len(resolved_root):].lstrip(os.sep).split(os.sep))
+    hops = 0
+    while pending:
+        component = pending.popleft()
+        if not component:
+            continue
+        selected = os.path.join(current, component)
+        if not _path_within(selected, resolved_root):
+            return None
+        try:
+            metadata = os.lstat(selected)
+        except (FileNotFoundError, NotADirectoryError):
+            current = os.path.normpath(os.path.join(selected, *pending))
+            break
+        if not stat.S_ISLNK(metadata.st_mode):
+            current = selected
+            continue
+        hops += 1
+        if hops > 40:
+            return None
+        target = os.readlink(selected)
+        _validate_path(target)
+        target = os.path.normpath(
+            target if os.path.isabs(target) else os.path.join(current, target)
+        )
+        mapped_target = map_root(target)
+        if mapped_target is None:
+            return None
+        target_parts = mapped_target[len(resolved_root):].lstrip(os.sep).split(os.sep)
+        pending.extendleft(reversed(target_parts))
+        current = resolved_root
+    normalised = os.path.realpath(current)
+    return normalised if _path_within(normalised, resolved_root) else None
 
 
 def _read_persisted_agent_working_status(
@@ -5720,11 +5791,11 @@ def create_api(
                 return agent
         raise HTTPException(403, "caller isolation could not be verified")
 
-    def _claude_transcript_roots(agent: Agent) -> list[Path]:
-        """Share the agent's applicable Claude roots between both path checks."""
+    def _claude_transcript_root_forms(agent: Agent) -> list[tuple[str, str]]:
+        """Read registered and canonical forms of daemon-owned Claude roots."""
         from pinky_daemon.provisioning import container_config_dir, local_config_dir
 
-        roots = [(Path.home() / ".claude" / "projects").resolve()]
+        roots = [Path.home() / ".claude" / "projects"]
         mode = getattr(agent, "isolation_mode", "local")
         config_dir = None
         if mode == "container":
@@ -5733,15 +5804,54 @@ def create_api(
             config_dir = local_config_dir
         wd = (agent.working_dir or "").strip()
         if config_dir is not None and wd and Path(wd).is_absolute():
-            roots.append((Path(config_dir(str(Path(wd).resolve()))) / "projects").resolve())
-        return roots
+            roots.append(Path(config_dir(wd)) / "projects")
+        return [
+            (os.path.normpath(os.path.abspath(root)), os.path.realpath(root))
+            for root in roots
+        ]
+
+    def _claude_transcript_roots(agent: Agent) -> list[Path]:
+        """Share canonical Claude roots with the existing own-project check."""
+        return [Path(resolved) for registered, resolved in _claude_transcript_root_forms(agent)]
+
+    def _codex_transcript_root_forms(agent: Agent) -> tuple[str, str]:
+        root = codex_home_for(agent) / "sessions"
+        registered = root
+        if per_agent_codex_home_enabled():
+            override = (getattr(agent, "codex_home", "") or "").strip()
+            registered = (
+                Path(override).expanduser() / "sessions" if override
+                else Path(agent.working_dir).expanduser() / ".codex" / "sessions"
+            )
+        return os.path.normpath(os.path.abspath(registered)), os.path.realpath(root)
 
     def _claude_owned_projects(agent: Agent) -> set[Path]:
-        return {
-            (root / claude_project_slug(cwd)).resolve()
-            for root in _claude_transcript_roots(agent)
-            for cwd in (agent.working_dir, Path(agent.working_dir).resolve())
-        }
+        """Own project aliases remain inside their configured canonical root."""
+        workdirs = (agent.working_dir, Path(agent.working_dir).resolve())
+        projects = set()
+        for registered, resolved in _claude_transcript_root_forms(agent):
+            for workdir in workdirs:
+                own = Path(resolved) / claude_project_slug(workdir)
+                project = _resolve_path_within(str(own), registered, resolved)
+                if project is not None:
+                    projects.add(Path(project))
+        return projects
+
+    def _claude_owned_project_forms(agent: Agent) -> list[tuple[str, str]]:
+        """Plan own-directory spellings only inside their configured root."""
+        workdirs = (agent.working_dir, os.path.realpath(agent.working_dir))
+        forms = []
+        for registered, resolved in _claude_transcript_root_forms(agent):
+            for root in (registered, resolved):
+                for workdir in workdirs:
+                    own = Path(root) / claude_project_slug(workdir)
+                    canonical = _resolve_path_within(str(own), registered, resolved)
+                    if canonical is None:
+                        continue
+                    pair = os.path.normpath(os.path.abspath(own)), canonical
+                    if pair not in forms:
+                        forms.append(pair)
+        return forms
 
     def _has_valid_session(request: Request) -> bool:
         secret = _session_secret()
@@ -8351,26 +8461,48 @@ npm run build</pre>
         path = Path(req.transcript_path)
         if not path.is_absolute():
             raise HTTPException(400, "transcript_path must be absolute")
-        # Isolated bindings use the verified caller's record, even in off mode.
-        claude_roots = _claude_transcript_roots(caller_agent or agent)
-        allowed_roots = [*claude_roots, (codex_home_for(agent) / "sessions").resolve()]
         try:
-            normalised = path.resolve(strict=False)
-        except (OSError, RuntimeError) as e:
-            raise HTTPException(400, f"transcript_path could not be resolved: {e}")
-        # ``is_relative_to`` (Py 3.9+) is the idiomatic sanitizer here and
-        # is recognized by CodeQL's path-traversal taint analysis — the
-        # equivalent ``parents``-membership check tripped a false-positive
-        # CodeQL alert in round-2 even though it had the same semantics.
-        if not any(normalised.is_relative_to(root) for root in allowed_roots):
-            raise HTTPException(
-                403,
+            _validate_path(req.transcript_path)
+            # Root lookup uses daemon-owned config; caller paths remain lexical
+            # until the shared walker has mapped them inside a trusted root.
+            root_forms = [
+                *_claude_transcript_root_forms(caller_agent or agent),
+                _codex_transcript_root_forms(agent),
+            ]
+            allowed_roots = [Path(resolved) for registered, resolved in root_forms]
+            candidate = os.path.normpath(req.transcript_path)
+            matching_forms = [
+                (registered, resolved) for registered, resolved in root_forms
+                if _path_within(candidate, registered) or _path_within(candidate, resolved)
+            ]
+            root_denial = (
                 f"transcript_path must be under one of "
-                f"{', '.join(str(r) for r in allowed_roots)}",
+                f"{', '.join(str(r) for r in allowed_roots)}"
             )
+            if not matching_forms:
+                raise HTTPException(403, root_denial)
+            if caller_agent is not None:
+                own_projects = _claude_owned_projects(caller_agent)
+                matching_forms = [
+                    (registered, resolved)
+                    for registered, resolved in _claude_owned_project_forms(caller_agent)
+                    if _path_within(candidate, registered) or _path_within(candidate, resolved)
+                ]
+                root_denial = "transcript_path must be in the caller's own project directory"
+                if not matching_forms:
+                    raise HTTPException(403, root_denial)
+            resolved_path = None
+            for registered, resolved in matching_forms:
+                resolved_path = _resolve_path_within(candidate, registered, resolved)
+                if resolved_path is not None:
+                    break
+            if resolved_path is None:
+                raise HTTPException(403, root_denial)
+        except (OSError, RuntimeError, ValueError) as e:
+            raise HTTPException(400, f"transcript_path could not be resolved: {e}")
+        normalised = Path(resolved_path)
 
         if caller_agent is not None:
-            own_projects = _claude_owned_projects(caller_agent)
             if normalised.parent not in own_projects:
                 raise HTTPException(403, "transcript_path must be in the caller's own project directory")
 
@@ -10945,34 +11077,29 @@ npm run build</pre>
             raise HTTPException(400, "agent_name, chat_id, and file_path are required")
 
         caller_agent = _isolated_resource_agent(request)
-        if caller_agent is not None:
-            working_dir = caller_agent.working_dir
-            try:
+        try:
+            _validate_path(file_path)
+            if caller_agent is not None:
+                working_dir = caller_agent.working_dir
                 root = os.path.realpath(working_dir)
                 registered_root = os.path.normpath(os.path.abspath(working_dir))
                 candidate = os.path.normpath(os.path.abspath(file_path))
-                if (
-                    candidate != root and not candidate.startswith(root + os.sep)
-                    and candidate != registered_root
-                    and not candidate.startswith(registered_root + os.sep)
-                ):
-                    raise HTTPException(403, "file_path must be inside the caller's working directory")
-                resolved_path = os.path.realpath(candidate)
-                if resolved_path != root and not resolved_path.startswith(root + os.sep):
+                resolved_path = _resolve_path_within(candidate, registered_root, root)
+                if resolved_path is None:
                     raise HTTPException(403, "file_path must be inside the caller's working directory")
                 resolved = Path(resolved_path)
                 if not await asyncio.to_thread(resolved.is_file):
                     raise FileNotFoundError("attachment is missing or not a regular file")
-            except (OSError, RuntimeError) as e:
-                error_repr = f"{type(e).__name__}: {e}"
-                _outreach_attempt_log(
-                    agent_name=agent_name, platform=platform, method=method,
-                    chat_id=chat_id, file_path=file_path, caption_len=len(caption),
-                    outcome="rejected", error=error_repr,
-                )
-                broker._stop_typing(agent_name, chat_id)
-                raise HTTPException(400, f"Failed to {method}: {error_repr}") from e
-            file_path = str(resolved)
+                file_path = str(resolved)
+        except (OSError, RuntimeError, ValueError) as e:
+            error_repr = f"{type(e).__name__}: {e}"
+            _outreach_attempt_log(
+                agent_name=agent_name, platform=platform, method=method,
+                chat_id=chat_id, file_path=file_path, caption_len=len(caption),
+                outcome="rejected", error=error_repr,
+            )
+            broker._stop_typing(agent_name, chat_id)
+            raise HTTPException(400, f"Failed to {method}: {error_repr}") from e
 
         from contextlib import asynccontextmanager
 
