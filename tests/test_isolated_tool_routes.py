@@ -280,7 +280,7 @@ def _replace_api(monkeypatch, fn, recorder):
     return False
 
 
-def _arguments(fn):
+def _arguments(fn, file_path=""):
     result = {}
     for name, parameter in inspect.signature(fn).parameters.items():
         if parameter.default is not inspect.Parameter.empty:
@@ -310,6 +310,8 @@ def _arguments(fn):
         "auto_install": True,
     }
     result.update({name: value for name, value in overrides.items() if name in result})
+    if "file_path" in result:
+        result["file_path"] = file_path
     return result
 
 
@@ -364,6 +366,8 @@ def tool_capture(tmp_path, monkeypatch):
     monkeypatch.setattr(self_server, "__file__", str(tmp_path / "src/pinky_self/server.py"))
     monkeypatch.setattr(self_server, "record_probe_success", lambda *args: {})
     store = ReflectionStore(str(tmp_path / "fixture-memory.db"))
+    file_path = tmp_path.resolve() / "fixture.txt"
+    file_path.write_bytes(b"fixture content")
     servers = {
         "self": self_server.create_server(
             agent_name="caller",
@@ -385,7 +389,7 @@ def tool_capture(tmp_path, monkeypatch):
         for tool in server._tool_manager.list_tools():
             if not _replace_api(monkeypatch, tool.fn, record):
                 assert (mount, tool.name) in DIRECT_TOOLS, (mount, tool.name)
-    yield SimpleNamespace(servers=servers, calls=calls)
+    yield SimpleNamespace(servers=servers, calls=calls, file_path=str(file_path))
     store.close()
 
 
@@ -398,7 +402,7 @@ async def _capture_all(capture):
             for tool in server._tool_manager.list_tools():
                 capture.calls.clear()
                 try:
-                    value = tool.fn(**_arguments(tool.fn))
+                    value = tool.fn(**_arguments(tool.fn, capture.file_path))
                     if inspect.isawaitable(value):
                         value = await value
                     assert value is not None, (mount, tool.name)
@@ -562,7 +566,9 @@ async def test_isolated_visibility_and_route_grants_share_one_table(
     hidden = {tool.name for tool in server._tool_manager.list_tools()} - listed
     for name in sorted(hidden):
         tool_capture.calls.clear()
-        result = await _dispatch(server, name, _arguments(server._tool_manager.get_tool(name).fn))
+        result = await _dispatch(
+            server, name, _arguments(server._tool_manager.get_tool(name).fn, tool_capture.file_path)
+        )
         assert result.isError, name
         assert result.content == [
             types.TextContent(
