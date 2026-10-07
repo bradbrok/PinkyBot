@@ -335,9 +335,17 @@ def test_t4_outcome_truth_table(evidence, ledger, expected, replay_count):
 @pytest.mark.parametrize("fault", ["raise", "slow", "busy", "busy_transient"])
 @pytest.mark.parametrize("edge", ["paste", "accept"])
 async def test_t5_trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, fault, edge):
+    await _trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, fault, edge)
+
+
+async def _trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, fault, edge):
     pending, durable = fire(pane.registry)
     flush(pane.registry)
     writer = pane.registry._fire_trace
+    # Flush completes prior writes but retains valid slow-write diagnostics.
+    prior_errors = [r for r in caplog.records if "schedule fire trace" in r.message.lower()]
+    prior_failures = writer.failure_counts(since=time.time() - 86400)
+    assert all("edge=enqueue (TimeoutError)" in r.message for r in prior_errors)
     connection = writer._connect()
     try:
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 0
@@ -407,8 +415,13 @@ async def test_t5_trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, f
             lock.close()
     failures = writer.failure_counts(since=time.time() - 86400)
     assert failures[edge] == (0 if fault == "busy_transient" else 1)
-    errors = [r for r in caplog.records if "schedule fire trace" in r.message.lower()]
+    trace_errors = [r for r in caplog.records if "schedule fire trace" in r.message.lower()]
+    errors = [r for r in trace_errors if f"edge={edge} " in r.message]
     assert len(errors) == (0 if fault == "busy_transient" else 1)
+    assert [r for r in trace_errors if f"edge={edge} " not in r.message] == prior_errors
+    for other_edge, count in prior_failures.items():
+        if other_edge != edge:
+            assert failures[other_edge] == count, "target fault affected an unrelated trace edge"
     if fault == "busy_transient":
         assert busy_attempts == [sqlite3.SQLITE_BUSY]
         record, = rows(pane.registry)
@@ -417,6 +430,49 @@ async def test_t5_trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, f
         assert pane.registry.get_schedule_wake_by_fire(
             pending.schedule_id, pending.fired_at,
         ).accepted_at > 0
+
+
+@pytest.mark.parametrize("fault", ["busy", "busy_transient"])
+@pytest.mark.parametrize("edge", ["paste", "accept"])
+async def test_t5_slow_enqueue_warning_is_separate_from_target_fault(
+    pane, monkeypatch, caplog, fault, edge,
+):
+    from pinky_daemon import schedule_fire_trace
+
+    class EnqueueClock:
+        offset = 0.0
+
+        def monotonic(self):
+            return time.monotonic() + self.offset
+
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+    clock = EnqueueClock()
+    monkeypatch.setattr(schedule_fire_trace, "time", clock)
+    writer = pane.registry._fire_trace
+    original = writer._write
+
+    def descheduled_enqueue(event):
+        result = original(event)
+        if event["edge"] == "enqueue":
+            # Model a worker descheduled during an otherwise successful write.
+            clock.offset += 0.6
+        return result
+
+    monkeypatch.setattr(writer, "_write", descheduled_enqueue)
+    await _trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, fault, edge)
+    errors = [r for r in caplog.records if "schedule fire trace" in r.message.lower()]
+    expected = 0 if fault == "busy_transient" else 1
+    assert len(errors) == 1 + expected
+    assert "edge=enqueue (TimeoutError)" in errors[0].message
+    if expected:
+        assert f"edge={edge} (OperationalError)" in errors[1].message
+    failures = writer.failure_counts(since=time.time() - 86400)
+    assert failures["enqueue"] == 1
+    assert failures[edge] == expected
+    record, = rows(pane.registry)
+    assert record["enqueued_at"] > 0, "slow enqueue write succeeded before paste fault injection"
 
 
 def test_t6_api_filters_counts_and_auth(tmp_path):
