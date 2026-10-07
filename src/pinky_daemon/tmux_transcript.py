@@ -49,11 +49,13 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from pinky_daemon.isolated_files import open_owned_transcript
 from pinky_daemon.turn_response import TurnResponse
 
 
@@ -72,6 +74,12 @@ _FALLBACK_POLL_SEC = 2.0
 # still want sub-second response. Bounded below by what stat()/read are happy
 # to do on a hot file.
 _ACTIVE_POLL_SEC = 0.2
+
+
+def claude_project_slug(working_dir: str | Path) -> str:
+    """Encode a working directory with the transcript discovery slug algorithm."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", str(working_dir))
+
 
 # A freshly-bound transcript path may be reported before Claude Code creates
 # the JSONL.  During that brief gap discovery keeps returning the previous
@@ -334,8 +342,11 @@ class TmuxTranscriptTailer:
         on_usage: Callable[[dict], None] | None = None,
         on_entry: EntryCallback | None = None,
         on_bound_path_wedge: Callable[[Path, float], None] | None = None,
+        owned_projects: frozenset[Path] | None = None,
     ) -> None:
         self._path = Path(transcript_path)
+        self._owned_projects = owned_projects
+        self._ownership_rejection_logged = False
         # #291: wall-clock when ``_path`` was last bound via an explicit
         # ``set_transcript_path`` call. Starts at 0.0 — the "no real bind yet"
         # sentinel — so the self-heal mtime-floor (``_try_self_heal_repoint``)
@@ -444,6 +455,10 @@ class TmuxTranscriptTailer:
         """
         self._offset = max(0, offset)
 
+    def set_owned_projects(self, projects: frozenset[Path]) -> None:
+        self._owned_projects = projects
+        self._ownership_rejection_logged = False
+
     def set_transcript_path(
         self, path: Path, *, seek_to_start: bool = False,
     ) -> None:
@@ -494,6 +509,7 @@ class TmuxTranscriptTailer:
         """
         if Path(path) != self._path:
             self._path = Path(path)
+            self._ownership_rejection_logged = False
             # #291: re-stamp the bind clock on every real path change so the
             # self-heal floor measures staleness against THIS bind, not a
             # stale construction-time value — the tailer instance is retained
@@ -775,8 +791,22 @@ class TmuxTranscriptTailer:
         # cap, the wake_event is re-armed below so the next loop iteration
         # picks it up — slower but bounded.
         try:
-            handle = self._path.open("rb")
+            if self._owned_projects is None:
+                handle = self._path.open("rb")
+            else:
+                handle = open_owned_transcript(
+                    self._path, lambda opened: opened.parent in self._owned_projects,
+                )
+                if handle is None:
+                    raise OSError("opened transcript is outside the caller's project directory")
         except FileNotFoundError:
+            return 0
+        except OSError as error:
+            if self._owned_projects is None:
+                raise
+            if not self._ownership_rejection_logged:
+                _log(f"tmux_tailer[{self._agent_name}]: transcript ownership rejected: {error}")
+                self._ownership_rejection_logged = True
             return 0
         with handle as fh:
             opened = os.fstat(fh.fileno())

@@ -13,11 +13,22 @@ The route grant is an exact method and registered FastAPI template. Resolution
 follows the first full framework match, including mounted roots. Unknown routes,
 unsupported mounts, partial matches and lookup failures cannot grant access.
 Existing fleet, peer-group, body-actor and object-ownership checks still apply.
-The initial 25 grants are defined in `isolated_policy.py`; adding a route does
-not automatically grant it to isolated agents. Media attachments, transcript
-binding, trigger creation and other unreviewed mutations remain unavailable to
-isolated callers in enforce mode. Their underlying resource-policy follow-ups
-are separate work.
+The 29 grants are defined in `isolated_policy.py`; adding a route does not
+automatically grant it to isolated agents. Trigger creation remains held, and
+other unreviewed mutations, including animation attachments, remain unavailable
+to isolated callers in enforce mode.
+
+Verified isolated media callers may send photos, documents and videos only from
+inside their own working directory. Both the file and directory are resolved;
+containment follows path components, and the resolved file is passed to the
+adapter. Missing registry information fails closed. Non-isolated callers retain
+their existing behavior.
+
+Isolated transcript binding requires the resolved file's parent to equal an own
+Claude project directory. Both the registered working-directory encoding and
+its realpath encoding are accepted using the transcript discovery encoder;
+peer directories and nested directories are refused. These resource ownership
+checks apply in every policy mode, before the adapter or tailer is called.
 
 In enabled modes, a presented internal signature is verified before a public
 route shortcut. A valid signed isolated mutation gets the same policy check

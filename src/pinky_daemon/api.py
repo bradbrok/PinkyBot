@@ -63,6 +63,7 @@ from pinky_daemon import schedule_fire_trace as _schedule_fire_trace
 from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import (
+    Agent,
     AgentAlreadyExistsError,
     AgentPathContainmentError,
     AgentRegistrationIncompleteError,
@@ -264,6 +265,7 @@ from pinky_daemon.store_snapshot import (
 )
 from pinky_daemon.streaming_session import is_1m_model
 from pinky_daemon.task_store import TaskStore
+from pinky_daemon.tmux_transcript import claude_project_slug
 from pinky_daemon.tool_policy import (
     DEFAULT_RULES,
     STATIC_ALLOW_TOOLS,
@@ -4186,6 +4188,8 @@ def create_api(
             init_kwargs["prepare_spawn_callback"] = lambda cwd: _publish_missing_claude_prompt(agent_name, cwd)
 
         ss = SessionClass(config, **init_kwargs)
+        if is_tmux and isolation_flag(agents, agent_name) is True:
+            ss.set_transcript_ownership(_claude_owned_projects(agent))
         ss._launch_runtime = runtime
         ss._launch_transport = transport
         ss._launch_snapshot = copy.deepcopy(_launch_fingerprint(agent))
@@ -5698,6 +5702,46 @@ def create_api(
                 "isolated agent may only act as itself",
                 hint=_isolation_denial_hint(request),
             )
+
+    def _isolated_resource_agent(request: Request) -> Agent | None:
+        """Use only the verified caller; registry uncertainty cannot grant access."""
+        caller = getattr(request.state, "internal_caller", "")
+        if not caller:
+            return None
+        flag = isolation_flag(agents, caller)
+        if flag is False:
+            return None
+        if flag is True:
+            try:
+                agent = agents.get(caller)
+            except Exception:
+                agent = None
+            if agent and agent.working_dir:
+                return agent
+        raise HTTPException(403, "caller isolation could not be verified")
+
+    def _claude_transcript_roots(agent: Agent) -> list[Path]:
+        """Share the agent's applicable Claude roots between both path checks."""
+        from pinky_daemon.provisioning import container_config_dir, local_config_dir
+
+        roots = [(Path.home() / ".claude" / "projects").resolve()]
+        mode = getattr(agent, "isolation_mode", "local")
+        config_dir = None
+        if mode == "container":
+            config_dir = container_config_dir
+        elif getattr(agent, "dedicated_config_dir", False) and mode in ("", "local"):
+            config_dir = local_config_dir
+        wd = (agent.working_dir or "").strip()
+        if config_dir is not None and wd and Path(wd).is_absolute():
+            roots.append((Path(config_dir(str(Path(wd).resolve()))) / "projects").resolve())
+        return roots
+
+    def _claude_owned_projects(agent: Agent) -> set[Path]:
+        return {
+            (root / claude_project_slug(cwd)).resolve()
+            for root in _claude_transcript_roots(agent)
+            for cwd in (agent.working_dir, Path(agent.working_dir).resolve())
+        }
 
     def _has_valid_session(request: Request) -> bool:
         secret = _session_secret()
@@ -8278,7 +8322,7 @@ npm run build</pre>
 
     @app.post("/agents/{name}/transport/transcript-path")
     async def transport_transcript_path(
-        name: str, req: TransportTranscriptPathRequest,
+        name: str, req: TransportTranscriptPathRequest, request: Request,
     ):
         """Update the Transport's watched transcript path — called by
         the SessionStart hook (PR8b).
@@ -8299,6 +8343,7 @@ npm run build</pre>
         it on first append); the tailer's ``read_once`` handles the
         missing-file path gracefully, so we don't insist on existence.
         """
+        caller_agent = _isolated_resource_agent(request)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -8306,44 +8351,9 @@ npm run build</pre>
         path = Path(req.transcript_path)
         if not path.is_absolute():
             raise HTTPException(400, "transcript_path must be absolute")
-        # Restrict to the agent's legitimate transcript roots. Resolve
-        # symlinks before the prefix check so a symlinked attack path is
-        # normalised. Local agents: ``~/.claude/projects/``. Container
-        # agents (#638): claude runs with CLAUDE_CONFIG_DIR =
-        # <working_dir>/.claude-container, so its SessionStart hook
-        # legitimately reports <working_dir>/.claude-container/projects/...
-        # — without this root the report 403s and the tailer never repoints
-        # off its cold-start guess.
-        allowed_roots = [(Path.home() / ".claude" / "projects").resolve()]
-        # #215: codex tmux agents tail rollouts under the codex session store
-        # (``$CODEX_HOME/sessions`` or ``~/.codex/sessions``), not ~/.claude.
-        allowed_roots.append((codex_home_for(agent) / "sessions").resolve())
-        if getattr(agent, "isolation_mode", "local") == "container":
-            wd = (agent.working_dir or "").strip()
-            if wd and Path(wd).is_absolute():
-                from pinky_daemon.provisioning import container_config_dir
-
-                allowed_roots.append(
-                    (Path(container_config_dir(str(Path(wd).resolve()))) / "projects")
-                    .resolve()
-                )
-        # Dedicated-config-dir LOCAL agent (#550/Picard): claude runs with
-        # CLAUDE_CONFIG_DIR=<working_dir>/.claude-local, so its SessionStart hook
-        # legitimately reports transcripts under <working_dir>/.claude-local/
-        # projects/... — without this root the report 403s and the tailer never
-        # repoints off its cold-start guess.
-        if (
-            getattr(agent, "dedicated_config_dir", False)
-            and getattr(agent, "isolation_mode", "local") in ("", "local")
-        ):
-            wd = (agent.working_dir or "").strip()
-            if wd and Path(wd).is_absolute():
-                from pinky_daemon.provisioning import local_config_dir
-
-                allowed_roots.append(
-                    (Path(local_config_dir(str(Path(wd).resolve()))) / "projects")
-                    .resolve()
-                )
+        # Isolated bindings use the verified caller's record, even in off mode.
+        claude_roots = _claude_transcript_roots(caller_agent or agent)
+        allowed_roots = [*claude_roots, (codex_home_for(agent) / "sessions").resolve()]
         try:
             normalised = path.resolve(strict=False)
         except (OSError, RuntimeError) as e:
@@ -8359,9 +8369,19 @@ npm run build</pre>
                 f"{', '.join(str(r) for r in allowed_roots)}",
             )
 
+        if caller_agent is not None:
+            own_projects = _claude_owned_projects(caller_agent)
+            if normalised.parent not in own_projects:
+                raise HTTPException(403, "transcript_path must be in the caller's own project directory")
+
         session = broker.get_streaming_session(name, label=req.label)
         if session is None:
             return {"ok": True, "agent": name, "session": None}
+
+        if caller_agent is not None:
+            restrict = getattr(session, "set_transcript_ownership", None)
+            if callable(restrict):
+                restrict(own_projects)
 
         update = getattr(session, "set_transcript_path", None)
         if callable(update):
@@ -10924,24 +10944,75 @@ npm run build</pre>
         if not agent_name or not chat_id or not file_path:
             raise HTTPException(400, "agent_name, chat_id, and file_path are required")
 
+        caller_agent = _isolated_resource_agent(request)
+        if caller_agent is not None:
+            working_dir = caller_agent.working_dir
+            try:
+                root = os.path.realpath(working_dir)
+                registered_root = os.path.normpath(os.path.abspath(working_dir))
+                candidate = os.path.normpath(os.path.abspath(file_path))
+                if (
+                    candidate != root and not candidate.startswith(root + os.sep)
+                    and candidate != registered_root
+                    and not candidate.startswith(registered_root + os.sep)
+                ):
+                    raise HTTPException(403, "file_path must be inside the caller's working directory")
+                resolved_path = os.path.realpath(candidate)
+                if resolved_path != root and not resolved_path.startswith(root + os.sep):
+                    raise HTTPException(403, "file_path must be inside the caller's working directory")
+                resolved = Path(resolved_path)
+                if not await asyncio.to_thread(resolved.is_file):
+                    raise FileNotFoundError("attachment is missing or not a regular file")
+            except (OSError, RuntimeError) as e:
+                error_repr = f"{type(e).__name__}: {e}"
+                _outreach_attempt_log(
+                    agent_name=agent_name, platform=platform, method=method,
+                    chat_id=chat_id, file_path=file_path, caption_len=len(caption),
+                    outcome="rejected", error=error_repr,
+                )
+                broker._stop_typing(agent_name, chat_id)
+                raise HTTPException(400, f"Failed to {method}: {error_repr}") from e
+            file_path = str(resolved)
+
+        from contextlib import asynccontextmanager
+
+        from pinky_daemon.isolated_files import IsolatedFileError, media_snapshot
         from pinky_identity.live_sqlite import LiveSQLiteFileError, refuse_sqlite_attachment
 
-        try:
-            refuse_sqlite_attachment(file_path)
-        except LiveSQLiteFileError as exc:
-            raise HTTPException(400, str(exc)) from exc
+        if caller_agent is None:
+            try:
+                refuse_sqlite_attachment(file_path)
+            except LiveSQLiteFileError as exc:
+                raise HTTPException(400, str(exc)) from exc
 
         loop = asyncio.get_running_loop()
         try:
-            msg = await loop.run_in_executor(
-                None,
-                lambda: _send_file_message(
-                    agent_name, platform, chat_id, file_path,
-                    caption=caption, reply_to=reply_to, kind=kind,
-                    has_spoiler=has_spoiler,
-                    show_caption_above_media=show_caption_above_media,
-                ),
+            @asynccontextmanager
+            async def original_attachment():
+                yield file_path
+
+            attachment = (
+                media_snapshot(resolved, Path(root), _data_dir / "tmp")
+                if caller_agent is not None else original_attachment()
             )
+            async with attachment as send_path:
+                msg = await loop.run_in_executor(
+                    None,
+                    lambda: _send_file_message(
+                        agent_name, platform, chat_id, str(send_path),
+                        caption=caption, reply_to=reply_to, kind=kind,
+                        has_spoiler=has_spoiler,
+                        show_caption_above_media=show_caption_above_media,
+                    ),
+                )
+        except IsolatedFileError as e:
+            error_repr = f"{type(e).__name__}: {e}"
+            _outreach_attempt_log(
+                agent_name=agent_name, platform=platform, method=method,
+                chat_id=chat_id, file_path=file_path, caption_len=len(caption),
+                outcome="rejected", error=error_repr,
+            )
+            raise HTTPException(400, f"Failed to {method}: {error_repr}") from e
         except HTTPException:
             # Already structured — let FastAPI render it. Still stop typing.
             # HTTPExceptions reachable here come from _send_file_message's

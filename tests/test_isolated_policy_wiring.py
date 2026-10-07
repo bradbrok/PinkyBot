@@ -28,7 +28,7 @@ from tests.test_isolated_launch_policy import DENIED, RUNTIMES, prepare
 pytestmark = pytest.mark.real_auth
 
 
-def test_allow_keys_are_exactly_the_independent_25():
+def test_allow_keys_are_exactly_the_independent_29():
     assert ISOLATED_MUTATION_ALLOW == frozenset(ALLOW_PAIRS)
 
 

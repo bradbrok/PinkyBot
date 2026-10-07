@@ -68,7 +68,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -103,6 +103,7 @@ from pinky_daemon.command_runner import (
     RunuserCommandRunner,
 )
 from pinky_daemon.effort import EFFORT_LEVELS, is_ultracode, resolve_cli_effort
+from pinky_daemon.isolated_files import open_owned_transcript
 from pinky_daemon.pricing import compute_cost_from_usage
 from pinky_daemon.runtime_model_catalog import ModelCatalogError
 from pinky_daemon.scheduler_delivery import scheduler_busy_delay
@@ -122,6 +123,7 @@ from pinky_daemon.tmux_targets import (
 from pinky_daemon.tmux_transcript import (
     TmuxTranscriptTailer,
     TurnResponse,
+    claude_project_slug,
 )
 from pinky_daemon.transport import TransportReplacementMixin
 from pinky_daemon.transport_state import (
@@ -1651,10 +1653,14 @@ def _snapshot_transcript_boundary(
     *,
     expected_identity: tuple[int, int] | None = None,
     expected_offset: int | None = None,
+    owned_predicate: Callable[[Path], bool] | None = None,
 ) -> tuple[tuple[int, int], int, int, bytes, int] | None:
     """Read one descriptor-bound EOF and its exact bounded suffix."""
     try:
-        with path.open("rb") as handle:
+        handle = open_owned_transcript(path, owned_predicate) if owned_predicate else path.open("rb")
+        if handle is None:
+            return None
+        with handle:
             opened = os.fstat(handle.fileno())
             identity = (opened.st_dev, opened.st_ino)
             offset = opened.st_size
@@ -1985,6 +1991,7 @@ class _InflightMeta:
     transcript_anchor_start_at_paste: int | None = None
     transcript_anchor_at_paste: bytes | None = None
     transcript_ticket_captured_at_ns: int | None = None
+    transcript_owned_predicate: Callable[[Path], bool] | None = None
     # Non-zero only for turns delivered during the active post-fresh lineage.
     # A completion may end ``_fresh_context_respawn_grace_until`` only when
     # this epoch matches the session's active epoch.  This prevents an
@@ -2005,6 +2012,7 @@ class _InflightMeta:
             self.transcript_path_at_paste,
             expected_identity=self.transcript_file_identity_at_paste,
             expected_offset=self.transcript_offset_at_paste,
+            owned_predicate=self.transcript_owned_predicate,
         )
         if snapshot is None:
             return
@@ -2576,6 +2584,7 @@ class TmuxSession(TransportReplacementMixin):
         # on every ``stop_hook_summary`` entry — which routes to
         # ``_response_callback`` to deliver the response upstream.
         self._tailer: TmuxTranscriptTailer | None = None
+        self._transcript_ownership: frozenset[Path] | None = None
         # FIFO of in-flight turn routing metadata. Issue #560 replaces
         # PR #496 round-2's single ``_inflight_meta`` dict (which forced
         # strictly serial dispatch via a worker gate, breaking mid-turn
@@ -5781,6 +5790,12 @@ class TmuxSession(TransportReplacementMixin):
         if self._tailer is not None:
             self._tailer.wake()
 
+    def set_transcript_ownership(self, projects: set[Path]) -> None:
+        """Apply caller-derived ownership to current and future Claude tailers."""
+        self._transcript_ownership = frozenset(projects)
+        if isinstance(self._tailer, TmuxTranscriptTailer):
+            self._tailer.set_owned_projects(self._transcript_ownership)
+
     def set_transcript_path(
         self,
         path: Path | str,
@@ -5898,14 +5913,15 @@ class TmuxSession(TransportReplacementMixin):
             )
             return False
 
+        if self._set_transcript_path_internal(path) is False:
+            return False
         self._bound_transcript_session_id = requested_session_id
-        self._set_transcript_path_internal(path)
         if not self._session_ready_event.is_set():
             self._session_ready_event.set()
             _log(f"tmux[{self.agent_name}]: session-ready gate opened (SessionStart hook)")
         return True
 
-    def _set_transcript_path_internal(self, path: Path | str) -> None:
+    def _set_transcript_path_internal(self, path: Path | str) -> bool | None:
         """Trusted call-site-only transcript rebind for daemon discovery.
 
         This is intentionally a separate method rather than a flag on the
@@ -5913,21 +5929,24 @@ class TmuxSession(TransportReplacementMixin):
         endpoint exposes ``set_transcript_path`` and cannot select this path.
         """
         if self._tailer is None:
-            return
+            return None
         seek_to_start = (
             self._tailer_first_bind_pending
             and not self._last_launch_used_continue
         )
-        # Consume the first-bind flag now — even if the tailer's
-        # internal equality guard short-circuits the actual swap.
-        self._tailer_first_bind_pending = False
-        self._tailer.set_transcript_path(
+        accepted = self._tailer.set_transcript_path(
             Path(path), seek_to_start=seek_to_start,
         )
+        if accepted is False:
+            return False
+        # Consume the first-bind flag only after an accepted attempt, including
+        # a path equality no-op. A refusal must leave the window available.
+        self._tailer_first_bind_pending = False
         _log(
             f"tmux[{self.agent_name}]: transcript path updated to {path}"
             + (" (first-bind — seek_to_start)" if seek_to_start else "")
         )
+        return None
 
     async def get_pane_snapshot(self, *, lines: int = 200) -> str:
         """Return the last ``lines`` lines of the tmux pane, with ANSI
@@ -7199,6 +7218,7 @@ class TmuxSession(TransportReplacementMixin):
                 # internal turn instead of waiting unboundedly for a receipt
                 # source that cannot exist yet.
                 on_bound_path_wedge=self._on_bound_path_wedge,
+                owned_projects=self._transcript_ownership,
             )
             await self._tailer.start()
             if guessed is None:
@@ -7516,7 +7536,7 @@ class TmuxSession(TransportReplacementMixin):
         # Match Claude Code's encoder exactly: every non-alphanumeric char
         # → '-'. For an absolute path the leading '/' yields the leading
         # '-' on its own; do NOT prepend an extra dash (that was the bug).
-        encoded = re.sub(r"[^a-zA-Z0-9]", "-", str(cwd))
+        encoded = claude_project_slug(cwd)
         # Container agents (#638): claude runs with CLAUDE_CONFIG_DIR set to
         # <working_dir>/.claude-container INSIDE the container — and because
         # the working_dir is bind-mounted at the SAME absolute path, that
@@ -8113,7 +8133,10 @@ class TmuxSession(TransportReplacementMixin):
         except OSError:
             return _TranscriptOccurrenceTicket(path, None, None)
 
-        snapshot = _snapshot_transcript_boundary(path)
+        snapshot = _snapshot_transcript_boundary(
+            path, owned_predicate=self._transcript_predicate(),
+            expected_identity=self._transcript_expected_identity(path),
+        )
         if snapshot is None:
             return _TranscriptOccurrenceTicket(path, None, None)
         identity, offset, anchor_start, anchor, captured_at_ns = snapshot
@@ -8125,6 +8148,17 @@ class TmuxSession(TransportReplacementMixin):
             anchor=anchor,
             captured_at_ns=captured_at_ns,
         )
+
+    def _transcript_predicate(self):
+        projects = self._transcript_ownership
+        return (lambda opened: opened.parent in projects) if projects is not None else None
+
+    def _transcript_expected_identity(self, path: Path):
+        return None
+
+    def _open_transcript(self, path: Path, identity=None):
+        predicate = self._transcript_predicate()
+        return open_owned_transcript(path, predicate) if predicate else path.open("rb")
 
     def _phantom_consumption_verdicts(
         self, candidates: list[_InflightMeta]
@@ -8185,7 +8219,13 @@ class TmuxSession(TransportReplacementMixin):
                     continue
 
                 try:
-                    handle = stack.enter_context(transcript.open("rb"))
+                    opened_handle = self._open_transcript(
+                        transcript, entry.transcript_file_identity_at_paste,
+                    )
+                    if opened_handle is None:
+                        sources.append(None)
+                        continue
+                    handle = stack.enter_context(opened_handle)
                     descriptor = _descriptor(handle)
                     opened = os.fstat(descriptor)
                 except (AttributeError, OSError, TypeError, ValueError):
@@ -12161,6 +12201,7 @@ class TmuxSession(TransportReplacementMixin):
             transcript_ticket_captured_at_ns=(
                 turn.transcript_ticket_captured_at_ns
             ),
+            transcript_owned_predicate=self._transcript_predicate(),
             fresh_context_epoch=self._fresh_context_respawn_epoch,
         ))
         self._trace_scheduler_turn(turn, "paste", at=_paste_succeeded_at,
