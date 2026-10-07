@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
+import shutil
+import stat
+import subprocess
 import sys
 import tempfile
-from unittest.mock import AsyncMock, patch
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +19,93 @@ from pinky_daemon.codex_tmux_session import CodexTmuxSession
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.transport_state import SessionState, Trigger
+
+
+@pytest.fixture(autouse=True)
+def _codex_executable_guard(request, monkeypatch, tmp_path, tmp_path_factory,
+                            _guard_default_tmux_socket):
+    """Observe command selection and refuse executables outside test fixtures."""
+    root = tmp_path_factory.getbasetemp().resolve()
+    bindir = tmp_path / "unowned-bin"
+    bindir.mkdir()
+    marker = tmp_path / "unowned-command-ran"
+    sentinel = bindir / "codex"
+    sentinel.write_text(f"#!/bin/sh\n: > {shlex.quote(str(marker))}\nexit 97\n")
+    sentinel.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{bindir}:/usr/bin:/bin:/opt/homebrew/bin")
+    original_which = shutil.which
+    original_popen = subprocess.Popen
+    observed = {"marker": str(marker), "resolutions": [], "spawns": [], "unowned": []}
+    request.node._codex_executable_observations = observed
+
+    def observe(command, path, phase):
+        resolved = Path(path).resolve() if path else None
+        owned = False
+        if (resolved is not None and resolved != sentinel.resolve()
+                and resolved.is_relative_to(root)):
+            info = resolved.stat()
+            owned = (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                     and info.st_nlink == 1)
+        row = {"command": os.fsdecode(command), "resolved": str(resolved), "owned": owned}
+        observed[phase].append(row)
+        if resolved is not None and not owned:
+            observed["unowned"].append(row)
+        return resolved
+
+    def which(command, *args, **kwargs):
+        path = original_which(command, *args, **kwargs)
+        if Path(os.fsdecode(command)).name == "codex":
+            observe(command, path, "resolutions")
+        return path
+
+    class OwnedPopen(original_popen):
+        def __init__(self, args, *positional, **kwargs):
+            command = kwargs.get("executable") or (
+                args[0] if isinstance(args, (list, tuple)) else args
+            )
+            if Path(os.fsdecode(command)).name == "codex":
+                env = kwargs.get("env")
+                if env is None:
+                    env = os.environ
+                path = original_which(command, path=env.get("PATH", os.defpath))
+                resolved = observe(command, path, "spawns")
+                if observed["spawns"][-1]["owned"] is False and resolved != sentinel.resolve():
+                    raise OSError("codex executable must be test-owned")
+            super().__init__(args, *positional, **kwargs)
+
+    monkeypatch.setattr(shutil, "which", which)
+    monkeypatch.setattr(subprocess, "Popen", OwnedPopen)
+
+    class Boundary:
+        @pytest.hookimpl(wrapper=True)
+        def pytest_runtest_call(self, item):
+            try:
+                return (yield)
+            finally:
+                if item is request.node:
+                    observed["marker_written"] = marker.exists()
+                    assert not observed["marker_written"], "PATH tripwire must never execute"
+                    assert observed["unowned"] == [], "codex executable must be test-owned"
+
+    boundary = Boundary()
+    request.config.pluginmanager.register(boundary)
+    try:
+        yield observed
+    finally:
+        request.config.pluginmanager.unregister(boundary)
+
+
+def test_codex_guard_respects_explicit_empty_environment(tmp_path, monkeypatch):
+    bindir = tmp_path / "default-bin"
+    bindir.mkdir()
+    executable = bindir / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    monkeypatch.setattr(os, "defpath", str(bindir))
+
+    result = subprocess.run(["codex"], env={}, cwd=tmp_path, check=True)
+
+    assert result.returncode == 0
 
 
 async def _to_connected(s: CodexSession) -> None:
@@ -408,20 +498,23 @@ class TestCodexSessionSendSignature:
 
     @pytest.mark.asyncio
     async def test_scheduler_receipt_is_false_when_exec_fails_before_acceptance(
-        self,
+        self, tmp_path, _codex_executable_guard,
     ):
         """A spawned/accepted turn, not _exec_lock acquisition, is the edge."""
-        s = self._make()
+        executable = tmp_path / "codex"
+        executable.write_text("invalid executable format\n")
+        executable.chmod(0o700)
+        s = self._make(working_dir=str(tmp_path))
         s._use_app_server = False
+        s._build_codex_cmd = lambda: [str(executable)]
         await _to_connected(s)
 
-        with patch(
-            "asyncio.create_subprocess_exec",
-            AsyncMock(side_effect=OSError("spawn failed before acceptance")),
-        ):
-            receipt = await s.send_scheduler_prompt("scheduled")
-            worker = asyncio.create_task(s._message_worker())
-            assert await asyncio.wait_for(receipt, timeout=1) is False
+        receipt = await s.send_scheduler_prompt("scheduled")
+        worker = asyncio.create_task(s._message_worker())
+        assert await asyncio.wait_for(receipt, timeout=1) is False
+        spawns = _codex_executable_guard["spawns"]
+        assert spawns, "the test-owned failing executable must be attempted"
+        assert spawns[0]["resolved"] == str(executable.resolve())
 
         await _to_dead(s)
         s._message_queue.put_nowait(("noop", "", "", ""))
