@@ -131,13 +131,14 @@ class CodexAppServerSupervisor:
         self._soul_version_store = soul_version_store
         self._registry = registry
         self._sock_dir, self._sock_dir_is_tmp = self._resolve_sock_dir(agent_name, working_dir)
-        self.sock_path = os.path.join(self._sock_dir, "app.sock")
+        self.sock_path = os.path.join(self._sock_dir, "app.sock") if self._sock_dir else None
+        self._sock_dir_identity: tuple[int, int] | None = None
         self._tmux = production_tmux_control(self.session_name, command_runner=LocalCommandRunner())
         self._kill_requested = False
 
     @staticmethod
-    def _resolve_sock_dir(agent_name: str, working_dir: str) -> tuple[str, bool]:
-        """Pick the socket dir; return (dir, is_tmp_fallback).
+    def _resolve_sock_dir(agent_name: str, working_dir: str) -> tuple[str | None, bool]:
+        """Plan the socket dir without creating it; None means a lazy fallback.
 
         Default: ``<working_dir>/.codex-app-server`` — inside the agent boundary
         (forward-compatible with #149 isolation) and under a parent only we can
@@ -156,7 +157,32 @@ class CodexAppServerSupervisor:
         in_boundary = os.path.abspath(os.path.join(working_dir or ".", ".codex-app-server"))
         if len(os.path.join(in_boundary, "app.sock")) <= 100:
             return in_boundary, False
-        return tempfile.mkdtemp(dir="/tmp", prefix=f"pinky-codex-as-{agent_name}-"), True
+        return None, True
+
+    def _tmp_sock_dir_is_owned(self, info: os.stat_result) -> bool:
+        return (
+            stat.S_ISDIR(info.st_mode)
+            and info.st_uid == os.getuid()
+            and self._sock_dir_identity == (info.st_dev, info.st_ino)
+        )
+
+    def _prepare_sock_dir(self) -> None:
+        """Allocate the short 0700 fallback only at the start boundary."""
+        if not self._sock_dir_is_tmp:
+            return
+        if self._sock_dir is None:
+            self._sock_dir = tempfile.mkdtemp(
+                dir="/tmp", prefix=f"pinky-codex-as-{self.agent_name}-",
+            )
+            info = os.lstat(self._sock_dir)
+            self._sock_dir_identity = (info.st_dev, info.st_ino)
+            self.sock_path = os.path.join(self._sock_dir, "app.sock")
+        else:
+            info = os.lstat(self._sock_dir)
+        if not self._tmp_sock_dir_is_owned(info):
+            raise RuntimeError(
+                f"refusing app-server socket dir {self._sock_dir}: ownership or identity changed"
+            )
 
     @property
     def session_name(self) -> str:
@@ -189,10 +215,12 @@ class CodexAppServerSupervisor:
         # Idempotent pre-start cleanup: a crashed predecessor can leave a live
         # tmux session and/or a stale socket; either would wedge a fresh start.
         await self._kill_tmux_session(strict=True)
+        self._prepare_sock_dir()
         self._unlink_sock()
 
         self._ensure_sock_dir_secure()
         env = self._build_env(launch_policy=launch_policy)
+        assert self.sock_path is not None and self._sock_dir is not None
 
         command = " ".join(
             shlex.quote(p)
@@ -261,6 +289,7 @@ class CodexAppServerSupervisor:
         return it, never a throwaway (the shim rejects a 2nd connection, and a
         throwaway initialize would consume the child's single-use one).
         """
+        assert self.sock_path is not None
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _READINESS_TIMEOUT
         last_err: Exception | None = None
@@ -284,6 +313,7 @@ class CodexAppServerSupervisor:
         owner-only directory we own is a hard stop, never a silent downgrade —
         the parent-dir perms are what gate who can connect to an
         approvals=never codex."""
+        assert self._sock_dir is not None
         os.makedirs(self._sock_dir, exist_ok=True)
         try:
             os.chmod(self._sock_dir, 0o700)
@@ -300,6 +330,8 @@ class CodexAppServerSupervisor:
                 f"refusing app-server socket dir {self._sock_dir}: "
                 f"perms {oct(stat.S_IMODE(st.st_mode))} != 0o700"
             )
+        if not self._sock_dir_is_tmp:
+            self._sock_dir_identity = (st.st_dev, st.st_ino)
 
     def request_kill(self) -> None:
         self._kill_requested = True
@@ -329,16 +361,57 @@ class CodexAppServerSupervisor:
         return False
 
     async def teardown(self, *, strict: bool = False) -> None:
-        """Kill the tmux session and unlink its socket.
+        """Kill tmux, unlink the socket, and rmdir only our unchanged fallback.
 
         Terminal shutdown remains best-effort. Replacement cleanup passes
         ``strict=True`` so a known failed kill aborts before any new child's
         environment is prepared or published.
         """
         await self._kill_tmux_session(strict=strict)
+        if self._sock_dir_is_tmp:
+            self._remove_tmp_sock_dir()
+        else:
+            self._unlink_sock()
+
+    def _forget_tmp_sock_dir(self) -> None:
+        self._sock_dir = None
+        self._sock_dir_identity = None
+        self.sock_path = None
+
+    def _remove_tmp_sock_dir(self) -> None:
+        if self._sock_dir is None:
+            return
+        try:
+            info = os.lstat(self._sock_dir)
+        except FileNotFoundError:
+            self._forget_tmp_sock_dir()
+            return
+        except OSError as exc:
+            self._log(f"app-server socket rmdir refused for {self._sock_dir}: {exc}")
+            return
+        if not self._tmp_sock_dir_is_owned(info):
+            self._log(
+                f"app-server socket rmdir refused for {self._sock_dir}: "
+                "ownership or identity changed"
+            )
+            return
         self._unlink_sock()
+        try:
+            os.rmdir(self._sock_dir)
+        except FileNotFoundError:
+            self._forget_tmp_sock_dir()
+        except OSError as exc:
+            self._log(f"app-server socket rmdir failed for {self._sock_dir}: {exc}")
+        else:
+            self._forget_tmp_sock_dir()
 
     def stats(self) -> dict:
+        """Report the short planned path, or a fallback only while it is allocated.
+
+        A fallback is None before start and after successful removal.
+        A refused fallback cleanup keeps its diagnostic path for a later retry.
+        Reading stats never allocates a directory.
+        """
         return {
             "app_server_mode": "tmux",
             "tmux_session": self.session_name,
@@ -346,6 +419,8 @@ class CodexAppServerSupervisor:
         }
 
     def _unlink_sock(self) -> None:
+        if self.sock_path is None:
+            return
         try:
             if os.path.exists(self.sock_path):
                 os.unlink(self.sock_path)

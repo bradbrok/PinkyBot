@@ -2639,6 +2639,7 @@ async def test_tmux_app_server_first_start_with_absent_server_proceeds(
         ("test-agent", "self edit before first start", "agent"),
         ("test-agent", "compiled app-server soul", "spawn"),
     ]
+    await supervisor.teardown()
 
 
 @pytest.mark.parametrize(

@@ -80,19 +80,7 @@ class Harness:
                 registry=self.registry,
                 log=self.logs.append,
             )
-            # Keep test-owned Unix socket paths short without using shared live state.
-            import tempfile
-
-            if owner._sock_dir_is_tmp:
-                Path(owner._sock_dir).rmdir()
-            owner._sock_dir = tempfile.mkdtemp(prefix="k806-uds-")
-            owner._sock_dir_is_tmp = True
-            owner.sock_path = str(Path(owner._sock_dir) / "app.sock")
-            # macOS may need the existing /tmp fallback for the production UDS limit.
-            if len(owner.sock_path) > 100:
-                Path(owner._sock_dir).rmdir()
-                owner._sock_dir = tempfile.mkdtemp(prefix="k806-uds-", dir="/tmp")
-                owner.sock_path = str(Path(owner._sock_dir) / "app.sock")
+            # The supervisor allocates its short private socket directory at start.
             self.supervisors.append(owner)
             return owner, owner._build_env
         self.patch.setenv("PINKY_CODEX_APP_SERVER", "1" if kind == "app_server" else "0")
@@ -122,7 +110,8 @@ def harness(tmp_path, monkeypatch, capsys):
     import shutil
 
     for owner in h.supervisors:
-        shutil.rmtree(owner._sock_dir, ignore_errors=True)
+        if owner._sock_dir is not None:
+            shutil.rmtree(owner._sock_dir, ignore_errors=True)
     captured = capsys.readouterr()
     scan_outputs(*h.logs, captured.out, captured.err)
 
