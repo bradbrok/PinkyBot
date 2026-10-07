@@ -610,6 +610,10 @@ _TMUX_TRANSCRIPT_BIND_MARKER_VALUE = "1"
 _TRANSCRIPT_BIND_REJECTED_LOG_PREFIX = "TRANSCRIPT_BIND_REJECTED"
 
 
+class _DeadRuntimeError(RuntimeError):
+    """A failed delivery verified that its execution runtime is absent."""
+
+
 class _ContextLockDeferral(Exception):  # noqa: N818
     """Transient: context-lock file present at paste time.
 
@@ -7922,7 +7926,7 @@ class TmuxSession(TransportReplacementMixin):
                     # disconnect from inside _deliver_turn. Exit the worker
                     # cleanly so we don't retry into the now-being-torn-down
                     # pane. The watchdog also exits when CONNECTED → DEAD.
-                    if _is_dead_runtime_stderr(str(e)):
+                    if isinstance(e, _DeadRuntimeError) or _is_dead_runtime_stderr(str(e)):
                         return
                 finally:
                     self._processing = False
@@ -12096,16 +12100,30 @@ class TmuxSession(TransportReplacementMixin):
             # via the default-disconnect path; the next inbound
             # send_to_agent triggers the normal auto-wake cold-start
             # path (validated in production by #517/#518/#519).
-            if _is_dead_runtime_stderr(result.stderr or ""):
+            dead_runtime = _is_dead_runtime_stderr(result.stderr or "")
+            if dead_runtime:
                 _log(
                     f"tmux[{self.agent_name}]: pane/container vanished "
                     f"(stderr={result.stderr.strip()!r}); scheduling disconnect"
                 )
+            else:
+                verify_absence = getattr(self._tmux, "_session_absence_is_verified", None)
+                if verify_absence is not None:
+                    try:
+                        dead_runtime = (await verify_absence(result)) is True
+                    except Exception as exc:
+                        _log(f"tmux[{self.agent_name}]: absence probe failed: {exc}")
+                if dead_runtime:
+                    _log(
+                        f"tmux[{self.agent_name}]: server/session verified absent; "
+                        "scheduling disconnect"
+                    )
+            if dead_runtime:
                 # create_task — must not await disconnect from inside
                 # the worker; disconnect cancels the worker task and
                 # awaits its completion, which would deadlock here.
                 asyncio.create_task(self.disconnect())
-            raise RuntimeError(
+            raise (_DeadRuntimeError if dead_runtime else RuntimeError)(
                 f"tmux paste-buffer / send-keys failed: rc={result.returncode} "
                 f"stderr={result.stderr.strip()!r}"
             )
