@@ -35,8 +35,8 @@ async def test_codex_discovery_to_bind_swap_never_dispatches_peer(daemon,monkeyp
     d=daemon()
     monkeypatch.setenv('PINKY_CODEX_PER_AGENT_HOME','1' if per_agent else '0')
     config=StreamingSessionConfig(agent_name='tenant',working_dir=str(d.root/'tenant'))
-    own_root=codex_home_for(d.agents.get('tenant'))/'sessions'
-    peer_root=codex_home_for(d.agents.get('peer'))/'sessions'
+    own_root=(codex_home_for(d.agents.get('tenant'))/'sessions').resolve()
+    peer_root=(codex_home_for(d.agents.get('peer'))/'sessions').resolve()
     own=own_root/(d.root.parent.name+'-owned')/'rollout-owned.jsonl'
     peer=peer_root/(d.root.parent.name+'-peer')/own.name
     own.parent.mkdir(parents=True)

@@ -88,6 +88,28 @@ async def _copy_media(payload: dict) -> dict:
             await child.wait()
 
 
+def _refuse_database_content(snapshot: Path, info: os.stat_result) -> None:
+    """Inspect only the validated private copy for database and sidecar headers."""
+    fd = os.open(snapshot, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino, opened.st_size)
+            != (info.st_dev, info.st_ino, info.st_size)
+        ):
+            raise IsolatedFileError("attachment snapshot changed before content validation")
+        prefix = os.read(fd, 16)
+    finally:
+        os.close(fd)
+    if (
+        prefix.startswith(b"SQLite format 3\x00")
+        or prefix.startswith((b"\x37\x7f\x06\x82", b"\x37\x7f\x06\x83"))
+        or prefix.startswith(b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7")
+    ):
+        raise IsolatedFileError("SQLite databases and sidecars cannot be sent as attachments")
+
+
 @asynccontextmanager
 async def media_snapshot(path: Path, working_dir: Path, tmp_parent: Path):
     """Await a private bounded child-process copy and remove it after sending."""
@@ -116,6 +138,7 @@ async def media_snapshot(path: Path, working_dir: Path, tmp_parent: Path):
             current_identities = await asyncio.to_thread(live_sqlite.live_sqlite_identities)
             if (result["dev"], result["ino"]) in current_identities:
                 raise IsolatedFileError("attachment copy is a live SQLite inode")
+            await asyncio.to_thread(_refuse_database_content, snapshot, info)
         except (OSError, RuntimeError, ValueError) as error:
             raise IsolatedFileError(str(error)) from error
         yield snapshot

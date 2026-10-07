@@ -17,6 +17,8 @@ async def discovered(d, monkeypatch, per_agent, caller="tenant"):
     monkeypatch.setenv("PINKY_CODEX_PER_AGENT_HOME", "1" if per_agent else "0")
     config = StreamingSessionConfig(agent_name=caller, working_dir=str(d.root / caller))
     root = codex_home_for(d.agents.get(caller)) / "sessions"
+    if d.agents.get(caller).isolated:
+        root = root.resolve()
     own = root / d.root.parent.name / "rollout-fixture.jsonl"
     own.parent.mkdir(parents=True)
     own.write_text(json.dumps({"type": "session_meta", "payload": {

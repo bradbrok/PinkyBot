@@ -266,6 +266,8 @@ def test_sqlite_registered_after_identity_snapshot_is_refused(daemon, monkeypatc
         connection.execute("CREATE TABLE fixture(value TEXT)").close()
         connection.execute("INSERT INTO fixture VALUES ('harmless new database fixture')").close()
         connection.commit()
+        # Keep the inode registered without a recognizable database header.
+        store.write_bytes(b"ordinary harmless fixture")
         info = store.stat()
         identity = (info.st_dev, info.st_ino)
         assert identity in live_sqlite.live_sqlite_identities()
@@ -286,6 +288,7 @@ def test_sqlite_registered_after_identity_snapshot_is_refused(daemon, monkeypatc
         response = post(d, own)
         assert len(registered) == 1
         assert (response.status_code, copied) == (400, []), response.text
+        assert "live SQLite inode" in response.text
         assert not list((d.root / "tmp").glob("media-*"))
     finally:
         for connection in connections:
