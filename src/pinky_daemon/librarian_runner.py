@@ -19,7 +19,8 @@ import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from pinky_daemon.kb_store import _FRONTMATTER_RE, KBStore, _content_hash
+from pinky_daemon.frontmatter import split_frontmatter
+from pinky_daemon.kb_store import KBStore, _content_hash
 from pinky_daemon.librarian_prompt import LIBRARIAN_SYSTEM_PROMPT
 from pinky_daemon.sdk_runner import SDKRunner, SDKRunnerConfig
 from pinky_daemon.store_catalog import StoreCatalog, open_store_connection
@@ -147,8 +148,8 @@ class LibrarianRunner:
 
     def _body_hash(self, content: str) -> str:
         """Hash only the body after YAML frontmatter (ignores metadata changes)."""
-        match = _FRONTMATTER_RE.match(content)
-        body = match.group(2) if match else content
+        match = split_frontmatter(content)
+        body = match[1] if match else content
         return _content_hash(body)
 
     def _get_processed_hash(self, source_id: str) -> str | None:

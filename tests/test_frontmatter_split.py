@@ -90,7 +90,7 @@ def test_writer_and_repository_fixture_corpus(tmp_path):
     ]
     repo = Path(__file__).resolve().parents[1]
     # Include checked-in markdown and literal frontmatter in existing test fixtures.
-    for folder in (repo / "tests", repo / "src"):
+    for folder in (repo / "tests", repo / "src", repo / "skills"):
         for path in folder.rglob("*.md"):
             text = path.read_text(encoding="utf-8")
             if text.startswith("---"):
