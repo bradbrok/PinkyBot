@@ -5810,10 +5810,6 @@ def create_api(
             for root in roots
         ]
 
-    def _claude_transcript_roots(agent: Agent) -> list[Path]:
-        """Share canonical Claude roots with the existing own-project check."""
-        return [Path(resolved) for registered, resolved in _claude_transcript_root_forms(agent)]
-
     def _codex_transcript_root_forms(agent: Agent) -> tuple[str, str]:
         root = codex_home_for(agent) / "sessions"
         registered = root
