@@ -1,7 +1,7 @@
 {
   "schema": "pinky-model-roster/1",
-  "revision": 3,
-  "updated": "2026-10-05",
+  "revision": 4,
+  "updated": "2026-10-07",
   "models": [
     {
       "provider": "anthropic",
@@ -230,6 +230,25 @@
       "supports_thinking": true,
       "active": true,
       "sort_order": 20
+    },
+    {
+      "provider": "anthropic",
+      "model_id": "claude-haiku-5-5",
+      "display_name": "Claude Haiku 5.5",
+      "description": "Newest Haiku. Fast, high-volume, latency-sensitive work (classification, extraction, routing) at $0.10/$0.50 per MTok for prompts up to 100K tokens; higher tier above 100K. 1M context; adaptive thinking, effort defaults to medium.",
+      "tier": "haiku",
+      "context_window": 1000000,
+      "is_1m": true,
+      "pricing": {
+        "input": 0.1,
+        "output": 0.5,
+        "cached_input": 0.01,
+        "cache_write_5m": 0.125,
+        "cache_write_1h": 0.2
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 28
     },
     {
       "provider": "anthropic",
