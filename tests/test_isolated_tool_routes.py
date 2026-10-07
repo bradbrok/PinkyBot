@@ -183,6 +183,7 @@ SELF_READ_ONLY = frozenset(
         "load_skill",
         "mcp_probe",
         "search_history",
+        "who_am_i",
     }
 )
 SELF_MUTATIONS = {
@@ -476,6 +477,62 @@ async def _dispatch(server, name=None, arguments=None):
         return result.root
     finally:
         request_ctx.reset(token)
+
+
+@pytest.fixture
+def identity_policy_server(monkeypatch):
+    from pinky_self.server import create_server
+
+    monkeypatch.setenv("PINKY_ISOLATED_POLICY_MODE", "enforce")
+    server = create_server(agent_name="caller", signing_key_resolver=lambda name: "fixture-key")
+    calls = []
+
+    def recorder(method, path, body=None):
+        calls.append((method, path))
+        return {"name": "caller", "model": "fixture-model", "agent": "", "sessions": []}
+
+    fn = server._tool_manager.get_tool("who_am_i").fn
+    cells = dict(zip(fn.__code__.co_freevars, fn.__closure__ or ()))
+    monkeypatch.setattr(cells["_api"], "cell_contents", recorder)
+    registry = SimpleNamespace(get=lambda name: SimpleNamespace(isolated=True))
+    install_tool_policy(server, "self", registry, None, lambda name: "fixture-key")
+    return server, calls
+
+
+async def test_core_identity_read_tool_remains_listed(identity_policy_server):
+    server, calls = identity_policy_server
+    listed = {tool.name for tool in (await _dispatch(server)).tools}
+    assert "who_am_i" in listed, "Core read-only identity tool is missing from isolated visibility"
+    assert calls == []
+
+
+async def test_core_identity_read_tool_remains_callable(identity_policy_server):
+    server, calls = identity_policy_server
+    result = await _dispatch(server, "who_am_i")
+    assert not result.isError, "Core read-only identity tool was refused by call_tool"
+    assert calls == [
+        ("GET", "/agents/caller"),
+        ("GET", "/settings/main-agent"),
+        ("GET", "/agents/caller/sessions"),
+    ]
+    assert result.content == [
+        types.TextContent(
+            type="text",
+            text="Name: caller\nModel: fixture-model\nPermission mode: default\n"
+            "Working directory: unknown\nMain agent: (none set)",
+        )
+    ]
+
+
+@pytest.mark.parametrize("mount", ["self", "messaging"])
+def test_core_tools_have_explicit_table_or_hidden_classification(mount):
+    # This independent exception is the entire specification for omitted core tools.
+    spec_hidden = {("self", "send_file_to_agent")}
+    core_keys = {(mount, name) for name in policy.CORE_TOOLS[mount]}
+    table_keys = set(policy.ISOLATED_TOOL_ROUTES)
+    missing = core_keys - table_keys - spec_hidden
+    assert not missing, f"Core tools lack explicit classification: {sorted(missing)}"
+    assert core_keys - table_keys == {key for key in spec_hidden if key[0] == mount}
 
 
 async def test_capture_walk_classifies_every_registered_tool(daemon, tool_capture):

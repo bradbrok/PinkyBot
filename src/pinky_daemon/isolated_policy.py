@@ -220,6 +220,7 @@ ISOLATED_TOOL_ROUTES = {
     ("self", "load_skill"): (),
     ("self", "mcp_probe"): (),
     ("self", "search_history"): (),
+    ("self", "who_am_i"): (),
     ("self", "block_task"): (("POST", "/tasks/block/{task_id}"),),
     ("self", "claim_task"): (("POST", "/tasks/claim/{task_id}"),),
     ("self", "complete_task"): (("POST", "/tasks/complete/{task_id}"),),
