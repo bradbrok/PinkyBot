@@ -8,6 +8,7 @@ HMAC cookie signing.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac as _hmac
 import html as _html
@@ -483,21 +484,26 @@ async def render_pdf(req: dict):
     if filename in ("", ".", ".."):
         raise HTTPException(400, "invalid filename")
     filename += ".pdf"
+    path = os.path.abspath(os.path.join(EXPORT_DIR, filename))
     try:
         export_dir = Path(EXPORT_DIR).resolve()
-        path = (export_dir / filename).resolve()
+        resolved_path = Path(path).resolve()
     except (OSError, RuntimeError, ValueError):
         raise HTTPException(400, "invalid filename") from None
-    if path.parent != export_dir:
-        raise HTTPException(400, "invalid filename")
-    export_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        export_dir.mkdir(parents=True, exist_ok=True)
+        if resolved_path.parent != export_dir and not os.path.samefile(resolved_path.parent, export_dir):
+            raise HTTPException(400, "invalid filename")
         from weasyprint import HTML as WP_HTML
         WP_HTML(string=html_str).write_pdf(path)
+    except HTTPException:
+        raise
     except ImportError:
         raise HTTPException(503, "WeasyPrint not installed — cannot render PDFs") from None
     except Exception as e:
+        if isinstance(e, OSError) and e.errno in (errno.ENAMETOOLONG, errno.ELOOP):
+            raise HTTPException(400, "invalid filename") from None
         raise HTTPException(500, f"PDF rendering failed: {e}") from e
 
     return {"success": True, "path": os.path.abspath(path), "filename": filename}
