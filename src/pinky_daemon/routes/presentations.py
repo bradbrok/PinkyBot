@@ -12,6 +12,7 @@ import hashlib
 import hmac as _hmac
 import html as _html
 import os
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -474,10 +475,22 @@ async def render_pdf(req: dict):
     html_body = _markdown_to_html(content)
     html_str = _HTML_TEMPLATE.format(title=title, body=html_body)
 
-    os.makedirs(EXPORT_DIR, exist_ok=True)
-    if not filename.endswith(".pdf"):
-        filename += ".pdf"
-    path = os.path.join(EXPORT_DIR, filename)
+    if not isinstance(filename, str):
+        raise HTTPException(400, "invalid filename")
+    filename = os.path.basename(filename).strip()
+    while filename.lower().endswith(".pdf"):
+        filename = filename[:-4].strip()
+    if filename in ("", ".", ".."):
+        raise HTTPException(400, "invalid filename")
+    filename += ".pdf"
+    try:
+        export_dir = Path(EXPORT_DIR).resolve()
+        path = (export_dir / filename).resolve()
+    except (OSError, RuntimeError, ValueError):
+        raise HTTPException(400, "invalid filename") from None
+    if path.parent != export_dir:
+        raise HTTPException(400, "invalid filename")
+    export_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         from weasyprint import HTML as WP_HTML

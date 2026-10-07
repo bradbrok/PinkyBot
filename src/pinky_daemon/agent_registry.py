@@ -4807,17 +4807,20 @@ except Exception as exc:
             for r in rows
         ]
 
-    def remove_directive(self, directive_id: int) -> bool:
+    def remove_directive(self, directive_id: int, *, agent_name: str) -> bool:
         """Remove a directive."""
-        cursor = self._db.execute("DELETE FROM agent_directives WHERE id=?", (directive_id,))
+        cursor = self._db.execute(
+            "DELETE FROM agent_directives WHERE id=? AND agent_name=?",
+            (directive_id, agent_name),
+        )
         self._db.commit()
         return cursor.rowcount > 0
 
-    def toggle_directive(self, directive_id: int, active: bool) -> bool:
+    def toggle_directive(self, directive_id: int, active: bool, *, agent_name: str) -> bool:
         """Enable/disable a directive."""
         cursor = self._db.execute(
-            "UPDATE agent_directives SET active=? WHERE id=?",
-            (int(active), directive_id),
+            "UPDATE agent_directives SET active=? WHERE id=? AND agent_name=?",
+            (int(active), directive_id, agent_name),
         )
         self._db.commit()
         return cursor.rowcount > 0
