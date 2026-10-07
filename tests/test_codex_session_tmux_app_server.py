@@ -8,6 +8,8 @@ initialize / stats contract.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from pinky_daemon.codex_app_server_tmux import CodexAppServerSupervisor
@@ -15,6 +17,12 @@ from pinky_daemon.codex_home import PER_AGENT_CODEX_HOME_ENV
 from pinky_daemon.codex_session import CodexSession
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.transport_state import SessionState, Trigger
+from tests.codex_socket_support import codex_socket_sandbox as codex_socket_sandbox
+
+
+@pytest.fixture(autouse=True)
+def socket_sandbox(codex_socket_sandbox):
+    return codex_socket_sandbox
 
 
 def _make_session(**overrides) -> CodexSession:
@@ -27,7 +35,11 @@ def _make_session(**overrides) -> CodexSession:
         provider_key="test-key",
         **overrides,
     )
-    return CodexSession(config)
+    session = CodexSession(config)
+    planned = os.path.abspath(os.path.join(config.working_dir, ".codex-app-server/app.sock"))
+    if session._app_supervisor is not None and len(planned) > 100:
+        assert session._app_supervisor.sock_path is None, "session construction leaked a socket dir"
+    return session
 
 
 async def _to_connected(session: CodexSession) -> None:
@@ -206,3 +218,11 @@ def test_stats_mode_subprocess_when_tmux_off(monkeypatch):
     monkeypatch.delenv("PINKY_CODEX_TMUX_APP_SERVER", raising=False)
     s = _make_session()
     assert s.stats["app_server_mode"] == "subprocess"
+
+
+def test_long_session_stats_do_not_allocate_socket_directory(tmp_path, monkeypatch, socket_sandbox):
+    monkeypatch.setenv("PINKY_CODEX_APP_SERVER", "1")
+    monkeypatch.setenv("PINKY_CODEX_TMUX_APP_SERVER", "1")
+    s = _make_session(working_dir=str(tmp_path / ("long-" + "x" * 140)))
+    assert s.stats["sock_path"] is None
+    assert socket_sandbox.created == [], "CodexSession stats must not allocate a socket directory"
