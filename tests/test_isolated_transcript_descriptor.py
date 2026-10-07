@@ -73,7 +73,8 @@ async def test_bound_transcript_replacement_cannot_read_peer(
 def test_nonlocal_dedicated_config_has_no_local_project_root(daemon, mode):
     d = daemon(mode)
     d.agents.update("tenant", isolation_mode="unix_user", dedicated_config_dir=True)
-    roots = closure(d.app, "_claude_transcript_roots")(d.agents.get("tenant"))
+    forms = closure(d.app, "_claude_transcript_root_forms")(d.agents.get("tenant"))
+    roots = [Path(resolved) for registered, resolved in forms]
     assert roots == [(Path.home() / ".claude/projects").resolve()]
 
 

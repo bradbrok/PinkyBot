@@ -54,7 +54,7 @@ async def ticking(request):
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(2)
+@pytest.mark.timeout(30)
 async def test_named_pipe_is_rejected_as_nonregular_without_stalling_loop(daemon, monkeypatch):
     d = daemon()
     own = d.root / "tenant" / "fixture.fifo"
@@ -83,7 +83,7 @@ async def test_named_pipe_is_rejected_as_nonregular_without_stalling_loop(daemon
     unblock = asyncio.create_task(unblock_file_check())
     started = time.monotonic()
     try:
-        response, ticks = await ticking(async_post(d, own))
+        response, ticks = await asyncio.wait_for(ticking(async_post(d, own)), 2.0)
     finally:
         release.set()
         unblock.cancel()
@@ -97,7 +97,7 @@ async def test_named_pipe_is_rejected_as_nonregular_without_stalling_loop(daemon
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(2)
+@pytest.mark.timeout(30)
 async def test_regular_attachment_swapped_to_fifo_before_child_is_refused(
     daemon, monkeypatch,
 ):
@@ -137,7 +137,7 @@ env['copy_attachment'] = controlled_copy
     before_child(monkeypatch, swap_before_child)
     adapter(d, monkeypatch, lambda *args, **kwargs: effects.append(args))
     started = time.monotonic()
-    response, ticks = await ticking(async_post(d, own))
+    response, ticks = await asyncio.wait_for(ticking(async_post(d, own)), 2.0)
     assert checked == [True] and swapped == [True]
     assert marker.read_text() == "entered"
     assert (response.status_code, effects) == (400, []), response.text

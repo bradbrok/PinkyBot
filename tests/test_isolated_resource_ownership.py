@@ -627,6 +627,13 @@ def test_isolated_media_resolve_errors_are_rejected(
             "agent_name": "tenant", "chat_id": "fixture", "file_path": str(selected)})
     finally:
         client.close()
+    if failure == "loop":
+        assert response.status_code == 403, response.text
+        assert adapters == []
+        assert attempts == []
+        assert stopped == []
+        assert "outreach-attempt:" not in capsys.readouterr().err
+        return
     assert response.status_code == 400, response.text
     assert adapters == []
     assert len(attempts) == 1 and attempts[0]["outcome"] == "rejected"
