@@ -611,7 +611,7 @@ _TRANSCRIPT_BIND_REJECTED_LOG_PREFIX = "TRANSCRIPT_BIND_REJECTED"
 
 
 class _DeadRuntimeError(RuntimeError):
-    """A failed delivery verified that its execution runtime is absent."""
+    """A failed delivery observed endpoint/session absence."""
 
 
 class _ContextLockDeferral(Exception):  # noqa: N818
@@ -828,8 +828,8 @@ class _TmuxControl:
     def _local_socket_path(self) -> Path | None:
         """Return the socket path used by a locally executed tmux command.
 
-        A missing socket is the one stderr-independent proof that a failed
-        command cannot have left a live server behind.  Wrapped runners may
+        A missing socket proves local endpoint absence as observed, not that
+        every runtime process has exited.  Wrapped runners may
         execute in another filesystem namespace, so their socket cannot be
         safely statted from the daemon process and deliberately returns
         ``None``.
@@ -880,7 +880,7 @@ class _TmuxControl:
         self,
         failed_result: TmuxCommandResult,
     ) -> bool:
-        """Prove the owned target absent from the failed command or server state."""
+        """Prove observed endpoint/session absence from the client or server state."""
         if self._server_absence_is_reported(failed_result):
             return True
         if self._server_socket_is_missing():
@@ -5030,8 +5030,8 @@ class TmuxSession(TransportReplacementMixin):
                 env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
         return env
 
-    async def disconnect(self) -> None:
-        """Tear down the worker and kill the tmux session. Idempotent.
+    async def disconnect(self, *, kill_tmux: bool = True) -> None:
+        """Tear down the worker and optionally kill the tmux session. Idempotent.
 
         Per the Transport contract: ``disconnect`` is the side-effect
         runner, NOT the intent declarer. Callers establish lifecycle
@@ -5243,9 +5243,10 @@ class TmuxSession(TransportReplacementMixin):
         # Kill tmux session. ``kill_session`` is idempotent after verifying
         # that a failed kill left no owned session behind.
         try:
-            killed = await self._tmux.kill_session()
-            if getattr(self, "_replacement_cleanup_strict", False) and not killed.ok:
-                raise RuntimeError("Owned tmux session cleanup failed")
+            if kill_tmux:
+                killed = await self._tmux.kill_session()
+                if getattr(self, "_replacement_cleanup_strict", False) and not killed.ok:
+                    raise RuntimeError("Owned tmux session cleanup failed")
         except Exception as e:
             _log(f"tmux[{self.agent_name}]: kill_session raised: {e}")
             if getattr(self, "_replacement_cleanup_strict", False):
@@ -12101,6 +12102,7 @@ class TmuxSession(TransportReplacementMixin):
             # send_to_agent triggers the normal auto-wake cold-start
             # path (validated in production by #517/#518/#519).
             dead_runtime = _is_dead_runtime_stderr(result.stderr or "")
+            kill_tmux = dead_runtime
             if dead_runtime:
                 _log(
                     f"tmux[{self.agent_name}]: pane/container vanished "
@@ -12114,6 +12116,13 @@ class TmuxSession(TransportReplacementMixin):
                     except Exception as exc:
                         _log(f"tmux[{self.agent_name}]: absence probe failed: {exc}")
                 if dead_runtime:
+                    # Endpoint absence is an observation, not authority to kill a replacement.
+                    try:
+                        dead_runtime = (await self._tmux.has_session()) is False
+                    except Exception as exc:
+                        dead_runtime = False
+                        _log(f"tmux[{self.agent_name}]: absence re-probe failed: {exc}")
+                if dead_runtime:
                     _log(
                         f"tmux[{self.agent_name}]: server/session verified absent; "
                         "scheduling disconnect"
@@ -12122,7 +12131,8 @@ class TmuxSession(TransportReplacementMixin):
                 # create_task — must not await disconnect from inside
                 # the worker; disconnect cancels the worker task and
                 # awaits its completion, which would deadlock here.
-                asyncio.create_task(self.disconnect())
+                disconnect = self.disconnect() if kill_tmux else self.disconnect(kill_tmux=False)
+                asyncio.create_task(disconnect)
             raise (_DeadRuntimeError if dead_runtime else RuntimeError)(
                 f"tmux paste-buffer / send-keys failed: rc={result.returncode} "
                 f"stderr={result.stderr.strip()!r}"
