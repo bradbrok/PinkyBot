@@ -6,6 +6,7 @@ import builtins
 import os
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -62,8 +63,83 @@ async def test_named_pipe_is_rejected_as_nonregular_without_stalling_loop(daemon
     monkeypatch.setattr(isolated_files, "MEDIA_COPY_TIMEOUT_SEC", 0.25, raising=False)
     effects = []
     adapter(d, monkeypatch, lambda *args, **kwargs: effects.append(args))
+    checking, release = threading.Event(), threading.Event()
+    resolved = own.resolve(strict=True)
+    original_is_file = Path.is_file
+
+    def hold_file_check(path):
+        if path == resolved:
+            checking.set()
+            assert release.wait(0.5), "file check blocked the event loop"
+        return original_is_file(path)
+
+    async def unblock_file_check():
+        while not checking.is_set():
+            await asyncio.sleep(0.001)
+        await asyncio.sleep(0.01)
+        release.set()
+
+    monkeypatch.setattr(Path, "is_file", hold_file_check)
+    unblock = asyncio.create_task(unblock_file_check())
+    started = time.monotonic()
+    try:
+        response, ticks = await ticking(async_post(d, own))
+    finally:
+        release.set()
+        unblock.cancel()
+        await asyncio.gather(unblock, return_exceptions=True)
+    assert checking.is_set()
+    assert (response.status_code, effects) == (400, []), response.text
+    assert "regular file" in response.text, response.text
+    assert time.monotonic() - started < 1
+    assert len(ticks) > 2
+    assert not list((d.root / "tmp").glob("media-*"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(2)
+async def test_regular_attachment_swapped_to_fifo_before_child_is_refused(
+    daemon, monkeypatch,
+):
+    d = daemon()
+    own = d.root / "tenant" / "fixture.fifo"
+    own.write_bytes(b"ordinary regular fixture")
+    resolved = own.resolve(strict=True)
+    checked, swapped, effects = [], [], []
+    original_is_file = Path.is_file
+
+    def record_route_check(path):
+        regular = original_is_file(path)
+        if path == resolved:
+            checked.append(regular)
+        return regular
+
+    def swap_before_child(payload):
+        assert checked == [True]
+        assert Path(payload["path"]) == resolved and original_is_file(own)
+        own.unlink()
+        os.mkfifo(own)
+        swapped.append(True)
+
+    marker = d.root / "child-copy-entered"
+    child_hook(monkeypatch, d.root, f"""
+import time
+from pathlib import Path
+original_copy = env['copy_attachment']
+def controlled_copy(payload):
+    Path({str(marker)!r}).write_text('entered')
+    time.sleep(0.03)
+    return original_copy(payload)
+env['copy_attachment'] = controlled_copy
+""")
+    monkeypatch.setattr(Path, "is_file", record_route_check)
+    monkeypatch.setattr(isolated_files, "MEDIA_COPY_TIMEOUT_SEC", 0.25)
+    before_child(monkeypatch, swap_before_child)
+    adapter(d, monkeypatch, lambda *args, **kwargs: effects.append(args))
     started = time.monotonic()
     response, ticks = await ticking(async_post(d, own))
+    assert checked == [True] and swapped == [True]
+    assert marker.read_text() == "entered"
     assert (response.status_code, effects) == (400, []), response.text
     assert "regular file" in response.text, response.text
     assert time.monotonic() - started < 1

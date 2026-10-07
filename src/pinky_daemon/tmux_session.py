@@ -5929,7 +5929,7 @@ class TmuxSession(TransportReplacementMixin):
         endpoint exposes ``set_transcript_path`` and cannot select this path.
         """
         if self._tailer is None:
-            return
+            return None
         seek_to_start = (
             self._tailer_first_bind_pending
             and not self._last_launch_used_continue
@@ -5946,6 +5946,7 @@ class TmuxSession(TransportReplacementMixin):
             f"tmux[{self.agent_name}]: transcript path updated to {path}"
             + (" (first-bind — seek_to_start)" if seek_to_start else "")
         )
+        return None
 
     async def get_pane_snapshot(self, *, lines: int = 200) -> str:
         """Return the last ``lines`` lines of the tmux pane, with ANSI

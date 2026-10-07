@@ -10948,7 +10948,21 @@ npm run build</pre>
         if caller_agent is not None:
             working_dir = caller_agent.working_dir
             try:
-                resolved = Path(file_path).resolve(strict=True)
+                root = os.path.realpath(working_dir)
+                registered_root = os.path.normpath(os.path.abspath(working_dir))
+                candidate = os.path.normpath(os.path.abspath(file_path))
+                if (
+                    candidate != root and not candidate.startswith(root + os.sep)
+                    and candidate != registered_root
+                    and not candidate.startswith(registered_root + os.sep)
+                ):
+                    raise HTTPException(403, "file_path must be inside the caller's working directory")
+                resolved_path = os.path.realpath(candidate)
+                if resolved_path != root and not resolved_path.startswith(root + os.sep):
+                    raise HTTPException(403, "file_path must be inside the caller's working directory")
+                resolved = Path(resolved_path)
+                if not await asyncio.to_thread(resolved.is_file):
+                    raise FileNotFoundError("attachment is missing or not a regular file")
             except (OSError, RuntimeError) as e:
                 error_repr = f"{type(e).__name__}: {e}"
                 _outreach_attempt_log(
@@ -10958,8 +10972,6 @@ npm run build</pre>
                 )
                 broker._stop_typing(agent_name, chat_id)
                 raise HTTPException(400, f"Failed to {method}: {error_repr}") from e
-            if not resolved.is_relative_to(Path(working_dir).resolve()):
-                raise HTTPException(403, "file_path must be inside the caller's working directory")
             file_path = str(resolved)
 
         from contextlib import asynccontextmanager
@@ -10980,7 +10992,7 @@ npm run build</pre>
                 yield file_path
 
             attachment = (
-                media_snapshot(resolved, Path(working_dir).resolve(), _data_dir / "tmp")
+                media_snapshot(resolved, Path(root), _data_dir / "tmp")
                 if caller_agent is not None else original_attachment()
             )
             async with attachment as send_path:

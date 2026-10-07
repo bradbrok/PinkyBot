@@ -279,7 +279,8 @@ def _read_owned_codex_rollout(
         ) == os.path.realpath(str(working_dir)):
             return path, (info.st_dev, info.st_ino)
     except (OSError, ValueError, TypeError, AttributeError):
-        pass
+        # Unreadable or malformed metadata cannot identify this agent's rollout.
+        return None
     return None
 
 

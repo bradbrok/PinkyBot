@@ -11,7 +11,7 @@ import stat
 import sys
 import tempfile
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import anyio
@@ -81,10 +81,8 @@ async def _copy_media(payload: dict) -> dict:
     finally:
         with anyio.CancelScope(shield=True):
             if child.returncode is None:
-                try:
+                with suppress(ProcessLookupError):
                     child.kill()
-                except ProcessLookupError:
-                    pass
             await child.wait()
 
 

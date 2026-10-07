@@ -559,8 +559,20 @@ def test_isolated_transcript_never_owns_codex_sessions(daemon, monkeypatch, mode
 
 @pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
 @pytest.mark.parametrize("kind", ["photo", "document", "video"])
-@pytest.mark.parametrize("failure", ["broken-symlink", "not-directory", "loop", "permission", "runtime"])
-def test_isolated_media_resolve_errors_are_rejected(daemon, monkeypatch, mode, kind, failure):
+@pytest.mark.parametrize("failure,filesystem_call", [
+    pytest.param("broken-symlink", None, id="broken-symlink"),
+    pytest.param("not-directory", None, id="not-directory"),
+    pytest.param("loop", None, id="loop"),
+    pytest.param("permission", "realpath", id="permission"),
+    pytest.param("runtime", "realpath", id="runtime"),
+    pytest.param("permission", "is-file", id="permission-is-file"),
+    pytest.param("runtime", "is-file", id="runtime-is-file"),
+    pytest.param("oserror", "realpath", id="oserror-realpath"),
+    pytest.param("oserror", "is-file", id="oserror-is-file"),
+])
+def test_isolated_media_resolve_errors_are_rejected(
+    daemon, monkeypatch, capsys, mode, kind, failure, filesystem_call,
+):
     d = daemon(mode)
     selected = d.root / "tenant" / "invalid"
     if failure == "broken-symlink":
@@ -574,20 +586,39 @@ def test_isolated_media_resolve_errors_are_rejected(daemon, monkeypatch, mode, k
         other.symlink_to(selected)
     else:
         selected.write_text("fixture")
-        original_resolve = Path.resolve
+        forms = {str(selected), str(selected.resolve(strict=True))}
+        error = {"permission": PermissionError, "runtime": RuntimeError, "oserror": OSError}[failure]
+        if filesystem_call == "realpath":
+            original_realpath = os.path.realpath
 
-        def resolve(path, *args, **kwargs):
-            if path == selected and kwargs.get("strict") is True:
-                error = PermissionError if failure == "permission" else RuntimeError
-                raise error("fixture resolve error")
-            return original_resolve(path, *args, **kwargs)
+            def realpath(path, *args, **kwargs):
+                if os.fsdecode(path) in forms:
+                    raise error("fixture filesystem error")
+                return original_realpath(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "resolve", resolve)
+            monkeypatch.setattr(os.path, "realpath", realpath)
+        else:
+            original_is_file = Path.is_file
+
+            def is_file(path, *args, **kwargs):
+                if str(path) in forms:
+                    raise error("fixture filesystem error")
+                return original_is_file(path, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "is_file", is_file)
     adapters, attempts, stopped = [], [], []
     replace_cell(monkeypatch, closure(d.app, "_send_file_message"),
                  "_get_platform_adapter", lambda *args: adapters.append(args))
-    replace_cell(monkeypatch, closure(d.app, "_broker_send_file_route"),
-                 "_outreach_attempt_log", lambda **kwargs: attempts.append(kwargs))
+    route = closure(d.app, "_broker_send_file_route")
+    original_log = dict(zip(route.__code__.co_freevars, route.__closure__))[
+        "_outreach_attempt_log"
+    ].cell_contents
+
+    def log(**kwargs):
+        attempts.append(kwargs)
+        original_log(**kwargs)
+
+    replace_cell(monkeypatch, route, "_outreach_attempt_log", log)
     monkeypatch.setattr(d.app.state.broker, "_stop_typing", lambda *args: stopped.append(args))
     path = f"/broker/send-{kind}"
     client = TestClient(d.app, raise_server_exceptions=False)
@@ -600,3 +631,7 @@ def test_isolated_media_resolve_errors_are_rejected(daemon, monkeypatch, mode, k
     assert adapters == []
     assert len(attempts) == 1 and attempts[0]["outcome"] == "rejected"
     assert stopped == [("tenant", "fixture")]
+    logged = capsys.readouterr().err
+    assert "outreach-attempt: agent=tenant" in logged and "outcome=rejected" in logged
+    if filesystem_call is not None:
+        assert error.__name__ in response.text and f"error={error.__name__}:" in logged
