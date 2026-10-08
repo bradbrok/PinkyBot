@@ -28,8 +28,14 @@ from tests.test_isolated_launch_policy import DENIED, RUNTIMES, prepare
 pytestmark = pytest.mark.real_auth
 
 
-def test_allow_keys_are_exactly_the_independent_29():
-    assert ISOLATED_MUTATION_ALLOW == frozenset(ALLOW_PAIRS)
+def test_allow_keys_retain_the_independent_29_and_only_five_additions():
+    assert ISOLATED_MUTATION_ALLOW == frozenset(ALLOW_PAIRS) | {
+        ("POST", "/tasks"),
+        ("POST", "/tasks/claim/{task_id}"),
+        ("POST", "/tasks/complete/{task_id}"),
+        ("POST", "/tasks/block/{task_id}"),
+        ("DELETE", "/agents/{agent_name}/schedules/{schedule_id}"),
+    }
 
 
 @pytest.mark.parametrize("gate", [None, *ALL_TOOL_GATES])

@@ -9,6 +9,7 @@ from mcp import types
 from pinky_daemon.isolated_policy import (
     CORE_TOOLS,
     GATE_TOOL_NAMES,
+    ISOLATED_TOOL_ROUTES,
     agent_tool_gates,
     isolation_flag,
     policy_mode,
@@ -68,6 +69,10 @@ def install_tool_policy(mcp, mount, registry, skills, signing_key_resolver):
         elif mount == "memory" and isolation_flag(registry, principal.name) is False:
             # The memory server independently applies its dreamer entitlement.
             allowed.update({"reflect_for", "kg_add_for", "recall_for"})
+        if mount in {"self", "messaging"} and isolation_flag(registry, principal.name) is not False:
+            allowed.intersection_update(
+                name for group, name in ISOLATED_TOOL_ROUTES if group == mount
+            )
         return allowed
 
     def notice(mode, principal, operation, name):

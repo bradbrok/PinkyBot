@@ -13,7 +13,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from pinky_daemon.api_models import (
     AddCommentRequest,
@@ -29,6 +30,8 @@ from pinky_daemon.api_models import (
     UpdateTaskRequest,
 )
 from pinky_daemon.autonomy import AgentEvent, EventType
+from pinky_daemon.isolated_policy import isolated_caller_policy
+from pinky_daemon.scheduler import _log
 
 router = APIRouter(tags=["projects-tasks"])
 
@@ -421,8 +424,34 @@ async def complete_sprint(sprint_id: int):
 # ── Tasks ─────────────────────────────────────────────────────────────────────
 
 
+def _task_actor(request, owned, identity):
+    """Check ownership before writes; shadow observes without rewriting identity."""
+    caller, mode = isolated_caller_policy(request)
+    if not caller:
+        return "", None
+    allowed = owned(caller)
+    if mode == "shadow":
+        for reason, mismatch in (("ownership", not allowed), ("identity", identity != caller)):
+            if mismatch:
+                _log(
+                    f"isolation: WOULD DENY {request.method} {request.scope['route'].path} "
+                    f"for {caller} mode=shadow reason={reason}"
+                )
+        return "", None
+    if not allowed:
+        return "", JSONResponse(
+            {"error": "isolated agent may only modify its own tasks"}, status_code=403,
+        )
+    return caller, None
+
+
 @router.post("/tasks")
-async def create_task(req: CreateTaskRequest):
+async def create_task(req: CreateTaskRequest, request: Request):
+    caller, denial = _task_actor(
+        request, lambda name: req.assigned_agent in {"", name}, req.created_by,
+    )
+    if denial is not None:
+        return denial
     task = _tasks.create(
         req.title,
         project_id=req.project_id,
@@ -432,7 +461,7 @@ async def create_task(req: CreateTaskRequest):
         status=req.status,
         priority=req.priority,
         assigned_agent=req.assigned_agent,
-        created_by=req.created_by,
+        created_by=caller or req.created_by,
         tags=req.tags,
         due_date=req.due_date,
         parent_id=req.parent_id,
@@ -536,11 +565,21 @@ async def delete_task(task_id: int):
 
 
 @router.post("/tasks/claim/{task_id}")
-async def claim_task(task_id: int, agent_name: str = ""):
+async def claim_task(task_id: int, request: Request, agent_name: str = ""):
     """Agent claims an unassigned task. Sets status to in_progress."""
     task = _tasks.get(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    caller, denial = _task_actor(
+        request,
+        lambda name: task.assigned_agent == name or (
+            not task.assigned_agent and task.created_by == name
+        ),
+        agent_name,
+    )
+    if denial is not None:
+        return denial
+    agent_name = caller or agent_name
     if task.assigned_agent and task.assigned_agent != agent_name:
         raise HTTPException(409, f"Task already assigned to {task.assigned_agent}")
 
@@ -550,11 +589,15 @@ async def claim_task(task_id: int, agent_name: str = ""):
 
 
 @router.post("/tasks/complete/{task_id}")
-async def complete_task(task_id: int, agent_name: str = "", summary: str = ""):
+async def complete_task(task_id: int, request: Request, agent_name: str = "", summary: str = ""):
     """Agent marks a task as completed with an optional summary."""
     task = _tasks.get(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    caller, denial = _task_actor(request, lambda name: task.assigned_agent == name, agent_name)
+    if denial is not None:
+        return denial
+    agent_name = caller or agent_name
 
     updated = _tasks.update(task_id, status="completed")
     comment = summary or "Task completed"
@@ -583,7 +626,7 @@ async def complete_task(task_id: int, agent_name: str = "", summary: str = ""):
     )
 
     # Auto-ingest substantive task completions into KB (skip trivial summaries)
-    if summary and len(summary) > 50:
+    if not caller and summary and len(summary) > 50:
         project_name = ""
         if task.project_id:
             proj = _tasks.get_project(task.project_id)
@@ -609,11 +652,15 @@ async def complete_task(task_id: int, agent_name: str = "", summary: str = ""):
 
 
 @router.post("/tasks/block/{task_id}")
-async def block_task(task_id: int, agent_name: str = "", reason: str = ""):
+async def block_task(task_id: int, request: Request, agent_name: str = "", reason: str = ""):
     """Agent marks a task as blocked with a reason."""
     task = _tasks.get(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    caller, denial = _task_actor(request, lambda name: task.assigned_agent == name, agent_name)
+    if denial is not None:
+        return denial
+    agent_name = caller or agent_name
 
     updated = _tasks.update(task_id, status="blocked")
     _tasks.add_comment(task_id, agent_name or task.assigned_agent, f"Blocked: {reason}")

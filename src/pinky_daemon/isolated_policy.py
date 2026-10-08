@@ -32,6 +32,19 @@ def isolation_flag(registry, name):
         return None
 
 
+def isolated_caller_policy(request):
+    """Return a verified isolated caller and mode, with uncertain flags closed."""
+    caller = getattr(request.state, "internal_caller", "")
+    mode = policy_mode()
+    if (
+        not caller
+        or mode == "off"
+        or isolation_flag(getattr(request.app.state, "agents", None), caller) is False
+    ):
+        return "", mode
+    return caller, mode
+
+
 SKILL_TO_GATES: dict[str, list[str]] = {
     "pinky-self": [
         "schedule",
@@ -181,48 +194,67 @@ def launch_denies(agent_name, skill_store=None, agent_registry=None, stored=()):
     return sorted(set(stored or ()) | denied)
 
 
-# Exact method/template grants; handlers retain body and object ownership checks.
-ISOLATED_MUTATION_ALLOW = frozenset(
+# Tool visibility and exact mutation grants share these reviewed registrations.
+# Empty tuples are read-only or have no daemon route; handlers retain ownership checks.
+ISOLATED_TOOL_ROUTES = {
+    ("self", "agent_status"): (),
+    ("self", "check_inbox"): (),
+    ("self", "check_my_health"): (),
+    ("self", "context_status"): (),
+    ("self", "get_agent_card"): (),
+    ("self", "get_attribution"): (),
+    ("self", "get_next_task"): (),
+    ("self", "get_owner_profile"): (),
+    ("self", "get_schedule"): (),
+    ("self", "get_task"): (),
+    ("self", "kb_get_wiki"): (),
+    ("self", "kb_search"): (),
+    ("self", "kb_stats"): (),
+    ("self", "list_agents"): (),
+    ("self", "list_call_requests"): (),
+    ("self", "list_my_schedules"): (),
+    ("self", "list_my_skills"): (),
+    ("self", "list_triggers"): (),
+    ("self", "list_voice_calls"): (),
+    ("self", "load_my_context"): (),
+    ("self", "load_skill"): (),
+    ("self", "mcp_probe"): (),
+    ("self", "search_history"): (),
+    ("self", "who_am_i"): (),
+    ("self", "block_task"): (("POST", "/tasks/block/{task_id}"),),
+    ("self", "claim_task"): (("POST", "/tasks/claim/{task_id}"),),
+    ("self", "complete_task"): (("POST", "/tasks/complete/{task_id}"),),
+    ("self", "context_restart"): (("POST", "/agents/{name}/streaming/restart"),),
+    ("self", "create_task"): (("POST", "/tasks"),),
+    ("self", "delete_trigger"): (("DELETE", "/agents/{agent_name}/triggers/{trigger_id}"),),
+    ("self", "discard_pending_schedule_wake"): (
+        ("DELETE", "/agents/{agent_name}/pending-schedule-wakes/{pending_id}"),
+    ),
+    ("self", "mesh_remote_send"): (("POST", "/agents/{name}/mesh/send"),),
+    ("self", "propose_call"): (("POST", "/api/voice/request"),),
+    ("self", "remove_wake_schedule"): (
+        ("DELETE", "/agents/{agent_name}/schedules/{schedule_id}"),  # Owned schedule lookup
+    ),
+    ("self", "save_my_context"): (("PUT", "/agents/{agent_name}/context"),),
+    ("self", "send_heartbeat"): (("POST", "/agents/{agent_name}/heartbeat"),),
+    ("self", "send_to_agent"): (("POST", "/agents/{name}/message"),),
+    ("self", "set_thinking_effort"): (("POST", "/agents/{name}/sessions/{session_label}/effort"),),
+    ("self", "set_wake_schedule"): (("POST", "/agents/{agent_name}/schedules"),),
+    ("self", "test_trigger"): (("POST", "/agents/{agent_name}/triggers/{trigger_id}/test"),),
+    ("self", "update_wake_schedule"): (("PATCH", "/agents/{agent_name}/schedules/{schedule_id}"),),
+    ("messaging", "broadcast"): (("POST", "/broker/broadcast"),),
+    ("messaging", "react"): (("POST", "/broker/react"),),
+    ("messaging", "send"): (("POST", "/broker/send"),),
+    ("messaging", "send_document"): (("POST", "/broker/send-document"),),
+    ("messaging", "send_gif"): (("POST", "/broker/send-gif"),),
+    ("messaging", "send_photo"): (("POST", "/broker/send-photo"),),
+    ("messaging", "send_video"): (("POST", "/broker/send-video"),),
+    ("messaging", "send_voice"): (("POST", "/broker/send-voice"),),
+    ("messaging", "thread"): (("POST", "/broker/thread"),),
+}
+
+ISOLATED_NON_TOOL_ROUTES = frozenset(
     {
-        ("POST", "/broker/thread"),  # Existing thread context and verified body sender
-        ("POST", "/broker/send"),  # Verified body sender
-        ("POST", "/broker/react"),  # Verified body sender
-        ("POST", "/broker/send-voice"),  # Verified body sender
-        ("POST", "/broker/send-gif"),  # Server-selected GIF; verified body sender
-        ("POST", "/broker/send-photo"),  # Verified body sender; file inside own working dir
-        ("POST", "/broker/send-document"),  # Verified body sender; file inside own working dir
-        ("POST", "/broker/send-video"),  # Verified body sender; file inside own working dir
-        ("POST", "/broker/broadcast"),  # Approved recipients and verified body sender
-        ("POST", "/agents/{agent_name}/schedules"),  # New row bound to path agent
-        ("PATCH", "/agents/{agent_name}/schedules/{schedule_id}"),  # Owned schedule lookup
-        (
-            "DELETE",
-            "/agents/{agent_name}/pending-schedule-wakes/{pending_id}",
-        ),  # Owned pending wake lookup
-        ("PUT", "/agents/{agent_name}/context"),  # Own context
-        (
-            "POST",
-            "/agents/{name}/streaming/restart",
-        ),  # Own streaming session; saved-context guard
-        ("POST", "/agents/{agent_name}/heartbeat"),  # Own heartbeat
-        (
-            "POST",
-            "/agents/{name}/sessions/{session_label}/effort",
-        ),  # Session lookup nested under path agent
-        ("POST", "/agents/{name}/message"),  # Existing group exception and body sender check
-        (
-            "POST",
-            "/agents/{name}/mesh/send",
-        ),  # Own sender and outbound destination allowlist
-        ("DELETE", "/agents/{agent_name}/triggers/{trigger_id}"),  # Owned trigger lookup
-        (
-            "POST",
-            "/agents/{agent_name}/triggers/{trigger_id}/test",
-        ),  # Owned trigger lookup before wake
-        (
-            "POST",
-            "/api/voice/request",
-        ),  # Requester derived from verified caller
         ("POST", "/agents/{name}/effort-drift"),  # Own drift telemetry
         ("POST", "/agents/{name}/transport/wake"),  # Own transport notification
         (
@@ -241,6 +273,10 @@ ISOLATED_MUTATION_ALLOW = frozenset(
         ("POST", "/agents/{name}/status"),  # Own working status
         ("POST", "/agents/{name}/policy/evaluate"),  # Own tool-policy evaluation
     }
+)
+
+ISOLATED_MUTATION_ALLOW = ISOLATED_NON_TOOL_ROUTES | frozenset(
+    route for routes in ISOLATED_TOOL_ROUTES.values() for route in routes
 )
 
 
