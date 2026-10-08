@@ -1,7 +1,7 @@
 {
   "schema": "pinky-model-roster/1",
-  "revision": 4,
-  "updated": "2026-10-07",
+  "revision": 5,
+  "updated": "2026-10-08",
   "models": [
     {
       "provider": "anthropic",
@@ -185,7 +185,7 @@
       "pricing": {
         "input": 2.0,
         "output": 10.0,
-        "cached_input": 0.2,
+        "cached_input": 0.1,
         "cache_write_5m": 2.5,
         "cache_write_1h": 4.0
       },
