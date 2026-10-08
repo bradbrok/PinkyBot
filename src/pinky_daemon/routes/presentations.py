@@ -492,7 +492,12 @@ async def render_pdf(req: dict):
         raise HTTPException(400, "invalid filename") from None
 
     try:
-        export_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            export_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            if e.errno in (errno.ENAMETOOLONG, errno.ELOOP):
+                raise HTTPException(400, "invalid filename") from None
+            raise
         if resolved_path.parent != export_dir:
             try:
                 same_directory = os.path.samefile(resolved_path.parent, export_dir)
@@ -507,7 +512,11 @@ async def render_pdf(req: dict):
     except ImportError:
         raise HTTPException(503, "WeasyPrint not installed — cannot render PDFs") from None
     except Exception as e:
-        if isinstance(e, OSError) and e.errno in (errno.ENAMETOOLONG, errno.ELOOP):
+        if (
+            isinstance(e, OSError)
+            and e.errno in (errno.ENAMETOOLONG, errno.ELOOP)
+            and e.filename == path
+        ):
             raise HTTPException(400, "invalid filename") from None
         raise HTTPException(500, f"PDF rendering failed: {e}") from e
 
