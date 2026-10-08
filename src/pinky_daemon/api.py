@@ -3401,7 +3401,13 @@ def create_api(
                 elif not (row.parked_at or row.abandoned_at):
                     schedule = agents.get_schedule(row.schedule_id)
                     if schedule is not None and not schedule.one_shot:
-                        owed.append(f"- {row.name} (fired_at={row.fired_at})")
+                        # The scheduler still delivers the stored prompt with an exact
+                        # receipt; say so, or a bare name reads as an instruction to run it.
+                        owed.append(
+                            f"- {row.name} (fired_at={row.fired_at}): not delivered yet; "
+                            "the full prompt arrives as its own message, so don't start it "
+                            "from this list"
+                        )
             if owed:
                 wake_ctx += "\n\nOwed scheduled wakes:\n" + "\n".join(owed)
         except Exception as exc:
