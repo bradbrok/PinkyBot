@@ -11907,6 +11907,10 @@ class TestWakeSubmissionVerification:
         assert target == ss.agent_name
         assert instruction.startswith("CONTEXT-RELOAD:")
         assert "already oriented" in instruction
+        assert "do not message transport-recovery" in instruction, (
+            "the sender is the daemon; a reply message has no reader"
+        )
+        assert "reply 'already oriented'" not in instruction
         assert "continue the work you were doing in this same turn" in instruction, (
             "already-oriented recovery must continue current work in the same turn"
         )
