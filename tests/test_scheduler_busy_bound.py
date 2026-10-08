@@ -440,6 +440,26 @@ async def test_restart_context_warns_unconsumed_paste_read_only(tmp_path, clock,
     registry.close()
 
 
+async def test_restart_context_marks_unpasted_owed_wake_as_pending_delivery(tmp_path, clock):
+    from pinky_daemon.api import create_api
+
+    app = create_api(default_working_dir=str(tmp_path), db_path=str(tmp_path / "api.db"))
+    registry = app.state.agents
+    registry.register("worker")
+    pending = fire(registry)
+    before = registry.get_schedule_wake_by_fire(pending.schedule_id, NOW).to_dict()
+    text = app.state._build_streaming_wake_context("worker", commit=False)
+    line = next(ln for ln in text.splitlines() if ln.startswith("- periodic "))
+    assert str(NOW) in line
+    assert "not delivered yet; the full prompt arrives as its own message" in line
+    assert "don't start it from this list" in line
+    assert "pasted before the restart" not in line
+    assert pending.prompt not in text
+    assert registry.get_schedule_wake_by_fire(pending.schedule_id, NOW).to_dict() == before
+    await app.state.scheduler.stop()
+    registry.close()
+
+
 async def test_live_paste_survives_reaper_and_replay(registry, clock):
     pending = fire(registry, at=NOW - 3500)
     assert callable(getattr(registry, "mark_schedule_wake_pasted", None)), "missing write-ahead paste marker"
