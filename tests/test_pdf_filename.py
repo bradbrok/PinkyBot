@@ -337,3 +337,58 @@ def test_pdf_oversized_output_uses_configured_path(renderer, monkeypatch, record
     assert response.json() == {'detail': 'invalid filename'}
     assert renderer.attempts == [Path(expected)]
     assert renderer.writes == [] and list(renderer.export.iterdir()) == []
+
+
+@pytest.mark.parametrize('configured', ['/', '//', '///', '/./'],
+                         ids=['root', 'double-slash', 'triple-slash', 'root-dot'])
+def test_pdf_accepts_root_export_directory_without_root_io(renderer, monkeypatch, configured):
+    from pinky_daemon.routes import presentations
+
+    expected = os.path.abspath(os.path.join(configured, 'report.pdf'))
+    export = Path(configured)
+    calls = []
+    targets = []
+
+    class RootPath(type(Path())):
+        def resolve(self, strict=False):
+            assert self in (export, Path(expected))
+            calls.append(('resolve', str(self)))
+            # These absolute paths need only lexical normalization for this case.
+            return self
+
+        def mkdir(self, mode=0o777, parents=False, exist_ok=False):
+            assert self == export and parents and exist_ok
+            calls.append(('mkdir', str(self)))
+
+    def record_target(self, path):
+        targets.append(path)
+
+    def unexpected_samefile(*args):
+        pytest.fail('root paths must not reach the real filesystem')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(research_export, 'EXPORT_DIR', configured)
+        patch.setattr(presentations, 'Path', RootPath)
+        patch.setattr(presentations.os.path, 'samefile', unexpected_samefile)
+        patch.setattr(sys.modules['weasyprint'].HTML, 'write_pdf', record_target)
+        response = render(renderer, 'report')
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {'success': True, 'path': expected, 'filename': 'report.pdf'}
+    assert targets == [expected]
+    assert calls == [('resolve', str(export)), ('resolve', str(Path(expected))),
+                     ('mkdir', str(export))]
+    assert renderer.attempts == [] and renderer.writes == []
+    assert list(renderer.export.iterdir()) == []
+
+
+@pytest.mark.parametrize('trailing_separator', [False, True], ids=['plain', 'trailing-separator'])
+def test_pdf_accepts_export_directory_separator_forms(renderer, monkeypatch, trailing_separator):
+    configured = str(renderer.export) + (os.sep if trailing_separator else '')
+    monkeypatch.setattr(research_export, 'EXPORT_DIR', configured)
+    expected = os.path.abspath(os.path.join(configured, 'report.pdf'))
+    response = render(renderer, 'report')
+    assert response.status_code == 200, response.text
+    assert response.json() == {'success': True, 'path': expected, 'filename': 'report.pdf'}
+    assert renderer.writes == [Path(expected)]
+    assert Path(expected).read_bytes() == b'%PDF synthetic'
