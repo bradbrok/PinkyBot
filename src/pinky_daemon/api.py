@@ -9705,14 +9705,14 @@ npm run build</pre>
     @app.delete("/agents/{name}/directives/{directive_id}")
     async def remove_directive(name: str, directive_id: int):
         """Remove a directive."""
-        if not agents.remove_directive(directive_id):
+        if not agents.remove_directive(directive_id, agent_name=name):
             raise HTTPException(404, "Directive not found")
         return {"deleted": True, "id": directive_id}
 
     @app.post("/agents/{name}/directives/{directive_id}/toggle")
     async def toggle_directive(name: str, directive_id: int, active: bool = True):
         """Enable or disable a directive."""
-        if not agents.toggle_directive(directive_id, active):
+        if not agents.toggle_directive(directive_id, active, agent_name=name):
             raise HTTPException(404, "Directive not found")
         return {"id": directive_id, "active": active}
 

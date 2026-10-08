@@ -1456,7 +1456,7 @@ class TestDirectives:
         registry.register("oleg")
         _d1 = registry.add_directive("oleg", "Active")
         d2 = registry.add_directive("oleg", "Inactive")
-        registry.toggle_directive(d2.id, False)
+        registry.toggle_directive(d2.id, False, agent_name=d2.agent_name)
         active = registry.get_directives("oleg", active_only=True)
         assert len(active) == 1
         all_d = registry.get_directives("oleg", active_only=False)
@@ -1465,13 +1465,13 @@ class TestDirectives:
     def test_remove_directive(self, registry):
         registry.register("oleg")
         d = registry.add_directive("oleg", "Temp rule")
-        assert registry.remove_directive(d.id) is True
+        assert registry.remove_directive(d.id, agent_name=d.agent_name) is True
         assert len(registry.get_directives("oleg")) == 0
 
     def test_toggle_directive(self, registry):
         registry.register("oleg")
         d = registry.add_directive("oleg", "Toggle me")
-        registry.toggle_directive(d.id, False)
+        registry.toggle_directive(d.id, False, agent_name=d.agent_name)
         directives = registry.get_directives("oleg", active_only=False)
         assert directives[0].active is False
 
