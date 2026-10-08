@@ -534,9 +534,10 @@ _WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC = 5.0
 _WAKE_SUBMISSION_BROKER_TIMEOUT_SEC = 5.0
 _WAKE_CONTEXT_RELOAD_INSTRUCTION = (
     "CONTEXT-RELOAD: If an orientation wake for this session already appears "
-    "above and you have begun acting on it, reply 'already oriented', "
-    "do not reload or restart, and continue the work you were doing in this same "
-    "turn. Otherwise, reload the saved continuation state now with load_my_context, "
+    "above and you have begun acting on it, say 'already oriented' in your own "
+    "turn (do not message transport-recovery: it is a daemon sender and nothing "
+    "reads replies), do not reload or restart, and continue the work you were "
+    "doing in this same turn. Otherwise, reload the saved continuation state now with load_my_context, "
     "then resume from that durable artifact. This is a distinct recovery "
     "instruction; never replay the failed orientation wake text."
 )
