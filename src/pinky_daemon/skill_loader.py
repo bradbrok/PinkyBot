@@ -23,6 +23,7 @@ from pathlib import Path
 
 import yaml
 
+from pinky_daemon.frontmatter import split_frontmatter
 from pinky_daemon.skill_tool_policy import (
     ToolPatternValidationError,
     split_tool_pattern_scalar,
@@ -57,8 +58,6 @@ class ParsedSkill:
 # ── SKILL.md Parsing ──────────────────────────────────────
 
 
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL)
-
 # Name validation: lowercase letters, numbers, hyphens; no start/end/consecutive hyphens
 _NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 _CONSECUTIVE_HYPHENS = re.compile(r"--")
@@ -84,12 +83,12 @@ def parse_skill_md(path: str | Path) -> ParsedSkill | None:
         return None
 
     # Extract frontmatter
-    match = _FRONTMATTER_RE.match(content)
+    match = split_frontmatter(content)
     if not match:
         _log(f"skill_loader: no valid frontmatter in {path}")
         return None
 
-    yaml_text, body = match.group(1), match.group(2).strip()
+    yaml_text, body = match[0], match[1].strip()
 
     # Parse YAML (with fallback for common issues)
     try:

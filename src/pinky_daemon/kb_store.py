@@ -34,6 +34,7 @@ from pathlib import Path
 
 import yaml
 
+from pinky_daemon.frontmatter import split_frontmatter
 from pinky_daemon.store_catalog import StoreCatalog, open_store_connection
 
 
@@ -57,14 +58,11 @@ def _content_hash(content: str) -> str:
 def _content_preview(content: str) -> str:
     """First ~500 chars of content body (after frontmatter) for fuzzy dedup."""
     # Strip YAML frontmatter
-    match = re.match(r"^---\s*\n.*?\n---\s*\n?(.*)", content, re.DOTALL)
-    body = match.group(1) if match else content
+    match = split_frontmatter(content)
+    body = match[1] if match else content
     # Normalize whitespace
     body = re.sub(r"\s+", " ", body).strip()
     return body[:500]
-
-
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL)
 
 
 def _fts5_phrase(query: str) -> str:
@@ -78,11 +76,11 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
     Returns:
         (frontmatter_dict, body_text) — body has the '# Title' header stripped.
     """
-    m = _FRONTMATTER_RE.match(text)
+    m = split_frontmatter(text)
     if not m:
         return {}, text
-    fm = yaml.safe_load(m.group(1)) or {}
-    body = m.group(2).strip()
+    fm = yaml.safe_load(m[0]) or {}
+    body = m[1].strip()
     # Strip leading '# Title' line if present
     body_lines = body.split("\n", 1)
     if body_lines and body_lines[0].startswith("# "):
@@ -928,8 +926,8 @@ class KBStore:
                 full_path = self.kb_dir / row["file_path"]
                 if full_path.exists():
                     content = full_path.read_text(encoding="utf-8")
-                    match = _FRONTMATTER_RE.match(content)
-                    body = match.group(2) if match else content
+                    match = split_frontmatter(content)
+                    body = match[1] if match else content
                     conn.execute(
                         "INSERT INTO fts_content (ref_id, kind, title, body, tags) "
                         "VALUES (?, ?, ?, ?, ?)",
@@ -942,8 +940,8 @@ class KBStore:
                 full_path = self.kb_dir / row["file_path"]
                 if full_path.exists():
                     content = full_path.read_text(encoding="utf-8")
-                    match = _FRONTMATTER_RE.match(content)
-                    body = match.group(2) if match else content
+                    match = split_frontmatter(content)
+                    body = match[1] if match else content
                     conn.execute(
                         "INSERT INTO fts_content (ref_id, kind, title, body, tags) "
                         "VALUES (?, ?, ?, ?, ?)",

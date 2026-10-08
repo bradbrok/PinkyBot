@@ -15,7 +15,8 @@ import re
 import sys
 from datetime import datetime, timezone
 
-from pinky_daemon.kb_store import _FRONTMATTER_RE, KBStore, _content_hash
+from pinky_daemon.frontmatter import split_frontmatter
+from pinky_daemon.kb_store import KBStore, _content_hash
 
 
 def _log(msg: str) -> None:
@@ -320,8 +321,8 @@ def save_wiki_pages(kb: KBStore, pages: list[dict]) -> list[str]:
             )
 
             # Extract body from content (strip frontmatter)
-            match = _FRONTMATTER_RE.match(content)
-            body = match.group(2) if match else content
+            match = split_frontmatter(content)
+            body = match[1] if match else content
 
             conn.execute(
                 "INSERT INTO fts_content (ref_id, kind, title, body, tags) "
