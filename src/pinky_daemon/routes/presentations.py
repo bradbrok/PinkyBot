@@ -485,6 +485,9 @@ async def render_pdf(req: dict):
         raise HTTPException(400, "invalid filename")
     filename += ".pdf"
     path = os.path.abspath(os.path.join(EXPORT_DIR, filename))
+    export_root = os.path.abspath(EXPORT_DIR)
+    if not path.startswith(export_root + os.sep):
+        raise HTTPException(400, "invalid filename")
     try:
         export_dir = Path(EXPORT_DIR).resolve()
         resolved_path = Path(path).resolve()
