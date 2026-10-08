@@ -234,3 +234,17 @@ def test_pdf_rejects_oversized_export_directory(renderer, monkeypatch):
     assert response.json() == {'detail': 'invalid filename'}
     assert renderer.writes == []
     assert renderer.attempts == []
+
+
+def test_pdf_rejects_symlink_into_missing_outside_directory(renderer):
+    outside = renderer.root / 'missing' / 'original.pdf'
+    target = renderer.export / 'report.pdf'
+    target.symlink_to(outside)
+    response = render(renderer, 'report')
+    assert response.status_code == 400, response.text
+    assert response.json() == {'detail': 'invalid filename'}
+    assert renderer.attempts == []
+    assert renderer.writes == []
+    assert not outside.parent.exists()
+    assert target.is_symlink()
+    assert os.readlink(target) == str(outside)

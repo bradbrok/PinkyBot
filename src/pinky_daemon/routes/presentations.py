@@ -493,8 +493,13 @@ async def render_pdf(req: dict):
 
     try:
         export_dir.mkdir(parents=True, exist_ok=True)
-        if resolved_path.parent != export_dir and not os.path.samefile(resolved_path.parent, export_dir):
-            raise HTTPException(400, "invalid filename")
+        if resolved_path.parent != export_dir:
+            try:
+                same_directory = os.path.samefile(resolved_path.parent, export_dir)
+            except OSError:
+                same_directory = False
+            if not same_directory:
+                raise HTTPException(400, "invalid filename")
         from weasyprint import HTML as WP_HTML
         WP_HTML(string=html_str).write_pdf(path)
     except HTTPException:
