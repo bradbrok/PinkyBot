@@ -18,6 +18,11 @@ def _thinking() -> SimpleNamespace:
     return SimpleNamespace(type="thinking", thinking="", signature="sig")
 
 
+def _redacted_thinking() -> SimpleNamespace:
+    # Real redacted_thinking blocks carry only opaque ``data`` -- no ``text`` attribute.
+    return SimpleNamespace(type="redacted_thinking", data="opaque")
+
+
 def _text(text: str) -> SimpleNamespace:
     return SimpleNamespace(type="text", text=text)
 
@@ -28,6 +33,16 @@ def _response(*blocks, stop_reason: str = "end_turn") -> SimpleNamespace:
 
 def test_thinking_block_first_then_text():
     assert message_text(_response(_thinking(), _text('{"ok": true}'))) == '{"ok": true}'
+
+
+def test_redacted_thinking_first_then_text():
+    assert message_text(_response(_redacted_thinking(), _text("ok"))) == "ok"
+
+
+def test_mixed_thinking_blocks_around_text_are_skipped_and_text_joined():
+    # Haiku/Sonnet 5.5 think by default; text can be split around thinking blocks.
+    resp = _response(_thinking(), _text("first "), _redacted_thinking(), _thinking(), _text("second"))
+    assert message_text(resp) == "first second"
 
 
 def test_joins_all_text_blocks_skipping_others():
@@ -41,6 +56,8 @@ def test_joins_all_text_blocks_skipping_others():
     "resp",
     [
         _response(_thinking()),
+        _response(_redacted_thinking()),
+        _response(_thinking(), _redacted_thinking()),
         _response(),
         _response(_thinking(), stop_reason="max_tokens"),
         SimpleNamespace(content=None),
