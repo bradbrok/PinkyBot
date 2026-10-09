@@ -6,8 +6,8 @@ Personal AI companion framework powered by Claude Code. Manages persistent AI ag
 
 - **`src/pinky_daemon/`** — Core daemon: FastAPI API (`api.py`), agent registry, session management, message handling, scheduling, dreams, skills, content scanning
 - **`src/pinky_memory/`** — MCP server for agent long-term memory (vector + semantic search)
-- **`src/pinky_messaging/`** — MCP server for Telegram/Discord/Slack messaging
-- **`src/pinky_outreach/`** — MCP server for proactive outreach tools (send, thread, react, broadcast)
+- **`src/pinky_messaging/`** — MCP server for agent messaging tools (send, thread, react, broadcast, media)
+- **`src/pinky_outreach/`** — Platform adapters and MCP server for Telegram/Discord/Slack/iMessage/WhatsApp/Buzz
 - **`src/pinky_self/`** — MCP server for agent self-awareness (read own config, update soul, manage directives)
 - **`src/pinky_calendar/`** — MCP server for Google Calendar / CalDAV
 - **`src/pinky_cli/`** — CLI entry point
