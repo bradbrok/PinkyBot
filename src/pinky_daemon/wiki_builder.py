@@ -15,6 +15,7 @@ import re
 import sys
 from datetime import datetime, timezone
 
+from pinky_daemon.anthropic_text import message_text
 from pinky_daemon.frontmatter import split_frontmatter
 from pinky_daemon.kb_store import KBStore, _content_hash
 
@@ -368,14 +369,18 @@ async def run_wiki_builder(
 
     _log("[WikiBuilder] Generating wiki pages...")
     response = client.messages.create(
-        model="claude-sonnet-4-6-20260217",
+        model="claude-sonnet-4-6",
         max_tokens=8192,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
     )
 
-    response_text = response.content[0].text
-    pages = parse_wiki_response(response_text)
+    try:
+        text = message_text(response)
+    except ValueError as e:
+        _log(f"[WikiBuilder] {e}")
+        raise
+    pages = parse_wiki_response(text)
 
     if not pages:
         _log("[WikiBuilder] No pages generated")
