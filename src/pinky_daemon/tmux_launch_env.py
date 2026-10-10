@@ -42,18 +42,6 @@ _CLOCK_SKEW = 300.0
 class UnsafeDirectoryError(PermissionError):
     """A directory refusal containing only trusted labels and numeric metadata."""
 
-    def __init__(self, label: str, mode: int, owner: int, euid: int, rule: str):
-        self.label, self.euid, self.rule = label, euid, rule
-        self.mode, self.owner = mode, owner
-        kind = "home" if label == "~" else "directory"
-        super().__init__(
-            f"unsafe launch environment {kind}: {label} mode {mode:04o} "
-            f"owner uid {owner} effective uid {euid} ({rule})"
-        )
-
-    def __reduce__(self):
-        return type(self), (self.label, self.mode, self.owner, self.euid, self.rule)
-
 
 def _check_directory(info, label: str, *, private: bool) -> None:
     euid, mode = os.geteuid(), stat.S_IMODE(info.st_mode)
@@ -61,7 +49,13 @@ def _check_directory(info, label: str, *, private: bool) -> None:
         rule = "owner" if info.st_uid != euid else (
             "group/other access" if private else "group/other-writable"
         )
-        raise UnsafeDirectoryError(label, mode, info.st_uid, euid, rule)
+        kind = "home" if label == "~" else "directory"
+        exc = UnsafeDirectoryError(
+            f"unsafe launch environment {kind}: {label} mode {mode:04o} "
+            f"owner uid {info.st_uid} effective uid {euid} ({rule})"
+        )
+        exc.label, exc.euid, exc.rule = label, euid, rule
+        raise exc
 
 
 def ambient_env(items, warn) -> dict[str, str]:

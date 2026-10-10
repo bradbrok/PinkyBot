@@ -141,20 +141,47 @@ def test_new_scope_message(home):
 
 
 @pytest.mark.parametrize("operation", ["copy", "deepcopy", "pickle"])
-def test_new_directory_error_round_trip(home, operation):
-    scope = state_tree(home) / SCOPE
-    scope.mkdir(mode=0o750)
+@pytest.mark.parametrize("annotated", [False, True])
+def test_new_directory_error_round_trip(home, monkeypatch, operation, annotated):
+    state_tree(home)
+    target = home / ".local/state"
+    target.chmod(0o1775)
+    owner = fake_owner(monkeypatch, target)
     with pytest.raises(PermissionError) as caught:
         stage()
     original = caught.value
+    assert_details(str(original), home, "~/.local/state", 0o1775, "owner", owner)
+    fields = {
+        "label": "~/.local/state", "euid": os.geteuid(), "rule": "owner",
+    }
+    assert vars(original) == fields
+    if annotated:
+        tmux_session.TmuxSession._annotate_spawn_rollback_failure(
+            original, "synthetic rollback failure",
+        )
+        fields["__notes__"] = ["synthetic rollback failure"]
+        assert str(original) == (
+            expected_refusal("~/.local/state", 0o1775, "owner", owner)
+            + "; synthetic rollback failure"
+        )
     restored = (pickle.loads(pickle.dumps(original)) if operation == "pickle" else
                 getattr(copy, operation)(original))
     assert type(restored) is tmux_launch_env.UnsafeDirectoryError
     assert str(restored) == str(original)
-    assert_details(str(restored), home, "scope", 0o750, "group/other access")
-    assert (restored.label, restored.euid, restored.rule) == (
-        "scope", os.geteuid(), "group/other access",
-    )
+    assert restored.args == original.args
+    assert getattr(restored, "__notes__", None) == getattr(original, "__notes__", None)
+    assert vars(original) == vars(restored) == fields
+    assert_private_message(str(restored), home)
+
+
+def test_new_conflicting_owner_and_mode_refusal(home, monkeypatch):
+    state_tree(home)
+    target = home / ".local/state"
+    target.chmod(0o1775)
+    owner = fake_owner(monkeypatch, target)
+    with pytest.raises(PermissionError) as caught:
+        stage()
+    assert_details(str(caught.value), home, "~/.local/state", 0o1775, "owner", owner)
 
 
 async def test_new_local_runner_preserves_message(home):
@@ -269,6 +296,22 @@ async def test_new_startup_owner_hint(home, mode, startup, monkeypatch):
 
 
 @pytest.mark.parametrize("mode", ["api", "poll"])
+async def test_new_conflicting_owner_and_mode_warning(home, mode, startup, monkeypatch):
+    state_tree(home)
+    target = home / ".local/state"
+    target.chmod(0o1775)
+    owner = fake_owner(monkeypatch, target)
+    start, logged = startup
+    await start()
+    await start()
+    assert warnings(logged) == [expected_warning(
+        "~/.local/state", 0o1775, "owner",
+        f"~/.local/state must be owned by uid {os.geteuid()}", owner,
+    )]
+    assert_private_message(warnings(logged)[0], home)
+
+
+@pytest.mark.parametrize("mode", ["api", "poll"])
 @pytest.mark.parametrize("error_number", [errno.EACCES, errno.ELOOP, 999999])
 async def test_new_startup_unexpected_error_is_symbol_only(
     home, mode, startup, monkeypatch, error_number,
@@ -288,8 +331,11 @@ async def test_new_startup_unexpected_error_is_symbol_only(
 
 @pytest.mark.parametrize("mode", ["api", "poll"])
 async def test_new_startup_non_oserror_is_unknown(home, mode, startup, monkeypatch):
+    class UnexpectedError(Exception):
+        pass
+
     def fail(**kwargs):
-        raise RuntimeError("sensitive-detail: " + str(home))
+        raise UnexpectedError("sensitive-detail: " + str(home))
 
     monkeypatch.setattr(tmux_launch_env, "_state_directory", fail)
     start, logged = startup
@@ -302,6 +348,9 @@ async def test_new_startup_non_oserror_is_unknown(home, mode, startup, monkeypat
 
 @pytest.mark.parametrize("mode", ["api", "poll"])
 async def test_new_startup_log_failure_does_not_stop_startup(home, mode, startup, monkeypatch):
+    class UnexpectedError(Exception):
+        pass
+
     state_tree(home)
     (home / ".local/state").chmod(0o775)
     start, logged = startup
@@ -312,7 +361,7 @@ async def test_new_startup_log_failure_does_not_stop_startup(home, mode, startup
     def fail(message):
         if message.startswith("WARNING launch environment state directory"):
             attempted.append(message)
-            raise RuntimeError("sensitive-detail: " + str(home))
+            raise UnexpectedError("sensitive-detail: " + str(home))
         normal_log(message)
 
     monkeypatch.setattr(module, "_log", fail)
