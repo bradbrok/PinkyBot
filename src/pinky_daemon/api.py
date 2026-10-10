@@ -3397,6 +3397,13 @@ def create_api(
             owed = []
             for row in agents.list_pending_schedule_wakes(agent_name, include_parked=True):
                 if row.pasted_at:
+                    schedule = agents.get_schedule(row.schedule_id)
+                    if (
+                        schedule is not None
+                        and not schedule.one_shot
+                        and row.fired_at <= schedule.last_accepted_fired_at
+                    ):
+                        continue
                     owed.append(f"- {row.name} (fired_at={row.fired_at}): pasted before the restart, may not have run; check before redoing")
                 elif not (row.parked_at or row.abandoned_at):
                     schedule = agents.get_schedule(row.schedule_id)

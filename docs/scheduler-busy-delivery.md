@@ -19,6 +19,8 @@ wake, but its replay cannot duplicate work. If that session is lost before
 acceptance while its receipt is still active, the row records `PASTED_UNCONFIRMED_SESSION_LOST` and follows the
 existing owner-alert route. Restart context lists its schedule name and fire
 time with a warning to check before redoing the work.
+This listing stops once a later fire of the same recurring schedule has been
+accepted, or when the ledger row is pruned.
 
 A past-deadline paste has a fresh acceptance window from the paste handoff.
 Only existing transcript or queue-dequeue evidence grants acceptance. Released

@@ -46,6 +46,184 @@ def fire(registry, *, at=NOW, name="periodic", cron="0 * * * *"):
     return pending
 
 
+@pytest.fixture
+def wake_context_app(tmp_path):
+    from pinky_daemon.api import create_api
+
+    app = create_api(default_working_dir=str(tmp_path), db_path=str(tmp_path / "api.db"))
+    app.state.agents.register("worker")
+    yield app
+    app.state.agents.close()
+
+
+def same_schedule_fire(registry, pending, at):
+    schedule = registry.get_schedule(pending.schedule_id)
+    assert schedule is not None
+    row, created = registry.persist_schedule_wake(
+        schedule.id, agent_name="worker", schedule_name=schedule.name,
+        prompt=schedule.prompt, fired_at=at,
+    )
+    assert created
+    return row
+
+
+def pasted_fire(registry, pending, *, pasted_at=NOW, abandoned=True):
+    assert registry.mark_schedule_wake_pasted(
+        pending.schedule_id, pending.fired_at, pasted_at=pasted_at, session_id="old-session",
+    )
+    if abandoned:
+        assert registry.abandon_pending_schedule_wake(
+            pending.id, abandoned_at=pasted_at + 30,
+            reason="PASTED_UNCONFIRMED_SESSION_LOST",
+        )
+
+
+def accept_fire(registry, pending, *, delivered_at=NOW + 5000):
+    assert registry.confirm_pending_schedule_wake_by_fire(
+        pending.schedule_id, pending.fired_at, delivered_at=delivered_at,
+    )
+
+
+def pasted_line(pending):
+    return (
+        f"- {pending.name} (fired_at={pending.fired_at}): pasted before the restart, "
+        "may not have run; check before redoing"
+    )
+
+
+def unpasted_line(pending):
+    return (
+        f"- {pending.name} (fired_at={pending.fired_at}): not delivered yet; "
+        "the full prompt arrives as its own message, so don't start it from this list"
+    )
+
+
+def assert_owed_context(app, rows, expected, *, commit):
+    registry = app.state.agents
+    identities = [(row.schedule_id, row.fired_at) for row in rows]
+    schedule_ids = {row.schedule_id for row in rows}
+
+    def ledger_snapshot():
+        snapshot = {}
+        for identity in identities:
+            row = registry.get_schedule_wake_by_fire(*identity)
+            snapshot[identity] = row.to_dict() if row is not None else None
+        return snapshot
+
+    before_rows = ledger_snapshot()
+    before_schedules = {sid: registry.get_schedule(sid) for sid in schedule_ids}
+    text = app.state._build_streaming_wake_context("worker", commit=commit)
+    assert ledger_snapshot() == before_rows
+    assert {sid: registry.get_schedule(sid) for sid in schedule_ids} == before_schedules
+    lines = text.splitlines()
+    header = "Owed scheduled wakes:"
+    actual = []
+    if header in lines:
+        index = lines.index(header) + 1
+        while index < len(lines) and lines[index]:
+            actual.append(lines[index])
+            index += 1
+    assert actual == expected
+    assert lines.count(header) == (1 if expected else 0)
+    return text
+
+
+@pytest.mark.parametrize("commit", [False, True])
+@pytest.mark.parametrize("abandoned", [False, True])
+def test_restart_context_omits_superseded_paste(wake_context_app, commit, abandoned):
+    registry = wake_context_app.state.agents
+    old = fire(registry)
+    pasted_fire(registry, old, abandoned=abandoned)
+    later = same_schedule_fire(registry, old, NOW + 3600)
+    accept_fire(registry, later)
+    assert_owed_context(wake_context_app, [old, later], [], commit=commit)
+
+
+@pytest.mark.parametrize("commit", [False, True])
+@pytest.mark.parametrize("abandoned", [False, True])
+def test_restart_context_omits_superseded_late_paste(wake_context_app, commit, abandoned):
+    registry = wake_context_app.state.agents
+    old = fire(registry)
+    pasted_fire(registry, old, pasted_at=NOW + 7200, abandoned=abandoned)
+    later = same_schedule_fire(registry, old, NOW + 3600)
+    accept_fire(registry, later, delivered_at=NOW + 7300)
+    assert_owed_context(wake_context_app, [old, later], [], commit=commit)
+
+
+@pytest.mark.parametrize("commit", [False, True])
+@pytest.mark.parametrize("abandoned", [False, True])
+def test_restart_context_retains_paste_without_acceptance(wake_context_app, commit, abandoned):
+    registry = wake_context_app.state.agents
+    old = fire(registry)
+    pasted_fire(registry, old, abandoned=abandoned)
+    assert_owed_context(wake_context_app, [old], [pasted_line(old)], commit=commit)
+
+
+@pytest.mark.parametrize("commit", [False, True])
+def test_restart_context_retains_newer_paste_after_late_older_receipt(wake_context_app, commit):
+    registry = wake_context_app.state.agents
+    older = fire(registry, at=NOW - 7200)
+    lost = same_schedule_fire(registry, older, NOW)
+    pasted_fire(registry, lost)
+    accept_fire(registry, older, delivered_at=NOW + 5000)
+    schedule = registry.get_schedule(lost.schedule_id)
+    assert schedule.last_delivered > lost.fired_at > schedule.last_accepted_fired_at
+    assert_owed_context(wake_context_app, [older, lost], [pasted_line(lost)], commit=commit)
+
+
+@pytest.mark.parametrize("commit", [False, True])
+def test_restart_context_retains_rearmed_one_shot_paste(wake_context_app, commit):
+    registry = wake_context_app.state.agents
+    old = fire(registry)
+    assert registry.update_schedule(old.schedule_id, one_shot=True) is not None
+    pasted_fire(registry, old)
+    assert registry.update_schedule(old.schedule_id, prompt="replacement prompt") is not None
+    later = same_schedule_fire(registry, old, NOW + 3600)
+    accept_fire(registry, later)
+    assert_owed_context(wake_context_app, [old, later], [pasted_line(old)], commit=commit)
+
+
+@pytest.mark.parametrize("commit", [False, True])
+def test_restart_context_retains_removed_schedule_paste_in_order(wake_context_app, commit):
+    registry = wake_context_app.state.agents
+    removed = fire(registry, name="alpha", at=NOW - 300)
+    pasted_fire(registry, removed)
+    later = same_schedule_fire(registry, removed, NOW + 3600)
+    accept_fire(registry, later)
+    assert registry.remove_schedule(removed.schedule_id)
+    retained = fire(registry, name="beta", at=NOW - 200)
+    pasted_fire(registry, retained, abandoned=False)
+    assert_owed_context(
+        wake_context_app, [removed, later, retained],
+        [pasted_line(removed), pasted_line(retained)], commit=commit,
+    )
+
+
+@pytest.mark.parametrize("commit", [False, True])
+def test_restart_context_keeps_unpasted_pending_line(wake_context_app, commit):
+    registry = wake_context_app.state.agents
+    pending = fire(registry)
+    later = same_schedule_fire(registry, pending, NOW + 3600)
+    accept_fire(registry, later)
+    assert_owed_context(wake_context_app, [pending, later], [unpasted_line(pending)], commit=commit)
+
+
+@pytest.mark.parametrize("commit", [False, True])
+def test_restart_context_skips_superseded_row_without_truncating_list(wake_context_app, commit):
+    registry = wake_context_app.state.agents
+    old = fire(registry, name="alpha", at=NOW - 300)
+    pasted_fire(registry, old)
+    later = same_schedule_fire(registry, old, NOW + 3600)
+    accept_fire(registry, later)
+    retained = fire(registry, name="beta", at=NOW - 200)
+    pasted_fire(registry, retained, abandoned=False)
+    pending = fire(registry, name="gamma", at=NOW - 100)
+    assert_owed_context(
+        wake_context_app, [old, later, retained, pending],
+        [pasted_line(retained), unpasted_line(pending)], commit=commit,
+    )
+
+
 def session(tmp_path, kind=TmuxSession):
     tmux = MagicMock(spec=_TmuxControl)
     tmux.session_name = "test-bound"
@@ -171,12 +349,9 @@ def test_restart_context_lists_owed_wakes_without_consuming(tmp_path, commit):
     registry = app.state.agents
     registry.register("worker")
     pending = fire(registry)
-    before = registry.get_schedule_wake_by_fire(pending.schedule_id, NOW).to_dict()
-    text = app.state._build_streaming_wake_context("worker", commit=commit)
-    assert "periodic" in text
-    assert "2027-01-15" in text or str(NOW) in text
+    text = assert_owed_context(app, [pending], [unpasted_line(pending)], commit=commit)
     assert pending.prompt not in text
-    assert registry.get_schedule_wake_by_fire(pending.schedule_id, NOW).to_dict() == before
+    registry.close()
 
 
 async def test_pasted_then_restart_before_consumption_never_replays(registry, tmp_path, clock, monkeypatch):
@@ -430,12 +605,8 @@ async def test_restart_context_warns_unconsumed_paste_read_only(tmp_path, clock,
     )
     if settled:
         await app.state.scheduler._replay_pending_locked("worker")
-    before = registry.get_schedule_wake_by_fire(pending.schedule_id, NOW).to_dict()
-    text = app.state._build_streaming_wake_context("worker", commit=commit)
-    assert "periodic" in text and str(NOW) in text
-    assert "pasted before the restart, may not have run; check before redoing" in text
+    text = assert_owed_context(app, [pending], [pasted_line(pending)], commit=commit)
     assert pending.prompt not in text
-    assert registry.get_schedule_wake_by_fire(pending.schedule_id, NOW).to_dict() == before
     await app.state.scheduler.stop()
     registry.close()
 
@@ -447,15 +618,8 @@ async def test_restart_context_marks_unpasted_owed_wake_as_pending_delivery(tmp_
     registry = app.state.agents
     registry.register("worker")
     pending = fire(registry)
-    before = registry.get_schedule_wake_by_fire(pending.schedule_id, NOW).to_dict()
-    text = app.state._build_streaming_wake_context("worker", commit=False)
-    line = next(ln for ln in text.splitlines() if ln.startswith("- periodic "))
-    assert str(NOW) in line
-    assert "not delivered yet; the full prompt arrives as its own message" in line
-    assert "don't start it from this list" in line
-    assert "pasted before the restart" not in line
+    text = assert_owed_context(app, [pending], [unpasted_line(pending)], commit=False)
     assert pending.prompt not in text
-    assert registry.get_schedule_wake_by_fire(pending.schedule_id, NOW).to_dict() == before
     await app.state.scheduler.stop()
     registry.close()
 
