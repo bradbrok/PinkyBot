@@ -23,6 +23,10 @@ SCOPE = "c" * 64
 NONCE = "d" * 32
 PARTS = (".local", "state", "pinkybot", "tmux-launch-env")
 
+# Safety bounds for a broken implementation, not performance targets.
+STARTUP_SAFETY_BOUND = 5
+STARTUP_HOLD_BOUND = 10
+
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
@@ -219,7 +223,7 @@ def background_workers(monkeypatch):
     def join(*, check_errors=True):
         for worker in threads:
             if worker.ident is not None:
-                worker.join(timeout=2)
+                worker.join(timeout=STARTUP_SAFETY_BOUND)
                 assert not worker.is_alive(), "diagnostic worker did not stop"
         if check_errors:
             assert failures == [], "diagnostic worker invoked the exception hook"
@@ -498,19 +502,23 @@ async def test_new_startup_background_does_not_wait(
     state_tree(home)
     (home / ".local/state").chmod(0o775)
     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    hold_expired = threading.Event()
     module = importlib.import_module("pinky_daemon." + ("api" if mode == "api" else "daemon"))
     normal_walk, normal_log = tmux_launch_env._state_directory, module._log
 
-    def walk(**kwargs):
+    def hold_operation():
         entered.set()
-        assert release.wait(timeout=1), "controlled walk was not released"
+        if not release.wait(timeout=STARTUP_HOLD_BOUND):
+            hold_expired.set()
+
+    def walk(**kwargs):
+        hold_operation()
         return normal_walk(**kwargs)
 
     def log(message):
         if message.startswith("WARNING launch environment state directory"):
             if held == "log":
-                entered.set()
-                assert release.wait(timeout=1), "controlled log was not released"
+                hold_operation()
             normal_log(message)
             finished.set()
         else:
@@ -522,12 +530,16 @@ async def test_new_startup_background_does_not_wait(
     start, logged = startup
     other_start, other_logged = startup_factory("poll" if mode == "api" else "api")
     try:
-        began = time.monotonic()
-        await asyncio.wait_for(start(wait=False), timeout=0.35)
-        assert time.monotonic() - began < 0.35, "startup ran the diagnostic inline"
-        assert entered.wait(timeout=0.35)
-        await asyncio.wait_for(other_start(wait=False), timeout=0.35)
-        await asyncio.wait_for(start(wait=False), timeout=0.35)
+        await asyncio.wait_for(start(wait=False), timeout=STARTUP_SAFETY_BOUND)
+        assert not hold_expired.is_set()
+        assert not release.is_set()
+        assert entered.wait(timeout=STARTUP_SAFETY_BOUND)
+        await asyncio.wait_for(other_start(wait=False), timeout=STARTUP_SAFETY_BOUND)
+        assert not hold_expired.is_set()
+        assert not release.is_set()
+        await asyncio.wait_for(start(wait=False), timeout=STARTUP_SAFETY_BOUND)
+        assert not hold_expired.is_set()
+        assert not release.is_set()
         assert len(background_workers.threads) == 1
         worker = background_workers.threads[0]
         assert worker.daemon and worker.is_alive()
@@ -535,8 +547,8 @@ async def test_new_startup_background_does_not_wait(
         assert warnings(logged) == warnings(other_logged) == []
     finally:
         release.set()
+        assert finished.wait(timeout=STARTUP_SAFETY_BOUND)
         background_workers.join()
-        finished.wait(timeout=1)
     line = expected_warning(
         "~/.local/state", 0o775, "group/other-writable", "chmod g-w,o-w ~/.local/state",
     )
