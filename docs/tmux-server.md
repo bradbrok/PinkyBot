@@ -25,3 +25,6 @@ server; parsed names can contain fragments of multiline values and are not logge
 Don't start the dedicated server by hand: a server started outside the daemon
 inherits that shell's environment, and isolated launches refuse it until it is
 restarted.
+
+See the [launch environment state directory runbook](runbooks/launch-env-state-directory.md)
+for ownership and permission requirements, startup warnings, and manual repair.

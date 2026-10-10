@@ -13981,6 +13981,10 @@ npm run build</pre>
         nonlocal shared_mcp_manager
         nonlocal active_boot_mcp_gate
 
+        from pinky_daemon.tmux_launch_env_startup import warn_state_directory
+
+        await asyncio.to_thread(warn_state_directory, _log)
+
         listener_readiness = app.state.api_readiness
         listener_readiness.start()
         pending_pollers = []
