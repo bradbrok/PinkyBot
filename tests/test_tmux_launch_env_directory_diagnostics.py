@@ -8,6 +8,7 @@ import os
 import pickle
 import stat
 import sys
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -200,53 +201,97 @@ class StopStartup(BaseException):
 
 
 @pytest.fixture
-def startup(mode, tmp_path, monkeypatch):
-    if mode == "api":
-        from pinky_daemon import api
+def background_workers(monkeypatch):
+    from pinky_daemon import tmux_launch_env_startup as checker
 
-        monkeypatch.setattr(api, "SHARED_MCP_ENABLED", False)
-        app = api.create_api(
-            default_working_dir=str(tmp_path), db_path=str(tmp_path / "test.db"),
-        )
-        boundary = Mock(side_effect=StopStartup)
-        monkeypatch.setattr(app.state.storage_observability, "enable_runtime", boundary)
-        handler = next(h for h in app.router.on_startup if h.__name__ == "on_startup")
+    threads, failures = [], []
+    normal_hook = threading.excepthook
 
-        async def start():
-            with pytest.raises(StopStartup):
-                await handler()
-            assert boundary.called
+    def hook(args):
+        failures.append(args.exc_value)
+        normal_hook(args)
 
-        module = api
-    else:
-        from pinky_daemon import daemon
+    def thread(*args, **kwargs):
+        worker = threading.Thread(*args, **kwargs)
+        threads.append(worker)
+        return worker
 
-        instance = object.__new__(daemon.Daemon)
-        instance._config = daemon.DaemonConfig()
-        instance._running = False
-        instance._pollers = []
-        instance._tasks = []
-        instance._registry = SimpleNamespace(get_main_agent=lambda: None)
-        instance._scheduler = SimpleNamespace(start=AsyncMock())
-        instance._autonomy = SimpleNamespace(start=AsyncMock())
-        async def start():
-            monkeypatch.setattr(
-                asyncio.get_running_loop(), "add_signal_handler", lambda *args: None,
+    def join(*, check_errors=True):
+        for worker in threads:
+            if worker.ident is not None:
+                worker.join(timeout=2)
+                assert not worker.is_alive(), "diagnostic worker did not stop"
+        if check_errors:
+            assert failures == [], "diagnostic worker invoked the exception hook"
+
+    monkeypatch.setattr(threading, "excepthook", hook)
+    monkeypatch.setattr(checker, "Thread", thread, raising=False)
+    yield SimpleNamespace(threads=threads, failures=failures, join=join)
+    join(check_errors=False)
+
+
+@pytest.fixture
+def startup_factory(tmp_path, monkeypatch, background_workers):
+    def create(mode):
+        if mode == "api":
+            from pinky_daemon import api
+
+            monkeypatch.setattr(api, "SHARED_MCP_ENABLED", False)
+            app = api.create_api(
+                default_working_dir=str(tmp_path), db_path=str(tmp_path / "test.db"),
             )
-            await instance.start()
-            assert instance._scheduler.start.await_count > 0
+            boundary = Mock(side_effect=StopStartup)
+            monkeypatch.setattr(app.state.storage_observability, "enable_runtime", boundary)
+            handler = next(h for h in app.router.on_startup if h.__name__ == "on_startup")
 
-        module = daemon
+            async def run():
+                with pytest.raises(StopStartup):
+                    await handler()
+                assert boundary.called
 
-    logged = []
-    normal_log = module._log
+            module = api
+        else:
+            from pinky_daemon import daemon
 
-    def log(message):
-        logged.append(message)
-        normal_log(message)
+            instance = object.__new__(daemon.Daemon)
+            instance._config = daemon.DaemonConfig()
+            instance._running = False
+            instance._pollers = []
+            instance._tasks = []
+            instance._registry = SimpleNamespace(get_main_agent=lambda: None)
+            instance._scheduler = SimpleNamespace(start=AsyncMock())
+            instance._autonomy = SimpleNamespace(start=AsyncMock())
 
-    monkeypatch.setattr(module, "_log", log)
-    return start, logged
+            async def run():
+                monkeypatch.setattr(
+                    asyncio.get_running_loop(), "add_signal_handler", lambda *args: None,
+                )
+                await instance.start()
+                assert instance._scheduler.start.await_count > 0
+
+            module = daemon
+
+        logged = []
+        normal_log = module._log
+
+        def log(message):
+            logged.append(message)
+            normal_log(message)
+
+        async def start(*, wait=True):
+            await run()
+            if wait:
+                background_workers.join()
+
+        monkeypatch.setattr(module, "_log", log)
+        return start, logged
+
+    return create
+
+
+@pytest.fixture
+def startup(mode, startup_factory):
+    return startup_factory(mode)
 
 
 def warnings(logged):
@@ -330,7 +375,7 @@ async def test_new_startup_unexpected_error_is_symbol_only(
 
 
 @pytest.mark.parametrize("mode", ["api", "poll"])
-async def test_new_startup_non_oserror_is_unknown(home, mode, startup, monkeypatch):
+async def test_new_startup_non_oserror_is_unknown(home, mode, startup, monkeypatch, capsys):
     class UnexpectedError(Exception):
         pass
 
@@ -344,10 +389,16 @@ async def test_new_startup_non_oserror_is_unknown(home, mode, startup, monkeypat
     assert warnings(logged) == [
         "WARNING launch environment state directory check failed: UNKNOWN",
     ]
+    stderr = capsys.readouterr().err
+    assert "Traceback" not in stderr
+    assert_private_message(stderr, home)
 
 
 @pytest.mark.parametrize("mode", ["api", "poll"])
-async def test_new_startup_log_failure_does_not_stop_startup(home, mode, startup, monkeypatch):
+@pytest.mark.parametrize("error", ["oserror", "valueerror", "unexpected"])
+async def test_new_startup_log_failure_does_not_stop_startup(
+    home, mode, startup, monkeypatch, capsys, error,
+):
     class UnexpectedError(Exception):
         pass
 
@@ -357,11 +408,12 @@ async def test_new_startup_log_failure_does_not_stop_startup(home, mode, startup
     module = importlib.import_module("pinky_daemon." + ("api" if mode == "api" else "daemon"))
     normal_log = module._log
     attempted = []
+    error_type = {"oserror": OSError, "valueerror": ValueError, "unexpected": UnexpectedError}[error]
 
     def fail(message):
         if message.startswith("WARNING launch environment state directory"):
             attempted.append(message)
-            raise UnexpectedError("sensitive-detail: " + str(home))
+            raise error_type("sensitive-detail: " + str(home))
         normal_log(message)
 
     monkeypatch.setattr(module, "_log", fail)
@@ -371,6 +423,9 @@ async def test_new_startup_log_failure_does_not_stop_startup(home, mode, startup
         "~/.local/state", 0o775, "group/other-writable", "chmod g-w,o-w ~/.local/state",
     )]
     assert warnings(logged) == []
+    stderr = capsys.readouterr().err
+    assert "Traceback" not in stderr
+    assert_private_message(stderr, home)
 
 
 @pytest.mark.parametrize("mode", ["api", "poll"])
@@ -391,12 +446,16 @@ async def test_new_startup_symlink_error_is_symbol_only(home, mode, startup, tmp
 
 @pytest.mark.parametrize("mode", ["api", "poll"])
 @pytest.mark.parametrize("tree", ["safe", "missing"])
-async def test_control_safe_or_missing_startup_is_silent(home, mode, tree, startup):
+async def test_control_safe_or_missing_startup_is_silent(home, mode, tree, startup, monkeypatch):
     if tree == "safe":
         state_tree(home)
     before = sorted(str(path.relative_to(home)) for path in home.rglob("*"))
+    walk = Mock(wraps=tmux_launch_env._state_directory)
+    monkeypatch.setattr(tmux_launch_env, "_state_directory", walk)
     start, logged = startup
     await start()
+    await start()
+    assert walk.call_count == 1
     assert warnings(logged) == []
     assert before == sorted(str(path.relative_to(home)) for path in home.rglob("*"))
     if tree == "missing":
@@ -427,3 +486,165 @@ async def test_control_nonlocal_refusal_text_is_exactly_generic(home, remote, ca
     assert str(caught.value) == "launch environment staging failed"
     assert not recorder.tmux_calls
     assert_private_message(capsys.readouterr().err, home)
+
+
+@pytest.mark.parametrize("mode", ["api", "poll"])
+@pytest.mark.parametrize("held", ["walk", "log"])
+async def test_new_startup_background_does_not_wait(
+    home, mode, held, startup, startup_factory, background_workers, monkeypatch, capsys,
+):
+    from pinky_daemon import tmux_launch_env_startup as checker
+
+    state_tree(home)
+    (home / ".local/state").chmod(0o775)
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    module = importlib.import_module("pinky_daemon." + ("api" if mode == "api" else "daemon"))
+    normal_walk, normal_log = tmux_launch_env._state_directory, module._log
+
+    def walk(**kwargs):
+        entered.set()
+        assert release.wait(timeout=1), "controlled walk was not released"
+        return normal_walk(**kwargs)
+
+    def log(message):
+        if message.startswith("WARNING launch environment state directory"):
+            if held == "log":
+                entered.set()
+                assert release.wait(timeout=1), "controlled log was not released"
+            normal_log(message)
+            finished.set()
+        else:
+            normal_log(message)
+
+    if held == "walk":
+        monkeypatch.setattr(tmux_launch_env, "_state_directory", walk)
+    monkeypatch.setattr(module, "_log", log)
+    start, logged = startup
+    other_start, other_logged = startup_factory("poll" if mode == "api" else "api")
+    try:
+        began = time.monotonic()
+        await asyncio.wait_for(start(wait=False), timeout=0.35)
+        assert time.monotonic() - began < 0.35, "startup ran the diagnostic inline"
+        assert entered.wait(timeout=0.35)
+        await asyncio.wait_for(other_start(wait=False), timeout=0.35)
+        await asyncio.wait_for(start(wait=False), timeout=0.35)
+        assert len(background_workers.threads) == 1
+        worker = background_workers.threads[0]
+        assert worker.daemon and worker.is_alive()
+        assert checker._START_LOCK.locked()
+        assert warnings(logged) == warnings(other_logged) == []
+    finally:
+        release.set()
+        background_workers.join()
+        finished.wait(timeout=1)
+    line = expected_warning(
+        "~/.local/state", 0o775, "group/other-writable", "chmod g-w,o-w ~/.local/state",
+    )
+    assert warnings(logged) == [line]
+    assert warnings(other_logged) == []
+    tmux_session._log("synthetic tmux launch sink marker")
+    stderr = capsys.readouterr().err.splitlines()
+    assert stderr.count(line) == 1
+    assert "synthetic tmux launch sink marker" in stderr
+
+
+@pytest.mark.parametrize("mode", ["api", "poll"])
+@pytest.mark.parametrize("failure", ["constructor", "start"])
+async def test_new_startup_worker_start_failure_is_contained(
+    home, mode, failure, startup, monkeypatch, capsys,
+):
+    from pinky_daemon import tmux_launch_env_startup as checker
+
+    class UnexpectedError(Exception):
+        pass
+
+    state_tree(home)
+    (home / ".local/state").chmod(0o775)
+    error = UnexpectedError("sensitive-detail: " + str(home))
+    worker = SimpleNamespace(start=Mock(side_effect=error))
+    factory = Mock(side_effect=error) if failure == "constructor" else Mock(return_value=worker)
+    monkeypatch.setattr(checker, "Thread", factory, raising=False)
+    start, logged = startup
+    await start()
+    await start()
+    assert factory.call_count == 1
+    assert factory.call_args.kwargs["daemon"] is True
+    if failure == "start":
+        worker.start.assert_called_once_with()
+    assert warnings(logged) == []
+    stderr = capsys.readouterr().err
+    assert "Traceback" not in stderr
+    assert_private_message(stderr, home)
+
+
+@pytest.mark.parametrize("component,label", [("", "~"), (".local/state", "~/.local/state")])
+@pytest.mark.parametrize("permissions", [0o720, 0o702])
+def test_new_ancestor_write_bits_are_independent(home, component, label, permissions):
+    state_tree(home)
+    (home / component).chmod(permissions)
+    with pytest.raises(PermissionError) as caught:
+        stage()
+    assert_details(str(caught.value), home, label, permissions, "group/other-writable")
+
+
+@pytest.mark.parametrize("component", ["state", "scope"])
+@pytest.mark.parametrize("permissions", [0o740, 0o720, 0o710, 0o704, 0o702, 0o701])
+def test_new_private_access_bits_are_independent(home, component, permissions):
+    root = state_tree(home)
+    scope = root / SCOPE
+    scope.mkdir(mode=0o700)
+    target = root if component == "state" else scope
+    target.chmod(permissions)
+    label = "~/.local/state/pinkybot/tmux-launch-env" if component == "state" else "scope"
+    with pytest.raises(PermissionError) as caught:
+        stage()
+    assert_details(str(caught.value), home, label, permissions, "group/other access")
+
+
+@pytest.mark.parametrize("mode", ["api", "poll"])
+async def test_control_755_ancestors_allow_staging_and_silent_startup(home, mode, startup):
+    state_tree(home)
+    for component in ("", ".local", ".local/state", ".local/state/pinkybot"):
+        (home / component).chmod(0o755)
+    assert stage() is not None
+    start, logged = startup
+    await start()
+    await start()
+    assert warnings(logged) == []
+
+
+def distinct_effective_uid(home, monkeypatch):
+    owner = home.stat().st_uid
+    euid = max(owner, os.getuid()) + 1
+    monkeypatch.setattr(tmux_launch_env.os, "geteuid", lambda: euid)
+    return owner, euid
+
+
+def test_new_effective_uid_message(home, monkeypatch):
+    owner, _ = distinct_effective_uid(home, monkeypatch)
+    with pytest.raises(PermissionError) as caught:
+        stage()
+    assert_details(str(caught.value), home, "~", 0o700, "owner", owner)
+
+
+@pytest.mark.parametrize("mode", ["api", "poll"])
+async def test_new_effective_uid_owner_hint(home, mode, startup, monkeypatch):
+    owner, euid = distinct_effective_uid(home, monkeypatch)
+    start, logged = startup
+    await start()
+    await start()
+    assert warnings(logged) == [expected_warning(
+        "~", 0o700, "owner", f"~ must be owned by uid {euid}", owner,
+    )]
+
+
+@pytest.mark.parametrize("mode", ["api", "poll"])
+async def test_new_real_walk_cannot_determine_home(mode, startup, monkeypatch, capsys):
+    monkeypatch.setattr(os.path, "expanduser", lambda path: path)
+    start, logged = startup
+    await start()
+    await start()
+    assert warnings(logged) == [
+        "WARNING launch environment state directory check failed: UNKNOWN",
+    ]
+    assert "Traceback" not in capsys.readouterr().err

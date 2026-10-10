@@ -1,22 +1,27 @@
 """Read-only, process-wide startup diagnostics for local launch state."""
 
 import errno
-import threading
 from collections.abc import Callable
+from threading import Lock, Thread
 
 from pinky_daemon import tmux_launch_env
 
-_CHECKED = False
-_CHECK_LOCK = threading.Lock()
+_START_LOCK = Lock()
 
 
 def warn_state_directory(log: Callable[[str], None]) -> None:
-    """Check the local service user's state once through the normal daemon sink."""
-    global _CHECKED
-    with _CHECK_LOCK:
-        if _CHECKED:
-            return
-        _CHECKED = True
+    """Start one best-effort diagnostic worker without delaying startup."""
+    try:
+        if _START_LOCK.acquire(blocking=False):
+            Thread(
+                target=_warn_state_directory, args=(log,),
+                name="launch-env-state-directory", daemon=True,
+            ).start()
+    except Exception:
+        pass
+
+
+def _warn_state_directory(log: Callable[[str], None]) -> None:
     try:
         with tmux_launch_env._state_directory(create=False):
             pass

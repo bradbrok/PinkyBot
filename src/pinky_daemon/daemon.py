@@ -251,7 +251,7 @@ class Daemon:
 
         from pinky_daemon.tmux_launch_env_startup import warn_state_directory
 
-        await asyncio.to_thread(warn_state_directory, _log)
+        warn_state_directory(_log)
 
         # Register signal handlers
         loop = asyncio.get_event_loop()

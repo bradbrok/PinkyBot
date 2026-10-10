@@ -7,12 +7,13 @@ restriction applies to an existing `~/.local/state/pinkybot`. The daemon creates
 its scope directories must allow no group or other access.
 
 An unsafe component can leave every agent pane in `boot_failed` while the daemon
-is still active. At startup, the daemon writes at most one warning naming the
-home-relative component, its four-digit octal mode, owner uid, effective uid,
+is still active. At startup, the daemon checks in the background and writes at
+most one warning naming the home-relative component, its four-digit octal mode,
+owner uid, effective uid,
 and the failed rule. Launch refusals retain the `unsafe launch environment
-directory` or `unsafe launch environment home` prefix. Unexpected filesystem
-errors report only an errno symbol; check for a symlink when the symbol is
-`ELOOP` or `ENOTDIR`.
+directory` or `unsafe launch environment home` prefix. In the startup warning,
+unexpected filesystem errors report only an errno symbol or UNKNOWN. Check for
+a symlink when the symbol is `ELOOP` or `ENOTDIR`.
 
 Run the warning's repair command in the service user's shell. For example,
 remove group and other write access from writable ancestors:
