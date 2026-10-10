@@ -44,11 +44,15 @@ class UnsafeDirectoryError(PermissionError):
 
     def __init__(self, label: str, mode: int, owner: int, euid: int, rule: str):
         self.label, self.euid, self.rule = label, euid, rule
+        self.mode, self.owner = mode, owner
         kind = "home" if label == "~" else "directory"
         super().__init__(
             f"unsafe launch environment {kind}: {label} mode {mode:04o} "
             f"owner uid {owner} effective uid {euid} ({rule})"
         )
+
+    def __reduce__(self):
+        return type(self), (self.label, self.mode, self.owner, self.euid, self.rule)
 
 
 def _check_directory(info, label: str, *, private: bool) -> None:

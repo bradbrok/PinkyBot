@@ -1,9 +1,11 @@
 """Directory refusals stay private and startup warnings reach the daemon log."""
 
 import asyncio
+import copy
 import errno
 import importlib
 import os
+import pickle
 import stat
 import sys
 import time
@@ -55,17 +57,28 @@ def assert_private_message(message, home):
         assert forbidden not in message
 
 
-def assert_details(message, home, label, mode, rule, owner=None):
+def expected_refusal(label, mode, rule, owner=None):
     prefix = "unsafe launch environment home" if label == "~" else (
         "unsafe launch environment directory"
     )
-    assert message.startswith(prefix)
-    assert label in message
-    assert f"mode {mode:04o}" in message
-    assert rule in message
-    assert f"owner uid {os.geteuid() if owner is None else owner}" in message
-    assert f"effective uid {os.geteuid()}" in message
+    return (
+        f"{prefix}: {label} mode {mode:04o} "
+        f"owner uid {os.geteuid() if owner is None else owner} "
+        f"effective uid {os.geteuid()} ({rule})"
+    )
+
+
+def assert_details(message, home, label, mode, rule, owner=None):
+    assert message == expected_refusal(label, mode, rule, owner)
     assert_private_message(message, home)
+
+
+def expected_warning(label, mode, rule, hint, owner=None):
+    return (
+        "WARNING launch environment state directory is unsafe: "
+        f"{expected_refusal(label, mode, rule, owner)}; "
+        f"agent panes will fail to launch until fixed: {hint}"
+    )
 
 
 @pytest.mark.parametrize("component,mode,rule", [
@@ -125,6 +138,23 @@ def test_new_scope_message(home):
     with pytest.raises(PermissionError) as caught:
         stage()
     assert_details(str(caught.value), home, "scope", 0o750, "group/other access")
+
+
+@pytest.mark.parametrize("operation", ["copy", "deepcopy", "pickle"])
+def test_new_directory_error_round_trip(home, operation):
+    scope = state_tree(home) / SCOPE
+    scope.mkdir(mode=0o750)
+    with pytest.raises(PermissionError) as caught:
+        stage()
+    original = caught.value
+    restored = (pickle.loads(pickle.dumps(original)) if operation == "pickle" else
+                getattr(copy, operation)(original))
+    assert type(restored) is tmux_launch_env.UnsafeDirectoryError
+    assert str(restored) == str(original)
+    assert_details(str(restored), home, "scope", 0o750, "group/other access")
+    assert (restored.label, restored.euid, restored.rule) == (
+        "scope", os.geteuid(), "group/other access",
+    )
 
 
 async def test_new_local_runner_preserves_message(home):
@@ -197,17 +227,25 @@ def warnings(logged):
 
 
 @pytest.mark.parametrize("mode", ["api", "poll"])
-async def test_new_startup_warning_once_on_normal_sink(home, mode, startup, capsys):
+@pytest.mark.parametrize("component,permissions,label,rule,hint", [
+    (".local/state", 0o775, "~/.local/state", "group/other-writable",
+     "chmod g-w,o-w ~/.local/state"),
+    (".local/state/pinkybot/tmux-launch-env", 0o750,
+     "~/.local/state/pinkybot/tmux-launch-env", "group/other access",
+     "chmod g-rwx,o-rwx ~/.local/state/pinkybot/tmux-launch-env"),
+    ("", 0o777, "~", "group/other-writable", "chmod g-w,o-w ~"),
+])
+async def test_new_startup_warning_once_on_normal_sink(
+    home, mode, startup, capsys, component, permissions, label, rule, hint,
+):
     state_tree(home)
-    (home / ".local/state").chmod(0o775)
+    (home / component).chmod(permissions)
     start, logged = startup
     await start()
     await start()
     lines = warnings(logged)
-    assert len(lines) == 1
-    line = lines[0]
-    assert "~/.local/state" in line and "mode 0775" in line
-    assert "chmod g-w,o-w ~/.local/state" in line
+    line = expected_warning(label, permissions, rule, hint)
+    assert lines == [line]
     assert_private_message(line, home)
     tmux_session._log("synthetic tmux launch sink marker")
     stderr = capsys.readouterr().err.splitlines()
@@ -218,13 +256,14 @@ async def test_new_startup_warning_once_on_normal_sink(home, mode, startup, caps
 @pytest.mark.parametrize("mode", ["api", "poll"])
 async def test_new_startup_owner_hint(home, mode, startup, monkeypatch):
     state_tree(home)
-    fake_owner(monkeypatch, home / ".local/state")
+    owner = fake_owner(monkeypatch, home / ".local/state")
     start, logged = startup
     await start()
     lines = warnings(logged)
-    assert len(lines) == 1
-    assert "~/.local/state" in lines[0]
-    assert f"must be owned by uid {os.geteuid()}" in lines[0]
+    assert lines == [expected_warning(
+        "~/.local/state", 0o700, "owner",
+        f"~/.local/state must be owned by uid {os.geteuid()}", owner,
+    )]
     assert "chown" not in lines[0]
     assert_private_message(lines[0], home)
 
@@ -245,6 +284,44 @@ async def test_new_startup_unexpected_error_is_symbol_only(
     assert warnings(logged) == [
         f"WARNING launch environment state directory check failed: {symbol}",
     ]
+
+
+@pytest.mark.parametrize("mode", ["api", "poll"])
+async def test_new_startup_non_oserror_is_unknown(home, mode, startup, monkeypatch):
+    def fail(**kwargs):
+        raise RuntimeError("sensitive-detail: " + str(home))
+
+    monkeypatch.setattr(tmux_launch_env, "_state_directory", fail)
+    start, logged = startup
+    await start()
+    await start()
+    assert warnings(logged) == [
+        "WARNING launch environment state directory check failed: UNKNOWN",
+    ]
+
+
+@pytest.mark.parametrize("mode", ["api", "poll"])
+async def test_new_startup_log_failure_does_not_stop_startup(home, mode, startup, monkeypatch):
+    state_tree(home)
+    (home / ".local/state").chmod(0o775)
+    start, logged = startup
+    module = importlib.import_module("pinky_daemon." + ("api" if mode == "api" else "daemon"))
+    normal_log = module._log
+    attempted = []
+
+    def fail(message):
+        if message.startswith("WARNING launch environment state directory"):
+            attempted.append(message)
+            raise RuntimeError("sensitive-detail: " + str(home))
+        normal_log(message)
+
+    monkeypatch.setattr(module, "_log", fail)
+    await start()
+    await start()
+    assert attempted == [expected_warning(
+        "~/.local/state", 0o775, "group/other-writable", "chmod g-w,o-w ~/.local/state",
+    )]
+    assert warnings(logged) == []
 
 
 @pytest.mark.parametrize("mode", ["api", "poll"])

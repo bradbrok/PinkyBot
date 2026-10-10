@@ -41,5 +41,5 @@ def warn_state_directory(log: Callable[[str], None]) -> None:
         return
     try:
         log(message)
-    except (OSError, ValueError):
+    except Exception:
         pass
