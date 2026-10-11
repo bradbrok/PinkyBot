@@ -1789,6 +1789,7 @@ class _QueuedTurn:
     scheduler_serialized: bool = False
     scheduler_busy_deliver_at: float | None = None
     scheduler_paste_held_logged_at: float | None = None
+    scheduler_redelivery_paste: _UnreceiptedSchedulerPaste | None = None
     pane_delivery_started: bool = False
     pane_queue_enqueued: bool = False
     transport_accepted: bool = False
@@ -5090,6 +5091,7 @@ class TmuxSession(TransportReplacementMixin):
         for turn in scheduler_turns:
             unique_scheduler_turns.setdefault(id(turn), turn)
         for turn in unique_scheduler_turns.values():
+            turn.scheduler_redelivery_paste = None
             delivery = turn.scheduler_delivery
             if delivery is not None and not delivery.done():
                 delivery.set_result(False)
@@ -5539,6 +5541,7 @@ class TmuxSession(TransportReplacementMixin):
 
     def _scheduler_receipt_done(self, turn: _QueuedTurn) -> None:
         """Retire every scheduler ownership path for one terminal receipt."""
+        turn.scheduler_redelivery_paste = None
         receipt = turn.scheduler_delivery
         if (
             turn.scheduler_accept is None
@@ -11069,6 +11072,7 @@ class TmuxSession(TransportReplacementMixin):
                     reason = "replay_cap"
                 else:
                     turn.replay_count += 1
+                    turn.scheduler_redelivery_paste = pending
                     self._purge_fold_removes_for_turn(turn)
                     turn.pane_delivery_recorded = False
                     turn.pane_delivery_started = False
@@ -12230,6 +12234,26 @@ class TmuxSession(TransportReplacementMixin):
                     retry_scheduler_gate = True
                 else:
                     retry_scheduler_gate = False
+                    pending = turn.scheduler_redelivery_paste
+                    if pending is not None:
+                        consumed = self._phantom_consumption_verdicts([pending.entry])[0]
+                        if consumed is not False:
+                            reason = "probe_unavailable"
+                            if consumed is True:
+                                self._mark_transport_accepted(turn)
+                                reason = "consumed_before_redelivery"
+                            else:
+                                # The under-lock terminal check fenced this receipt.
+                                turn.scheduler_delivery.set_result(False)
+                            now = time.time()
+                            _log(
+                                f"tmux[{self.agent_name}]: SCHEDULER_PASTE_SETTLED "
+                                f"outcome={'accepted' if consumed is True else 'undelivered'} "
+                                f"reason={reason} paste_age_s={now - pending.entry.dispatched_at:.1f} "
+                                f"pop_age_s={now - pending.popped_at:.1f} owner=owner-less "
+                                f"replay_count={turn.replay_count}"
+                            )
+                            raise _SchedulerDeliveryCancelled
                     if not api_allows_submission(self._config, "tmux-turn"):
                         self._refuse_api_turn(turn)
                         return
@@ -12256,6 +12280,7 @@ class TmuxSession(TransportReplacementMixin):
                         self._scheduler_paste_session_id, turn.prompt
                     ):
                         raise RuntimeError("scheduler paste marker refused exact fire")
+                    turn.scheduler_redelivery_paste = None
                     turn.pane_delivery_started = True
                     result = await self._tmux.paste_text(
                         turn.prompt, enter=True

@@ -556,7 +556,7 @@ async def test_t6_redelivery_stops_at_the_replay_cap(harness, monkeypatch, capsy
     assert len(outcomes) == cap + 1 and "reason=replay_cap" in outcomes[-1]
 
 
-@pytest.mark.parametrize("nonqualifying", ["working", "stale", "nonnumeric", "boolean"])
+@pytest.mark.parametrize("nonqualifying", ["working", "stale", "nonnumeric", "boolean", "missing"])
 async def test_t7_only_consecutive_fresh_idle_ticks_settle(
     harness, monkeypatch, nonqualifying, capsys
 ):
@@ -568,7 +568,14 @@ async def test_t7_only_consecutive_fresh_idle_ticks_settle(
     await _start_watchdog(harness, monkeypatch)
 
     async def disqualify():
-        if nonqualifying == "working":
+        if nonqualifying == "missing":
+            live_status = harness.session._config.live_status_fn
+            harness.session._config.live_status_fn = lambda: None
+            try:
+                await _tick(harness)
+            finally:
+                harness.session._config.live_status_fn = live_status
+        elif nonqualifying == "working":
             await _tick(harness, status="working")
         else:
             updated = {"stale": NOW - 1, "nonnumeric": str(NOW), "boolean": True}[nonqualifying]
@@ -753,8 +760,6 @@ async def test_t14_codex_completion_keeps_its_existing_receipt_rule(
         assert _pastes(harness) == [FIRST, SECOND]
         assert not first.receipt.done() and not _unreceipted(harness)
         assert not _lines(capsys, "SCHEDULER_PASTE_SETTLED")
-        with capsys.disabled():
-            print("CODEX_PASTE_LIST=" + json.dumps(_pastes(harness)))
     finally:
         for task in harness.tasks:
             task.cancel()
@@ -898,3 +903,345 @@ async def test_stop_failure_records_the_same_unreceipted_paste(harness, monkeypa
     await _tick(harness)
     assert _pastes(harness) == [FIRST, FIRST] and not _unreceipted(harness)
     assert not first.receipt.done()
+
+
+def _observe_accept_edges(session, monkeypatch):
+    edges = []
+    mark = session._mark_transport_accepted
+
+    def observe(turn):
+        accepted = turn.transport_accepted
+        result = mark(turn)
+        if not accepted and turn.transport_accepted:
+            edges.append(turn)
+        return result
+
+    monkeypatch.setattr(session, "_mark_transport_accepted", observe)
+    return edges
+
+
+def _kept_paste(turn):
+    return getattr(turn, "scheduler_redelivery_paste", None)
+
+
+def _ticket(value):
+    return (
+        value.transcript_path_at_paste,
+        value.transcript_file_identity_at_paste,
+        value.transcript_offset_at_paste,
+        value.transcript_anchor_start_at_paste,
+        value.transcript_anchor_at_paste,
+        value.transcript_ticket_captured_at_ns,
+    )
+
+
+async def _foreign_completion(harness):
+    harness.clock.now += 12
+    harness.clock.updated = harness.clock.now
+    await _rows(
+        harness,
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "unrelated work"}],
+            },
+        },
+        {"type": "system", "subtype": "stop_hook_summary"},
+    )
+
+
+async def test_t16_first_paste_row_while_replay_waits_accepts_without_pasting(
+    harness, monkeypatch, capsys
+):
+    edges = _observe_accept_edges(harness.session, monkeypatch)
+    first = await _first_paste(harness)
+    turn = first.entry.turn
+    await _unrelated_stop(harness, first)
+    await _start_watchdog(harness, monkeypatch)
+    await _tick(harness)
+    async with harness.session._repl_control_lock:
+        await _tick(harness)
+        live = list(harness.session._scheduler_delivery_tasks)
+        assert len(live) == 1 and not live[0].done()
+        assert live[0].get_coro().cr_frame.f_locals["turn"] is turn
+        assert turn.replay_count == 1 and not turn.pane_delivery_started
+        assert _pastes(harness) == [FIRST]
+        harness.clock.now += 9
+        harness.clock.updated = harness.clock.now
+        await _rows(harness, _user(FIRST))
+        assert not first.receipt.done()
+    await _settle()
+    assert first.receipt.done() and first.receipt.result() is True
+    assert edges == [turn] and _pastes(harness) == [FIRST]
+    assert _ticket(turn) == _ticket(first.entry)
+    assert harness.session._stats["turns"] == 1
+    assert not _kept_paste(turn) and not _unreceipted(harness)
+    assert not harness.session._scheduler_delivery_tasks
+    lines = _lines(capsys, "SCHEDULER_PASTE_SETTLED")
+    assert len(lines) == 2 and "outcome=redelivered reason=not_consumed" in lines[0]
+    assert "outcome=accepted reason=consumed_before_redelivery" in lines[1]
+    assert "paste_age_s=51.0" in lines[1] and "pop_age_s=39.0" in lines[1]
+    assert "owner=owner-less replay_count=1" in lines[1]
+    await _foreign_completion(harness)
+    await _tick(harness)
+    await _tick(harness)
+    assert first.receipt.result() is True and edges == [turn]
+    assert _pastes(harness) == [FIRST] and not _kept_paste(turn)
+    assert not _lines(capsys, "SCHEDULER_PASTE_SETTLED")
+
+
+async def test_t17_combined_user_row_accepts_first_paste_before_replay(harness, monkeypatch):
+    edges = _observe_accept_edges(harness.session, monkeypatch)
+    first = await _first_paste(harness)
+    await _unrelated_stop(harness, first)
+    second = await _second_paste(harness, expired=True)
+    await _start_watchdog(harness, monkeypatch)
+    await _tick(harness)
+    await _tick(harness)
+    assert _pastes(harness) == [FIRST, SECOND] and not first.receipt.done()
+    await _rows(harness, _user(FIRST + SECOND))
+    await _settle()
+    assert second.done() and second.result() is True
+    assert first.receipt.done() and first.receipt.result() is True
+    assert _pastes(harness) == [FIRST, SECOND]
+    assert edges.count(first.entry.turn) == 1 and len(edges) == 2
+    assert not _kept_paste(first.entry.turn) and not _unreceipted(harness)
+    assert not harness.session._scheduler_delivery_tasks
+
+
+async def test_t18_unavailable_first_ticket_stops_waiting_replay(harness, monkeypatch, capsys):
+    edges = _observe_accept_edges(harness.session, monkeypatch)
+    first = await _first_paste(harness)
+    await _unrelated_stop(harness, first)
+    await _start_watchdog(harness, monkeypatch)
+    await _tick(harness)
+    async with harness.session._repl_control_lock:
+        await _tick(harness)
+        assert _pastes(harness) == [FIRST] and not first.receipt.done()
+        harness.clock.now += 9
+        harness.clock.updated = harness.clock.now
+        harness.transcript.unlink()
+    await _settle()
+    assert first.receipt.done() and first.receipt.result() is False
+    assert _pastes(harness) == [FIRST] and not edges
+    assert _ticket(first.entry.turn) == _ticket(first.entry)
+    assert harness.session._stats["turns"] == 1
+    lines = _lines(capsys, "SCHEDULER_PASTE_SETTLED")
+    assert len(lines) == 2 and "outcome=redelivered" in lines[0]
+    assert "outcome=undelivered reason=probe_unavailable" in lines[1]
+    assert "paste_age_s=51.0" in lines[1] and "pop_age_s=39.0" in lines[1]
+    assert "owner=owner-less replay_count=1" in lines[1]
+    assert not _kept_paste(first.entry.turn) and not _unreceipted(harness)
+    assert not harness.session._scheduler_delivery_tasks
+
+
+async def test_t19_row_before_first_ticket_does_not_prevent_replay(harness, monkeypatch):
+    edges = _observe_accept_edges(harness.session, monkeypatch)
+    await _rows(harness, _user(FIRST))
+    first = await _first_paste(harness)
+    await _unrelated_stop(harness, first)
+    await _start_watchdog(harness, monkeypatch)
+    await _tick(harness)
+    await _tick(harness)
+    assert _pastes(harness) == [FIRST, FIRST]
+    assert not edges and not first.receipt.done()
+    assert not _kept_paste(first.entry.turn)
+    await _rows(harness, _user(FIRST))
+    await _settle()
+    assert first.receipt.result() is True and edges == [first.entry.turn]
+
+
+@pytest.mark.parametrize("owned", [False, True])
+async def test_c2_c3_settlement_ages_and_ownership_are_independent(
+    harness, monkeypatch, capsys, owned
+):
+    first = await _first_paste(harness, owned=owned)
+    await _unrelated_stop(harness, first)
+    owner = "owned" if owned else "owner-less"
+    lines = _lines(capsys, "SCHEDULER_PASTE_UNRECEIPTED")
+    assert len(lines) == 1 and f"owner={owner}" in lines[0]
+    assert "paste_age_s=12.0" in lines[0]
+    await _start_watchdog(harness, monkeypatch)
+    await _tick(harness)
+    await _tick(harness)
+    lines = _lines(capsys, "SCHEDULER_PASTE_SETTLED")
+    assert len(lines) == 1
+    assert "paste_age_s=42.0" in lines[0] and "pop_age_s=30.0" in lines[0]
+    assert f"owner={owner}" in lines[0] and f"replay_count={0 if owned else 1}" in lines[0]
+
+
+async def test_c4_held_line_uses_the_holders_queue_age(harness, capsys):
+    first = await _first_paste(harness)
+    await _unrelated_stop(harness, first)
+    harness.clock.now += 91
+    capsys.readouterr()
+    await _second_paste(harness, expired=True)
+    lines = _lines(capsys, "SCHEDULER_PASTE_HELD")
+    assert len(lines) == 1 and "queued_age_s=103.0" in lines[0]
+
+
+async def test_c5_terminal_scheduler_pop_is_counted_without_retention(harness, capsys):
+    first = await _first_paste(harness)
+    first.receipt.set_result(False)
+    await _settle()
+    capsys.readouterr()
+    await _foreign_completion(harness)
+    lines = capsys.readouterr().err.splitlines()
+    assert not any("SCHEDULER_PASTE_UNRECEIPTED" in line for line in lines)
+    popped = [line for line in lines if "PANE_ENTRY_POPPED_UNACCEPTED" in line]
+    assert len(popped) == 1 and "kind=scheduler" in popped[0]
+    assert not _unreceipted(harness) and not _kept_paste(first.entry.turn)
+    assert harness.session._stats["pane_entries_popped_unaccepted"] == 1
+
+
+@pytest.mark.parametrize("source", ["flag", "queued", "dequeued", "removed"])
+@pytest.mark.parametrize("shape", ["live", "retired", "other"])
+async def test_c6_native_evidence_requires_a_live_matching_occurrence(harness, source, shape):
+    turn = tmux_session._QueuedTurn(FIRST)
+    other = tmux_session._QueuedTurn(SECOND)
+    pointed = other if shape == "other" else turn
+    retired = shape == "retired"
+    queued = tmux_session._QueuedPromptEvidence(FIRST, pointed, 1, retired=retired)
+    if source == "flag":
+        pointed.pane_queue_enqueued = not retired
+    elif source == "queued":
+        harness.session._pane_queue_operations.append(queued)
+    elif source == "dequeued":
+        harness.session._pane_dequeued_turns.append(
+            tmux_session._DequeuedPromptEvidence(FIRST, False, pointed, retired=retired)
+        )
+    else:
+        harness.session._pane_fold_removes.append(
+            tmux_session._RemovedPromptEvidence(queued, None, None)
+        )
+    assert harness.session._scheduler_turn_has_native_queue_evidence(turn) == (shape == "live")
+
+
+async def test_c8_codex_deadline_crossing_without_a_holder_keeps_waiting_safe(
+    tmp_path, clock, monkeypatch, capsys
+):
+    harness = await _make_harness(tmp_path, clock, kind=CodexTmuxSession)
+    original = harness.session._scheduler_pane_busy
+    deadline = clock.now + 1
+    checked = []
+    holder_checks = []
+    log_held = harness.session._log_scheduler_paste_held
+
+    def cross_deadline(turn=None):
+        busy = original(turn)
+        checked.append(busy)
+        clock.now = deadline
+        return busy
+
+    def observe_holder(turn):
+        holder_checks.append((
+            harness.session._scheduler_busy_deadline_reached(turn),
+            harness.session._unresolved_pasted_acceptance_holders(),
+        ))
+        log_held(turn)
+
+    monkeypatch.setattr(harness.session, "_scheduler_pane_busy", cross_deadline)
+    monkeypatch.setattr(harness.session, "_log_scheduler_paste_held", observe_holder)
+    try:
+        assert await harness.session.send("ordinary steering")
+        capsys.readouterr()
+        receipt = await harness.session.send_scheduler_prompt(FIRST, busy_deliver_at=deadline)
+        await _settle()
+        assert checked[0] is True and checked[-1] is False
+        assert _pastes(harness) == [FIRST] and not receipt.done()
+        assert holder_checks == [(True, [])]
+        assert not _lines(capsys, "SCHEDULER_PASTE_HELD")
+        assert not harness.session._scheduler_delivery_tasks
+        assert harness.session._stats["errors"] == 0
+        await _rows(
+            harness,
+            {"type": "event_msg", "payload": {"type": "user_message", "message": FIRST}},
+        )
+        await _settle()
+        assert receipt.result() is True
+    finally:
+        await harness.session.disconnect()
+        harness.registry.close()
+
+
+async def test_each_replay_keeps_only_its_previous_paste_ticket(harness, monkeypatch):
+    first = await _first_paste(harness)
+    turn = first.entry.turn
+    await _start_watchdog(harness, monkeypatch)
+    original_paste = harness.control.paste_text.side_effect
+    seen_at_paste = []
+
+    async def paste(prompt, *, enter=True):
+        seen_at_paste.append(_kept_paste(turn))
+        assert turn.pane_delivery_started
+        return TmuxCommandResult(returncode=0, stdout="", stderr="")
+
+    harness.control.paste_text.side_effect = paste
+    try:
+        for attempt in range(2):
+            latest = harness.session._inflight_metas[0]
+            assert latest.turn is turn and not _kept_paste(turn)
+            await _unrelated_stop(harness, first)
+            await _tick(harness)
+            async with harness.session._repl_control_lock:
+                await _tick(harness)
+                kept = _kept_paste(turn)
+                assert kept.entry is latest and kept.popped_at == harness.clock.now - 30
+                assert not turn.pane_delivery_started
+                assert len(harness.session._scheduler_delivery_tasks) == 1
+            await _settle()
+            assert not _kept_paste(turn) and not harness.session._scheduler_delivery_tasks
+            assert _pastes(harness) == [FIRST] * (attempt + 2)
+        assert seen_at_paste == [None, None] and not first.receipt.done()
+    finally:
+        harness.control.paste_text.side_effect = original_paste
+
+
+@pytest.mark.parametrize("ending", ["accepted", "undelivered", "cancelled"])
+async def test_terminal_receipt_drops_the_ticket_before_waiting_replay(
+    harness, monkeypatch, ending
+):
+    first = await _first_paste(harness)
+    turn = first.entry.turn
+    await _unrelated_stop(harness, first)
+    await _start_watchdog(harness, monkeypatch)
+    await _tick(harness)
+    async with harness.session._repl_control_lock:
+        await _tick(harness)
+        assert _kept_paste(turn).entry is first.entry
+        if ending == "accepted":
+            first.receipt.set_result(True)
+        elif ending == "undelivered":
+            first.receipt.set_result(False)
+        else:
+            first.receipt.cancel()
+        await _settle()
+        assert not _kept_paste(turn) and not harness.session._scheduler_pending_turns
+        assert _pastes(harness) == [FIRST]
+    await _settle()
+    assert not harness.session._scheduler_delivery_tasks and _pastes(harness) == [FIRST]
+
+
+async def test_disconnect_drops_the_ticket_before_receipt_callbacks(harness, monkeypatch):
+    first = await _first_paste(harness)
+    turn = first.entry.turn
+    await _unrelated_stop(harness, first)
+    await _start_watchdog(harness, monkeypatch)
+    await _tick(harness)
+    receipt_done = harness.session._scheduler_receipt_done
+    observed = []
+
+    def observe_done(ended):
+        observed.append(_kept_paste(ended))
+        receipt_done(ended)
+
+    monkeypatch.setattr(harness.session, "_scheduler_receipt_done", observe_done)
+    async with harness.session._repl_control_lock:
+        await _tick(harness)
+        assert _kept_paste(turn).entry is first.entry
+        await harness.session.disconnect()
+    await _settle()
+    assert observed == [None] and not _kept_paste(turn)
+    assert first.receipt.result() is False and _pastes(harness) == [FIRST]
+    assert not harness.session._scheduler_delivery_tasks

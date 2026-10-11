@@ -36,6 +36,11 @@ ticks with fresh idle status and no native queue evidence: exact transcript
 proof accepts it immediately, a known unconsumed owner-less paste can be
 redelivered, and unavailable proof, disabled recovery or a replay limit reports
 it undelivered.
+Before redelivering, it re-checks the first paste under the REPL lock: consumed
+proof accepts the receipt without another paste, and unavailable proof reports
+it undelivered without another paste. If the pane accepts the first paste only
+after the second paste, the prompt runs twice. The existing replay of a
+surviving entry has no such re-check.
 A marked fire is reported undelivered and is never pasted twice. A lost paste
 inside a long turn waits for a completion; an idle report older than the paste
 waits for a later completion, and native queue evidence waits for dequeue or
