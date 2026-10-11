@@ -1788,6 +1788,7 @@ class _QueuedTurn:
     scheduler_accept: object = None  # Callable() -> bool
     scheduler_serialized: bool = False
     scheduler_busy_deliver_at: float | None = None
+    scheduler_paste_held_logged_at: float | None = None
     pane_delivery_started: bool = False
     pane_queue_enqueued: bool = False
     transport_accepted: bool = False
@@ -2398,6 +2399,13 @@ def _claude_host_command(command: str, env: dict[str, str]) -> str:
     return shlex.join(["/usr/bin/env", *unset, "/bin/sh", "-c", command])
 
 
+@dataclass
+class _UnreceiptedSchedulerPaste:
+    entry: _InflightMeta
+    popped_at: float
+    qualifying_ticks: int = 0
+
+
 class TmuxSession(TransportReplacementMixin):
     """Agent session backed by an interactive ``claude`` REPL in tmux.
 
@@ -2418,6 +2426,7 @@ class TmuxSession(TransportReplacementMixin):
     # CodexTmuxSession. See
     # MessageBroker.injection_confirms_consumption.
     injection_confirms_consumption: bool = False
+    _settle_unreceipted_scheduler_pastes_enabled = True
     _trace_transport_kind = "tmux_claude"
     _scrub_codex_headers = False
 
@@ -2479,6 +2488,7 @@ class TmuxSession(TransportReplacementMixin):
         # turns. Exact-content tickets survive a racing Stop that retires the local
         # turn object before Claude emits its dequeue row (#1098).
         self._scheduler_pending_turns: list[_QueuedTurn] = []
+        self._unreceipted_scheduler_pastes: list[_UnreceiptedSchedulerPaste] = []
         self._pane_queue_operations: deque[_QueuedPromptEvidence] = deque()
         self._pane_dequeued_turns: deque[_DequeuedPromptEvidence] = deque()
         self._pane_fold_attachments: deque[_QueuedCommandAttachmentEvidence] = deque()
@@ -2517,6 +2527,7 @@ class TmuxSession(TransportReplacementMixin):
             "reconnects": 0,
             "auto_restarts": 0,
             "transcript_bind_rejections": 0,
+            "pane_entries_popped_unaccepted": 0,
         }
         self.usage = SessionUsage()
 
@@ -5090,6 +5101,7 @@ class TmuxSession(TransportReplacementMixin):
             await asyncio.gather(*scheduler_tasks, return_exceptions=True)
         self._scheduler_delivery_tasks.clear()
         self._scheduler_pending_turns.clear()
+        self._unreceipted_scheduler_pastes.clear()
         removed_scheduler_replays = self._remove_terminal_scheduler_replays()
         if removed_scheduler_replays:
             _log(
@@ -5527,6 +5539,18 @@ class TmuxSession(TransportReplacementMixin):
 
     def _scheduler_receipt_done(self, turn: _QueuedTurn) -> None:
         """Retire every scheduler ownership path for one terminal receipt."""
+        receipt = turn.scheduler_delivery
+        if (
+            turn.scheduler_accept is None
+            and receipt is not None
+            and not self._receipt_accepted(receipt)
+        ):
+            header = turn.prompt.splitlines()[0] if turn.prompt else ""
+            _log(
+                f"tmux[{self.agent_name}]: SCHEDULER_UNOWNED_TURN_NOT_ACCEPTED "
+                f"pasted={turn.pane_delivery_started} state={self.state.value} "
+                f"prompt_header={header!r}"
+            )
         self._scheduler_pending_turns[:] = [
             pending
             for pending in self._scheduler_pending_turns
@@ -6843,6 +6867,7 @@ class TmuxSession(TransportReplacementMixin):
             return
 
         entry = self._inflight_metas.popleft()
+        self._record_unreceipted_scheduler_paste(entry)
         # A racing prompt can make this Stop retire a turn's local FIFO meta
         # before Claude emits that prompt's contentless dequeue row. Preserve
         # every native occurrence until dequeue: unresolved receipt owners stay
@@ -9357,6 +9382,13 @@ class TmuxSession(TransportReplacementMixin):
         try:
             while self.state == SessionState.CONNECTED:
                 await asyncio.sleep(_WATCHDOG_TICK_SEC)
+                try:
+                    self._settle_unreceipted_scheduler_pastes()
+                except Exception as exc:
+                    _log(
+                        f"tmux[{self.agent_name}]: SCHEDULER_PASTE_SETTLE_ERROR "
+                        f"{type(exc).__name__}: {exc}"
+                    )
                 # #846 kill-switch: if watchdog_config.enabled=false, skip the
                 # force_restart decision but keep the loop alive so re-enabling
                 # takes effect live (no respawn). Checked at the TOP so nothing
@@ -10089,6 +10121,7 @@ class TmuxSession(TransportReplacementMixin):
         while self._scheduler_pane_busy(turn):
             if self._scheduler_receipt_terminal(turn):
                 raise _SchedulerDeliveryCancelled
+            self._log_scheduler_paste_held(turn)
             await asyncio.sleep(0.25)
 
         if self._scheduler_receipt_terminal(turn):
@@ -10900,8 +10933,8 @@ class TmuxSession(TransportReplacementMixin):
             for receipt in (turn.scheduler_delivery, turn.submission_receipt)
         )
 
-    def _has_unresolved_pasted_acceptance(self) -> bool:
-        """Whether any live pane occurrence owns an unresolved exact receipt."""
+    def _unresolved_pasted_acceptance_holders(self) -> list[_QueuedTurn]:
+        """List live pane occurrences that own unresolved exact receipts."""
         candidates = self._acceptance_candidates()
         candidates.extend(
             evidence.turn
@@ -10922,6 +10955,7 @@ class TmuxSession(TransportReplacementMixin):
             )
         )
         seen: set[int] = set()
+        holders: list[_QueuedTurn] = []
         for turn in candidates:
             identity = id(turn)
             if identity in seen:
@@ -10931,8 +10965,158 @@ class TmuxSession(TransportReplacementMixin):
                 turn.pane_delivery_started
                 and self._turn_has_unresolved_acceptance(turn)
             ):
-                return True
-        return False
+                holders.append(turn)
+        return holders
+
+    def _has_unresolved_pasted_acceptance(self) -> bool:
+        """Whether any live pane occurrence owns an unresolved exact receipt."""
+        return bool(self._unresolved_pasted_acceptance_holders())
+
+    def _scheduler_turn_has_native_queue_evidence(self, turn: _QueuedTurn) -> bool:
+        return (
+            turn.pane_queue_enqueued
+            or any(
+                evidence.turn is turn and not evidence.retired
+                for evidence in (*self._pane_queue_operations, *self._pane_dequeued_turns)
+            )
+            or any(
+                evidence.queued.turn is turn and not evidence.queued.retired
+                for evidence in self._pane_fold_removes
+            )
+        )
+
+    def _record_unreceipted_scheduler_paste(self, entry: _InflightMeta) -> None:
+        turn = entry.turn
+        receipt = turn.scheduler_delivery
+        unreceipted = (
+            turn.scheduler_serialized
+            and turn.pane_delivery_started
+            and not turn.transport_accepted
+            and receipt is not None
+            and not receipt.done()
+        )
+        now = time.time()
+        header = turn.prompt.splitlines()[0] if turn.prompt else ""
+        if not turn.transport_accepted and not turn.pane_queue_enqueued:
+            self._stats["pane_entries_popped_unaccepted"] += 1
+            if not unreceipted:
+                kind = (
+                    "scheduler"
+                    if turn.scheduler_serialized
+                    else "internal"
+                    if turn.internal
+                    else "ordinary"
+                )
+                _log(
+                    f"tmux[{self.agent_name}]: PANE_ENTRY_POPPED_UNACCEPTED "
+                    f"kind={kind} paste_age_s={now - entry.dispatched_at:.1f} "
+                    f"prompt_header={header!r}"
+                )
+        if not unreceipted:
+            return
+        ownership = "owned" if turn.scheduler_accept is not None else "owner-less"
+        _log(
+            f"tmux[{self.agent_name}]: SCHEDULER_PASTE_UNRECEIPTED "
+            f"paste_age_s={now - entry.dispatched_at:.1f} owner={ownership} "
+            f"prompt_header={header!r}"
+        )
+        if self._settle_unreceipted_scheduler_pastes_enabled and not any(
+            pending.entry.turn is turn for pending in self._unreceipted_scheduler_pastes
+        ):
+            self._unreceipted_scheduler_pastes.append(_UnreceiptedSchedulerPaste(entry, now))
+
+    def _settle_unreceipted_scheduler_pastes(self) -> None:
+        """Settle popped scheduler pastes using fresh idle and exact evidence."""
+        if not self._settle_unreceipted_scheduler_pastes_enabled:
+            return
+        for pending in list(self._unreceipted_scheduler_pastes):
+            entry = pending.entry
+            turn = entry.turn
+            receipt = turn.scheduler_delivery
+            if receipt is None or receipt.done() or turn.transport_accepted:
+                self._unreceipted_scheduler_pastes.remove(pending)
+                continue
+            if self._scheduler_turn_has_native_queue_evidence(turn):
+                pending.qualifying_ticks = 0
+                continue
+            live = self._read_live_status()
+            updated = live.get("last_updated") if live else None
+            if (
+                not live
+                or live.get("status") != "idle"
+                or not isinstance(updated, (int, float))
+                or isinstance(updated, bool)
+                or not updated >= entry.dispatched_at
+            ):
+                pending.qualifying_ticks = 0
+                continue
+            consumed = self._phantom_consumption_verdicts([entry])[0]
+            outcome = "undelivered"
+            if consumed is True:
+                self._mark_transport_accepted(turn)
+                outcome, reason = "accepted", "consumed"
+            else:
+                pending.qualifying_ticks += 1
+                if pending.qualifying_ticks < 2:
+                    continue
+                if consumed is None:
+                    reason = "probe_unavailable"
+                elif turn.scheduler_accept is not None:
+                    reason = "marked_fire"
+                elif not self._watchdog_enabled():
+                    reason = "watchdog_disabled"
+                elif (cap := _inflight_replay_cap()) > 0 and turn.replay_count >= cap:
+                    reason = "replay_cap"
+                else:
+                    turn.replay_count += 1
+                    self._purge_fold_removes_for_turn(turn)
+                    turn.pane_delivery_recorded = False
+                    turn.pane_delivery_started = False
+                    turn.pane_queue_enqueued = False
+                    if not any(candidate is turn for candidate in self._scheduler_pending_turns):
+                        self._scheduler_pending_turns.append(turn)
+                    task = asyncio.create_task(self._deliver_scheduler_turn(turn))
+                    self._scheduler_delivery_tasks.add(task)
+                    task.add_done_callback(
+                        lambda done, _turn=turn: self._scheduler_delivery_done(done, _turn)
+                    )
+                    outcome, reason = "redelivered", "not_consumed"
+                if outcome == "undelivered" and not receipt.done():
+                    receipt.set_result(False)
+            now = time.time()
+            ownership = "owned" if turn.scheduler_accept is not None else "owner-less"
+            _log(
+                f"tmux[{self.agent_name}]: SCHEDULER_PASTE_SETTLED "
+                f"outcome={outcome} reason={reason} "
+                f"paste_age_s={now - entry.dispatched_at:.1f} "
+                f"pop_age_s={now - pending.popped_at:.1f} owner={ownership} "
+                f"replay_count={turn.replay_count}"
+            )
+            self._unreceipted_scheduler_pastes.remove(pending)
+
+    def _log_scheduler_paste_held(self, turn: _QueuedTurn) -> None:
+        if not self._scheduler_busy_deadline_reached(turn):
+            return
+        holders = self._unresolved_pasted_acceptance_holders()
+        if not holders:
+            return
+        now = time.time()
+        logged_at = turn.scheduler_paste_held_logged_at
+        if logged_at is not None and now - logged_at < 300:
+            return
+        turn.scheduler_paste_held_logged_at = now
+        holder = holders[0]
+        ownership = "owned" if holder.scheduler_accept is not None else "owner-less"
+        inflight = any(entry.turn is holder for entry in self._inflight_metas)
+        unreceipted = any(
+            pending.entry.turn is holder for pending in self._unreceipted_scheduler_pastes
+        )
+        _log(
+            f"tmux[{self.agent_name}]: SCHEDULER_PASTE_HELD holder={ownership} "
+            f"queued_age_s={now - holder.queued_at:.1f} inflight={inflight} "
+            f"unreceipted={unreceipted} "
+            f"native_queue={self._scheduler_turn_has_native_queue_evidence(holder)}"
+        )
 
     def _retire_acceptance_evidence(self, turn: _QueuedTurn) -> None:
         """Tombstone this occurrence without shifting the native FIFO ledger."""

@@ -123,6 +123,8 @@ class CodexTmuxSession(TmuxSession):
     _ANALYTICS_PROVIDER = "codex_cli"
     _trace_transport_kind = "tmux_codex"
     _scrub_codex_headers = True
+    # Codex retains its own late-receipt rule without Claude idle hooks.
+    _settle_unreceipted_scheduler_pastes_enabled = False
 
     def _reported_context_window(self) -> int:
         """Return the latest positive window reported by the Codex rollout."""
@@ -633,6 +635,7 @@ class CodexTmuxSession(TmuxSession):
             delivery = turn.scheduler_delivery
             if delivery is not None and delivery.cancelled():
                 raise _SchedulerDeliveryCancelled
+            self._log_scheduler_paste_held(turn)
             if self._codex_gate_blocked_only_by_metas(turn):
                 first_idle = await self._codex_capture_explicit_idle()
                 if first_idle:
