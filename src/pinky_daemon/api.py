@@ -3401,6 +3401,7 @@ def create_api(
                     if (
                         schedule is not None
                         and not schedule.one_shot
+                        and not schedule.direct_send
                         and row.fired_at <= schedule.last_accepted_fired_at
                     ):
                         continue

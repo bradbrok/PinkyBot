@@ -224,6 +224,86 @@ def test_restart_context_skips_superseded_row_without_truncating_list(wake_conte
     )
 
 
+@pytest.mark.parametrize("commit", [False, True])
+@pytest.mark.parametrize("abandoned", [False, True])
+def test_restart_context_retains_paste_after_direct_send_confirmation(
+    wake_context_app, commit, abandoned,
+):
+    registry = wake_context_app.state.agents
+    old = fire(registry)
+    pasted_fire(registry, old, abandoned=abandoned)
+    assert registry.update_schedule(
+        old.schedule_id, direct_send=True, target_channel="test:synthetic",
+    ) is not None
+    registry.update_schedule_last_delivered(
+        old.schedule_id, NOW + 5000, accepted_fired_at=NOW + 3600,
+    )
+    schedule = registry.get_schedule(old.schedule_id)
+    assert schedule.direct_send is True
+    assert schedule.last_accepted_fired_at >= old.fired_at
+    assert registry.get_schedule_wake_by_fire(old.schedule_id, NOW + 3600) is None
+    assert_owed_context(wake_context_app, [old], [pasted_line(old)], commit=commit)
+    assert registry.get_schedule_wake_by_fire(old.schedule_id, NOW + 3600) is None
+
+
+@pytest.mark.parametrize("commit", [False, True])
+@pytest.mark.parametrize("abandoned", [False, True])
+def test_restart_context_omits_paste_after_next_minute_acceptance(
+    wake_context_app, commit, abandoned,
+):
+    registry = wake_context_app.state.agents
+    old = fire(registry)
+    pasted_fire(registry, old, abandoned=abandoned)
+    later = same_schedule_fire(registry, old, NOW + 60)
+    accept_fire(registry, later)
+    assert_owed_context(wake_context_app, [old, later], [], commit=commit)
+
+
+@pytest.mark.parametrize("commit", [False, True])
+def test_restart_context_keeps_paste_when_same_name_has_different_id(wake_context_app, commit):
+    registry = wake_context_app.state.agents
+    old = fire(registry, name="shared")
+    pasted_fire(registry, old)
+    assert registry.toggle_schedule(old.schedule_id, False)
+    later = fire(registry, name="shared", at=NOW + 3600)
+    assert later.schedule_id != old.schedule_id
+    accept_fire(registry, later)
+    old_schedule = registry.get_schedule(old.schedule_id)
+    new_schedule = registry.get_schedule(later.schedule_id)
+    assert old_schedule.name == new_schedule.name
+    assert old_schedule.last_accepted_fired_at < old.fired_at
+    assert new_schedule.last_accepted_fired_at >= old.fired_at
+    assert_owed_context(wake_context_app, [old, later], [pasted_line(old)], commit=commit)
+
+
+@pytest.mark.parametrize("commit", [False, True])
+def test_restart_context_keeps_two_pasted_fires_in_order(wake_context_app, commit):
+    registry = wake_context_app.state.agents
+    older = fire(registry)
+    newer = same_schedule_fire(registry, older, NOW + 60)
+    pasted_fire(registry, older)
+    pasted_fire(registry, newer, pasted_at=NOW + 60)
+    assert registry.get_schedule(older.schedule_id).last_accepted_fired_at == 0
+    assert_owed_context(
+        wake_context_app, [older, newer], [pasted_line(older), pasted_line(newer)], commit=commit,
+    )
+
+
+@pytest.mark.parametrize("commit", [False, True])
+@pytest.mark.parametrize("abandoned", [False, True])
+def test_restart_context_omits_superseded_paste_when_schedule_disabled(
+    wake_context_app, commit, abandoned,
+):
+    registry = wake_context_app.state.agents
+    old = fire(registry)
+    pasted_fire(registry, old, abandoned=abandoned)
+    later = same_schedule_fire(registry, old, NOW + 3600)
+    accept_fire(registry, later)
+    assert registry.toggle_schedule(old.schedule_id, False)
+    assert registry.get_schedule(old.schedule_id).enabled is False
+    assert_owed_context(wake_context_app, [old, later], [], commit=commit)
+
+
 def session(tmp_path, kind=TmuxSession):
     tmux = MagicMock(spec=_TmuxControl)
     tmux.session_name = "test-bound"
