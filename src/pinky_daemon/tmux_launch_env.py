@@ -39,6 +39,25 @@ _SECRET_TTL = 10 * 60
 _CLOCK_SKEW = 300.0
 
 
+class UnsafeDirectoryError(PermissionError):
+    """A directory refusal containing only trusted labels and numeric metadata."""
+
+
+def _check_directory(info, label: str, *, private: bool) -> None:
+    euid, mode = os.geteuid(), stat.S_IMODE(info.st_mode)
+    if info.st_uid != euid or mode & (0o077 if private else 0o022):
+        rule = "owner" if info.st_uid != euid else (
+            "group/other access" if private else "group/other-writable"
+        )
+        kind = "home" if label == "~" else "directory"
+        exc = UnsafeDirectoryError(
+            f"unsafe launch environment {kind}: {label} mode {mode:04o} "
+            f"owner uid {info.st_uid} effective uid {euid} ({rule})"
+        )
+        exc.label, exc.euid, exc.rule = label, euid, rule
+        raise exc
+
+
 def ambient_env(items, warn) -> dict[str, str]:
     """Filter inherited shell state; diagnostics contain only bounded key names."""
     result = {}
@@ -86,6 +105,7 @@ def _deadline(deadline: float | None) -> None:
 
 def _directory(
     parent_fd: int, name: str, *, private: bool, create: bool, deadline: float | None = None,
+    label: str = "scope",
 ) -> int:
     _deadline(deadline)
     if create:
@@ -96,10 +116,7 @@ def _directory(
     _deadline(deadline)
     fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
     try:
-        info = os.fstat(fd)
-        denied = 0o077 if private else 0o022
-        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & denied:
-            raise PermissionError("unsafe launch environment directory")
+        _check_directory(os.fstat(fd), label, private=private)
     except BaseException:
         os.close(fd)
         raise
@@ -115,11 +132,12 @@ def _state_directory(*, create: bool, deadline: float | None = None):
         _deadline(deadline)
         fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         fds.append(fd)
-        info = os.fstat(fd)
-        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
-            raise PermissionError("unsafe launch environment home")
+        _check_directory(os.fstat(fd), "~", private=False)
         for index, part in enumerate(parts):
-            fd = _directory(fd, part, private=index >= 3, create=create, deadline=deadline)
+            fd = _directory(
+                fd, part, private=index >= 3, create=create, deadline=deadline,
+                label="~/" + "/".join(parts[:index + 1]),
+            )
             fds.append(fd)
         yield home.joinpath(*parts), fd
     finally:

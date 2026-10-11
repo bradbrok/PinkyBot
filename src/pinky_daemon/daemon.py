@@ -249,6 +249,10 @@ class Daemon:
         self._running = True
         _log("daemon: starting Pinky daemon")
 
+        from pinky_daemon.tmux_launch_env_startup import warn_state_directory
+
+        warn_state_directory(_log)
+
         # Register signal handlers
         loop = asyncio.get_event_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
