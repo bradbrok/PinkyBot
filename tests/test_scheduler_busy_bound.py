@@ -304,6 +304,60 @@ def test_restart_context_omits_superseded_paste_when_schedule_disabled(
     assert_owed_context(wake_context_app, [old, later], [], commit=commit)
 
 
+@pytest.mark.parametrize("commit", [False, True])
+def test_restart_context_uses_schedule_id_when_ledger_id_differs(wake_context_app, commit):
+    registry = wake_context_app.state.agents
+    first = registry.add_schedule("worker", "0 * * * *", name="first", prompt="execute first")
+    hidden = fire(registry, name="second")
+    listed, created = registry.persist_schedule_wake(
+        first.id, agent_name="worker", schedule_name=first.name,
+        prompt=first.prompt, fired_at=NOW + 60,
+    )
+    assert created
+    pasted_fire(registry, hidden)
+    pasted_fire(registry, listed, pasted_at=NOW + 60)
+    later = same_schedule_fire(registry, hidden, NOW + 3600)
+    accept_fire(registry, later)
+    for row in (hidden, listed):
+        stored = registry.get_schedule_wake_by_fire(row.schedule_id, row.fired_at)
+        assert stored is not None
+        assert stored.id != stored.schedule_id
+        other = registry.get_schedule(stored.id)
+        assert other is None or other.id != stored.schedule_id
+    hidden_schedule = registry.get_schedule(hidden.schedule_id)
+    listed_schedule = registry.get_schedule(listed.schedule_id)
+    assert hidden_schedule.last_accepted_fired_at >= hidden.fired_at
+    assert listed_schedule.last_accepted_fired_at == 0
+    wrong_hidden_schedule = registry.get_schedule(hidden.id)
+    wrong_listed_schedule = registry.get_schedule(listed.id)
+    assert wrong_hidden_schedule.id == listed.schedule_id
+    assert wrong_listed_schedule.id == hidden.schedule_id
+    assert wrong_hidden_schedule.last_accepted_fired_at < hidden.fired_at
+    assert wrong_listed_schedule.last_accepted_fired_at >= listed.fired_at
+    assert_owed_context(
+        wake_context_app, [hidden, listed, later], [pasted_line(listed)], commit=commit,
+    )
+
+
+@pytest.mark.parametrize("commit", [False, True])
+@pytest.mark.parametrize("abandoned", [False, True])
+def test_restart_context_omits_superseded_wake_with_target_channel(
+    wake_context_app, commit, abandoned,
+):
+    registry = wake_context_app.state.agents
+    old = fire(registry)
+    assert registry.update_schedule(
+        old.schedule_id, target_channel="test:synthetic",
+    ) is not None
+    pasted_fire(registry, old, abandoned=abandoned)
+    later = same_schedule_fire(registry, old, NOW + 3600)
+    accept_fire(registry, later)
+    schedule = registry.get_schedule(old.schedule_id)
+    assert schedule.direct_send is False
+    assert schedule.target_channel == "test:synthetic"
+    assert_owed_context(wake_context_app, [old, later], [], commit=commit)
+
+
 def session(tmp_path, kind=TmuxSession):
     tmux = MagicMock(spec=_TmuxControl)
     tmux.session_name = "test-bound"
