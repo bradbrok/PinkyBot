@@ -30,6 +30,25 @@ Only existing transcript or queue-dequeue evidence grants acceptance. Released
 rows also receive a fresh first receipt window. Neither change resets the
 replay staleness clock or counts context rendering as delivery.
 
+An unreceipted scheduler paste has no acceptance evidence when a completion
+removes its local entry. Claude tmux settles it after two consecutive watchdog
+ticks with fresh idle status and no native queue evidence: exact transcript
+proof accepts it immediately, a known unconsumed owner-less paste can be
+redelivered, and unavailable proof, disabled recovery or a replay limit reports
+it undelivered.
+Before redelivering, it re-checks the first paste under the REPL lock: consumed
+proof accepts the receipt without another paste, and unavailable proof reports
+it undelivered without another paste. If the pane accepts the first paste only
+after the second paste, the prompt runs twice. The existing replay of a
+surviving entry has no such re-check.
+A marked fire is reported undelivered and is never pasted twice. A lost paste
+inside a long turn waits for a completion; an idle report older than the paste
+waits for a later completion, and native queue evidence waits for dequeue or
+fold completion. The idle check still cannot see a harness-started turn before
+its first tool call. Recovery of a surviving entry still permits a later wake
+before the replay, which waits in the ordinary worker. Codex keeps its existing
+receipt rule.
+
 Drain parking applies each row's own age limit. An attempt-cap event parks only
 the oldest fire of the current drain episode. Restart context also lists owed
 recurring wakes without consuming or receipting them.

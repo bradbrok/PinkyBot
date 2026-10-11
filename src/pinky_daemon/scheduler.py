@@ -1880,6 +1880,14 @@ class AgentScheduler:
         row = self._registry.get_schedule_wake_by_fire(
             schedule_id, fired_at
         )
+        paste_status = ""
+        if row is not None:
+            if row.pasted_at == 0:
+                paste_status = "The prompt was never pasted: the agent did not get this wake. "
+            elif row.pasted_at > 0:
+                paste_status = (
+                    "The prompt was pasted and not confirmed: the agent may have received it. "
+                )
         abandoned = bool(
             row is not None
             and self._registry.abandon_pending_schedule_wake(
@@ -1901,6 +1909,7 @@ class AgentScheduler:
             age=age,
             bound_reason=bound_reason,
             wait_attempts=wait_attempts,
+            paste_status=paste_status,
         )
         if self._activity:
             try:
@@ -1921,6 +1930,7 @@ class AgentScheduler:
         age: float,
         bound_reason: str,
         wait_attempts: int | None,
+        paste_status: str = "",
     ) -> None:
         """Keep exact-fire diagnostics while bounding recurring owner pages."""
         schedule_id = self._schedule_id(schedule)
@@ -1964,6 +1974,7 @@ class AgentScheduler:
                 f"{age:.1f}s and {attempts} confirmation wait(s). The exact "
                 "fire was moved to explicit abandonment to prevent replay; "
                 "an already-pasted delivery retains one late-receipt authority. "
+                f"{paste_status}"
                 "Inspect the transport and wake ledger before intervening."
             ),
         ):
