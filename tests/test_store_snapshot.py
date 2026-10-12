@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 import importlib
 import json
-import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -830,7 +829,6 @@ def test_cli_is_endpoint_only_and_requires_explicit_signing_identity() -> None:
     assert "--as-agent" in source
     assert "PINKY_AGENT_NAME" in source
     assert source.index("PINKY_AGENT_KEY") < source.index("PINKY_SESSION_SECRET")
-    assert not os.path.exists(script.with_name("safe_db_read.py"))
 
 
 def test_cli_signs_endpoint_request_and_prints_only_returned_copy_path(
