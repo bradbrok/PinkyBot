@@ -1229,3 +1229,54 @@ class TestConsolidateBatch:
         assert store.get(ref.id).superseded_by == winner.id
         # ...and must not have gone on to archive the weaker active memory
         assert store.get(weak.id).active is True
+
+
+class TestLegacySalienceCoercion:
+    """Rows written by early builds carry 0-1 float salience; hydration must
+    coerce them onto the 1-5 int scale instead of raising ValidationError
+    and poisoning every recall()/query that touches the row (#834)."""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (0.7, 4),     # legacy 0-1 scale -> x5, rounded
+            (0.9, 4),     # round-half-even: 4.5 -> 4
+            (1.0, 5),     # FLOAT 1.0 is legacy-scale boundary -> maps high
+            (1, 1),       # INT 1 is a valid modern salience -> passes through
+            (0.0, 1),     # legacy float 0.0 clamps to lower bound
+            (0, 1),       # int 0 is not legacy-mapped; just clamps to 1
+            (3, 3),       # modern ints pass through
+            (4.4, 4),     # stray float on modern scale just rounds
+            (99, 5),      # clamped to upper bound
+            (None, 3),    # garbage falls back to default
+            (True, 3),    # bool is an int subclass but is garbage here
+            ("high", 3),  # garbage falls back to default
+        ],
+    )
+    def test_coerce_salience(self, raw, expected):
+        assert ReflectionStore._coerce_salience(raw) == expected
+
+    def test_recall_survives_legacy_float_salience_row(self, tmp_path):
+        store = _store(tmp_path)
+        r = store.insert(_fact("legacy row", salience=3))
+        # Corrupt the row the way early builds wrote it: 0-1 float scale
+        with store._lock:
+            store._conn.execute(
+                "UPDATE reflections SET salience = 0.7 WHERE id = ?", (r.id,)
+            )
+            store._conn.commit()
+        got = store.get(r.id)
+        assert got is not None
+        assert got.salience == 4
+
+    def test_modern_salience_one_is_not_inflated(self, tmp_path):
+        """A valid modern salience of 1 (stored as INTEGER) must hydrate as 1.
+
+        Regression guard: the legacy 0-1 x5 mapping must key off the value
+        being a float, or int 1 gets mistaken for legacy 1.0 and read back
+        as 5 on every hydration."""
+        store = _store(tmp_path)
+        r = store.insert(_fact("low-salience row", salience=1))
+        got = store.get(r.id)
+        assert got is not None
+        assert got.salience == 1
