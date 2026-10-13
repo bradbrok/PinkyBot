@@ -52,3 +52,4 @@ pytest
 - Releases are cut manually via the `Release` workflow (Actions → Release → Run workflow → version `YY.MM.NNN`). Production picks up new releases on the next `update_and_restart()`.
 - CI auto-runs on push (`ci.yml`); `main` is branch-protected and requires passing CI + PR review
 - Agent data in `data/agents/{name}/` (gitignored)
+- Updates and restarts check the main data-root layout first, and updates undo a target that fails its import/layout check before scheduling a restart; use `check_for_updates(preflight=True)` for an explicit preview (tenant roots are not covered).

@@ -61,6 +61,10 @@ python -m pinky_daemon --mode api --port 8888 --host 0.0.0.0
 
 Open the dashboard at `http://localhost:8888`.
 
+### Deployment checks
+
+Run `python -B -m pinky_daemon --mode check-startup --db-path PATH` to check imports and the main data-root layout without opening stores or stopping a running daemon; a completed check prints JSON and exits 0 when clean or 1 for layout findings, while an incomplete check exits 2 with its reason on stderr. Updates and restarts inspect that layout before changing the working tree or scheduling a restart, including forced updates; request the optional dry-run inspection with `check_for_updates(preflight=True)` or `POST /admin/update?dry_run=true&preflight=true`. After checkout and dependency installation, an update checks the target release in a child process before building the frontend; failure triggers an undo to the previous commit and restores dependencies if installation was attempted, reports whether the undo succeeded, and declines the restart. The command itself opens no store and writes no file; Python may write bytecode caches next to source files unless started with `-B`. The update's Python children (the installer version check, dependency install and startup check) disable bytecode writes; the startup check ends its process group before continuing, and a process that leaves that group on its own is outside this check's scope. Targets predating the check report that it was skipped. These checks cover imports and the main root's layout, not every possible startup failure; tenant roots are not covered, and their existing startup checks remain in place. Later releases may append stage names to `checked`, add keys to the report and add finding kinds; they do not remove, rename or reorder `import` and `layout`, every finding keeps `kind` and `path`, and the meaning of the exit status does not change.
+
 ### Create your first agent
 
 Via the web UI at `http://localhost:8888/#/agents`, or via API:

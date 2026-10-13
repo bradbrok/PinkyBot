@@ -326,7 +326,7 @@ def tool_capture(tmp_path, monkeypatch):
 
     calls = []
 
-    def record(method, path, body=None):
+    def record(method, path, body=None, *, timeout=30):
         calls.append((method, urllib.parse.urlsplit(path).path))
         if path.endswith("/health"):
             return {"agent": "caller", "recommendation": "ok", "tasks": {}}
