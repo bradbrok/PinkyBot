@@ -40,11 +40,12 @@ def _stub_resolve_and_verify():
         yield
 
 
-def _make_client():
+def _make_client(tmp_path: Path):
     from pinky_daemon.api import create_api
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(mode=0o700)
+    app = create_api(max_sessions=10, default_working_dir=str(tmp_path),
+                     db_path=str(data_dir / "conversations.db"))
     return TestClient(app)
 
 
@@ -109,6 +110,14 @@ class _GitMock:
             self._hash_call += 1
             val = self.before_hash if self._hash_call == 1 else self.after_hash
             return (val + "\n").encode()
+
+        # Full object ids and the optional target entry point are new probes.
+        if cmd[:2] == ["git", "rev-parse"] and (
+            cmd[2] == "HEAD" or cmd[2].endswith("^{commit}")
+        ):
+            return ("a" * 40 + "\n").encode()
+        if cmd[:2] == ["git", "show"]:
+            return b"# Older entry point without the startup inspection mode\n"
 
         # git describe --tags --exact-match HEAD — pretend untagged
         if cmd[:2] == ["git", "describe"]:
@@ -177,7 +186,7 @@ class _GitMock:
 class TestAdminUpdateForce:
     """Verify the force=True flag from task #77."""
 
-    def test_force_false_is_default(self):
+    def test_force_false_is_default(self, tmp_path: Path):
         """No force param → no `git checkout -- .` is invoked."""
         gm = _GitMock(dirty_files=["frontend-dist/index.html"])
         with (
@@ -185,7 +194,7 @@ class TestAdminUpdateForce:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main")
         assert r.status_code == 200
         body = r.json()
@@ -195,7 +204,7 @@ class TestAdminUpdateForce:
         assert not gm.did_force_reset()
         assert gm.did_deploy_checkout()
 
-    def test_force_true_resets_dirty_tracked_files(self):
+    def test_force_true_resets_dirty_tracked_files(self, tmp_path: Path):
         """force=True with a dirty tree → checkout -- . runs before pull."""
         dirty = ["frontend-dist/index.html", "frontend-dist/assets/app.js"]
         gm = _GitMock(dirty_files=dirty)
@@ -204,7 +213,7 @@ class TestAdminUpdateForce:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main&force=true")
         assert r.status_code == 200
         body = r.json()
@@ -223,7 +232,7 @@ class TestAdminUpdateForce:
         )
         assert reset_idx < deploy_idx, "force reset must precede the deploy checkout"
 
-    def test_force_true_clean_tree_no_reset(self):
+    def test_force_true_clean_tree_no_reset(self, tmp_path: Path):
         """force=True but tree is clean → no checkout invoked, forced_reset=False."""
         gm = _GitMock(dirty_files=[])
         with (
@@ -231,7 +240,7 @@ class TestAdminUpdateForce:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main&force=true")
         assert r.status_code == 200
         body = r.json()
@@ -240,7 +249,7 @@ class TestAdminUpdateForce:
         assert not gm.did_force_reset()
         assert gm.did_deploy_checkout()
 
-    def test_force_never_runs_git_clean(self):
+    def test_force_never_runs_git_clean(self, tmp_path: Path):
         """Untracked files must be preserved — never invoke `git clean`."""
         gm = _GitMock(dirty_files=["some/file.py"])
         with (
@@ -248,18 +257,18 @@ class TestAdminUpdateForce:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             client.post("/admin/update?branch=main&force=true")
         assert not gm.did_clean(), "force must not delete untracked files"
 
-    def test_force_ignored_in_dry_run(self):
+    def test_force_ignored_in_dry_run(self, tmp_path: Path):
         """dry_run=True returns before the destructive force block runs."""
         gm = _GitMock(dirty_files=["frontend-dist/index.html"])
         with (
             patch("subprocess.check_output", side_effect=gm),
             patch("shutil.which", return_value=None),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main&force=true&dry_run=true")
         assert r.status_code == 200
         body = r.json()
@@ -272,13 +281,13 @@ class TestAdminUpdateForce:
 class TestAdminUpdateBaseline:
     """Sanity coverage for the existing endpoint paths."""
 
-    def test_dry_run_reports_pending_commits(self):
+    def test_dry_run_reports_pending_commits(self, tmp_path: Path):
         gm = _GitMock(dirty_files=[])
         with (
             patch("subprocess.check_output", side_effect=gm),
             patch("shutil.which", return_value=None),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main&dry_run=true")
         assert r.status_code == 200
         body = r.json()
@@ -288,7 +297,7 @@ class TestAdminUpdateBaseline:
         assert body.get("pending_commits") == 1
         assert body.get("up_to_date") is False
 
-    def test_checkout_failure_returns_error(self):
+    def test_checkout_failure_returns_error(self, tmp_path: Path):
         """If the deploy checkout errors, endpoint returns {'error': ...}."""
 
         def fail_on_checkout(cmd, **kwargs):
@@ -302,7 +311,7 @@ class TestAdminUpdateBaseline:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main")
         assert r.status_code == 200
         body = r.json()
@@ -873,7 +882,7 @@ class TestAdminUpdateStoragePreflight:
         assert response.json()["updated"] is True
         assert "update" in calls
 
-    def test_successful_frontend_rebuild_writes_manifest_and_status(self):
+    def test_successful_frontend_rebuild_writes_manifest_and_status(self, tmp_path: Path):
         """When npm build succeeds, /admin/update writes and returns the build manifest."""
         gm = _GitMock(dirty_files=[])
         manifest = {"git_hash": "def5678", "assets": ["index.js"]}
@@ -889,7 +898,7 @@ class TestAdminUpdateStoragePreflight:
                   return_value=frontend_status),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main")
 
         assert r.status_code == 200
@@ -900,7 +909,7 @@ class TestAdminUpdateStoragePreflight:
         write_manifest.assert_called_once()
         assert write_manifest.call_args.kwargs["git_hash"] == "def5678"
 
-    def test_successful_frontend_rebuild_reports_manifest_error_separately(self):
+    def test_successful_frontend_rebuild_reports_manifest_error_separately(self, tmp_path: Path):
         """A post-build manifest failure should not be mislabeled as a build failure."""
         gm = _GitMock(dirty_files=[])
         frontend_status = {"status": "unverified", "message": "manifest missing"}
@@ -915,7 +924,7 @@ class TestAdminUpdateStoragePreflight:
                   return_value=frontend_status),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main")
 
         assert r.status_code == 200
@@ -1080,8 +1089,8 @@ class TestFrontendBuildManifest:
         assert manifest["assets"] == ["index-test.js", "index-test.css"]
         assert status["status"] == "ok"
 
-    def test_admin_update_status_endpoint_exposes_frontend_status(self):
-        client = _make_client()
+    def test_admin_update_status_endpoint_exposes_frontend_status(self, tmp_path: Path):
+        client = _make_client(tmp_path)
         with patch(
             "pinky_daemon.api._frontend_build_status",
             return_value={"status": "unverified", "message": "test"},
@@ -1126,7 +1135,7 @@ class TestAdminUpdateForceDepsIntegration:
             return True
         return _REAL_PATH_EXISTS(path)
 
-    def test_force_deps_triggers_pip_install_even_on_clean_pull(self):
+    def test_force_deps_triggers_pip_install_even_on_clean_pull(self, tmp_path: Path):
         """force_deps=True → pip install runs even when nothing changed in git."""
         gm = _GitMock(dirty_files=[], before_hash="same1", after_hash="same1")
         wrapped = self._track_pip_calls(gm)
@@ -1135,7 +1144,7 @@ class TestAdminUpdateForceDepsIntegration:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main&force_deps=true")
         assert r.status_code == 200
         body = r.json()
@@ -1146,7 +1155,7 @@ class TestAdminUpdateForceDepsIntegration:
         assert "-e" in gm.pip_calls[0]
         assert ".[all]" in gm.pip_calls[0]
 
-    def test_force_and_force_deps_combine(self):
+    def test_force_and_force_deps_combine(self, tmp_path: Path):
         """Both flags together: dirty tree gets reset AND deps get rebuilt."""
         gm = _GitMock(dirty_files=["frontend-dist/index.html"])
         wrapped = self._track_pip_calls(gm)
@@ -1155,7 +1164,7 @@ class TestAdminUpdateForceDepsIntegration:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main&force=true&force_deps=true")
         assert r.status_code == 200
         body = r.json()
@@ -1165,7 +1174,7 @@ class TestAdminUpdateForceDepsIntegration:
         assert gm.did_force_reset()
         assert len(gm.pip_calls) == 1
 
-    def test_no_force_deps_skips_pip_when_pyproject_unchanged(self):
+    def test_no_force_deps_skips_pip_when_pyproject_unchanged(self, tmp_path: Path):
         """Default behavior: don't reinstall when pyproject.toml didn't change.
 
         The drift detector is also a reinstall trigger (see
@@ -1181,13 +1190,13 @@ class TestAdminUpdateForceDepsIntegration:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main")
         body = r.json()
         assert body.get("deps_rebuilt") is False
         assert gm.pip_calls == []
 
-    def test_deps_error_surfaced_when_pip_fails(self):
+    def test_deps_error_surfaced_when_pip_fails(self, tmp_path: Path):
         """If pip install errors out, deps_error is populated and surfaced."""
         gm = _GitMock(dirty_files=[], before_hash="same1", after_hash="same1")
 
@@ -1206,14 +1215,14 @@ class TestAdminUpdateForceDepsIntegration:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main&force_deps=true")
         body = r.json()
         assert body.get("deps_rebuilt") is False
         assert body.get("deps_error")
         assert "pip install failed" in body["deps_error"]
 
-    def test_broken_venv_pip_falls_back_and_logs_vestigial_warning(self):
+    def test_broken_venv_pip_falls_back_and_logs_vestigial_warning(self, tmp_path: Path):
         gm = _GitMock(dirty_files=[], before_hash="same1", after_hash="same1")
         calls: list[list[str]] = []
         logs: list[str] = []
@@ -1221,7 +1230,7 @@ class TestAdminUpdateForceDepsIntegration:
         def broken_venv_pip(cmd, **kwargs):
             cmd_list = list(cmd)
             calls.append(cmd_list)
-            if cmd_list[1:] == ["-m", "pip", "--version"]:
+            if cmd_list[1:] == ["-B", "-m", "pip", "--version"]:
                 raise sp.CalledProcessError(
                     1, cmd, output=b".venv/bin/python: No module named pip",
                 )
@@ -1236,13 +1245,13 @@ class TestAdminUpdateForceDepsIntegration:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main&force_deps=true")
 
         assert r.status_code == 200
         assert r.json()["deps_rebuilt"] is True
         assert any(
-            call[:4] == [sys.executable, "-m", "pip", "install"]
+            call[:5] == [sys.executable, "-B", "-m", "pip", "install"]
             and "--break-system-packages" in call
             for call in calls
         )
@@ -1254,7 +1263,7 @@ class TestAdminUpdateForceDepsIntegration:
         assert "No module named pip" in warnings[0]
         assert f"falling back to {sys.executable}" in warnings[0]
 
-    def test_functional_venv_pip_is_still_preferred(self):
+    def test_functional_venv_pip_is_still_preferred(self, tmp_path: Path):
         gm = _GitMock(dirty_files=[], before_hash="same1", after_hash="same1")
         calls: list[list[str]] = []
         project_venv_python: list[str] = []
@@ -1262,7 +1271,7 @@ class TestAdminUpdateForceDepsIntegration:
         def functional_venv_pip(cmd, **kwargs):
             cmd_list = list(cmd)
             calls.append(cmd_list)
-            if cmd_list[1:] == ["-m", "pip", "--version"]:
+            if cmd_list[1:] == ["-B", "-m", "pip", "--version"]:
                 project_venv_python.append(cmd_list[0])
                 return b"pip 26.0"
             if cmd_list[0].endswith("/.venv/bin/python") and "install" in cmd_list:
@@ -1275,15 +1284,15 @@ class TestAdminUpdateForceDepsIntegration:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main&force_deps=true")
 
         assert r.status_code == 200
         assert r.json()["deps_rebuilt"] is True
-        assert any(call[1:] == ["-m", "pip", "--version"] for call in calls)
+        assert any(call[1:] == ["-B", "-m", "pip", "--version"] for call in calls)
         assert any(
             call[0] == project_venv_python[0]
-            and call[1:4] == ["-m", "pip", "install"]
+            and call[1:5] == ["-B", "-m", "pip", "install"]
             and "--break-system-packages" not in call
             for call in calls
         )
@@ -1291,7 +1300,7 @@ class TestAdminUpdateForceDepsIntegration:
         assert len(install_calls) == 1
         assert "--break-system-packages" not in install_calls[0]
 
-    def test_deps_error_alerts_owner_once(self):
+    def test_deps_error_alerts_owner_once(self, tmp_path: Path):
         gm = _GitMock(dirty_files=[], before_hash="same1", after_hash="same1")
 
         def fail_on_pip(cmd, **kwargs):
@@ -1305,7 +1314,7 @@ class TestAdminUpdateForceDepsIntegration:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             owner_notify = AsyncMock(return_value=True)
             client.app.state.scheduler._owner_notify_callback = owner_notify
             r = client.post("/admin/update?branch=main&force_deps=true")
@@ -1455,7 +1464,7 @@ class TestInstalledDepsDriftDetection:
             drifts = _check_installed_deps_drift(tmp)
         assert drifts == []
 
-    def test_drift_triggers_reinstall_in_admin_update(self):
+    def test_drift_triggers_reinstall_in_admin_update(self, tmp_path: Path):
         """When the drift check reports any entry, admin_update kicks off
         pip install even if pyproject.toml didn't change in this pull and
         force_deps=False."""
@@ -1488,14 +1497,14 @@ class TestInstalledDepsDriftDetection:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main")
         body = r.json()
         assert body.get("deps_rebuilt") is True
         assert body.get("deps_drift") == fake_drift
         assert pip_calls, "drift should have triggered pip install"
 
-    def test_no_drift_no_diff_no_force_means_no_reinstall(self):
+    def test_no_drift_no_diff_no_force_means_no_reinstall(self, tmp_path: Path):
         """The drift signal is additive — when there's no drift AND no
         pyproject change AND no force_deps, pip is not invoked."""
         gm = _GitMock(dirty_files=[], before_hash="same1", after_hash="same1")
@@ -1521,14 +1530,14 @@ class TestInstalledDepsDriftDetection:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main")
         body = r.json()
         assert body.get("deps_rebuilt") is False
         assert body.get("deps_drift") == []
         assert pip_calls == []
 
-    def test_drift_check_failure_is_non_fatal(self):
+    def test_drift_check_failure_is_non_fatal(self, tmp_path: Path):
         """If the drift check itself raises (e.g. pyproject parse fails),
         admin_update keeps going — drift just can't contribute to the
         reinstall decision."""
@@ -1544,7 +1553,7 @@ class TestInstalledDepsDriftDetection:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update?branch=main")
         assert r.status_code == 200
         body = r.json()
@@ -1561,20 +1570,20 @@ class TestTrunkBasedChannel:
     must 400. Legacy PINKYBOT_CHANNEL=beta is coerced (logged) to stable.
     """
 
-    def test_admin_update_rejects_beta_branch(self):
+    def test_admin_update_rejects_beta_branch(self, tmp_path: Path):
         """branch=beta must 400 — beta channel was removed."""
-        client = _make_client()
+        client = _make_client(tmp_path)
         r = client.post("/admin/update?branch=beta")
         assert r.status_code == 400
         assert "beta" in r.json()["detail"].lower() or "main" in r.json()["detail"].lower()
 
-    def test_admin_update_rejects_arbitrary_branch(self):
+    def test_admin_update_rejects_arbitrary_branch(self, tmp_path: Path):
         """Only 'main' or empty is accepted."""
-        client = _make_client()
+        client = _make_client(tmp_path)
         r = client.post("/admin/update?branch=feature/foo")
         assert r.status_code == 400
 
-    def test_admin_update_empty_branch_defaults_to_main(self):
+    def test_admin_update_empty_branch_defaults_to_main(self, tmp_path: Path):
         """No branch arg → defaults to main (release tags)."""
         gm = _GitMock(dirty_files=[], branch="main")
         with (
@@ -1582,12 +1591,12 @@ class TestTrunkBasedChannel:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update")
         assert r.status_code == 200
         assert gm.did_deploy_checkout()
 
-    def test_admin_update_coerces_legacy_beta_env(self):
+    def test_admin_update_coerces_legacy_beta_env(self, tmp_path: Path):
         """PINKYBOT_CHANNEL=beta env should not crash; coerced to stable."""
         gm = _GitMock(dirty_files=[], branch="main")
         with (
@@ -1596,7 +1605,7 @@ class TestTrunkBasedChannel:
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.post("/admin/update")
         assert r.status_code == 200
         # Should operate on main, not beta: fetch targets main + deploy checkout ran.
@@ -1604,26 +1613,26 @@ class TestTrunkBasedChannel:
         assert fetch_calls and fetch_calls[0][-1] == "main"
         assert gm.did_deploy_checkout()
 
-    def test_admin_channel_get_always_returns_stable(self):
-        client = _make_client()
+    def test_admin_channel_get_always_returns_stable(self, tmp_path: Path):
+        client = _make_client(tmp_path)
         r = client.get("/admin/channel")
         assert r.status_code == 200
         body = r.json()
         assert body == {"channel": "stable", "branch": "main"}
 
-    def test_admin_channel_get_coerces_legacy_beta_env(self):
+    def test_admin_channel_get_coerces_legacy_beta_env(self, tmp_path: Path):
         with patch.dict(os.environ, {"PINKYBOT_CHANNEL": "beta"}):
-            client = _make_client()
+            client = _make_client(tmp_path)
             r = client.get("/admin/channel")
         assert r.status_code == 200
         assert r.json() == {"channel": "stable", "branch": "main"}
 
-    def test_admin_channel_post_rejects_beta(self):
-        client = _make_client()
+    def test_admin_channel_post_rejects_beta(self, tmp_path: Path):
+        client = _make_client(tmp_path)
         r = client.post("/admin/channel?channel=beta")
         assert r.status_code == 400
 
-    def test_admin_channel_post_rejects_arbitrary(self):
-        client = _make_client()
+    def test_admin_channel_post_rejects_arbitrary(self, tmp_path: Path):
+        client = _make_client(tmp_path)
         r = client.post("/admin/channel?channel=edge")
         assert r.status_code == 400

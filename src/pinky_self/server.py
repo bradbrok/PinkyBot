@@ -84,7 +84,9 @@ def create_server(
 
     mcp = FastMCP("pinky-self", host=host, port=port)
 
-    def _api(method: str, path: str, body: dict | None = None) -> dict:
+    def _api(
+        method: str, path: str, body: dict | None = None, *, timeout: float = 30,
+    ) -> dict:
         """Call the PinkyBot API."""
         url = f"{api_url}{path}"
         data = json.dumps(resolve_lazy(body)).encode() if body else None
@@ -101,7 +103,7 @@ def create_server(
             headers=headers,
         )
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8", errors="replace")
@@ -2126,16 +2128,85 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
     def _register_admin_tools():
         # ── System Admin ──────────────────────────────────────
 
+        def _with_startup_check(message: str, result: dict) -> str:
+            """Append complete layout findings and target-check outcomes."""
+            parts = [message]
+
+            def findings_text(findings: list[dict]) -> None:
+                for finding in findings:
+                    parts.append(f"  {finding['kind']}: {finding['path']}")
+                    if "resolved_path" in finding:
+                        resolved = finding["resolved_path"]
+                        parts.append(f"    Resolved path: {resolved or 'unresolved'}")
+                    if "detail" in finding:
+                        parts.append(f"    {finding['detail']}")
+
+            preflight = result.get("preflight")
+            if preflight is not None:
+                if preflight.get("incomplete"):
+                    parts.append(f"Layout pre-flight incomplete: {preflight.get('reason', '')}")
+                elif "ok" in preflight:
+                    outcome = "passed" if preflight["ok"] else "failed"
+                    parts.append(f"Layout pre-flight: {outcome}.")
+                findings_text(preflight.get("findings", []))
+                if "warnings_count" in preflight:
+                    parts.append(f"Layout warnings: {preflight['warnings_count']}")
+
+            target_check = result.get("target_check")
+            if target_check is not None:
+                if "skipped" in target_check:
+                    parts.append(f"Target startup check skipped: {target_check['skipped']}")
+                else:
+                    reason = target_check.get("reason", "passed")
+                    rc = target_check.get("rc")
+                    parts.append(f"Target startup check: {reason}; exit status: {rc}.")
+                findings_text(target_check.get("findings", []))
+                if target_check.get("stderr_tail"):
+                    parts.append(f"Child stderr: {target_check['stderr_tail']}")
+
+            undo = result.get("undo")
+            if undo is not None:
+                outcome = "succeeded" if undo.get("ok") else "failed"
+                parts.append(f"Undo: {outcome}.")
+                if result.get("undo_warning"):
+                    parts.append(result["undo_warning"])
+                    if undo.get("checked_out"):
+                        parts.append(f"Requested checkout: {undo['checked_out']}")
+                elif undo.get("checked_out"):
+                    parts.append(f"Checked out: {undo['checked_out']}")
+                else:
+                    parts.append(
+                        "The working tree still holds the target commit; "
+                        "the next restart would start it."
+                    )
+                restored = undo.get("deps_restored")
+                deps = "not needed" if restored is None else "restored" if restored else "failed"
+                parts.append(f"Dependencies: {deps}.")
+                if undo.get("error"):
+                    parts.append(f"Undo error: {undo['error']}")
+            if "staying_on_version" in result:
+                parts.append(f"Staying on version: {result['staying_on_version']}")
+            return "\n".join(parts)
+
         @mcp.tool()
-        def check_for_updates() -> str:
-            """Check for pending code updates (dry run, no changes applied)."""
-            result = _api("POST", "/admin/update?dry_run=true")
+        def check_for_updates(preflight: bool = False) -> str:
+            """Check for pending code updates (dry run, no changes applied).
+
+            preflight=True also inspects the current startup layout; this can
+            take longer on a large data root.
+            """
+            url = "/admin/update?dry_run=true"
+            if preflight:
+                url += "&preflight=true"
+            result = _api("POST", url, timeout=1800 if preflight else 30)
             if "error" in result:
-                return f"Failed to check for updates: {result['error']}"
+                return _with_startup_check(f"Failed to check for updates: {result['error']}", result)
 
             if result.get("up_to_date"):
                 current = result.get("current_release") or result.get("current_hash", "?")
-                return f"Already up to date at {current} on {result.get('branch', 'main')}."
+                return _with_startup_check(
+                    f"Already up to date at {current} on {result.get('branch', 'main')}.", result,
+                )
 
             commits = result.get("commits", [])
             parts = []
@@ -2151,7 +2222,7 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
                 parts.append(f"  {c}")
             if len(commits) > 20:
                 parts.append(f"  ... and {len(commits) - 20} more")
-            return "\n".join(parts)
+            return _with_startup_check("\n".join(parts), result)
 
         @mcp.tool()
         def update_and_restart(
@@ -2188,12 +2259,12 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
                 params.append("force_deps=true")
             if params:
                 url += "?" + "&".join(params)
-            result = _api("POST", url)
+            result = _api("POST", url, timeout=1800)
             if "error" in result:
-                return f"Update failed: {result['error']}"
+                return _with_startup_check(f"Update failed: {result['error']}", result)
 
             if not result.get("updated"):
-                return f"Unexpected response: {result}"
+                return _with_startup_check(f"Unexpected response: {result}", result)
 
             release = result.get("release")
             before, after = result.get("before_hash", "?"), result.get("after_hash", "?")
@@ -2231,15 +2302,18 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
             else:
                 parts.append("\nNo restart needed (already up to date).")
 
-            return "\n".join(parts)
+            return _with_startup_check("\n".join(parts), result)
 
         @mcp.tool()
         def restart_daemon() -> str:
             """Restart the daemon without pulling code updates. Session resumes automatically."""
-            result = _api("POST", "/admin/restart")
+            result = _api("POST", "/admin/restart", timeout=1800)
             if "error" in result:
-                return f"Restart failed: {result['error']}"
-            return f"Daemon is restarting (was at {result.get('git_hash', '?')}). Your session will resume automatically."
+                return _with_startup_check(f"Restart failed: {result['error']}", result)
+            return _with_startup_check(
+                f"Daemon is restarting (was at {result.get('git_hash', '?')}). "
+                "Your session will resume automatically.", result,
+            )
 
         @mcp.tool()
         def register_agent(

@@ -802,6 +802,237 @@ class _FilesystemDatabase:
     dev_ino: tuple[int, int]
 
 
+@dataclass(frozen=True, slots=True)
+class LayoutInspection:
+    """Detached filesystem findings and hygiene warnings in discovery order."""
+
+    findings: list[dict[str, str | None]]
+    warnings: list[str]
+
+
+def read_store_identities(
+    paths: Iterable[str | os.PathLike[str]],
+) -> dict[str, tuple[int, int] | None]:
+    """Stat canonical store paths without opening their contents.
+
+    An absent store retains its footprint without an inode. Other errors mean
+    the inventory could not be read, rather than an empty or safe inventory.
+    """
+    identities: dict[str, tuple[int, int] | None] = {}
+    for value in paths:
+        path = os.fspath(value)
+        if path in identities:
+            continue
+        try:
+            metadata = os.stat(path)
+        except OSError as exc:
+            if StoreCatalog._is_missing_path_error(exc):
+                identities[path] = None
+                continue
+            if exc.filename is None:
+                exc.filename = path
+            raise
+        identities[path] = (metadata.st_dev, metadata.st_ino)
+    return identities
+
+
+def inspect_filesystem_layout(
+    expected_root: str | os.PathLike[str],
+    registered_identities: Mapping[str, tuple[int, int] | None],
+    *,
+    silence_allowlist: Mapping[str, str] | None = None,
+) -> LayoutInspection:
+    """Inspect metadata once without changing catalog state or opening files."""
+    return _FilesystemLayoutInspector(
+        expected_root, registered_identities, silence_allowlist
+    ).inspect()
+
+
+class _FilesystemLayoutInspector:
+    def __init__(self, expected_root, registered_identities, silence_allowlist):
+        self.root = os.path.realpath(os.fspath(expected_root))
+        self.registered_realpaths = set(registered_identities)
+        self.registered_paths_by_inode: dict[tuple[int, int], set[str]] = {}
+        for path, identity in registered_identities.items():
+            if identity is not None:
+                self.registered_paths_by_inode.setdefault(identity, set()).add(path)
+        self.allowlist = dict(
+            DEFAULT_FILESYSTEM_SILENCE_ALLOWLIST
+            if silence_allowlist is None else silence_allowlist
+        )
+        self.findings: list[dict[str, str | None]] = []
+        self.warnings: list[str] = []
+        self.unclaimed_databases: list[_FilesystemDatabase] = []
+
+    def inspect(self) -> LayoutInspection:
+        pending_directories = [self.root]
+        # Cycles are guarded by inode; warning policy follows each file realpath.
+        visited_directories: set[tuple[int, int]] = set()
+        while pending_directories:
+            directory = pending_directories.pop()
+            try:
+                resolved_directory = os.path.realpath(directory)
+            except OSError as exc:
+                self._inspection_error("directory", directory, None, exc)
+                continue
+            try:
+                directory_stat = os.stat(resolved_directory)
+            except OSError as exc:
+                self._inspection_error("directory", directory, resolved_directory, exc)
+                continue
+            if not stat.S_ISDIR(directory_stat.st_mode):
+                self._record_database(directory, resolved_directory, directory_stat)
+                continue
+            if not self._under_root(resolved_directory):
+                self._outside_root("directory", directory, resolved_directory)
+                continue
+            directory_identity = (directory_stat.st_dev, directory_stat.st_ino)
+            if directory_identity in visited_directories:
+                continue
+            visited_directories.add(directory_identity)
+            try:
+                with os.scandir(resolved_directory) as iterator:
+                    entries = sorted(iterator, key=lambda entry: entry.name)
+            except OSError as exc:
+                self._inspection_error("directory", directory, resolved_directory, exc)
+                continue
+
+            child_directories: list[str] = []
+            for entry in entries:
+                discovered_path = entry.path
+                try:
+                    resolved_path = os.path.realpath(discovered_path)
+                except OSError as exc:
+                    self._inspection_error("file or directory", discovered_path, None, exc)
+                    continue
+                try:
+                    entry_stat = os.stat(resolved_path)
+                except OSError as exc:
+                    self._inspection_error(
+                        "file or directory", discovered_path, resolved_path, exc
+                    )
+                    continue
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    if not self._under_root(resolved_path):
+                        self._outside_root("directory", discovered_path, resolved_path)
+                        continue
+                    child_directories.append(discovered_path)
+                    continue
+                self._record_database(discovered_path, resolved_path, entry_stat)
+            pending_directories.extend(reversed(child_directories))
+
+        matched_allowlist_patterns: set[str] = set()
+        for database in self.unclaimed_databases:
+            matching_patterns = {
+                pattern for pattern in self.allowlist
+                if self._allowlist_matches(pattern, database.relative_path)
+            }
+            matched_allowlist_patterns.update(matching_patterns)
+            if matching_patterns:
+                continue
+            self.warnings.append(
+                "unclaimed database file: "
+                f"path={database.relative_path!r} resolved_path={database.resolved_path!r} "
+                f"dev_ino={database.dev_ino!r}"
+            )
+        for pattern, reason in self.allowlist.items():
+            if pattern not in matched_allowlist_patterns:
+                self.warnings.append(
+                    f"dead silence-allowlist entry {pattern!r} matched no database files "
+                    f"(reason: {reason})"
+                )
+        return LayoutInspection(self.findings, self.warnings)
+
+    def _record_database(self, discovered_path, resolved_path, path_stat) -> None:
+        name = os.path.basename(discovered_path)
+        if not name.endswith(".db") or name.endswith(_SQLITE_SIDECAR_SUFFIXES):
+            return
+        if not self._under_root(resolved_path):
+            self._outside_root("database", discovered_path, resolved_path)
+            return
+        if not stat.S_ISREG(path_stat.st_mode):
+            return
+        database = _FilesystemDatabase(
+            relative_path=os.path.relpath(resolved_path, self.root).replace(os.sep, "/"),
+            resolved_path=resolved_path,
+            dev_ino=(path_stat.st_dev, path_stat.st_ino),
+        )
+        registered_inode_paths = self.registered_paths_by_inode.get(database.dev_ino, set())
+        if registered_inode_paths and resolved_path not in registered_inode_paths:
+            self.findings.append({
+                "kind": "alias_of_registered_store",
+                "path": os.path.abspath(discovered_path),
+                "resolved_path": resolved_path,
+                "detail": (
+                    "unregistered path aliases registered store inode: "
+                    f"path={database.relative_path!r} resolved_path={database.resolved_path!r} "
+                    f"dev_ino={database.dev_ino!r} "
+                    f"registered_realpaths={sorted(registered_inode_paths)!r}"
+                ),
+            })
+            return
+        if resolved_path in self.registered_realpaths or self._ignored_path(resolved_path):
+            return
+        self.unclaimed_databases.append(database)
+
+    def _outside_root(self, kind: str, path: str, resolved_path: str) -> None:
+        self.findings.append({
+            "kind": f"{kind}_outside_root",
+            "path": os.path.abspath(path),
+            "resolved_path": resolved_path,
+            "detail": (
+                "Store catalog filesystem alias coverage failed:\n- "
+                f"{kind} symlink escapes expected root {self.root!r}: "
+                f"path={path!r} resolved_path={resolved_path!r}"
+            ),
+        })
+
+    def _inspection_error(self, kind, path, resolved_path, exc) -> None:
+        if StoreCatalog._is_missing_path_error(exc):
+            return
+        footprint = os.path.normpath(resolved_path or os.path.abspath(path))
+        prefix = footprint if footprint.endswith(os.sep) else footprint + os.sep
+        if any(
+            registered == footprint or registered.startswith(prefix)
+            for registered in self.registered_realpaths
+        ):
+            self.findings.append({
+                "kind": "uninspectable_in_store_footprint",
+                "path": os.path.abspath(path),
+                "resolved_path": resolved_path,
+                "detail": (
+                    "Store catalog filesystem alias coverage failed:\n- "
+                    f"could not inspect database {kind}: path={path!r} "
+                    f"error={type(exc).__name__}: {exc}"
+                ),
+            })
+            return
+        self.warnings.append(
+            f"could not inspect database {kind} outside registered store footprint; "
+            f"skipping: path={path!r} error={type(exc).__name__}: {exc}"
+        )
+
+    def _under_root(self, path: str) -> bool:
+        try:
+            return os.path.commonpath((self.root, path)) == self.root
+        except ValueError:
+            return False
+
+    def _ignored_path(self, path: str) -> bool:
+        directories = os.path.relpath(path, self.root).split(os.sep)[:-1]
+        return any(
+            token in _IGNORED_DIRECTORY_KINDS
+            for directory in directories
+            for token in re.split(r"[._-]+", directory.casefold()) if token
+        )
+
+    @staticmethod
+    def _allowlist_matches(pattern: str, relative_path: str) -> bool:
+        normalized_pattern = pattern.replace(os.sep, "/")
+        candidate = relative_path if "/" in normalized_pattern else os.path.basename(relative_path)
+        return fnmatch.fnmatchcase(candidate, normalized_pattern)
+
+
 class StoreReservation:
     """One catalog record reserved before its SQLite file is created.
 
@@ -1663,80 +1894,46 @@ class StoreCatalog:
             raise error from detail
         raise error
 
-    def reconcile_filesystem(self) -> list[str]:
-        """Reconcile registered stores with SQLite files found below the data root.
+    def inspect_layout(self) -> LayoutInspection:
+        """Inspect current metadata without refreshing records or logging warnings."""
+        with self._lock:
+            paths = [
+                entry.record.resolved_path
+                for entry in self._entries if not entry.record.is_memory
+            ]
+            allowlist = dict(self._silence_allowlist)
+        return inspect_filesystem_layout(
+            self._expected_root,
+            read_store_identities(paths),
+            silence_allowlist=allowlist,
+        )
 
-        A distinct path sharing a registered store's inode is unsafe and fails
-        closed. Inspection failures within a registered store's path footprint
-        also fail closed; unrelated unreadable paths warn instead. Standalone
-        unclaimed databases and stale warning suppressions are surfaced as
-        warnings so inventory drift cannot remain invisible or brick an otherwise
-        safe boot.
-        """
+    def reconcile_filesystem(self) -> list[str]:
+        """Raise legacy layout errors and log filesystem hygiene warnings."""
         with self._lock:
             self._require_observations_unchanged()
             self._refresh_identities()
-            records = [entry.record for entry in self._entries if not entry.record.is_memory]
-
-        registered_realpaths = {record.resolved_path for record in records}
-        registered_paths_by_inode: dict[tuple[int, int], set[str]] = {}
-        for record in records:
-            if record.dev_ino is not None:
-                registered_paths_by_inode.setdefault(record.dev_ino, set()).add(
-                    record.resolved_path
-                )
-
-        databases, warnings = self._enumerate_database_files(registered_realpaths)
-        alias_violations: list[str] = []
-        matched_allowlist_patterns: set[str] = set()
-
-        for database in databases:
-            registered_inode_paths = registered_paths_by_inode.get(database.dev_ino, set())
-            if registered_inode_paths and database.resolved_path not in registered_inode_paths:
-                alias_violations.append(
-                    "unregistered path aliases registered store inode: "
-                    f"path={database.relative_path!r} resolved_path={database.resolved_path!r} "
-                    f"dev_ino={database.dev_ino!r} "
-                    f"registered_realpaths={sorted(registered_inode_paths)!r}"
-                )
-                continue
-
-            if database.resolved_path in registered_realpaths or self._is_in_ignored_directory(
-                database.resolved_path
-            ):
-                continue
-
-            matching_patterns = {
-                pattern
-                for pattern in self._silence_allowlist
-                if self._allowlist_pattern_matches(pattern, database.relative_path)
+            identities = {
+                entry.record.resolved_path: entry.record.dev_ino
+                for entry in self._entries if not entry.record.is_memory
             }
-            matched_allowlist_patterns.update(matching_patterns)
-            if matching_patterns:
-                continue
+            allowlist = dict(self._silence_allowlist)
 
-            warnings.append(
-                "unclaimed database file: "
-                f"path={database.relative_path!r} resolved_path={database.resolved_path!r} "
-                f"dev_ino={database.dev_ino!r}"
-            )
-
-        if alias_violations:
+        report = inspect_filesystem_layout(
+            self._expected_root, identities, silence_allowlist=allowlist
+        )
+        # Traversal failures preceded deferred inode-alias checks historically.
+        for finding in report.findings:
+            if finding["kind"] != "alias_of_registered_store":
+                raise StoreCatalogError(finding["detail"])
+        if report.findings:
             raise StoreCatalogError(
                 "Store catalog filesystem reconciliation failed:\n- "
-                + "\n- ".join(alias_violations)
+                + "\n- ".join(finding["detail"] for finding in report.findings)
             )
-
-        for pattern, reason in self._silence_allowlist.items():
-            if pattern not in matched_allowlist_patterns:
-                warnings.append(
-                    f"dead silence-allowlist entry {pattern!r} matched no database files "
-                    f"(reason: {reason})"
-                )
-
-        for warning in warnings:
+        for warning in report.warnings:
             logger.warning("STORE CATALOG WARNING: %s", warning)
-        return warnings
+        return report.warnings
 
     def snapshot(self) -> list[StoreRecord]:
         """Return the current canonical records in registration order."""
@@ -1808,208 +2005,9 @@ class StoreCatalog:
                     connection_policy=record.connection_policy,
                 )
 
-    def _enumerate_database_files(
-        self, registered_realpaths: set[str]
-    ) -> tuple[list[_FilesystemDatabase], list[str]]:
-        databases: list[_FilesystemDatabase] = []
-        warnings: list[str] = []
-        pending_directories = [self._expected_root]
-        # Alias-coverage cycle guard only; warning policy is derived from each file realpath.
-        visited_directories: set[tuple[int, int]] = set()
-
-        while pending_directories:
-            directory = pending_directories.pop()
-            try:
-                resolved_directory = os.path.realpath(directory)
-            except OSError as exc:
-                if self._is_missing_path_error(exc):
-                    continue
-                self._warn_or_raise_inspection_error(
-                    "directory",
-                    directory,
-                    exc,
-                    footprint_path=os.path.abspath(directory),
-                    registered_realpaths=registered_realpaths,
-                    warnings=warnings,
-                )
-                continue
-            try:
-                directory_stat = os.stat(resolved_directory)
-            except OSError as exc:
-                if self._is_missing_path_error(exc):
-                    continue
-                self._warn_or_raise_inspection_error(
-                    "directory",
-                    directory,
-                    exc,
-                    footprint_path=resolved_directory,
-                    registered_realpaths=registered_realpaths,
-                    warnings=warnings,
-                )
-                continue
-            if not stat.S_ISDIR(directory_stat.st_mode):
-                database = self._filesystem_database_for_path(
-                    directory, resolved_directory, directory_stat
-                )
-                if database is not None:
-                    databases.append(database)
-                continue
-            if not self._is_under_expected_root(resolved_directory):
-                raise StoreCatalogError(
-                    "Store catalog filesystem alias coverage failed:\n- "
-                    f"directory symlink escapes expected root {self._expected_root!r}: "
-                    f"path={directory!r} resolved_path={resolved_directory!r}"
-                )
-            directory_identity = (directory_stat.st_dev, directory_stat.st_ino)
-            if directory_identity in visited_directories:
-                continue
-            visited_directories.add(directory_identity)
-
-            try:
-                with os.scandir(resolved_directory) as iterator:
-                    entries = sorted(iterator, key=lambda entry: entry.name)
-            except OSError as exc:
-                if self._is_missing_path_error(exc):
-                    continue
-                self._warn_or_raise_inspection_error(
-                    "directory",
-                    directory,
-                    exc,
-                    footprint_path=resolved_directory,
-                    registered_realpaths=registered_realpaths,
-                    warnings=warnings,
-                )
-                continue
-
-            child_directories: list[str] = []
-            for entry in entries:
-                discovered_path = entry.path
-                try:
-                    resolved_path = os.path.realpath(discovered_path)
-                except OSError as exc:
-                    if self._is_missing_path_error(exc):
-                        continue
-                    self._warn_or_raise_inspection_error(
-                        "file or directory",
-                        discovered_path,
-                        exc,
-                        footprint_path=os.path.abspath(discovered_path),
-                        registered_realpaths=registered_realpaths,
-                        warnings=warnings,
-                    )
-                    continue
-                try:
-                    entry_stat = os.stat(resolved_path)
-                except OSError as exc:
-                    if self._is_missing_path_error(exc):
-                        continue
-                    self._warn_or_raise_inspection_error(
-                        "file or directory",
-                        discovered_path,
-                        exc,
-                        footprint_path=resolved_path,
-                        registered_realpaths=registered_realpaths,
-                        warnings=warnings,
-                    )
-                    continue
-
-                if stat.S_ISDIR(entry_stat.st_mode):
-                    if not self._is_under_expected_root(resolved_path):
-                        raise StoreCatalogError(
-                            "Store catalog filesystem alias coverage failed:\n- "
-                            f"directory symlink escapes expected root {self._expected_root!r}: "
-                            f"path={discovered_path!r} resolved_path={resolved_path!r}"
-                        )
-                    child_directories.append(discovered_path)
-                    continue
-
-                database = self._filesystem_database_for_path(
-                    discovered_path, resolved_path, entry_stat
-                )
-                if database is not None:
-                    databases.append(database)
-            pending_directories.extend(reversed(child_directories))
-        return databases, warnings
-
-    def _filesystem_database_for_path(
-        self,
-        discovered_path: str,
-        resolved_path: str,
-        path_stat: os.stat_result,
-    ) -> _FilesystemDatabase | None:
-        name = os.path.basename(discovered_path)
-        if not name.endswith(".db") or name.endswith(_SQLITE_SIDECAR_SUFFIXES):
-            return None
-        if not self._is_under_expected_root(resolved_path):
-            raise StoreCatalogError(
-                "Store catalog filesystem alias coverage failed:\n- "
-                f"database symlink escapes expected root {self._expected_root!r}: "
-                f"path={discovered_path!r} resolved_path={resolved_path!r}"
-            )
-        if not stat.S_ISREG(path_stat.st_mode):
-            return None
-        relative_path = os.path.relpath(resolved_path, self._expected_root).replace(os.sep, "/")
-        return _FilesystemDatabase(
-            relative_path=relative_path,
-            resolved_path=resolved_path,
-            dev_ino=(path_stat.st_dev, path_stat.st_ino),
-        )
-
-    def _warn_or_raise_inspection_error(
-        self,
-        kind: str,
-        path: str,
-        exc: OSError,
-        *,
-        footprint_path: str,
-        registered_realpaths: set[str],
-        warnings: list[str],
-    ) -> None:
-        if self._registered_store_at_or_under(footprint_path, registered_realpaths):
-            self._raise_inspection_error(kind, path, exc)
-        warnings.append(
-            f"could not inspect database {kind} outside registered store footprint; "
-            f"skipping: path={path!r} error={type(exc).__name__}: {exc}"
-        )
-
-    @staticmethod
-    def _registered_store_at_or_under(path: str, registered_realpaths: set[str]) -> bool:
-        normalized_path = os.path.normpath(path)
-        path_prefix = (
-            normalized_path if normalized_path.endswith(os.sep) else normalized_path + os.sep
-        )
-        return any(
-            store_path == normalized_path or store_path.startswith(path_prefix)
-            for store_path in registered_realpaths
-        )
-
-    @staticmethod
-    def _raise_inspection_error(kind: str, path: str, exc: OSError) -> None:
-        raise StoreCatalogError(
-            "Store catalog filesystem alias coverage failed:\n- "
-            f"could not inspect database {kind}: path={path!r} "
-            f"error={type(exc).__name__}: {exc}"
-        ) from exc
-
     @staticmethod
     def _is_missing_path_error(exc: OSError) -> bool:
         return isinstance(exc, FileNotFoundError) or exc.errno == errno.ENOENT
-
-    @staticmethod
-    def _is_ignored_directory(name: str) -> bool:
-        tokens = [token for token in re.split(r"[._-]+", name.casefold()) if token]
-        return any(token in _IGNORED_DIRECTORY_KINDS for token in tokens)
-
-    def _is_in_ignored_directory(self, resolved_path: str) -> bool:
-        relative_path = os.path.relpath(resolved_path, self._expected_root)
-        directory_names = relative_path.split(os.sep)[:-1]
-        return any(self._is_ignored_directory(name) for name in directory_names)
-
-    @staticmethod
-    def _allowlist_pattern_matches(pattern: str, relative_path: str) -> bool:
-        normalized_pattern = pattern.replace(os.sep, "/")
-        candidate = relative_path if "/" in normalized_pattern else os.path.basename(relative_path)
-        return fnmatch.fnmatchcase(candidate, normalized_pattern)
 
     @staticmethod
     def _is_memory_path(raw_path: str) -> bool:

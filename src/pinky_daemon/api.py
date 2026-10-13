@@ -1774,6 +1774,191 @@ def _frontend_build_status(
 # ── API Server ───────────────────────────────────────────────
 
 
+_STARTUP_CHECK_TIMEOUT_SECONDS = 600
+_STARTUP_ALERT_WINDOW_SECONDS = 20 * 60 * 60
+_startup_alert_now = time.monotonic
+
+
+def _startup_layout_preflight(catalog: StoreCatalog) -> dict:
+    """Inspect detached metadata without refreshing the serving catalog."""
+    try:
+        report = catalog.inspect_layout()
+    except OSError as exc:
+        return {
+            "ok": False, "incomplete": True,
+            "reason": f"{type(exc).__name__}: {exc.filename or catalog.expected_root}",
+            "findings": [],
+        }
+    return {
+        "ok": not report.findings, "findings": report.findings,
+        "warnings_count": len(report.warnings),
+    }
+
+
+def _startup_full_ref(repo_dir: str, ref: str = "HEAD") -> str:
+    import subprocess as sp
+
+    value = sp.check_output(
+        ["git", "rev-parse", ref], cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+    ).decode().strip()
+    if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", value):
+        raise ValueError("git did not return a full object id")
+    return value
+
+
+def _startup_stderr_tail(value: Any) -> str:
+    if isinstance(value, bytes):
+        value = value.decode(errors="replace")
+    return str(value or "")[-500:]
+
+
+def _startup_target_report(stdout: str | bytes, rc: int) -> dict:
+    """Validate required fields while accepting additions from later releases."""
+    report = json.loads(stdout)
+    if not isinstance(report, dict):
+        raise ValueError("startup report must be an object")
+    if type(report.get("ok")) is not bool or not isinstance(report.get("root"), str):
+        raise ValueError("invalid startup report status or root")
+    checked = report.get("checked")
+    if (not isinstance(checked, list) or checked[:2] != ["import", "layout"]
+            or not all(isinstance(name, str) and name for name in checked)
+            or len(set(checked)) != len(checked)):
+        raise ValueError("invalid startup report stages")
+    findings = report.get("findings")
+    if not isinstance(findings, list) or not all(
+        isinstance(finding, dict)
+        and all(isinstance(finding.get(key), str) and finding[key] for key in ("kind", "path"))
+        for finding in findings
+    ):
+        raise ValueError("invalid startup findings")
+    count, warnings = report.get("warnings_count"), report.get("warnings")
+    if (type(count) is not int or count < 0 or not isinstance(warnings, list)
+            or not all(isinstance(warning, str) for warning in warnings)
+            or len(warnings) != min(20, count)):
+        raise ValueError("invalid startup warnings")
+    if rc not in (0, 1) or report["ok"] is not (rc == 0) or bool(findings) != (rc == 1):
+        raise ValueError("startup report disagrees with exit status")
+    return report
+
+
+def _startup_child_exited(pid: int, timeout: float) -> bool:
+    """Observe exit without reaping, preserving the process group identity."""
+    import errno
+    import select
+
+    if hasattr(os, "waitid"):
+        deadline = time.monotonic() + timeout
+        while True:
+            status = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+            if status is not None:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(.01, remaining))
+
+    queue = select.kqueue()
+    try:
+        event = select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                              flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                              fflags=select.KQ_NOTE_EXIT)
+        events = queue.control([event], 1, timeout)
+        if not events:
+            return False
+        observed = events[0]
+        if observed.flags & select.KQ_EV_ERROR:
+            # Registering an already-ended, unreaped child reports ESRCH.
+            if observed.data == errno.ESRCH:
+                return True
+            raise OSError(observed.data, "cannot observe startup child")
+        return bool(observed.fflags & select.KQ_NOTE_EXIT)
+    finally:
+        queue.close()
+
+
+def _signal_startup_group(pid: int, ended: bool) -> bool:
+    import errno
+    import signal
+
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError as exc:
+        # Linux succeeds in this ended-child state, so this adds no blind spot.
+        return sys.platform == "darwin" and ended and exc.errno == errno.EPERM
+    return True
+
+
+def _run_startup_child(command, *, cwd: str, env: dict, timeout: float):
+    import subprocess as sp
+
+    # Files prevent a descendant holding an inherited pipe from blocking collection.
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        child = sp.Popen(command, cwd=cwd, env=env, stdout=stdout, stderr=stderr,
+                         start_new_session=True)
+        ended = False
+        try:
+            ended = _startup_child_exited(child.pid, timeout)
+        finally:
+            group_ended = _signal_startup_group(child.pid, ended)
+            if not group_ended and not ended:
+                child.kill()
+            child.wait()
+        stdout.seek(0)
+        stderr.seek(0)
+        output, diagnostic = stdout.read(), stderr.read()
+        if not ended:
+            raise sp.TimeoutExpired(command, timeout, output=output, stderr=diagnostic)
+        return SimpleNamespace(returncode=child.returncode, stdout=output, stderr=diagnostic,
+                               cleanup_failed=not group_ended)
+
+
+def _check_target_startup(repo_dir: str, db_path: str, target_ref: str) -> dict:
+    import subprocess as sp
+
+    try:
+        source = sp.check_output(
+            ["git", "show", f"{target_ref}:src/pinky_daemon/__main__.py"],
+            cwd=repo_dir, stderr=sp.STDOUT, timeout=10,
+        )
+    except Exception as exc:
+        return {
+            "rc": getattr(exc, "returncode", None), "reason": "source_unreadable", "findings": [],
+            "stderr_tail": _startup_stderr_tail(getattr(exc, "output", None) or exc),
+        }
+    if b"check-startup" not in source:
+        return {"skipped": "target has no startup check"}
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(repo_dir) / "src")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    try:
+        child = _run_startup_child(
+            [sys.executable, "-B", "-m", "pinky_daemon", "--mode", "check-startup",
+             "--db-path", db_path],
+            cwd=repo_dir, env=env,
+            timeout=_STARTUP_CHECK_TIMEOUT_SECONDS,
+        )
+    except sp.TimeoutExpired as exc:
+        return {"rc": None, "reason": "timeout", "findings": [],
+                "stderr_tail": _startup_stderr_tail(exc.stderr)}
+    except Exception as exc:
+        return {"rc": None, "reason": "spawn_failed", "findings": [],
+                "stderr_tail": _startup_stderr_tail(exc)}
+    result = {"rc": child.returncode, "findings": [],
+              "stderr_tail": _startup_stderr_tail(child.stderr)}
+    if child.returncode == 2:
+        return {**result, "reason": "incomplete"}
+    try:
+        report = _startup_target_report(child.stdout, child.returncode)
+    except Exception:
+        return {**result, "reason": "invalid_report"}
+    result["findings"] = report["findings"]
+    if child.returncode == 1:
+        result["reason"] = "findings"
+    elif child.cleanup_failed:
+        result.update(reason="invalid_report", stderr_tail="target process group cleanup failed")
+    return result
+
+
 def _derive_api_store_manifest(
     db_path: str | os.PathLike[str],
 ) -> dict[str, StoreIntegrityTarget]:
@@ -14697,6 +14882,50 @@ npm run build</pre>
             "frontend": frontend_status,
         }
 
+    startup_alert_slots: dict[tuple, float] = {}
+    startup_alert_lock = threading.Lock()
+
+    async def _notify_startup_decline(result: dict, target_ref: str, target_label: str) -> None:
+        check = result.get("target_check") or result.get("preflight") or {}
+        findings = check.get("findings", [])
+        reason = check.get("reason") or ("incomplete" if check.get("incomplete") else "findings")
+        pairs = tuple(sorted({(finding["kind"], finding["path"]) for finding in findings}))
+        key = ("findings", pairs) if pairs else ("target", target_ref, reason)
+        undo = result.get("undo")
+        if result.get("undo_warning"):
+            undo_outcome = "unconfirmed"
+        elif undo is None:
+            undo_outcome = "none"
+        else:
+            undo_outcome = "undone" if undo["ok"] else "restore_failed"
+        key += (undo_outcome,)
+        now = _startup_alert_now()
+        with startup_alert_lock:
+            reserved = startup_alert_slots.get(key)
+            if reserved is not None and now - reserved < _STARTUP_ALERT_WINDOW_SECONDS:
+                return
+            startup_alert_slots[key] = now
+        text = f"ADMIN UPDATE STARTUP CHECK FAILED: target={target_label} reason={reason}."
+        if pairs:
+            text += " Findings: " + "; ".join(f"{kind}: {path}" for kind, path in pairs)
+        if result.get("undo_warning"):
+            text += " " + result["undo_warning"]
+        elif (result.get("undo") or {}).get("deps_restored") is False:
+            text += (
+                " Dependency restore failed. Installed packages may not match the release in the working tree."
+            )
+        delivered = False
+        try:
+            delivered = bool(await scheduler._owner_notify_callback("admin", text))
+        except Exception as exc:
+            _log(f"admin: startup-check owner alert failed: {type(exc).__name__}")
+        finally:
+            if not delivered:
+                with startup_alert_lock:
+                    if startup_alert_slots.get(key) == now:
+                        startup_alert_slots.pop(key, None)
+                _log("admin: startup-check owner alert was not delivered")
+
     @app.post("/admin/update")
     async def admin_update(
         branch: str = "",
@@ -14704,6 +14933,7 @@ npm run build</pre>
         dry_run: bool = False,
         force: bool = False,
         force_deps: bool = False,
+        preflight: bool = False,
     ):
         """Update to a verified release (or a pinned ref) and restart.
 
@@ -14754,11 +14984,16 @@ npm run build</pre>
         branch = "main"
         repo_dir = str(Path(__file__).resolve().parent.parent.parent)
 
+        layout_preflight: dict | None = None
+        alert_ref = target
+        alert_label = target or "latest release"
+
         # The whole update pipeline (git fetch/checkout, release
         # verification over TLS, pip install, npm build) is blocking and can
         # take minutes; run it off the event loop so the daemon keeps
         # routing messages while the update proceeds.
         def _run_update() -> dict:
+            nonlocal layout_preflight, alert_ref, alert_label
             # Current state
             try:
                 before_hash = sp.check_output(
@@ -14809,9 +15044,12 @@ npm run build</pre>
                 repo_dir, target, force=force, log=_log,
             )
             target_tag = self_update.latest_release_tag(repo_dir)
+            alert_label = decision.ref or alert_label
 
             # Preview mode — report the planned deploy without mutating anything.
             if dry_run:
+                if preflight:
+                    layout_preflight = _startup_layout_preflight(store_catalog)
                 try:
                     pending = sp.check_output(
                         ["git", "log", "--oneline", f"HEAD..origin/{branch}"],
@@ -14856,14 +15094,14 @@ npm run build</pre>
                 if isinstance(exc, StorePathAuthorityError):
                     failed_path = exc.path
                     if exc.failure_class == "owner":
-                        preflight = {"path": failed_path, "uid": exc.uid}
+                        ancestor_preflight = {"path": failed_path, "uid": exc.uid}
                         detail = f"path={failed_path!r} uid={exc.uid}"
                     else:
-                        preflight = {"path": failed_path, "mode": f"{exc.mode:04o}"}
+                        ancestor_preflight = {"path": failed_path, "mode": f"{exc.mode:04o}"}
                         detail = f"path={failed_path!r} mode={exc.mode:04o}"
                 else:
                     failed_path = os.path.realpath(exc.filename or catalog.expected_root)
-                    preflight = {"path": failed_path}
+                    ancestor_preflight = {"path": failed_path}
                     detail = f"path={failed_path!r} error={type(exc).__name__}: {exc}"
                 error = f"storage ancestor preflight failed: {detail}"
                 _log(
@@ -14873,8 +15111,27 @@ npm run build</pre>
                 return {
                     "error": error,
                     "staying_on_version": before_hash,
-                    "preflight": preflight,
+                    "preflight": ancestor_preflight,
                 }
+
+            try:
+                alert_ref = _startup_full_ref(repo_dir, f"{decision.ref}^{{commit}}")
+            except Exception as exc:
+                return {"error": f"could not record full target ref: {type(exc).__name__}",
+                        "staying_on_version": before_hash}
+            layout_preflight = _startup_layout_preflight(store_catalog)
+            if not layout_preflight["ok"]:
+                return {
+                    "error": ("startup layout pre-flight could not complete"
+                              if layout_preflight.get("incomplete")
+                              else "startup layout pre-flight failed"),
+                    "staying_on_version": before_hash,
+                }
+            try:
+                previous_ref = _startup_full_ref(repo_dir)
+            except Exception as exc:
+                return {"error": f"could not record full previous ref: {type(exc).__name__}",
+                        "staying_on_version": before_hash}
 
             # Force mode: discard local mods to TRACKED files before checkout.
             # Untracked files (e.g. .env, local notes) are NOT touched.
@@ -14936,6 +15193,8 @@ npm run build</pre>
             # installed package versions have drifted from the pyproject pins
             # (e.g., pyproject was bumped on an earlier pull that skipped reinstall).
             deps_rebuilt = False
+            deps_attempted = False
+            pip_cmd: list[str] | None = None
             deps_error = ""
             deps_drift: list[dict] = []
             try:
@@ -14965,12 +15224,12 @@ npm run build</pre>
                     # so file existence alone is not enough to select it.
                     venv_pip = Path(repo_dir) / ".venv" / "bin" / "pip"
                     venv_python = Path(repo_dir) / ".venv" / "bin" / "python"
-                    pip_cmd: list[str] | None = None
                     if venv_pip.exists():
                         try:
                             sp.check_output(
-                                [str(venv_python), "-m", "pip", "--version"],
+                                [str(venv_python), "-B", "-m", "pip", "--version"],
                                 cwd=repo_dir, stderr=sp.STDOUT, timeout=10,
+                                env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
                             )
                         except Exception as probe_exc:
                             probe_output = getattr(probe_exc, "output", None)
@@ -14990,7 +15249,7 @@ npm run build</pre>
                             )
                         else:
                             pip_cmd = [
-                                str(venv_python), "-m", "pip", "install",
+                                str(venv_python), "-B", "-m", "pip", "install",
                                 "-e", ".[all]", "--quiet",
                             ]
 
@@ -14999,10 +15258,12 @@ npm run build</pre>
                         # externally-managed. --break-system-packages lets us install
                         # into the same env the daemon imports from.
                         pip_cmd = [
-                            sys.executable, "-m", "pip", "install",
+                            sys.executable, "-B", "-m", "pip", "install",
                             "-e", ".[all]", "--quiet", "--break-system-packages",
                         ]
-                    sp.check_output(pip_cmd, cwd=repo_dir, stderr=sp.STDOUT, timeout=180)
+                    deps_attempted = True
+                    sp.check_output(pip_cmd, cwd=repo_dir, stderr=sp.STDOUT, timeout=180,
+                                    env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
                     deps_rebuilt = True
             except sp.CalledProcessError as e:
                 deps_error = f"pip install failed: {e.output.decode()[:500] if e.output else e}"
@@ -15010,6 +15271,45 @@ npm run build</pre>
             except Exception as e:
                 deps_error = f"deps rebuild failed: {e}"
                 _log(f"admin: {deps_error}")
+
+            target_check = _check_target_startup(repo_dir, db_path, alert_ref)
+            if target_check.get("reason"):
+                undo = {"checked_out": previous_ref, "ok": False,
+                        "deps_restored": False if deps_attempted else None, "error": None}
+                observed_ref = "unknown"
+                checkout_confirmed = False
+                try:
+                    sp.check_output(
+                        ["git", "checkout", "--detach", previous_ref], cwd=repo_dir,
+                        stderr=sp.STDOUT, timeout=60,
+                    )
+                    observed_ref = _startup_full_ref(repo_dir)
+                    if observed_ref != previous_ref:
+                        raise RuntimeError("undo HEAD does not match previous ref")
+                    checkout_confirmed = True
+                    if deps_attempted:
+                        sp.check_output(pip_cmd, cwd=repo_dir, stderr=sp.STDOUT, timeout=180,
+                                        env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+                        undo["deps_restored"] = True
+                    undo["ok"] = True
+                except Exception as exc:
+                    undo["error"] = _startup_stderr_tail(getattr(exc, "output", None) or exc)
+                    if not checkout_confirmed:
+                        try:
+                            observed_ref = _startup_full_ref(repo_dir)
+                        except Exception:
+                            observed_ref = "unknown"
+                result = {
+                    "error": "target release failed its startup check", "target_check": target_check,
+                    "undo": undo, "staying_on_version": observed_ref,
+                    "deps_rebuilt": deps_rebuilt, "deps_error": deps_error or None,
+                }
+                if not checkout_confirmed:
+                    result["undo_warning"] = (
+                        "Undo checkout is not confirmed. The working tree still holds the target "
+                        "commit; the next restart would start it."
+                    )
+                return result
 
             # Always rebuild frontend on update to keep compiled assets fresh
             frontend_rebuilt = False
@@ -15048,6 +15348,7 @@ npm run build</pre>
 
             result = {
                 "updated": True,
+                "target_check": target_check,
                 "before_hash": before_hash,
                 "after_hash": after_hash,
                 # The release actually deployed (the resolved ref when it's a tag);
@@ -15074,6 +15375,11 @@ npm run build</pre>
             return result
 
         result = await asyncio.to_thread(_run_update)
+        if layout_preflight is not None:
+            result["preflight"] = layout_preflight
+            if layout_preflight.get("incomplete") and not result.get("error"):
+                result["error"] = "startup layout pre-flight could not complete"
+                result["staying_on_version"] = result.get("current_hash", _git_hash)
 
         if result.get("deps_error"):
             try:
@@ -15088,6 +15394,12 @@ npm run build</pre>
                     _log("admin: dependency rebuild owner alert was not delivered")
             except Exception as notify_exc:
                 _log(f"admin: dependency rebuild owner alert failed: {notify_exc}")
+
+        if not dry_run and (
+            (layout_preflight is not None and not layout_preflight["ok"])
+            or result.get("target_check", {}).get("reason")
+        ):
+            await _notify_startup_decline(result, alert_ref, alert_label)
 
         # Schedule graceful restart if anything changed
         if result.get("restarting"):
@@ -15107,13 +15419,21 @@ npm run build</pre>
         """Graceful daemon restart. Requires process manager for auto-restart."""
         import signal
 
+        preflight = await asyncio.to_thread(_startup_layout_preflight, store_catalog)
+        if not preflight["ok"]:
+            return {
+                "error": ("startup layout pre-flight could not complete"
+                          if preflight.get("incomplete") else "startup layout pre-flight failed"),
+                "preflight": preflight, "staying_on_version": _git_hash,
+            }
+
         async def _delayed_exit():
             await asyncio.sleep(1)
             _log("admin: SIGTERM self for restart")
             os.kill(os.getpid(), signal.SIGTERM)
 
         asyncio.create_task(_delayed_exit())
-        return {"restarting": True, "git_hash": _git_hash}
+        return {"restarting": True, "git_hash": _git_hash, "preflight": preflight}
 
     @app.post("/admin/force-restart-agent/{name}")
     @_locked_agent

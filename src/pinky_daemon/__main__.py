@@ -7,6 +7,9 @@ Usage:
     # Polling daemon (auto-processes inbound messages)
     python -m pinky_daemon --mode poll --config pinky.yaml
 
+    # Inspect startup imports and storage layout without opening stores
+    python -m pinky_daemon --mode check-startup --db-path data/conversations.db
+
     # Default is API mode
     python -m pinky_daemon
 """
@@ -17,9 +20,12 @@ import argparse
 import asyncio
 import contextlib
 import faulthandler
+import io
+import json
 import os
 import signal
 import sys
+from pathlib import Path
 
 
 def _install_faulthandler() -> None:
@@ -82,14 +88,22 @@ def _quiet_http_client_loggers() -> None:
 
 def main() -> None:
     _install_faulthandler()
-    _load_dotenv()
+    try:
+        _load_dotenv()
+    except (Exception, SystemExit) as exc:
+        mode_parser = argparse.ArgumentParser(add_help=False)
+        mode_parser.add_argument("--mode", default="api")
+        mode, _ = mode_parser.parse_known_args()
+        if mode.mode != "check-startup":
+            raise
+        sys.exit(_startup_check_incomplete(exc))
     _quiet_http_client_loggers()
     parser = argparse.ArgumentParser(description="Pinky — headless Claude Code")
     parser.add_argument(
         "--mode",
-        choices=["api", "poll"],
+        choices=["api", "poll", "check-startup"],
         default="api",
-        help="Run mode: api (HTTP server) or poll (message polling daemon)",
+        help="Run mode: api (HTTP server), poll (message polling), or check-startup (inspection)",
     )
     parser.add_argument("--host", default="0.0.0.0", help="API server host")
     parser.add_argument("--port", type=int, default=8888, help="API server port")
@@ -116,10 +130,51 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.mode == "api":
+    if args.mode == "check-startup":
+        sys.exit(_run_startup_check(args))
+    elif args.mode == "api":
         _run_api(args)
     elif args.mode == "poll":
         _run_poll(args)
+
+
+def _startup_check_incomplete(exc: BaseException) -> int:
+    detail = " ".join(str(exc).splitlines())
+    print(f"startup check could not complete: {type(exc).__name__}: {detail}", file=sys.stderr)
+    return 2
+
+
+def _run_startup_check(args) -> int:
+    """Inspect the API import and main storage layout without opening stores."""
+    try:
+        # Keep an incomplete check to one diagnostic, including noisy imports.
+        diagnostics = io.StringIO()
+        with contextlib.redirect_stdout(diagnostics), contextlib.redirect_stderr(diagnostics):
+            from pinky_daemon import api
+            from pinky_daemon.store_catalog import (
+                inspect_filesystem_layout,
+                read_store_identities,
+            )
+
+            db_path = os.path.realpath(args.db_path)
+            root = Path(db_path).parent
+            manifest = api._derive_api_store_manifest(db_path)
+            identities = read_store_identities(os.path.realpath(target.path) for target in manifest.values())
+            inspection = inspect_filesystem_layout(root, identities)
+            report = json.dumps({
+                "ok": not inspection.findings,
+                "root": str(root),
+                "checked": ["import", "layout"],
+                "findings": inspection.findings,
+                "warnings_count": len(inspection.warnings),
+                "warnings": inspection.warnings[:20],
+            })
+    except (Exception, SystemExit) as exc:
+        return _startup_check_incomplete(exc)
+
+    sys.stderr.write(diagnostics.getvalue())
+    print(report)
+    return 1 if inspection.findings else 0
 
 
 def _run_api(args) -> None:
