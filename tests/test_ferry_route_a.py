@@ -729,10 +729,12 @@ class TestFerryListenerStartup:
 
         import uvicorn
 
+        # Keep the chosen port bound until uvicorn serves on this socket; closing
+        # it first would free the number for a listener in a parallel test file.
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
+        s.listen()
         port = s.getsockname()[1]
-        s.close()
 
         cfg = FerryConfig.from_env(
             {
@@ -751,7 +753,7 @@ class TestFerryListenerStartup:
         # Mirror __main__: no-op CONTEXT MANAGER (the bug was `lambda: None`).
         server.capture_signals = lambda: _ctx.nullcontext()
 
-        task = asyncio.create_task(server.serve())
+        task = asyncio.create_task(server.serve(sockets=[s]))
         try:
             for _ in range(100):
                 if getattr(server, "started", False):
@@ -771,3 +773,26 @@ class TestFerryListenerStartup:
         finally:
             server.should_exit = True
             await asyncio.gather(task, return_exceptions=True)
+            s.close()
+
+    async def test_listener_port_stays_reserved_until_the_server_binds(self, monkeypatch):
+        """The port handed to uvicorn must still be held when the server is
+        configured, so a listener in a parallel test file cannot take it."""
+        import errno
+        import socket
+
+        import uvicorn
+
+        real_config = uvicorn.Config
+
+        def checked_config(*args, **kwargs):
+            selected = kwargs.get("port", 0)
+            if selected:
+                with socket.socket() as contender:
+                    with pytest.raises(OSError) as occupied:
+                        contender.bind(("127.0.0.1", selected))
+                    assert occupied.value.errno == errno.EADDRINUSE
+            return real_config(*args, **kwargs)
+
+        monkeypatch.setattr(uvicorn, "Config", checked_config)
+        await self.test_listener_serves_with_capture_signals_override()

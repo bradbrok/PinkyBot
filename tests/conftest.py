@@ -188,6 +188,19 @@ def _isolate_temporary_files(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_working_directory(tmp_path, monkeypatch):
+    """Run each test in a private working directory.
+
+    Paths that default to the current directory (an agent's data/agents/<name>
+    workspace, relative lock or export folders) then stay private to the test:
+    parallel workers never share them, and nothing lands in the checkout.
+    """
+    working_directory = tmp_path / "cwd"
+    working_directory.mkdir(mode=0o700)
+    monkeypatch.chdir(working_directory)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_test_env(request, monkeypatch):
     """Re-apply the ambient guard before every test.
 
