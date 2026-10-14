@@ -1,6 +1,5 @@
 """Ambient shell state and undecodable values do not prevent child startup."""
 
-import asyncio
 import json
 import os
 import shlex
@@ -16,6 +15,7 @@ from pinky_daemon.codex_app_server_tmux import CodexAppServerSupervisor
 from pinky_daemon.codex_tmux_session import CodexTmuxSession
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import _TmuxControl
+from tests.child_report_support import wait_for_child_report
 from tests.tmux_env_r3_support import SECRET, probe_command
 from tests.tmux_env_support import LaunchRecorder, secret_files
 from tests.tmux_socket_support import private_socket
@@ -121,17 +121,21 @@ async def test_real_tmux_child_runs_with_shell_owned_daemon_environment(home, mo
     env = ambient(home, transport)
     # Do not let inherited daemon state explain delivery or bypass the builder.
     with patch.dict(os.environ, {"HOME": str(home), "PATH": os.defpath}, clear=True):
-        code = "import os,json,pathlib;pathlib.Path(" + repr(str(output)) + ").write_text(json.dumps({'SECRET':os.environ.get('SECRET')}))"
+        code = (
+            "import os,json,pathlib;"
+            f"report=pathlib.Path({str(output)!r});"
+            "temporary=report.with_name(report.name+'.tmp');"
+            "temporary.write_text(json.dumps({'SECRET':os.environ.get('SECRET')}));"
+            "os.replace(temporary,report)"
+        )
         command = shlex.join([sys.executable, "-I", "-c", code])
         try:
             result = await control.new_session(cwd=str(home), command=command, env=env)
             assert result.ok
-            for _ in range(200):
-                if output.exists():
-                    break
-                await asyncio.sleep(0.01)
-            assert output.exists(), "tmux returned success but the child never ran"
-            assert json.loads(output.read_text()) == {"SECRET": SECRET}
+            text = await wait_for_child_report(
+                output, "tmux returned success but the child never ran",
+            )
+            assert json.loads(text) == {"SECRET": SECRET}
             output.unlink()
             assert not secret_files(home, SECRET)
         finally:

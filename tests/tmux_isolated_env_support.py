@@ -1,6 +1,5 @@
 """Private-server launch probes with synthetic inputs and names-only output."""
 
-import asyncio
 import json
 import os
 import shlex
@@ -17,6 +16,7 @@ from pinky_daemon.codex_session import CodexSession
 from pinky_daemon.codex_tmux_session import CodexTmuxSession
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import TmuxSession, _TmuxControl
+from tests.child_report_support import wait_for_child_report
 from tests.tmux_socket_support import private_socket
 
 DAEMON_NAMES = {"PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET", "HRPOS_PASSWORD"}
@@ -170,13 +170,12 @@ class LaunchProbe:
             self.client, _ = await self.supervisor.start()
         else:
             await session._spawn_tmux_repl()
-        for _ in range(300):
-            if self.names_path.exists():
-                names = json.loads(self.names_path.read_text())
-                assert isinstance(names, list) and all(isinstance(n, str) for n in names)
-                return set(names)
-            await asyncio.sleep(0.01)
-        raise AssertionError("child did not produce a names-only environment report")
+        text = await wait_for_child_report(
+            self.names_path, "child did not produce a names-only environment report",
+        )
+        names = json.loads(text)
+        assert isinstance(names, list) and all(isinstance(n, str) for n in names)
+        return set(names)
 
     async def close(self):
         if self.client is not None:

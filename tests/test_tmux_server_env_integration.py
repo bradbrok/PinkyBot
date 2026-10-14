@@ -5,7 +5,6 @@ contain only names or booleans. Routing is separately exercised through all four
 production constructors in test_tmux_server_routes.
 """
 
-import asyncio
 import json
 import os
 import shlex
@@ -19,6 +18,7 @@ import pytest
 from pinky_daemon.command_runner import LocalCommandRunner
 from pinky_daemon.isolated_launch_env import LaunchEnvError
 from pinky_daemon.tmux_dream_runner import TmuxDreamConfig, TmuxDreamRunner
+from tests.child_report_support import wait_for_child_report
 from tests.tmux_isolated_env_support import LaunchProbe, Registry
 from tests.tmux_server_env_support import CANARY, allowed, control, no_values, owner
 from tests.tmux_socket_support import private_labels
@@ -107,13 +107,12 @@ async def test_dream_cold_start_uses_managed_globals_and_raw_ancillary_route(tmp
         captured = []
 
         async def result(*args, **kwargs):
-            for _ in range(300):
-                if probe.names_path.exists():
-                    captured.append(set(json.loads(probe.names_path.read_text())))
-                    captured.append(globals_names(probe) | globals_names(probe, hidden=True))
-                    return "completed"
-                await asyncio.sleep(0.01)
-            raise AssertionError("inert dream child did not report")
+            text = await wait_for_child_report(
+                probe.names_path, "inert dream child did not report",
+            )
+            captured.append(set(json.loads(text)))
+            captured.append(globals_names(probe) | globals_names(probe, hidden=True))
+            return "completed"
 
         monkeypatch.setattr(dream, "_wait_for_result", result)
         outcome = await dream.run("synthetic prompt")
@@ -149,18 +148,20 @@ async def test_candidate_path_resolves_fake_tool_after_loader(tmp_path, monkeypa
     async with managed_probe(tmp_path, monkeypatch) as probe:
         report = tmp_path / "path-booleans.json"
         expected = str(probe.bin)
-        code = ("import json,os,pathlib,shutil; "
-                f"pathlib.Path({str(report)!r}).write_text(json.dumps({{"
-                f"'candidate_present':{expected!r} in os.environ.get('PATH','').split(':'),"
-                f"'fake_resolved':shutil.which('claude')=={str(probe.bin / 'claude')!r}}}))")
+        code = (
+            "import json,os,pathlib,shutil;"
+            f"report=pathlib.Path({str(report)!r});"
+            "temporary=report.with_name(report.name+'.tmp');"
+            "temporary.write_text(json.dumps({"
+            f"'candidate_present':{expected!r} in os.environ.get('PATH','').split(':'),"
+            f"'fake_resolved':shutil.which('claude')=={str(probe.bin / 'claude')!r}}}));"
+            "os.replace(temporary,report)"
+        )
         result = await probe.control.new_session(cwd=str(tmp_path),
             command=shlex.join([sys.executable, "-I", "-c", code]), env={}, inherit="none")
         assert result.ok
-        for _ in range(300):
-            if report.exists():
-                break
-            await asyncio.sleep(0.01)
-        assert json.loads(report.read_text()) == {"candidate_present": True, "fake_resolved": True}
+        text = await wait_for_child_report(report, "child did not report its resolved tool")
+        assert json.loads(text) == {"candidate_present": True, "fake_resolved": True}
 
 
 async def test_shared_default_is_untouched_while_compatibility_launches(tmp_path, monkeypatch):

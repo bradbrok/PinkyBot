@@ -15,6 +15,7 @@ from pinky_daemon.codex_tmux_session import CodexTmuxSession
 from pinky_daemon.shared_mcp import derive_mcp_bearer
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_launch_env_loader import BASE_ALLOWLIST, DAEMON_ONLY
+from tests.child_report_support import wait_for_child_report
 from tests.tmux_socket_support import private_socket
 
 KINDS = ("repl", "exec", "app_server", "tmux_app_server")
@@ -374,7 +375,6 @@ def test_output_scanner_detects_planted_value():
 async def test_real_private_child_cannot_inherit_daemon_authority(
     harness, kind, server_only, withheld
 ):
-    import asyncio
     import shlex
     import shutil
     import subprocess
@@ -396,7 +396,10 @@ async def test_real_private_child_cannot_inherit_daemon_authority(
         script.write_text(
             f"#!{sys.executable}\n"
             "import json,os,pathlib,sys,time\n"
-            f"pathlib.Path({str(report)!r}).write_text(json.dumps(sorted(os.environ)))\n"
+            f"report=pathlib.Path({str(report)!r})\n"
+            "temporary=report.with_name(report.name+'.tmp')\n"
+            "temporary.write_text(json.dumps(sorted(os.environ)))\n"
+            "os.replace(temporary,report)\n"
             "if 'app-server' in sys.argv:\n"
             " for line in sys.stdin:\n"
             "  frame=json.loads(line)\n"
@@ -460,19 +463,19 @@ async def test_real_private_child_cannot_inherit_daemon_authority(
                 [
                     sys.executable,
                     "-c",
-                    "import json,os,pathlib;pathlib.Path("
-                    + repr(str(positive))
-                    + ").write_text(json.dumps(sorted(os.environ)))",
+                    "import json,os,pathlib;"
+                    f"report=pathlib.Path({str(positive)!r});"
+                    "temporary=report.with_name(report.name+'.tmp');"
+                    "temporary.write_text(json.dumps(sorted(os.environ)));"
+                    "os.replace(temporary,report)",
                 ]
             )
             planted = await control._run("new-window", "-t", "=seed", positive_command)
             assert planted.ok
-            for _ in range(200):
-                if positive.exists():
-                    break
-                await asyncio.sleep(0.01)
-            assert positive.exists(), "server-global positive control did not report"
-            present = DAEMON_ONLY.issubset(json.loads(positive.read_text()))
+            positive_text = await wait_for_child_report(
+                positive, "server-global positive control did not report",
+            )
+            present = DAEMON_ONLY.issubset(json.loads(positive_text))
             assert present, "private server did not carry planted authority names"
             owner, _ = h.make(kind, provider_key="" if withheld else SENTINEL + "provider")
             owner._tmux = control
@@ -496,12 +499,10 @@ async def test_real_private_child_cannot_inherit_daemon_authority(
                 await owner._spawn_tmux_repl()
             else:
                 client, _ = await owner.start()
-            for _ in range(200):
-                if report.exists():
-                    break
-                await asyncio.sleep(0.01)
-            assert report.exists(), "inert child did not report its environment names"
-            names = set(json.loads(report.read_text()))
+            text = await wait_for_child_report(
+                report, "inert child did not report its environment names",
+            )
+            names = set(json.loads(text))
             absent = not DAEMON_ONLY.intersection(names)
             assert absent, "real child inherited daemon authority"
             foreign_header_absent = "PINKY_MCP_HDR_FOREIGN_AUTHORIZATION" not in names
@@ -573,7 +574,6 @@ def test_policy_is_refreshed_for_replacement(harness, kind):
 @pytest.mark.parametrize("kind", ("exec", "app_server"))
 @pytest.mark.parametrize("mode", ("off", "shadow", "enforce"))
 async def test_real_direct_child_has_filtered_environment(harness, kind, mode):
-    import asyncio
     import sys
 
     h = harness
@@ -587,7 +587,10 @@ async def test_real_direct_child_has_filtered_environment(harness, kind, mode):
     script.write_text(
         f"#!{sys.executable}\n"
         "import json,os,pathlib,sys\n"
-        f"pathlib.Path({str(report)!r}).write_text(json.dumps(sorted(os.environ)))\n"
+        f"report=pathlib.Path({str(report)!r})\n"
+        "temporary=report.with_name(report.name+'.tmp')\n"
+        "temporary.write_text(json.dumps(sorted(os.environ)))\n"
+        "os.replace(temporary,report)\n"
         "if 'app-server' in sys.argv:\n"
         " for line in sys.stdin:\n"
         "  frame=json.loads(line)\n"
@@ -604,12 +607,8 @@ async def test_real_direct_child_has_filtered_environment(harness, kind, mode):
             await owner._exec_codex("synthetic prompt")
         else:
             assert await owner._ensure_app_server()
-        for _ in range(200):
-            if report.exists():
-                break
-            await asyncio.sleep(0.01)
-        assert report.exists(), "actual direct child did not report names"
-        names = set(json.loads(report.read_text()))
+        text = await wait_for_child_report(report, "actual direct child did not report names")
+        names = set(json.loads(text))
         absent = not DAEMON_ONLY.intersection(names)
         assert absent, "actual direct child received daemon authority"
         assert ("ORDINARY_TOOL_CONFIG" in names) is (mode != "enforce")

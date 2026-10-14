@@ -2,6 +2,7 @@
 import pytest
 
 from tests import test_codex_mcp_header_env as supplied
+from tests.child_report_support import wait_for_child_report
 from tests.tmux_socket_support import private_socket
 
 harness = supplied.harness
@@ -76,7 +77,6 @@ async def test_empty_launch_scrubs_only_when_codex_policy_is_enabled(
 
 
 async def test_real_shared_tmux_server_keeps_current_headers_out_of_global_env(harness):
-    import asyncio
     import json
     import os
     import shlex
@@ -100,9 +100,12 @@ async def test_real_shared_tmux_server_keeps_current_headers_out_of_global_env(h
     output = home / 'child-observations.json'
     code = (
         'import json,os,pathlib; '
-        f'pathlib.Path({str(output)!r}).write_text(json.dumps({{'
+        f'report=pathlib.Path({str(output)!r});'
+        "temporary=report.with_name(report.name+'.tmp');"
+        'temporary.write_text(json.dumps({'
         f'"stale_present": {stale!r} in os.environ, '
-        f'"own_matches": os.environ.get({own!r}) == "inert-agent-b"}}))'
+        f'"own_matches": os.environ.get({own!r}) == "inert-agent-b"}}));'
+        'os.replace(temporary,report)'
     )
     try:
         subprocess.run(base + ['new-session', '-d', '-s', 'keeper', 'sleep 30'],
@@ -113,11 +116,8 @@ async def test_real_shared_tmux_server_keeps_current_headers_out_of_global_env(h
             env={own: 'inert-agent-b'}, codex_headers=True,
         )
         assert result.ok
-        for _ in range(200):
-            if output.exists():
-                break
-            await asyncio.sleep(0.01)
-        assert json.loads(output.read_text()) == {'stale_present': False, 'own_matches': True}
+        text = await wait_for_child_report(output, "child did not report its header observations")
+        assert json.loads(text) == {'stale_present': False, 'own_matches': True}
         # Inspect names only; never retain or report global environment values.
         global_result = subprocess.run(base + ['show-environment', '-g'], env=server_env,
                                        capture_output=True, check=True, timeout=5)

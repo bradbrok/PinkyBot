@@ -15,6 +15,7 @@ from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.dream_runner import DreamRunner
 from pinky_daemon.isolated_launch_env import LaunchEnvError
 from pinky_daemon.tmux_dream_runner import TmuxDreamRunner
+from tests.child_report_support import wait_for_child_report
 from tests.test_tmux_legacy_socket_reap import Registry, launch_probe
 from tests.tmux_isolated_env_support import LaunchProbe
 from tests.tmux_server_env_support import CANARY, FAMILIES, no_values, seed
@@ -131,13 +132,12 @@ async def test_public_standalone_dream_observes_gate(tmp_path, monkeypatch, tran
                     env=env, capture_output=True, timeout=5)
 
             async def result(self, *args, **kwargs):
-                for _ in range(300):
-                    if probe.names_path.exists():
-                        selected = "default" if state == "compat" else "test-standalone"
-                        observed.append(client(selected, "has-session", "-t", "=pinky-dream-test-agent").returncode == 0)
-                        return "synthetic completed dream"
-                    await asyncio.sleep(.01)
-                raise AssertionError("inert standalone dream child did not report")
+                await wait_for_child_report(
+                    probe.names_path, "inert standalone dream child did not report",
+                )
+                selected = "default" if state == "compat" else "test-standalone"
+                observed.append(client(selected, "has-session", "-t", "=pinky-dream-test-agent").returncode == 0)
+                return "synthetic completed dream"
 
             monkeypatch.setattr(TmuxDreamRunner, "_wait_for_result", result)
             try:
