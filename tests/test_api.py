@@ -507,6 +507,18 @@ class TestAPI:
         from pinky_daemon.api import create_api
         return create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
 
+    def test_default_workspace_stays_in_the_test_working_directory(self, tmp_path):
+        """POST /agents without working_dir must not share a workspace with tests
+        running in parallel files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            with TestClient(app) as client:
+                r = client.post("/agents", json={"name": "tenant", "model": "sonnet"})
+                assert r.status_code == 200, r.text
+                workspace = Path(r.json()["working_dir"]).resolve()
+        assert workspace.is_relative_to(tmp_path.resolve())
+        assert (workspace / ".claude" / "settings.json").is_file()
+
     @pytest.mark.asyncio
     async def test_tmux_liveness_uses_configured_owner_destination(self, tmp_path):
         """#902 + #865: the Billie shape pages the configured owner route once."""

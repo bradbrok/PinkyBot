@@ -11,6 +11,7 @@ import threading
 import time
 import urllib.request
 from io import StringIO
+from pathlib import Path
 from unittest.mock import MagicMock
 from urllib.error import URLError
 
@@ -2675,3 +2676,12 @@ class TestRestartTokensCap:
             agent = registry.get("cap-test")
             assert agent.restart_tokens_cap == 550_000
             assert agent.display_name == ""
+
+
+def test_default_workspace_stays_in_the_test_working_directory(registry, tmp_path):
+    """A registration without working_dir resolves data/agents/<name> against the
+    current directory; tests in parallel files must not share that workspace."""
+    agent = registry.register("tenant")
+    workspace = Path(agent.working_dir).resolve()
+    assert workspace.is_relative_to(tmp_path.resolve())
+    assert (workspace / ".claude" / "settings.json").is_file()
