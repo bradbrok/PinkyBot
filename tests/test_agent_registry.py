@@ -141,6 +141,192 @@ def registry():
     os.unlink(path)
 
 
+class TestPendingSlackEnvelope:
+    def test_rows_without_envelopes_use_empty_storage_and_stay_quiet(self, tmp_path, monkeypatch):
+        registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+        try:
+            registry.register("worker", working_dir=str(tmp_path))
+            row_ids = []
+            for platform in ("slack", "telegram"):
+                row_ids.append(registry.queue_pending_message(
+                    "worker", platform, "synthetic-gate", "Sample Sender", "hello",
+                ))
+            raw = registry._db.execute(
+                "SELECT id, slack_envelope FROM pending_messages WHERE agent_name=?", ("worker",),
+            ).fetchall()
+            assert dict(raw) == {row_id: "" for row_id in row_ids}
+            warnings = []
+            monkeypatch.setattr("pinky_daemon.agent_registry._log", warnings.append)
+
+            filtered = registry.get_pending_messages("worker", "synthetic-gate")
+
+            assert {row["id"] for row in filtered} == set(row_ids)
+            assert all("slack_envelope" not in row for row in filtered)
+            assert warnings == []
+            assert registry.get_pending_messages("worker") == filtered
+            assert warnings == []
+        finally:
+            registry.close()
+
+    @pytest.mark.parametrize("filtered", [False, True])
+    def test_decoder_recursion_keeps_the_bad_row_and_the_later_good_row(
+        self, tmp_path, monkeypatch, filtered,
+    ):
+        registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+        try:
+            registry.register("worker", working_dir=str(tmp_path))
+            values = {
+                "agent_name": "worker", "platform": "slack", "chat_id": "D0123",
+                "sender_name": "Sample Sender", "content": "synthetic private message",
+                "sender_id": "U0ABC123",
+            }
+            bad_id = registry.queue_pending_message(**values)
+            envelope = {
+                "message_id": "1711584001.000200", "metadata": {"user_id": "U0ABC123"},
+            }
+            registry.queue_pending_message(**values, slack_envelope=envelope)
+            before = registry.get_pending_messages("worker", "D0123")
+            nested = "[" * 65536 + "0" + "]" * 65536
+            registry._db.execute(
+                "UPDATE pending_messages SET slack_envelope=? WHERE id=?", (nested, bad_id),
+            )
+            registry._db.commit()
+            original_loads = json.loads
+
+            def decoder_with_depth_limit(value, *args, **kwargs):
+                if value == nested:
+                    raise RecursionError("synthetic decoder nesting limit")
+                return original_loads(value, *args, **kwargs)
+
+            monkeypatch.setattr("pinky_daemon.agent_registry.json.loads", decoder_with_depth_limit)
+            warnings = []
+            monkeypatch.setattr("pinky_daemon.agent_registry._log", warnings.append)
+
+            rows = registry.get_pending_messages("worker", "D0123" if filtered else "")
+
+            assert rows == before
+            assert "slack_envelope" not in rows[0]
+            assert rows[1]["slack_envelope"] == envelope
+            assert warnings == [
+                f"agent_registry: WARNING invalid pending Slack envelope row_id={bad_id}",
+            ]
+        finally:
+            registry.close()
+
+    @pytest.mark.parametrize("filtered", [False, True])
+    @pytest.mark.parametrize("invalid", [
+        "{", "[]", "null", '"fixture"', "42", "true", '["fixture"]', b"\xff",
+        pytest.param("[" * 65536 + "0" + "]" * 65536, id="deep-array"),
+    ])
+    def test_invalid_envelope_is_omitted_without_blocking_later_rows(
+        self, tmp_path, monkeypatch, filtered, invalid,
+    ):
+        registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+        try:
+            registry.register("worker", working_dir=str(tmp_path))
+            values = {
+                "agent_name": "worker", "platform": "slack", "chat_id": "D0123",
+                "sender_name": "Sample Sender", "content": "synthetic private message",
+                "sender_id": "U0ABC123",
+            }
+            bad_id = registry.queue_pending_message(**values)
+            envelope = {
+                "message_id": "1711584001.000200", "metadata": {"user_id": "U0ABC123"},
+            }
+            good_id = registry.queue_pending_message(**values, slack_envelope=envelope)
+            registry._db.execute(
+                "UPDATE pending_messages SET slack_envelope=? WHERE id=?", (invalid, bad_id),
+            )
+            registry._db.commit()
+            warnings = []
+            monkeypatch.setattr("pinky_daemon.agent_registry._log", warnings.append)
+
+            rows = registry.get_pending_messages("worker", "D0123" if filtered else "")
+
+            assert [row["id"] for row in rows] == [bad_id, good_id]
+            assert "slack_envelope" not in rows[0]
+            assert rows[1]["slack_envelope"] == envelope
+            assert all(row["content"] == values["content"] for row in rows)
+            assert warnings == [
+                f"agent_registry: WARNING invalid pending Slack envelope row_id={bad_id}",
+            ]
+        finally:
+            registry.close()
+
+    @pytest.mark.parametrize("atomic", [False, True])
+    @pytest.mark.parametrize("platform", ["slack", "telegram", "discord"])
+    def test_envelope_round_trip_is_slack_only_and_durable(self, tmp_path, atomic, platform):
+        db_path = str(tmp_path / "agents.db")
+        registry = AgentRegistry(db_path=db_path)
+        envelope = {
+            "metadata": {"user_id": "U0ABC123", "bot_id": ""},
+            "message_id": "1711584001.000200", "reply_to": "1711584000.000100",
+            "timestamp": 0, "chat_title": "#sample",
+        }
+        try:
+            registry.register("worker", working_dir=str(tmp_path))
+            values = {
+                "agent_name": "worker", "platform": platform, "chat_id": "C0123",
+                "reply_chat_id": "C0123", "sender_name": "Sample Sender", "content": "hello",
+                "is_group": True, "sender_id": "U0ABC123", "slack_envelope": envelope,
+            }
+            if atomic:
+                row_id, _ = registry.queue_pending_message_with_approval_request(**values)
+            else:
+                row_id = registry.queue_pending_message(**values)
+            before = registry.get_pending_messages("worker", "C0123")
+            assert len(before) == 1
+            assert before[0]["id"] == row_id
+            assert before[0]["reply_chat_id"] == "C0123"
+            assert before[0]["is_group"] is True
+            assert before[0]["sender_id"] == "U0ABC123"
+            if platform == "slack":
+                assert before[0]["slack_envelope"] == envelope
+            else:
+                assert "slack_envelope" not in before[0]
+
+            registry.close()
+            registry = AgentRegistry(db_path=db_path)
+
+            assert registry.get_pending_messages("worker", "C0123") == before
+            assert registry.get_pending_messages("worker") == before
+        finally:
+            registry.close()
+
+    @pytest.mark.parametrize("platform", ["slack", "telegram"])
+    def test_column_upgrade_preserves_legacy_pending_rows(self, tmp_path, platform):
+        db_path = tmp_path / "agents.db"
+        legacy = AgentRegistry(db_path=str(db_path))
+        try:
+            legacy.register("worker", working_dir=str(tmp_path))
+            legacy.queue_pending_message(
+                "worker", platform, "C0123", "Sample Sender", "hello",
+                reply_chat_id="C0123", is_group=True, sender_id="B0XYZ",
+            )
+            before = legacy.get_pending_messages("worker", "C0123")
+            assert "slack_envelope" not in before[0]
+        finally:
+            legacy.close()
+        with sqlite3.connect(db_path) as db:
+            db.execute("ALTER TABLE pending_messages DROP COLUMN slack_envelope")
+            assert "slack_envelope" not in {
+                row[1] for row in db.execute("PRAGMA table_info(pending_messages)")
+            }
+
+        for _ in range(2):
+            upgraded = AgentRegistry(db_path=str(db_path))
+            try:
+                columns = {
+                    row[1]: row
+                    for row in upgraded._db.execute("PRAGMA table_info(pending_messages)")
+                }
+                assert columns["slack_envelope"][2:5] == ("TEXT", 1, "''")
+                assert upgraded.get_pending_messages("worker", "C0123") == before
+                assert upgraded.get_pending_messages("worker") == before
+            finally:
+                upgraded.close()
+
+
 class TestVerifiedContactBootstrap:
     def test_finalize_rolls_back_state_bit_and_contact_if_marker_write_fails(
         self,

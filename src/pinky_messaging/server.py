@@ -149,6 +149,9 @@ def create_server(
         that thread (thread() already does this for an inbound message_id). Omit
         reply_to to explicitly break out of the thread and post at the channel root.
 
+        Slack headers carry slack_user_id (or slack_bot_id); use that ID, not the
+        display name, when the sender's identity matters.
+
         Link-preview flags (Telegram): disable_link_preview suppresses the URL
         preview card; prefer_large_media forces a big thumbnail; link_preview_above
         floats the preview above your text.

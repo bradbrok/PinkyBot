@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -1373,6 +1374,16 @@ class MessageBroker:
                 username = message.metadata.get("username", "")
                 if username and not is_channel:
                     target_name = f"{target_name or 'Unknown'} (@{username})"
+                slack_envelope = None
+                if message.platform == "slack" and message.message_id:
+                    slack_envelope = {
+                        "metadata": {key: message.metadata[key] for key in ("user_id", "bot_id")
+                                     if key in message.metadata},
+                        "message_id": message.message_id,
+                        "reply_to": message.reply_to,
+                        "timestamp": message.timestamp,
+                        "chat_title": message.chat_title,
+                    }
                 _, approval_request = self._registry.queue_pending_message_with_approval_request(
                     agent_name=agent_name,
                     platform=message.platform,
@@ -1384,6 +1395,7 @@ class MessageBroker:
                     sender_id=message.sender_id,
                     target_name=target_name,
                     held_at=message.timestamp,
+                    slack_envelope=slack_envelope,
                 )
                 await self._notify_approval_request(approval_request)
                 self._stats["pending"] += 1
@@ -1456,6 +1468,18 @@ class MessageBroker:
             f" | thread_root_ts:{message.reply_to} | is_thread_reply:true"
             if message.reply_to else ""
         )
+        slack_identity = ""
+        if message.platform == "slack":
+            slack_id = message.metadata.get("user_id")
+            slack_kind = "user"
+            if slack_id in (None, ""):
+                slack_id = message.metadata.get("bot_id")
+                slack_kind = "bot"
+            if slack_id not in (None, ""):
+                if isinstance(slack_id, str) and re.fullmatch(r"[A-Z0-9]{2,32}", slack_id):
+                    slack_identity = f" | slack_{slack_kind}_id:{slack_id}"
+                else:
+                    _log("broker: WARNING invalid Slack sender ID; omitting header field")
         buzz_principal = message.metadata.get("buzz_verified_principal", "")
         if message.platform == "buzz" and buzz_principal:
             alias = self._registry.get_group_chat_alias(message.agent_name, message.chat_id)
@@ -1523,9 +1547,15 @@ class MessageBroker:
         elif message.is_group:
             alias = self._registry.get_group_chat_alias(message.agent_name, message.chat_id)
             display = alias or message.chat_title or message.chat_id
-            header = f"[{message.platform} | group | {display} | {message.sender_name} | {message.chat_id} | {ts}{msg_id}{thread_provenance}]"
+            header = (
+                f"[{message.platform} | group | {display} | {message.sender_name} | "
+                f"{message.chat_id} | {ts}{msg_id}{thread_provenance}{slack_identity}]"
+            )
         else:
-            header = f"[{message.platform} | dm | {message.sender_name} | {message.chat_id} | {ts}{msg_id}{thread_provenance}]"
+            header = (
+                f"[{message.platform} | dm | {message.sender_name} | {message.chat_id} | "
+                f"{ts}{msg_id}{thread_provenance}{slack_identity}]"
+            )
 
         body = message.content
 
@@ -1589,6 +1619,9 @@ class MessageBroker:
         # DM. sender_id is restored from the approval key so group context (and
         # the reply hint) reflect the right surface.
         for msg in pending:
+            envelope = msg.get("slack_envelope") or {}
+            if msg["platform"] != "slack" or not envelope.get("message_id"):
+                envelope = {}
             broker_msg = BrokerMessage(
                 platform=msg["platform"],
                 chat_id=msg["reply_chat_id"],
@@ -1596,8 +1629,12 @@ class MessageBroker:
                 sender_id=msg.get("sender_id") or msg["chat_id"],
                 content=msg["content"],
                 agent_name=agent_name,
-                timestamp=msg["created_at"],
+                timestamp=envelope.get("timestamp", msg["created_at"]),
                 is_group=bool(msg.get("is_group")),
+                message_id=envelope.get("message_id", ""),
+                reply_to=envelope.get("reply_to", ""),
+                chat_title=envelope.get("chat_title", ""),
+                metadata=envelope.get("metadata", {}),
             )
             handoff = await self._route_streaming(agent_name, broker_msg)
             if handoff is False:
