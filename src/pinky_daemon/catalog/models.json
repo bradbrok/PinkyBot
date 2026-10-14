@@ -1,7 +1,7 @@
 {
   "schema": "pinky-model-roster/1",
-  "revision": 5,
-  "updated": "2026-10-08",
+  "revision": 6,
+  "updated": "2026-10-14",
   "models": [
     {
       "provider": "anthropic",
@@ -349,7 +349,7 @@
       "provider": "openai",
       "model_id": "gpt-5.5",
       "display_name": "GPT-5.5",
-      "description": "Previous frontier. Coding + reasoning. Codex sign-in auth only (API pending).",
+      "description": "Previous frontier. Coding + reasoning. Available via the Responses API.",
       "tier": "flagship",
       "context_window": 200000,
       "is_1m": false,
@@ -477,6 +477,44 @@
       "supports_thinking": false,
       "active": true,
       "sort_order": 85
+    },
+    {
+      "provider": "openai",
+      "model_id": "gpt-5.6-terra",
+      "display_name": "GPT-5.6 Terra",
+      "description": "GPT-5.6 mid tier. Reasoning + coding. 1.05M context, 128K output. Available via the Responses API.",
+      "tier": "mid",
+      "context_window": 1050000,
+      "is_1m": true,
+      "pricing": {
+        "input": 2.0,
+        "output": 12.0,
+        "cached_input": 0.2,
+        "cache_write_5m": 2.5,
+        "cache_write_1h": 2.5
+      },
+      "supports_thinking": false,
+      "active": true,
+      "sort_order": 65
+    },
+    {
+      "provider": "openai",
+      "model_id": "gpt-5.6-luna",
+      "display_name": "GPT-5.6 Luna",
+      "description": "Cheapest GPT-5.6 for high-volume tasks. 1.05M context, 128K output. Available via the Responses API.",
+      "tier": "low",
+      "context_window": 1050000,
+      "is_1m": true,
+      "pricing": {
+        "input": 0.2,
+        "output": 1.2,
+        "cached_input": 0.02,
+        "cache_write_5m": 0.25,
+        "cache_write_1h": 0.25
+      },
+      "supports_thinking": false,
+      "active": true,
+      "sort_order": 82
     }
   ]
 }
