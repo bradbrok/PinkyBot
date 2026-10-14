@@ -131,6 +131,131 @@ class TestMessageBrokerRouting:
         finally:
             tmpdir.cleanup()
 
+    @pytest.fixture
+    def slack_prompt_broker(self, tmp_path):
+        registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+        registry.register("worker", working_dir=str(tmp_path))
+        registry.set_default_timezone("UTC")
+        try:
+            yield MessageBroker(registry, SessionManager())
+        finally:
+            registry.close()
+
+    def _slack_header_message(self, **overrides):
+        values = {
+            "platform": "slack", "chat_id": "D0123", "sender_name": "Sample Sender",
+            "sender_id": "raw-sender", "content": "synthetic message content",
+            "agent_name": "worker", "timestamp": 0, "message_id": "1711584001.000200",
+            "metadata": {"user_id": "U0ABC123"},
+        }
+        values.update(overrides)
+        return BrokerMessage(**values)
+
+    @pytest.mark.parametrize("user_id", ["U0ABC123", "A1", "A" * 32, "12"])
+    def test_slack_sender_user_id_ends_dm_header(self, slack_prompt_broker, user_id):
+        message = self._slack_header_message(metadata={"user_id": user_id})
+
+        assert slack_prompt_broker._format_prompt(message) == (
+            "[slack | dm | Sample Sender | D0123 | 1970-01-01 00:00:00 UTC | "
+            f"msg_id:1711584001.000200 | slack_user_id:{user_id}]\nsynthetic message content"
+        )
+
+    def test_slack_sender_user_id_follows_group_thread_fields(self, slack_prompt_broker):
+        message = self._slack_header_message(
+            chat_id="C0123", chat_title="#sample", is_group=True,
+            reply_to="1711584000.000100",
+        )
+
+        assert slack_prompt_broker._format_prompt(message) == (
+            "[slack | group | #sample | Sample Sender | C0123 | "
+            "1970-01-01 00:00:00 UTC | msg_id:1711584001.000200 | "
+            "thread_root_ts:1711584000.000100 | is_thread_reply:true | "
+            "slack_user_id:U0ABC123]\nsynthetic message content"
+        )
+
+    @pytest.mark.parametrize("user_metadata", [{}, {"user_id": ""}, {"user_id": None}])
+    def test_slack_sender_bot_id_when_user_is_unset(self, slack_prompt_broker, user_metadata):
+        message = self._slack_header_message(metadata={**user_metadata, "bot_id": "B0XYZ"})
+
+        assert slack_prompt_broker._format_prompt(message) == (
+            "[slack | dm | Sample Sender | D0123 | 1970-01-01 00:00:00 UTC | "
+            "msg_id:1711584001.000200 | slack_bot_id:B0XYZ]\nsynthetic message content"
+        )
+
+    def test_slack_sender_user_id_takes_precedence(self, slack_prompt_broker):
+        message = self._slack_header_message(
+            metadata={"user_id": "U0ABC123", "bot_id": "B0XYZ"},
+        )
+        header = slack_prompt_broker._format_prompt(message).splitlines()[0]
+
+        assert header.endswith(" | slack_user_id:U0ABC123]")
+        assert "slack_bot_id:" not in header
+
+    @pytest.mark.parametrize("key", ["user_id", "bot_id"])
+    @pytest.mark.parametrize("invalid_id", [
+        "U0ABc123", "U0ABC|123", "U0ABC]123", "U0ABC 123", "U0ABC123\n",
+        "U", "U" * 33, "UÖABC123", 42, False, ["U0ABC123"],
+    ])
+    def test_slack_sender_invalid_id_warns_once_without_message_text(
+        self, slack_prompt_broker, monkeypatch, key, invalid_id,
+    ):
+        warnings = []
+        monkeypatch.setattr("pinky_daemon.broker._log", warnings.append)
+        message = self._slack_header_message(metadata={key: invalid_id})
+
+        assert slack_prompt_broker._format_prompt(message) == (
+            "[slack | dm | Sample Sender | D0123 | 1970-01-01 00:00:00 UTC | "
+            "msg_id:1711584001.000200]\nsynthetic message content"
+        )
+        assert len(warnings) == 1
+        assert "WARNING" in warnings[0]
+        assert message.content not in warnings[0]
+
+    def test_slack_sender_invalid_user_does_not_fall_back_to_bot(
+        self, slack_prompt_broker, monkeypatch,
+    ):
+        warnings = []
+        monkeypatch.setattr("pinky_daemon.broker._log", warnings.append)
+        message = self._slack_header_message(
+            metadata={"user_id": "bad|user", "bot_id": "B0XYZ"},
+        )
+        header = slack_prompt_broker._format_prompt(message).splitlines()[0]
+
+        assert header.endswith(" | msg_id:1711584001.000200]")
+        assert "slack_user_id:" not in header
+        assert "slack_bot_id:" not in header
+        assert len(warnings) == 1
+
+    @pytest.mark.parametrize("metadata", [{}, {"user_id": "", "bot_id": ""}])
+    def test_slack_sender_absent_metadata_keeps_header(self, slack_prompt_broker, metadata):
+        message = self._slack_header_message(sender_id="U0ABC123", metadata=metadata)
+
+        assert slack_prompt_broker._format_prompt(message) == (
+            "[slack | dm | Sample Sender | D0123 | 1970-01-01 00:00:00 UTC | "
+            "msg_id:1711584001.000200]\nsynthetic message content"
+        )
+
+    @pytest.mark.parametrize("platform,is_group", [
+        ("telegram", False), ("telegram", True), ("discord", False),
+        ("discord", True), ("buzz", True),
+    ])
+    def test_slack_sender_metadata_leaves_other_platforms_unchanged(
+        self, slack_prompt_broker, platform, is_group,
+    ):
+        message = self._slack_header_message(
+            platform=platform, is_group=is_group, chat_title="#sample",
+            metadata={"user_id": "U0ABC123", "bot_id": "B0XYZ"},
+        )
+        prefix = (
+            f"[{platform} | group | #sample | Sample Sender | D0123 | " if is_group
+            else f"[{platform} | dm | Sample Sender | D0123 | "
+        )
+
+        assert slack_prompt_broker._format_prompt(message) == (
+            prefix + "1970-01-01 00:00:00 UTC | msg_id:1711584001.000200]"
+            "\nsynthetic message content"
+        )
+
     def test_buzz_known_contact_uses_registry_name_role_and_fingerprint(self):
         tmpdir, registry, broker, _sent, _reactions = self._make_broker()
         try:

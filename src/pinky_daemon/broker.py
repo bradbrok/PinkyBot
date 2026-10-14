@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -1456,6 +1457,18 @@ class MessageBroker:
             f" | thread_root_ts:{message.reply_to} | is_thread_reply:true"
             if message.reply_to else ""
         )
+        slack_identity = ""
+        if message.platform == "slack":
+            slack_id = message.metadata.get("user_id")
+            slack_kind = "user"
+            if slack_id in (None, ""):
+                slack_id = message.metadata.get("bot_id")
+                slack_kind = "bot"
+            if slack_id not in (None, ""):
+                if isinstance(slack_id, str) and re.fullmatch(r"[A-Z0-9]{2,32}", slack_id):
+                    slack_identity = f" | slack_{slack_kind}_id:{slack_id}"
+                else:
+                    _log("broker: WARNING invalid Slack sender ID; omitting header field")
         buzz_principal = message.metadata.get("buzz_verified_principal", "")
         if message.platform == "buzz" and buzz_principal:
             alias = self._registry.get_group_chat_alias(message.agent_name, message.chat_id)
@@ -1523,9 +1536,15 @@ class MessageBroker:
         elif message.is_group:
             alias = self._registry.get_group_chat_alias(message.agent_name, message.chat_id)
             display = alias or message.chat_title or message.chat_id
-            header = f"[{message.platform} | group | {display} | {message.sender_name} | {message.chat_id} | {ts}{msg_id}{thread_provenance}]"
+            header = (
+                f"[{message.platform} | group | {display} | {message.sender_name} | "
+                f"{message.chat_id} | {ts}{msg_id}{thread_provenance}{slack_identity}]"
+            )
         else:
-            header = f"[{message.platform} | dm | {message.sender_name} | {message.chat_id} | {ts}{msg_id}{thread_provenance}]"
+            header = (
+                f"[{message.platform} | dm | {message.sender_name} | {message.chat_id} | "
+                f"{ts}{msg_id}{thread_provenance}{slack_identity}]"
+            )
 
         body = message.content
 
