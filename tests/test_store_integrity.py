@@ -73,8 +73,13 @@ def _sidecar_identities(path: Path) -> dict[str, tuple[int, int]]:
 
 @pytest.fixture
 def daemon_store_root() -> Any:
-    """Create a daemon-owned root outside world-writable pytest temp ancestors."""
-    with tempfile.TemporaryDirectory(prefix=".pinky-daemon-store-", dir=Path.cwd()) as root:
+    """Create a daemon-owned root outside world-writable pytest temp ancestors.
+
+    Anchored to the checkout, not the current directory: each test runs in a
+    private working directory under the pytest temp tree.
+    """
+    checkout_root = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory(prefix=".pinky-daemon-store-", dir=checkout_root) as root:
         yield Path(root)
 
 
