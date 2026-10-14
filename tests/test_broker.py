@@ -160,6 +160,17 @@ class TestMessageBrokerRouting:
             f"msg_id:1711584001.000200 | slack_user_id:{user_id}]\nsynthetic message content"
         )
 
+    def test_slack_sender_user_id_follows_dm_thread_fields(self, slack_prompt_broker):
+        message = self._slack_header_message(
+            reply_to="1711584000.000100", metadata={"user_id": "U0ABC123"},
+        )
+        header = slack_prompt_broker._format_prompt(message).splitlines()[0]
+
+        assert header.startswith("[slack | dm |")
+        assert header.endswith(
+            " | thread_root_ts:1711584000.000100 | is_thread_reply:true | slack_user_id:U0ABC123]"
+        )
+
     def test_slack_sender_user_id_follows_group_thread_fields(self, slack_prompt_broker):
         message = self._slack_header_message(
             chat_id="C0123", chat_title="#sample", is_group=True,
