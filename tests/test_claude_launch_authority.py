@@ -174,9 +174,15 @@ async def probe_at(h, root, source, names):
                 "export " + name + "=" + shlex.quote(SENTINEL + "shell") + "\n"
                 for name in sorted(names)
             )
-            shell.write_text(
+            # The seed pane may still be starting this script, and Linux does not let a
+            # file be opened for writing while it is being executed (ETXTBSY): publish
+            # the edited script as a new file instead of rewriting it in place.
+            pending = shell.with_name("pane-shell.pending")
+            pending.write_text(
                 shell.read_text().replace('exec /bin/sh "$@"', insertion + 'exec /bin/sh "$@"')
             )
+            pending.chmod(0o700)
+            pending.replace(shell)
         probe.script.write_text(
             f"#!{sys.executable}\n"
             "import json,os,pathlib,time\n"
