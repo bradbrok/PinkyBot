@@ -168,6 +168,16 @@ def _ensure_test_session_secret():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_slow_request_logging(monkeypatch):
+    """Parallel load can make any request slow; exact logs need stable output."""
+    import math
+
+    from pinky_daemon import api
+
+    monkeypatch.setattr(api, "SLOW_REQUEST_MS", math.inf)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_runtime_model_catalog():
     """Release process-wide registry bindings at each test boundary."""
     from pinky_daemon import runtime_model_catalog

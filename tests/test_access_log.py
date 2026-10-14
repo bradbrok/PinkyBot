@@ -210,6 +210,27 @@ def test_upgrade_header_does_not_skip_http_middleware(factory, header, expected)
     assert response.headers.get(header, "").startswith(expected)
 
 
+@pytest.mark.parametrize("log_slow_requests", [False, True])
+def test_timing_log_threshold_is_read_after_app_creation(
+    factory, monkeypatch, capsys, log_slow_requests,
+):
+    from pinky_daemon import api
+
+    client, _ = factory()
+    if log_slow_requests:
+        monkeypatch.setattr(api, "SLOW_REQUEST_MS", 0)
+    capsys.readouterr()
+    response = client.get("/api")
+    assert response.status_code == 200
+    assert response.headers["Server-Timing"].startswith("total;dur=")
+    lines = capsys.readouterr().err.splitlines()
+    if log_slow_requests:
+        assert len(lines) == 1
+        assert re.fullmatch(r"timing: GET /api — \d+ms", lines[0])
+    else:
+        assert lines == []
+
+
 def test_voice_websocket_dispatch_is_unchanged(factory, monkeypatch):
     import pinky_daemon.voice_routes as voice_routes
 
