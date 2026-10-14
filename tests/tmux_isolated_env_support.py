@@ -67,7 +67,11 @@ class LaunchProbe:
             "json.dumps(sorted(k for k,v in os.environ.items() if v == '')))\n"
             f"pathlib.Path({str(self.base_path)!r}).write_text(json.dumps({{"
             f"'home_matches':os.environ.get('HOME')=={str(self.home)!r}}}))\n"
-            f"pathlib.Path({str(self.names_path)!r}).write_text(json.dumps(sorted(os.environ)))\n"
+            # names_path is written last and published in one step: readers wait for it
+            # to exist and then parse it, so it must never be seen half written.
+            f"_tmp=pathlib.Path({str(self.names_path)!r}+'.tmp')\n"
+            "_tmp.write_text(json.dumps(sorted(os.environ)))\n"
+            f"os.replace(_tmp,{str(self.names_path)!r})\n"
             "if 'app-server' in sys.argv:\n"
             " for line in sys.stdin:\n"
             "  frame=json.loads(line)\n"

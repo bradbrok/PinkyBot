@@ -199,7 +199,10 @@ async def private_server(root, monkeypatch):
             "result['TMUX_PANE']={'pane':os.environ.get('TMUX_PANE','').startswith('%')}\n"
             "result['PINKYBOT_FERRY_SHARED_SECRET']={'present':'PINKYBOT_FERRY_SHARED_SECRET' in os.environ}\n"
             "result['CUSTOM_TOOL_TOKEN']={'daemon':os.environ.get('CUSTOM_TOOL_TOKEN')==marker+'daemon'}\n"
-            f"pathlib.Path({str(report)!r}).write_text(json.dumps(result))\n"
+            # Publish the report in one step: the test reads it as soon as the name exists.
+            f"_tmp=pathlib.Path({str(report)!r}+'.tmp')\n"
+            "_tmp.write_text(json.dumps(result))\n"
+            f"os.replace(_tmp,{str(report)!r})\n"
             "time.sleep(60)\n"
         )
         script.write_text(f"#!{sys.executable}\n" + code)
