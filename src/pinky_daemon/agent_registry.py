@@ -1760,6 +1760,7 @@ class AgentRegistry:
                 content TEXT NOT NULL,
                 created_at REAL NOT NULL,
                 delivered INTEGER NOT NULL DEFAULT 0,
+                slack_envelope TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
             );
 
@@ -2347,6 +2348,11 @@ class AgentRegistry:
                 "UPDATE pending_messages SET sender_id=chat_id WHERE sender_id=''"
             )
             _log("agent_registry: migrated — added sender_id to pending_messages")
+        if "slack_envelope" not in pm_existing:
+            self._db.execute(
+                "ALTER TABLE pending_messages ADD COLUMN slack_envelope TEXT NOT NULL DEFAULT ''"
+            )
+            _log("agent_registry: migrated — added slack_envelope to pending_messages")
 
         # Approval maintenance metadata (#998). Aging re-prompts are bounded
         # independently from transport retries/new-message notifications, and
@@ -7301,6 +7307,7 @@ except Exception as exc:
         self, agent_name: str, platform: str, chat_id: str,
         sender_name: str, content: str, reply_chat_id: str = "",
         is_group: bool = False, sender_id: str = "",
+        slack_envelope: dict | None = None,
     ) -> int:
         """Queue a message from a pending user. Returns the message ID.
 
@@ -7311,12 +7318,13 @@ except Exception as exc:
         differs from the sender. Defaults to ``chat_id`` (correct for 1:1 DMs
         where sender == destination). ``is_group`` records whether the held
         message arrived in a group/channel so it re-delivers with the right
-        context on approval.
+        context on approval. ``slack_envelope`` optionally preserves Slack
+        sender metadata, event identity and thread context for the header.
         """
         cursor = self._queue_pending_message_uncommitted(
             agent_name=agent_name, platform=platform, chat_id=chat_id,
             sender_name=sender_name, content=content, reply_chat_id=reply_chat_id,
-            is_group=is_group, sender_id=sender_id,
+            is_group=is_group, sender_id=sender_id, slack_envelope=slack_envelope,
         )
         self._db.commit()
         return cursor
@@ -7325,6 +7333,7 @@ except Exception as exc:
         self, *, agent_name: str, platform: str, chat_id: str,
         sender_name: str, content: str, reply_chat_id: str = "",
         is_group: bool = False, sender_id: str = "",
+        slack_envelope: dict | None = None,
         db: sqlite3.Connection | None = None,
     ) -> int:
         """Insert one held row without committing (transaction helper)."""
@@ -7332,11 +7341,14 @@ except Exception as exc:
         now = time.time()
         dest = reply_chat_id or chat_id
         sid = sender_id or chat_id
+        envelope = json.dumps(slack_envelope) if platform == "slack" and slack_envelope else ""
         cursor = connection.execute(
             """INSERT INTO pending_messages
-               (agent_name, platform, chat_id, reply_chat_id, is_group, sender_id, sender_name, content, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (agent_name, platform, chat_id, dest, int(is_group), sid, sender_name, content, now),
+               (agent_name, platform, chat_id, reply_chat_id, is_group, sender_id,
+                sender_name, content, created_at, slack_envelope)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (agent_name, platform, chat_id, dest, int(is_group), sid,
+             sender_name, content, now, envelope),
         )
         return cursor.lastrowid
 
@@ -7347,7 +7359,7 @@ except Exception as exc:
         if chat_id:
             rows = self._db.execute(
                 """SELECT id, agent_name, platform, chat_id, reply_chat_id,
-                          is_group, sender_id, sender_name, content, created_at
+                          is_group, sender_id, sender_name, content, created_at, slack_envelope
                    FROM pending_messages
                    WHERE agent_name=? AND chat_id=? AND delivered=0
                    ORDER BY created_at ASC""",
@@ -7356,7 +7368,7 @@ except Exception as exc:
         else:
             rows = self._db.execute(
                 """SELECT id, agent_name, platform, chat_id, reply_chat_id,
-                          is_group, sender_id, sender_name, content, created_at
+                          is_group, sender_id, sender_name, content, created_at, slack_envelope
                    FROM pending_messages
                    WHERE agent_name=? AND delivered=0
                    ORDER BY created_at ASC""",
@@ -7368,6 +7380,7 @@ except Exception as exc:
                 "chat_id": r[3], "reply_chat_id": r[4] or r[3],
                 "is_group": bool(r[5]), "sender_id": r[6] or r[3],
                 "sender_name": r[7], "content": r[8], "created_at": r[9],
+                **({"slack_envelope": json.loads(r[10])} if r[10] else {}),
             }
             for r in rows
         ]
@@ -7681,6 +7694,7 @@ except Exception as exc:
         sender_name: str, content: str, reply_chat_id: str = "",
         is_group: bool = False, sender_id: str = "", target_name: str = "",
         held_at: float | None = None,
+        slack_envelope: dict | None = None,
     ) -> tuple[int, dict]:
         """Atomically persist a held row and its legacy approval aggregate.
 
@@ -7702,7 +7716,7 @@ except Exception as exc:
                 agent_name=agent_name, platform=platform, chat_id=chat_id,
                 sender_name=sender_name, content=content,
                 reply_chat_id=reply_chat_id, is_group=is_group,
-                sender_id=sender_id, db=transaction_db,
+                sender_id=sender_id, slack_envelope=slack_envelope, db=transaction_db,
             )
             self._record_approval_hold_uncommitted(
                 agent_name, chat_id, target_name=target_name,

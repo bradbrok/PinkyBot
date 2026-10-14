@@ -140,6 +140,81 @@ def registry():
     os.unlink(path)
 
 
+class TestPendingSlackEnvelope:
+    @pytest.mark.parametrize("atomic", [False, True])
+    @pytest.mark.parametrize("platform", ["slack", "telegram", "discord"])
+    def test_envelope_round_trip_is_slack_only_and_durable(self, tmp_path, atomic, platform):
+        db_path = str(tmp_path / "agents.db")
+        registry = AgentRegistry(db_path=db_path)
+        envelope = {
+            "metadata": {"user_id": "U0ABC123", "bot_id": ""},
+            "message_id": "1711584001.000200", "reply_to": "1711584000.000100",
+            "timestamp": 0, "chat_title": "#sample",
+        }
+        try:
+            registry.register("worker", working_dir=str(tmp_path))
+            values = {
+                "agent_name": "worker", "platform": platform, "chat_id": "C0123",
+                "reply_chat_id": "C0123", "sender_name": "Sample Sender", "content": "hello",
+                "is_group": True, "sender_id": "U0ABC123", "slack_envelope": envelope,
+            }
+            if atomic:
+                row_id, _ = registry.queue_pending_message_with_approval_request(**values)
+            else:
+                row_id = registry.queue_pending_message(**values)
+            before = registry.get_pending_messages("worker", "C0123")
+            assert len(before) == 1
+            assert before[0]["id"] == row_id
+            assert before[0]["reply_chat_id"] == "C0123"
+            assert before[0]["is_group"] is True
+            assert before[0]["sender_id"] == "U0ABC123"
+            if platform == "slack":
+                assert before[0]["slack_envelope"] == envelope
+            else:
+                assert "slack_envelope" not in before[0]
+
+            registry.close()
+            registry = AgentRegistry(db_path=db_path)
+
+            assert registry.get_pending_messages("worker", "C0123") == before
+            assert registry.get_pending_messages("worker") == before
+        finally:
+            registry.close()
+
+    @pytest.mark.parametrize("platform", ["slack", "telegram"])
+    def test_column_upgrade_preserves_legacy_pending_rows(self, tmp_path, platform):
+        db_path = tmp_path / "agents.db"
+        legacy = AgentRegistry(db_path=str(db_path))
+        try:
+            legacy.register("worker", working_dir=str(tmp_path))
+            legacy.queue_pending_message(
+                "worker", platform, "C0123", "Sample Sender", "hello",
+                reply_chat_id="C0123", is_group=True, sender_id="B0XYZ",
+            )
+            before = legacy.get_pending_messages("worker", "C0123")
+            assert "slack_envelope" not in before[0]
+        finally:
+            legacy.close()
+        with sqlite3.connect(db_path) as db:
+            db.execute("ALTER TABLE pending_messages DROP COLUMN slack_envelope")
+            assert "slack_envelope" not in {
+                row[1] for row in db.execute("PRAGMA table_info(pending_messages)")
+            }
+
+        for _ in range(2):
+            upgraded = AgentRegistry(db_path=str(db_path))
+            try:
+                columns = {
+                    row[1]: row
+                    for row in upgraded._db.execute("PRAGMA table_info(pending_messages)")
+                }
+                assert columns["slack_envelope"][2:5] == ("TEXT", 1, "''")
+                assert upgraded.get_pending_messages("worker", "C0123") == before
+                assert upgraded.get_pending_messages("worker") == before
+            finally:
+                upgraded.close()
+
+
 class TestVerifiedContactBootstrap:
     def test_finalize_rolls_back_state_bit_and_contact_if_marker_write_fails(
         self,
