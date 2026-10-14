@@ -1,6 +1,6 @@
 {
   "schema": "pinky-model-roster/1",
-  "revision": 6,
+  "revision": 7,
   "updated": "2026-10-14",
   "models": [
     {
@@ -316,11 +316,11 @@
       "context_window": 200000,
       "is_1m": false,
       "pricing": {
-        "input": 5.0,
-        "output": 30.0,
-        "cached_input": 0.5,
-        "cache_write_5m": 6.25,
-        "cache_write_1h": 6.25
+        "input": 4.0,
+        "output": 20.0,
+        "cached_input": 0.4,
+        "cache_write_5m": 5.0,
+        "cache_write_1h": 5.0
       },
       "supports_thinking": false,
       "active": true,
