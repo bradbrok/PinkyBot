@@ -2,6 +2,7 @@
 
 import hashlib
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,10 @@ from tests.test_isolated_transcript_containment import post, record_session
 
 pytestmark = pytest.mark.real_auth
 OWN_DENIAL = {"detail": "transcript_path must be in the caller's own project directory"}
+# The API logs any request slower than its timing threshold; under load that can be this one.
+SLOW_REQUEST_LOG = re.compile(
+    r"^timing: POST /agents/tenant/transport/transcript-path — \d+ms\n", re.MULTILINE,
+)
 
 
 def owned_root(d):
@@ -156,7 +161,7 @@ def test_peer_scope_permission_error_keeps_own_project_refusal(
     assert response.status_code == 403, response.text
     assert response.json() == OWN_DENIAL
     assert (bindings, ownership, effects, attempts, stopped) == ([], [], [], [], [])
-    assert log == ""
+    assert SLOW_REQUEST_LOG.sub("", log) == ""
     assert calls == []
 
 

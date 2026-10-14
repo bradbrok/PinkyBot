@@ -76,7 +76,9 @@ jobs:
       - name: Run tests
         run: |
           install -d -m 700 "$RUNNER_TEMP/pinky-pytest"
-          TMPDIR="$RUNNER_TEMP/pinky-pytest" uv run --no-sync pytest
+          # One worker per runner core; each test file stays on one worker so
+          # module-level fixtures and file-local state behave as in a serial run.
+          TMPDIR="$RUNNER_TEMP/pinky-pytest" uv run --no-sync pytest -n auto --dist loadfile
 
   frontend:
     name: Frontend (build + i18n)

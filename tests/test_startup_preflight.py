@@ -886,7 +886,9 @@ async def test_target_process_group_ends_before_continuing(deployment, tmp_path,
     )
     if outcome == 'timeout':
         effect += 'time.sleep(60)\n'
-        fx.child_timeout = 2
+        # Counted from the hand-back in ObservedChild; it must end well before the
+        # descendant's own 3 s deadline, so only the group kill can stop it.
+        fx.child_timeout = 1
     elif outcome == 'findings':
         finding = dict(kind='directory_outside_root', path=str(fx.data / 'link'))
         effect += (
@@ -904,6 +906,12 @@ async def test_target_process_group_ends_before_continuing(deployment, tmp_path,
             super().__init__(command, *args, **kwargs)
             if self.is_check:
                 processes.append(self)
+                # The preflight's wait and timeout start when this returns, so hand the child
+                # back only once its descendant is recorded and heartbeating (bounded).
+                deadline = time.monotonic() + 30
+                while spawn and time.monotonic() < deadline and not (
+                        pidfile.exists() and heartbeat.exists() and heartbeat.stat().st_size):
+                    time.sleep(.01)
 
         def wait(self, *args, **kwargs):
             if self.is_check and self.returncode is None:
