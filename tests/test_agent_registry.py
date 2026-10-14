@@ -141,9 +141,81 @@ def registry():
 
 
 class TestPendingSlackEnvelope:
+    def test_rows_without_envelopes_use_empty_storage_and_stay_quiet(self, tmp_path, monkeypatch):
+        registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+        try:
+            registry.register("worker", working_dir=str(tmp_path))
+            row_ids = []
+            for platform in ("slack", "telegram"):
+                row_ids.append(registry.queue_pending_message(
+                    "worker", platform, "synthetic-gate", "Sample Sender", "hello",
+                ))
+            raw = registry._db.execute(
+                "SELECT id, slack_envelope FROM pending_messages WHERE agent_name=?", ("worker",),
+            ).fetchall()
+            assert dict(raw) == {row_id: "" for row_id in row_ids}
+            warnings = []
+            monkeypatch.setattr("pinky_daemon.agent_registry._log", warnings.append)
+
+            filtered = registry.get_pending_messages("worker", "synthetic-gate")
+
+            assert {row["id"] for row in filtered} == set(row_ids)
+            assert all("slack_envelope" not in row for row in filtered)
+            assert warnings == []
+            assert registry.get_pending_messages("worker") == filtered
+            assert warnings == []
+        finally:
+            registry.close()
+
+    @pytest.mark.parametrize("filtered", [False, True])
+    def test_decoder_recursion_keeps_the_bad_row_and_the_later_good_row(
+        self, tmp_path, monkeypatch, filtered,
+    ):
+        registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+        try:
+            registry.register("worker", working_dir=str(tmp_path))
+            values = {
+                "agent_name": "worker", "platform": "slack", "chat_id": "D0123",
+                "sender_name": "Sample Sender", "content": "synthetic private message",
+                "sender_id": "U0ABC123",
+            }
+            bad_id = registry.queue_pending_message(**values)
+            envelope = {
+                "message_id": "1711584001.000200", "metadata": {"user_id": "U0ABC123"},
+            }
+            registry.queue_pending_message(**values, slack_envelope=envelope)
+            before = registry.get_pending_messages("worker", "D0123")
+            nested = "[" * 65536 + "0" + "]" * 65536
+            registry._db.execute(
+                "UPDATE pending_messages SET slack_envelope=? WHERE id=?", (nested, bad_id),
+            )
+            registry._db.commit()
+            original_loads = json.loads
+
+            def decoder_with_depth_limit(value, *args, **kwargs):
+                if value == nested:
+                    raise RecursionError("synthetic decoder nesting limit")
+                return original_loads(value, *args, **kwargs)
+
+            monkeypatch.setattr("pinky_daemon.agent_registry.json.loads", decoder_with_depth_limit)
+            warnings = []
+            monkeypatch.setattr("pinky_daemon.agent_registry._log", warnings.append)
+
+            rows = registry.get_pending_messages("worker", "D0123" if filtered else "")
+
+            assert rows == before
+            assert "slack_envelope" not in rows[0]
+            assert rows[1]["slack_envelope"] == envelope
+            assert warnings == [
+                f"agent_registry: WARNING invalid pending Slack envelope row_id={bad_id}",
+            ]
+        finally:
+            registry.close()
+
     @pytest.mark.parametrize("filtered", [False, True])
     @pytest.mark.parametrize("invalid", [
         "{", "[]", "null", '"fixture"', "42", "true", '["fixture"]', b"\xff",
+        pytest.param("[" * 65536 + "0" + "]" * 65536, id="deep-array"),
     ])
     def test_invalid_envelope_is_omitted_without_blocking_later_rows(
         self, tmp_path, monkeypatch, filtered, invalid,

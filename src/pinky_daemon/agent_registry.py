@@ -7385,7 +7385,7 @@ except Exception as exc:
             if r[10]:
                 try:
                     envelope = json.loads(r[10])
-                except (ValueError, TypeError):
+                except (ValueError, TypeError, RecursionError):
                     envelope = None
                 if isinstance(envelope, dict):
                     message["slack_envelope"] = envelope
