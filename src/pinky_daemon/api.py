@@ -607,6 +607,7 @@ async def _bounded_cold_start_connect(
 
 VALID_PERMISSION_MODES = ("", "default", "acceptEdits", "bypassPermissions", "dontAsk", "plan", "auto")
 MIN_UI_PASSWORD_LENGTH = 8
+SLOW_REQUEST_MS = 500
 CONTEXT_SAVE_SOURCE_SELF_TOOL = "save_my_context"
 CONTEXT_ACTIVITY_SAVE_BUFFER_SECONDS = 5 * 60
 CONTEXT_STALE_WARNING_SECONDS = 12 * 60 * 60
@@ -6406,8 +6407,6 @@ def create_api(
     # Logs slow requests and adds Server-Timing header for frontend diagnostics.
     # Registered after auth middleware so it wraps the full request lifecycle.
 
-    _SLOW_REQUEST_MS = 500  # noqa: N806 — log requests slower than this
-
     # ── Security Headers ──────────────────────────────────
     @app.middleware("http")
     async def security_headers_middleware(request: Request, call_next):
@@ -6434,7 +6433,7 @@ def create_api(
 
         # Log slow requests (skip streaming/websocket-like paths)
         path = request.url.path
-        if elapsed_ms >= _SLOW_REQUEST_MS and "/ws" not in path:
+        if elapsed_ms >= SLOW_REQUEST_MS and "/ws" not in path:
             _log(f"timing: {request.method} {path} — {elapsed_ms:.0f}ms")
 
         return response

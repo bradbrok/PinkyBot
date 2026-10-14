@@ -1,6 +1,5 @@
 """G2 contracts: retained base values and value-free server warnings."""
 
-import asyncio
 import json
 import subprocess
 from unittest.mock import AsyncMock
@@ -14,6 +13,7 @@ from pinky_daemon.command_runner import (
     RunuserCommandRunner,
 )
 from pinky_daemon.tmux_dream_runner import TmuxDreamConfig, TmuxDreamRunner
+from tests.child_report_support import wait_for_child_report
 from tests.test_tmux_server_env_integration import managed_probe
 from tests.tmux_isolated_env_support import Registry
 from tests.tmux_server_env_support import FAMILIES, control, owner, seed
@@ -28,11 +28,8 @@ async def launch_dream(probe, monkeypatch):
     monkeypatch.setattr(dream, "_ensure_submitted", AsyncMock())
 
     async def result(*args, **kwargs):
-        for _ in range(300):
-            if probe.names_path.exists():
-                return "completed"
-            await asyncio.sleep(0.01)
-        raise AssertionError("inert dream child did not report")
+        await wait_for_child_report(probe.names_path, "inert dream child did not report")
+        return "completed"
 
     monkeypatch.setattr(dream, "_wait_for_result", result)
     assert (await dream.run("synthetic prompt")).ok

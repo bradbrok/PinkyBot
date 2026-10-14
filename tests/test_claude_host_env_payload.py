@@ -1,6 +1,5 @@
 """Host launch provenance uses disposable sockets and names-only child reports."""
 
-import asyncio
 import json
 import os
 import shlex
@@ -20,6 +19,7 @@ from pinky_daemon.isolated_launch_env import LaunchPolicy
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_dream_runner import TmuxDreamConfig, TmuxDreamRunner
 from pinky_daemon.tmux_session import TmuxSession, _TmuxControl
+from tests.child_report_support import wait_for_child_report
 from tests.tmux_socket_support import private_socket
 
 SENTINEL = "private-launch-" + "q" * 48
@@ -153,11 +153,8 @@ def test_host_overlay_excludes_clean_and_other_runners(clean_daemon, monkeypatch
 
 
 async def wait_report(path):
-    for _ in range(500):
-        if path.exists():
-            return json.loads(path.read_text())
-        await asyncio.sleep(0.01)
-    raise AssertionError("inert child did not publish its names-only report")
+    text = await wait_for_child_report(path, "inert child did not publish its names-only report")
+    return json.loads(text)
 
 
 @asynccontextmanager

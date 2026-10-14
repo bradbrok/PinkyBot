@@ -1,6 +1,5 @@
 """The loader leaves room for ordinary commands in the tmux message budget."""
 
-import asyncio
 import importlib
 import os
 import shlex
@@ -15,6 +14,7 @@ import pytest
 from pinky_daemon import tmux_launch_env, tmux_session
 from pinky_daemon.command_runner import RunuserCommandRunner
 from pinky_daemon.tmux_session import _TmuxControl
+from tests.child_report_support import wait_for_child_report
 from tests.tmux_env_r3_support import SECRET
 from tests.tmux_env_support import LaunchRecorder, secret_files
 from tests.tmux_socket_support import private_socket
@@ -33,7 +33,12 @@ def home(tmp_path):
 def long_launch(home):
     cwd = home / ("a" * 200) / ("b" * 200) / ("c" * 200)
     cwd.mkdir(parents=True, mode=0o700)
-    code = "import pathlib;pathlib.Path('child-ran').write_text('ok')"
+    code = (
+        "import os,pathlib;"
+        "report=pathlib.Path('child-ran');"
+        "temporary=report.with_name(report.name+'.tmp');"
+        "temporary.write_text('ok');os.replace(temporary,report)"
+    )
     command = shlex.join([
         sys.executable, "-I", "-c", code,
         "--model", "synthetic", "--config", "note=" + "p" * 4200,
@@ -83,11 +88,8 @@ async def test_real_tmux_executes_long_command_with_empty_environment_overrides(
     try:
         result = await control.new_session(cwd=str(cwd), command=command, env=env)
         assert result.ok, result.stderr
-        for _ in range(200):
-            if (cwd / "child-ran").exists():
-                break
-            await asyncio.sleep(0.01)
-        assert (cwd / "child-ran").read_text() == "ok"
+        text = await wait_for_child_report(cwd / "child-ran", "tmux child did not report completion")
+        assert text == "ok"
         assert not secret_files(home, SECRET)
     finally:
         subprocess.run([TMUX_BINARY, "-S", str(socket), "kill-server"],

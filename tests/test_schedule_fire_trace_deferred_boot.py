@@ -16,6 +16,7 @@ import pinky_daemon.schedule_fire_trace as ft
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.api import _derive_api_store_manifest, create_api
 from pinky_daemon.auth import SESSION_COOKIE_NAME, create_session_cookie
+from pinky_daemon.store_catalog import DaemonStoreCatalog
 
 
 def test_real_api_boot_with_locked_trace(tmp_path, monkeypatch):
@@ -36,15 +37,41 @@ def test_real_api_boot_with_locked_trace(tmp_path, monkeypatch):
         assert child.stdout.readline().strip() == 'locked'
         monkeypatch.setattr(ft, 'SETUP_TIMEOUT_SECONDS', .04)
         monkeypatch.setattr(ft, 'SETUP_RETRY_SECONDS', 60)
+        preflight_calls, setup_durations = [], []
+        real_preflight = DaemonStoreCatalog.preflight_integrity
+        real_setup = ft.ScheduleFireTrace._setup
+
+        def timed_preflight(self, *args, **kwargs):
+            started = time.monotonic()
+            try:
+                return real_preflight(self, *args, **kwargs)
+            finally:
+                preflight_calls.append((
+                    kwargs.get('telemetry_busy_timeout'), time.monotonic() - started,
+                ))
+
+        def timed_setup(self):
+            started = time.monotonic()
+            try:
+                return real_setup(self)
+            finally:
+                setup_durations.append(time.monotonic() - started)
+
+        monkeypatch.setattr(DaemonStoreCatalog, 'preflight_integrity', timed_preflight)
+        monkeypatch.setattr(ft.ScheduleFireTrace, '_setup', timed_setup)
         started = time.monotonic()
         try:
             app = create_api(db_path=base)
         finally:
             elapsed = time.monotonic() - started
             print('REAL_BOOT_SECONDS', elapsed)
-            assert elapsed < ft.SETUP_TIMEOUT_SECONDS + 2.0, (
-                'telemetry preflight ignored its injected bounded budget'
-            )
+        assert preflight_calls, 'API boot did not run telemetry preflight'
+        for timeout, duration in preflight_calls:
+            assert timeout == .04, 'telemetry preflight ignored its injected bounded budget'
+            assert duration < 2.0, 'telemetry preflight waited for the default setup budget'
+        assert setup_durations, 'API boot did not run trace writer setup'
+        for duration in setup_durations:
+            assert duration < 2.0, 'trace writer waited for the default setup budget'
         assert app.state.agents._fire_trace.status()['state'] == 'degraded'
         preflight = app.state.storage_observability.snapshot()['preflight']
         assert preflight['schedule_fire_trace'] == 'deferred-busy'
