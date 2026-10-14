@@ -7374,16 +7374,28 @@ except Exception as exc:
                    ORDER BY created_at ASC""",
                 (agent_name,),
             ).fetchall()
-        return [
-            {
+        messages = []
+        for r in rows:
+            message = {
                 "id": r[0], "agent_name": r[1], "platform": r[2],
                 "chat_id": r[3], "reply_chat_id": r[4] or r[3],
                 "is_group": bool(r[5]), "sender_id": r[6] or r[3],
                 "sender_name": r[7], "content": r[8], "created_at": r[9],
-                **({"slack_envelope": json.loads(r[10])} if r[10] else {}),
             }
-            for r in rows
-        ]
+            if r[10]:
+                try:
+                    envelope = json.loads(r[10])
+                except (ValueError, TypeError):
+                    envelope = None
+                if isinstance(envelope, dict):
+                    message["slack_envelope"] = envelope
+                else:
+                    _log(
+                        "agent_registry: WARNING invalid pending Slack envelope "
+                        f"row_id={r[0]}"
+                    )
+            messages.append(message)
+        return messages
 
     def mark_pending_delivered(self, agent_name: str, chat_id: str) -> int:
         """Mark all pending messages from a chat as delivered. Returns count."""

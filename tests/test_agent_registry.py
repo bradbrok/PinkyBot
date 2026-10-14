@@ -141,6 +141,45 @@ def registry():
 
 
 class TestPendingSlackEnvelope:
+    @pytest.mark.parametrize("filtered", [False, True])
+    @pytest.mark.parametrize("invalid", [
+        "{", "[]", "null", '"fixture"', "42", "true", '["fixture"]', b"\xff",
+    ])
+    def test_invalid_envelope_is_omitted_without_blocking_later_rows(
+        self, tmp_path, monkeypatch, filtered, invalid,
+    ):
+        registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+        try:
+            registry.register("worker", working_dir=str(tmp_path))
+            values = {
+                "agent_name": "worker", "platform": "slack", "chat_id": "D0123",
+                "sender_name": "Sample Sender", "content": "synthetic private message",
+                "sender_id": "U0ABC123",
+            }
+            bad_id = registry.queue_pending_message(**values)
+            envelope = {
+                "message_id": "1711584001.000200", "metadata": {"user_id": "U0ABC123"},
+            }
+            good_id = registry.queue_pending_message(**values, slack_envelope=envelope)
+            registry._db.execute(
+                "UPDATE pending_messages SET slack_envelope=? WHERE id=?", (invalid, bad_id),
+            )
+            registry._db.commit()
+            warnings = []
+            monkeypatch.setattr("pinky_daemon.agent_registry._log", warnings.append)
+
+            rows = registry.get_pending_messages("worker", "D0123" if filtered else "")
+
+            assert [row["id"] for row in rows] == [bad_id, good_id]
+            assert "slack_envelope" not in rows[0]
+            assert rows[1]["slack_envelope"] == envelope
+            assert all(row["content"] == values["content"] for row in rows)
+            assert warnings == [
+                f"agent_registry: WARNING invalid pending Slack envelope row_id={bad_id}",
+            ]
+        finally:
+            registry.close()
+
     @pytest.mark.parametrize("atomic", [False, True])
     @pytest.mark.parametrize("platform", ["slack", "telegram", "discord"])
     def test_envelope_round_trip_is_slack_only_and_durable(self, tmp_path, atomic, platform):

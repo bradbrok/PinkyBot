@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 from unittest.mock import AsyncMock
 
@@ -219,7 +220,7 @@ class TestMessageBrokerRouting:
             message = BrokerMessage(
                 platform="slack", chat_id=channel, sender_name="Sample Sender",
                 sender_id=sender_id, content="synthetic message content", agent_name="worker",
-                timestamp=0, message_id=message_id, reply_to=thread_root,
+                timestamp=1711584123.375, message_id=message_id, reply_to=thread_root,
                 chat_title="#sample" if is_group else "", is_group=is_group,
                 metadata={"user_id": sender_id if kind == "user" else "",
                           "bot_id": sender_id if kind == "bot" else ""},
@@ -228,6 +229,9 @@ class TestMessageBrokerRouting:
             await broker.handle_inbound(message)
             assert prompts == []
             assert len(registry.get_pending_messages("worker", gate)) == 1
+            stored = registry.get_pending_messages("worker", gate)[0]
+            assert stored["created_at"] != message.timestamp
+            assert stored["slack_envelope"]["timestamp"] == message.timestamp
 
             if restart:
                 registry.close()
@@ -254,6 +258,113 @@ class TestMessageBrokerRouting:
             assert registry.get_pending_messages("worker", gate) == []
         finally:
             registry.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind,sender_id", [("user", "U0ABC123"), ("bot", "B0XYZ")])
+    @pytest.mark.parametrize("is_group", [False, True])
+    @pytest.mark.parametrize("reopen", [False, True])
+    async def test_held_slack_envelope_stores_only_identity_metadata(
+        self, tmp_path, monkeypatch, kind, sender_id, is_group, reopen,
+    ):
+        db_path = str(tmp_path / "agents.db")
+        registry = AgentRegistry(db_path=db_path)
+        try:
+            registry.register("worker", working_dir=str(tmp_path))
+            registry.set_primary_user("owner-primary", display_name="Owner")
+            broker = MessageBroker(registry, SessionManager())
+            route = AsyncMock(return_value=True)
+            monkeypatch.setattr(broker, "_route_streaming", route)
+            monkeypatch.setattr(broker, "_notify_approval_request", AsyncMock())
+            expected = {
+                "user_id": sender_id if kind == "user" else "",
+                "bot_id": sender_id if kind == "bot" else "",
+            }
+            channel = "C0123" if is_group else "D0123"
+            gate = channel if is_group else sender_id
+            message = BrokerMessage(
+                platform="slack", chat_id=channel, sender_name="Sample Sender",
+                sender_id=sender_id, content="hello", agent_name="worker",
+                message_id="1711584001.000200", timestamp=1711584123.375,
+                is_group=is_group, chat_title="#sample" if is_group else "",
+                metadata={**expected, "username": "synthetic_name",
+                          "unrelated_marker": "synthetic-extra",
+                          "raw_event": {"text": "synthetic-unrelated-text"}},
+            )
+
+            await broker.handle_inbound(message)
+
+            route.assert_not_called()
+            if reopen:
+                registry.close()
+                registry = AgentRegistry(db_path=db_path)
+            rows = registry.get_pending_messages("worker", gate)
+            assert len(rows) == 1
+            assert rows[0]["slack_envelope"]["metadata"] == expected
+            assert registry.get_pending_messages("worker") == rows
+            raw = registry._db.execute(
+                "SELECT slack_envelope FROM pending_messages WHERE id=?", (rows[0]["id"],),
+            ).fetchone()[0]
+            assert json.loads(raw)["metadata"] == expected
+        finally:
+            registry.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("invalid", ["{", "[]", "null"])
+    async def test_corrupt_slack_envelope_keeps_legacy_header_and_delivers_next_row(
+        self, slack_prompt_broker, monkeypatch, invalid,
+    ):
+        broker = slack_prompt_broker
+        registry = broker._registry
+        registry.set_primary_user("owner-primary", display_name="Owner")
+        route = AsyncMock(return_value=True)
+        monkeypatch.setattr(broker, "_route_streaming", route)
+        monkeypatch.setattr(broker, "_notify_approval_request", AsyncMock())
+        first = self._slack_header_message(
+            content="synthetic first private content", timestamp=1711584123.375,
+            reply_to="1711584000.000100",
+        )
+        second = self._slack_header_message(
+            content="synthetic second private content", timestamp=1711584128.375,
+            message_id="1711584002.000300", reply_to="1711584000.000100",
+        )
+        await broker.handle_inbound(first)
+        await broker.handle_inbound(second)
+        route.assert_not_called()
+        before = registry.get_pending_messages("worker", first.sender_id)
+        assert len(before) == 2
+        bad_id = before[0]["id"]
+        registry._db.execute(
+            "UPDATE pending_messages SET slack_envelope=? WHERE id=?", (invalid, bad_id),
+        )
+        registry._db.commit()
+        registry.approve_user("worker", first.sender_id)
+        warnings = []
+        monkeypatch.setattr("pinky_daemon.agent_registry._log", warnings.append)
+        expected_warning = f"agent_registry: WARNING invalid pending Slack envelope row_id={bad_id}"
+
+        rows = registry.get_pending_messages("worker", first.sender_id)
+
+        assert "slack_envelope" not in rows[0]
+        assert rows[1] == before[1]
+        assert warnings == [expected_warning]
+        warnings.clear()
+        assert registry.get_pending_messages("worker") == rows
+        assert warnings == [expected_warning]
+        warnings.clear()
+
+        assert await broker.handle_approval("worker", first.sender_id) == 2
+
+        assert route.await_count == 2
+        delivered_first = route.call_args_list[0].args[1]
+        legacy = self._slack_header_message(
+            content=first.content, timestamp=rows[0]["created_at"], metadata={},
+            message_id="", reply_to="",
+        )
+        assert broker._format_prompt(delivered_first) == broker._format_prompt(legacy)
+        delivered_second = route.call_args_list[1].args[1]
+        assert broker._format_prompt(delivered_second) == broker._format_prompt(second)
+        assert warnings == [expected_warning]
+        assert registry.get_pending_messages("worker", first.sender_id) == []
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("sender_id", ["U0ABC123", "B0XYZ"])
