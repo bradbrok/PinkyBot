@@ -14,6 +14,7 @@ from tests.test_codex_scheduler_idle_receipt import (
     _drain_delivery,
     _paste,
     _read,
+    _replay_after_offline_grace,
     _schedule_fire,
 )
 from tests.test_codex_scheduler_idle_receipt import harness as harness
@@ -56,7 +57,7 @@ async def test_witnessed_user_row_accepts_before_completion(harness, version):
     harness.tmux.capture_pane.assert_not_awaited()
 
 
-async def test_current_user_row_releases_first_boundary_replay(harness):
+async def test_current_user_row_releases_first_boundary_replay(harness, monkeypatch):
     schedule, older, durable = _schedule_fire(harness, age=3601)
     turn, receipt = await _paste(harness, on_accept=durable.accept)
     submitted = []
@@ -76,7 +77,7 @@ async def test_current_user_row_releases_first_boundary_replay(harness):
         delivery_inflight_fn=lambda _name, prompt: harness.session.scheduler_wake_inflight(prompt),
     )
     harness.schedulers.append(scheduler)
-    await scheduler._replay_pending_locked("worker")
+    await _replay_after_offline_grace(scheduler, monkeypatch)
     assert harness.registry.get_schedule_wake_by_fire(schedule.id, older.fired_at).abandoned_at > 0
     newer, _ = harness.registry.persist_schedule_wake(
         schedule.id, agent_name="worker", schedule_name=schedule.name,

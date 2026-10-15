@@ -109,6 +109,19 @@ def _schedule_fire(harness, *, age=10, prompt="scheduled work"):
     return schedule, pending, ScheduleWakeReceipt(harness.registry, schedule.id, fired_at)
 
 
+async def _replay_after_offline_grace(engine, monkeypatch):
+    """Receipt cases without a live-session probe must first observe the offline grace."""
+    from pinky_daemon import scheduler
+
+    clock = SimpleNamespace(now=10_000.0)
+    monkeypatch.setattr(scheduler, "time", SimpleNamespace(
+        **{**vars(scheduler.time), "monotonic": lambda: clock.now},
+    ))
+    await engine._replay_pending_locked("worker")
+    clock.now += 300
+    await engine._replay_pending_locked("worker")
+
+
 @pytest.mark.asyncio
 @pytest.mark.xfail(
     strict=True,
@@ -311,7 +324,7 @@ async def test_unpasted_wake_is_not_accepted_by_unrelated_completion(harness):
 
 
 @pytest.mark.asyncio
-async def test_exact_transcript_receipt_retains_late_authority_after_abandonment(harness):
+async def test_exact_transcript_receipt_retains_late_authority_after_abandonment(harness, monkeypatch):
     schedule, pending, durable = _schedule_fire(harness, age=3_601)
     turn, receipt = await _paste(harness, on_accept=durable.accept)
     scheduler = AgentScheduler(
@@ -319,7 +332,7 @@ async def test_exact_transcript_receipt_retains_late_authority_after_abandonment
         delivery_inflight_fn=lambda _name, prompt: harness.session.scheduler_wake_inflight(prompt),
     )
     harness.schedulers.append(scheduler)
-    await scheduler._replay_pending_locked("worker")
+    await _replay_after_offline_grace(scheduler, monkeypatch)
     assert harness.registry.get_schedule_wake_by_fire(
         schedule.id, pending.fired_at,
     ).ledger_state == "abandoned"

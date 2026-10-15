@@ -12,6 +12,7 @@ from tests.test_codex_scheduler_idle_receipt import (
     _drain_delivery,
     _paste,
     _read,
+    _replay_after_offline_grace,
     _schedule_fire,
     _start,
 )
@@ -21,7 +22,7 @@ from tests.test_codex_scheduler_idle_receipt import harness as harness
 @pytest.mark.asyncio
 @pytest.mark.parametrize("matching_user_message", [False, True])
 async def test_idle_replay_requires_independent_acceptance(
-    harness, matching_user_message,
+    harness, monkeypatch, matching_user_message,
 ):
     # Exercise the real transport policy; no acceptance method is patched.
     schedule, older, durable = _schedule_fire(
@@ -50,7 +51,7 @@ async def test_idle_replay_requires_independent_acceptance(
         ),
     )
     harness.schedulers.append(scheduler)
-    await scheduler._replay_pending_locked("worker")
+    await _replay_after_offline_grace(scheduler, monkeypatch)
     assert harness.registry.get_schedule_wake_by_fire(
         schedule.id, older.fired_at,
     ).ledger_state == "abandoned"
