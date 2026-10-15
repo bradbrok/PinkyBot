@@ -3739,11 +3739,13 @@ def create_api(
         reason: WakeReason = WakeReason.NEW_SESSION,
         *,
         commit: bool = False,
+        builder=None,
     ) -> str:
         # Stamp the snapshot's start so a paste racing the render is never
         # mistaken for one that the continuation text already covered.
         rendered_at = time.time()
-        text = _build_streaming_wake_context(agent_name, reason, commit=commit)
+        build = builder if builder is not None else _build_streaming_wake_context
+        text = build(agent_name, reason, commit=commit)
         config.wake_context = text
         config.wake_context_rendered_at = rendered_at
         return text
@@ -4403,7 +4405,10 @@ def create_api(
             *,
             commit: bool = True,
         ) -> str:
-            return _refresh_streaming_wake_context(target_agent, config, reason, commit=commit)
+            return _refresh_streaming_wake_context(
+                target_agent, config, reason, commit=commit,
+                builder=_build_streaming_wake_context,
+            )
 
         config = StreamingSessionConfig(
             agent_name=agent_name,
@@ -4457,7 +4462,9 @@ def create_api(
             ),
             idle_timeout=max(0, agent.auto_sleep_hours) * 3600,
         )
-        _refresh_streaming_wake_context(agent_name, config, commit=False)
+        _refresh_streaming_wake_context(
+            agent_name, config, commit=False, builder=_build_streaming_wake_context,
+        )
 
         callback = await _make_streaming_response_callback()
         SessionClass = _expected_session_class(agent)  # noqa: N806
