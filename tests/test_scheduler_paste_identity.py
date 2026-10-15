@@ -77,7 +77,7 @@ async def test_legacy_empty_paste_identity_has_bounded_fence(registry, clock, mo
         older.schedule_id, agent_name="worker", schedule_name=older.name,
         prompt="newer work", fired_at=NOW - 1,
     )
-    logs, alerts, calls = [], [], []
+    logs, alerts, notices, calls = [], [], [], []
     current = ["current"]
     monkeypatch.setattr(scheduler, "_log", logs.append)
 
@@ -88,9 +88,14 @@ async def test_legacy_empty_paste_identity_has_bounded_fence(registry, clock, mo
     async def notify(_agent, message):
         alerts.append(message)
 
+    async def notify_agent(_agent, message):
+        notices.append(message)
+        return True
+
     engine = AgentScheduler(
         registry, wake_callback=wake, delivery_session_fn=lambda _: current[0],
         delivery_inflight_fn=lambda *_: False, owner_notify_callback=notify,
+        agent_notify_callback=notify_agent,
     )
     await engine._replay_pending_locked("worker")
     assert calls == [], "missing physical identity must fence inside the live-session ceiling"
@@ -107,12 +112,16 @@ async def test_legacy_empty_paste_identity_has_bounded_fence(registry, clock, mo
     await engine._replay_pending_locked("worker")
     if engine._owner_alert_tasks:
         await asyncio.gather(*engine._owner_alert_tasks)
+    if engine._agent_notice_tasks:
+        await asyncio.gather(*engine._agent_notice_tasks)
     assert calls == [newer.prompt]
     row = registry.get_schedule_wake_by_fire(older.schedule_id, older.fired_at)
     assert row.abandoned_at > 0 and row.last_error.startswith(reason)
     assert row.accepted_at == row.attempts == 0
     assert sum(reason in line for line in logs) == 1
-    assert sum(reason in line for line in alerts) == 1
+    # A replacement session with unknown render time receives the check itself.
+    assert sum(reason in line for line in alerts) == (release == "ceiling")
+    assert len(notices) == (release == "session-change")
 
 
 @pytest.mark.parametrize("kind_name", ["TmuxSession", "CodexTmuxSession"])

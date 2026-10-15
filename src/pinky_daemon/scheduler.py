@@ -22,7 +22,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from pinky_daemon.agent_registry import (
@@ -400,10 +400,13 @@ class AgentScheduler:
         delivery_drain_busy_fn=None,
         delivery_inflight_fn=None,
         delivery_session_fn=None,
+        delivery_context_rendered_at_fn=None,
+        delivery_timezone_fn=None,
         scheduler_busy_deliver_after_s: float | None = None,
         delivery_queued_fn=None,
         delivery_cancel_queued_fn=None,
         owner_notify_callback=None,
+        agent_notify_callback=None,
         trigger_store=None,
         activity=None,
         tick_interval: int = 30,
@@ -417,6 +420,8 @@ class AgentScheduler:
     ) -> None:
         self._registry = registry
         self._delivery_session_fn = delivery_session_fn
+        self._delivery_context_rendered_at_fn = delivery_context_rendered_at_fn
+        self._delivery_timezone_fn = delivery_timezone_fn
         self._scheduler_busy_deliver_after_s = scheduler_busy_delay(
             scheduler_busy_deliver_after_s if scheduler_busy_deliver_after_s is not None
             else registry.get_setting("SCHEDULER_BUSY_DELIVER_AFTER_S", "")
@@ -485,6 +490,7 @@ class AgentScheduler:
         # transport. Routine FIRED-BUT-UNDELIVERED receipt failures are logged
         # only, NOT owner-notified (#1043).
         self._owner_notify_callback = owner_notify_callback
+        self._agent_notify_callback = agent_notify_callback
         self._trigger_store = trigger_store  # TriggerStore | None
         self._url_refusal_warned_at: dict[int, float] = {}
         self._activity = activity  # ActivityStore | None
@@ -655,6 +661,7 @@ class AgentScheduler:
         self._receipt_extension_last_page: dict[int, float] = {}
         self._outbox_drain_notified_through: dict[str, float] = {}
         self._owner_alert_tasks: set[asyncio.Task] = set()
+        self._agent_notice_tasks: set[asyncio.Task] = set()
         self._last_schedule_prompt_warn_at: float | None = None
         self._last_pending_wake_liveness_drain_at: float | None = None
         self._last_outbox_reaper_day: date | None = None
@@ -731,10 +738,11 @@ class AgentScheduler:
             await asyncio.gather(*replay_tasks, return_exceptions=True)
         self._pending_replay_tasks.clear()
         self._outbox_drain_extensions.clear()
-        alert_tasks = list(self._owner_alert_tasks)
+        alert_tasks = list(self._owner_alert_tasks | self._agent_notice_tasks)
         if alert_tasks:
             await asyncio.gather(*alert_tasks, return_exceptions=True)
         self._owner_alert_tasks.clear()
+        self._agent_notice_tasks.clear()
         _log("scheduler: stopped")
 
     def _spawn_loop(self) -> None:
@@ -2161,7 +2169,73 @@ class AgentScheduler:
             reason = "PASTED_UNCONFIRMED_SESSION_LOST: pasted before the restart, may not have run; check before redoing"
             if self._registry.abandon_pending_schedule_wake(row.id, reason=reason):
                 _log(f"scheduler: {reason} schedule '{row.name}' fired_at={row.fired_at}")
-                self._queue_owner_alert(agent_name, f"{reason}; schedule '{row.name}', fired_at={row.fired_at}")
+                if not session_id:
+                    fired = self._lost_paste_local_time(agent_name, row.fired_at, for_agent=False)
+                    self._queue_owner_alert(
+                        agent_name,
+                        f"{agent_name} went offline before it confirmed the scheduled prompt "
+                        f"'{row.name}' (fired {fired}); it may not have run.",
+                    )
+                    continue
+                try:
+                    rendered_at = (float(self._delivery_context_rendered_at_fn(agent_name) or 0)
+                                   if self._delivery_context_rendered_at_fn else 0.0)
+                except Exception:
+                    rendered_at = 0.0
+                if math.isfinite(rendered_at) and rendered_at >= row.pasted_at:
+                    continue
+                fired = self._lost_paste_local_time(agent_name, row.fired_at, for_agent=True)
+                self._queue_agent_notice(
+                    agent_name,
+                    f"Scheduled prompt '{row.name}' (fired {fired}) was pasted into your "
+                    "previous session and may not have run; check before redoing.",
+                )
+
+    def _lost_paste_local_time(self, agent_name: str, fired_at: float, *, for_agent: bool) -> str:
+        """Use the recipient's clock, with an explicit owner/UTC fallback."""
+        zones = []
+        if for_agent and self._delivery_timezone_fn is not None:
+            try:
+                zones.append(self._delivery_timezone_fn(agent_name))
+            except Exception:
+                pass
+        try:
+            zones.append(self._registry.get_owner_profile().get("timezone", ""))
+        except Exception:
+            pass
+        for zone in zones:
+            try:
+                tz = ZoneInfo(zone)
+            except (KeyError, TypeError, ValueError):
+                continue
+            return datetime.fromtimestamp(fired_at, tz=tz).strftime("%Y-%m-%d %H:%M %Z")
+        return datetime.fromtimestamp(fired_at, tz=timezone.utc).strftime("%Y-%m-%d %H:%M %Z")
+
+    def _queue_agent_notice(self, agent_name: str, message: str) -> None:
+        """Tell the live agent once through ordinary delivery, outside scheduler pastes."""
+        if self._agent_notify_callback is None:
+            _log(f"scheduler: AGENT_NOTIFY_UNAVAILABLE for lost paste agent '{agent_name}'")
+            return
+
+        async def notify() -> None:
+            try:
+                result = self._agent_notify_callback(agent_name, message)
+                if inspect.isawaitable(result):
+                    result = await result
+                if result is not True:
+                    raise RuntimeError("agent notify returned no positive receipt")
+            except Exception as exc:
+                _log(f"scheduler: AGENT_NOTIFY_FAILURE for lost paste agent '{agent_name}': "
+                     f"{type(exc).__name__}: {exc}")
+
+        try:
+            task = asyncio.get_running_loop().create_task(notify())
+        except RuntimeError:
+            _log(f"scheduler: AGENT_NOTIFY_FAILURE for lost paste agent '{agent_name}': "
+                 "no running event loop")
+            return
+        self._agent_notice_tasks.add(task)
+        task.add_done_callback(self._agent_notice_tasks.discard)
 
     def _receipt_age(self, schedule) -> float:
         """Age one durable fire; direct legacy callers with no stamp start now."""

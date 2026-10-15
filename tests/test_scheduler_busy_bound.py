@@ -520,7 +520,9 @@ async def test_pasted_then_restart_before_consumption_never_replays(registry, tm
     if restarted._owner_alert_tasks:
         await asyncio.gather(*restarted._owner_alert_tasks)
     assert len(alerts) == 1
-    assert "PASTED_UNCONFIRMED_SESSION_LOST" in alerts[0][1]
+    # With no replacement session, the owner receives the plain offline notice.
+    assert "went offline before it confirmed the scheduled prompt" in alerts[0][1]
+    assert "PASTED_UNCONFIRMED_SESSION_LOST" not in alerts[0][1]
 
 
 async def test_midturn_queue_consumed_at_boundary_receipted_once(registry, tmp_path, monkeypatch, clock):
