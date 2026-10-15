@@ -4425,8 +4425,8 @@ def create_api(
             system_prompt=("" if is_tmux else
                            agents.build_system_prompt(agent_name, skill_store=skills)),
             resume_handle=resume_id,
-            # Preview only: daemon transports rebuild committed wake text at
-            # submission, so an unavailable listener cannot consume the manifest.
+            # Rebuild committed text at submission. The initial preview below
+            # leaves the manifest intact while the listener is unavailable.
             wake_context_builder=_build_session_wake_context,
             api_readiness=app.state.api_readiness,
             on_wake_delivered=_log_agent_wake_event,

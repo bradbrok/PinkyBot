@@ -255,6 +255,22 @@ async def test_api_uses_live_session_render_and_normal_notice_route(api_session,
         row.schedule_id, row.fired_at, pasted_at=pasted_at, session_id="previous",
         pasted_prompt=row.prompt,
     )
+    if not after_render:
+        from pinky_daemon.wake_prompt import WakeReason
+
+        second = registry.add_schedule("worker", "0 * * * *", name="secondary", prompt="check more")
+        other, _ = registry.persist_schedule_wake(
+            second.id, agent_name="worker", schedule_name=second.name,
+            prompt=second.prompt, fired_at=FIRED + 1,
+        )
+        assert registry.mark_schedule_wake_pasted(
+            other.schedule_id, other.fired_at, pasted_at=pasted_at,
+            session_id="previous", pasted_prompt=other.prompt,
+        )
+        body = ss._config.wake_context_builder("worker", WakeReason.CONTEXT_RESTART)
+        assert "Owed scheduled wakes:" in body
+        assert f"- periodic (fired_at={FIRED})" in body
+        assert f"- secondary (fired_at={FIRED + 1})" in body
     ss._config.timezone = "America/New_York"
     engine = app.state.scheduler
     owner = AsyncMock(return_value=True)
