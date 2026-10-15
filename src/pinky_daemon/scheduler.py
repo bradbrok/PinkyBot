@@ -401,6 +401,7 @@ class AgentScheduler:
         delivery_inflight_fn=None,
         delivery_session_fn=None,
         delivery_context_rendered_at_fn=None,
+        delivery_replacement_pending_fn=None,
         delivery_timezone_fn=None,
         scheduler_busy_deliver_after_s: float | None = None,
         delivery_queued_fn=None,
@@ -421,6 +422,7 @@ class AgentScheduler:
         self._registry = registry
         self._delivery_session_fn = delivery_session_fn
         self._delivery_context_rendered_at_fn = delivery_context_rendered_at_fn
+        self._delivery_replacement_pending_fn = delivery_replacement_pending_fn
         self._delivery_timezone_fn = delivery_timezone_fn
         self._scheduler_busy_deliver_after_s = scheduler_busy_delay(
             scheduler_busy_deliver_after_s if scheduler_busy_deliver_after_s is not None
@@ -738,8 +740,8 @@ class AgentScheduler:
             await asyncio.gather(*replay_tasks, return_exceptions=True)
         self._pending_replay_tasks.clear()
         self._outbox_drain_extensions.clear()
-        alert_tasks = list(self._owner_alert_tasks | self._agent_notice_tasks)
-        if alert_tasks:
+        # An agent handoff can create an owner fallback while stop waits.
+        while alert_tasks := list(self._owner_alert_tasks | self._agent_notice_tasks):
             await asyncio.gather(*alert_tasks, return_exceptions=True)
         self._owner_alert_tasks.clear()
         self._agent_notice_tasks.clear()
@@ -2151,6 +2153,13 @@ class AgentScheduler:
 
     def _settle_lost_pastes(self, agent_name: str) -> None:
         """Never replay a write-ahead paste whose owning session is gone."""
+        if self._delivery_replacement_pending_fn is not None:
+            try:
+                if self._delivery_replacement_pending_fn(agent_name):
+                    return
+            except Exception as exc:
+                _log(f"scheduler: replacement check deferred: {type(exc).__name__}")
+                return
         try:
             rows = self._registry.list_pending_schedule_wakes(agent_name, include_parked=True)
         except Exception as exc:
@@ -2185,10 +2194,15 @@ class AgentScheduler:
                 if math.isfinite(rendered_at) and rendered_at >= row.pasted_at:
                     continue
                 fired = self._lost_paste_local_time(agent_name, row.fired_at, for_agent=True)
+                owner_fired = self._lost_paste_local_time(agent_name, row.fired_at, for_agent=False)
                 self._queue_agent_notice(
                     agent_name,
                     f"Scheduled prompt '{row.name}' (fired {fired}) was pasted into your "
                     "previous session and may not have run; check before redoing.",
+                    fallback_message=(
+                        f"Scheduled prompt '{row.name}' for {agent_name} (fired {owner_fired}) "
+                        f"may not have run, and {agent_name} could not be told; check before redoing."
+                    ),
                 )
 
     def _lost_paste_local_time(self, agent_name: str, fired_at: float, *, for_agent: bool) -> str:
@@ -2211,10 +2225,13 @@ class AgentScheduler:
             return datetime.fromtimestamp(fired_at, tz=tz).strftime("%Y-%m-%d %H:%M %Z")
         return datetime.fromtimestamp(fired_at, tz=timezone.utc).strftime("%Y-%m-%d %H:%M %Z")
 
-    def _queue_agent_notice(self, agent_name: str, message: str) -> None:
+    def _queue_agent_notice(
+        self, agent_name: str, message: str, *, fallback_message: str,
+    ) -> None:
         """Tell the live agent once through ordinary delivery, outside scheduler pastes."""
         if self._agent_notify_callback is None:
             _log(f"scheduler: AGENT_NOTIFY_UNAVAILABLE for lost paste agent '{agent_name}'")
+            self._queue_owner_alert(agent_name, fallback_message)
             return
 
         async def notify() -> None:
@@ -2227,12 +2244,17 @@ class AgentScheduler:
             except Exception as exc:
                 _log(f"scheduler: AGENT_NOTIFY_FAILURE for lost paste agent '{agent_name}': "
                      f"{type(exc).__name__}: {exc}")
+                self._queue_owner_alert(agent_name, fallback_message)
+            except asyncio.CancelledError:
+                self._queue_owner_alert(agent_name, fallback_message)
+                raise
 
         try:
             task = asyncio.get_running_loop().create_task(notify())
         except RuntimeError:
             _log(f"scheduler: AGENT_NOTIFY_FAILURE for lost paste agent '{agent_name}': "
                  "no running event loop")
+            self._queue_owner_alert(agent_name, fallback_message)
             return
         self._agent_notice_tasks.add(task)
         task.add_done_callback(self._agent_notice_tasks.discard)

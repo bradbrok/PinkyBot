@@ -196,26 +196,30 @@ async def test_current_paste_session_is_not_lost(rig):
 
 @pytest.fixture
 def api_session(tmp_path, monkeypatch):
+    import claude_agent_sdk
+
     from pinky_daemon import api
+    from pinky_daemon import streaming_session as sdk_transport
     from pinky_daemon.api import create_api
     from pinky_daemon.streaming_session import StreamingSession
-    from pinky_daemon.transport_state import SessionState
 
     clock = SimpleNamespace(now=NOW)
-    monkeypatch.setattr(api, "time", SimpleNamespace(
-        **{**vars(api.time), "time": lambda: clock.now},
-    ))
+    for module in (api, sdk_transport, scheduler, agent_registry):
+        monkeypatch.setattr(module, "time", SimpleNamespace(
+            **{**vars(module.time), "time": lambda: clock.now},
+        ))
     sent = []
-
-    async def connect(ss):
-        ss._state_machine._state = SessionState.CONNECTED
-        ss.resume_handle = "replacement"
+    client_stub = SimpleNamespace(
+        connect=AsyncMock(), query=AsyncMock(), disconnect=AsyncMock(),
+        get_server_info=AsyncMock(return_value={}),
+    )
 
     async def send(ss, prompt, *args, **kwargs):
         sent.append(prompt)
         return True
 
-    monkeypatch.setattr(StreamingSession, "connect", connect)
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", lambda options: client_stub)
+    monkeypatch.setattr(StreamingSession, "_reader_loop", AsyncMock())
     monkeypatch.setattr(StreamingSession, "send", send)
     app = create_api(default_working_dir=str(tmp_path), db_path=str(tmp_path / "api.db"))
     app.state.agents.register("worker", working_dir=str(tmp_path / "worker"))
@@ -230,15 +234,16 @@ def api_session(tmp_path, monkeypatch):
     app.state.agents.close()
 
 
-def test_session_records_preview_and_committed_context_render_time(api_session):
+def test_session_keeps_preview_separate_from_committed_context(api_session):
     from pinky_daemon.wake_prompt import WakeReason
 
     app, ss, clock, _ = api_session
     assert getattr(ss._config, "wake_context_rendered_at", 0) == NOW
+    preview = ss._config.wake_context
     clock.now += 10
-    body = ss._config.wake_context_builder("worker", WakeReason.CONTEXT_RESTART)
-    assert getattr(ss._config, "wake_context_rendered_at", 0) == NOW + 10
-    assert ss._config.wake_context == body
+    ss._config.wake_context_builder("worker", WakeReason.CONTEXT_RESTART)
+    assert getattr(ss._config, "wake_context_rendered_at", 0) == NOW
+    assert ss._config.wake_context == preview
 
 
 @pytest.mark.parametrize("after_render", [False, True])
@@ -271,6 +276,9 @@ async def test_api_uses_live_session_render_and_normal_notice_route(api_session,
         assert "Owed scheduled wakes:" in body
         assert f"- periodic (fired_at={FIRED})" in body
         assert f"- secondary (fired_at={FIRED + 1})" in body
+        # Deliver that rebuilt context through the SDK's actual wake hook.
+        await ss.connect()
+        await ss._initial_wake_task
     ss._config.timezone = "America/New_York"
     engine = app.state.scheduler
     owner = AsyncMock(return_value=True)

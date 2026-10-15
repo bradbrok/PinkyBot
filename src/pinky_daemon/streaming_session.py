@@ -34,6 +34,7 @@ from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.transport import TransportReplacementMixin
 from pinky_daemon.transport_state import SessionState, StateMachine, Trigger
 from pinky_daemon.turn_response import TurnResponse
+from pinky_daemon.wake_context import WakeContextDelivery
 from pinky_daemon.wake_prompt import (
     WakePromptInput,
     build_idle_sleep_prompt,
@@ -115,7 +116,7 @@ class StreamingSessionConfig:
     system_prompt: str = ""
     resume_handle: str = ""  # SDK resume token (opaque session-continuation handle) from previous run
     wake_context: str = ""  # Saved continuation context to inject on wake
-    wake_context_rendered_at: float = 0.0  # Snapshot time of the matching continuation text
+    wake_context_rendered_at: float = 0.0  # Render start of the non-committing fallback preview
     wake_context_builder: object = None  # Callable(agent_name) -> str; refreshes wake_context on restart
     api_readiness: object = None  # Shared daemon listener gate; None keeps embedders open.
     # Fires AFTER successful wake-prompt delivery (paste/query landed).
@@ -305,6 +306,7 @@ class StreamingSession(TransportReplacementMixin):
         auth_success_callback=None,  # fn(agent_name) — fires on a successful turn (clears auth fail state)
     ) -> None:
         self._config = config
+        self._wake_context_delivery = WakeContextDelivery()
         self._reported_context_max_tokens = 0
         self._restart_tokens_cap_warned = False
         self._response_callback = response_callback
@@ -598,6 +600,7 @@ class StreamingSession(TransportReplacementMixin):
                     self._replacement_cleanup_strict = prior_strict
             if not resume_recovery.enabled():
                 self._client = ClaudeSDKClient(options)
+                self._wake_context_delivery.new_process()
                 await self._client.connect()
             else:
                 while True:
@@ -733,13 +736,18 @@ class StreamingSession(TransportReplacementMixin):
         # predates this signal — kept as a fallback for tests / paths
         # without a builder. Trailing positional kwarg keeps 1-arg
         # callers of older builders working.
+        snapshot = self._wake_context_delivery.snapshot()
+
         def _build_initial_prompt():
             wake_context_body = self._config.wake_context or ""
+            snapshot.rendered_at = self._config.wake_context_rendered_at
             if self._config.wake_context_builder:
+                started_at = time.time()
                 try:
                     wake_context_body = self._config.wake_context_builder(
                         self.agent_name, wake_reason
                     )
+                    snapshot.rendered_at = started_at
                 except TypeError:
                     # Legacy 1-arg builder — fall back to the pre-built body.
                     pass
@@ -785,6 +793,7 @@ class StreamingSession(TransportReplacementMixin):
             except Exception as e:
                 _log(f"streaming[{self.agent_name}]: wake prompt failed: {e}")
                 return  # delivery failed → DO NOT fire on_wake_delivered (#591 P1#2)
+            snapshot.delivered()
             # Wake prompt delivered. Fire the post-delivery callback so
             # the agent_wake activity event is logged (advances the
             # #591 cycle-gate boundary on every successful warm wake,

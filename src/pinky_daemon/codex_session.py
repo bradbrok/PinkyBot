@@ -62,6 +62,7 @@ from pinky_daemon.transport_state import (
     Trigger,
 )
 from pinky_daemon.turn_response import TurnResponse
+from pinky_daemon.wake_context import WakeContextDelivery
 from pinky_daemon.wake_prompt import WakeReason
 
 APP_SERVER_INIT_TIMEOUT = 20.0
@@ -170,6 +171,7 @@ class CodexSession(TransportReplacementMixin):
         registry=None,  # AgentRegistry — for server-side presence stamping
     ) -> None:
         self._config = config
+        self._wake_context_delivery = WakeContextDelivery()
         self._response_callback = response_callback
         self._cost_callback = cost_callback
         self._conversation_store = conversation_store
@@ -403,6 +405,7 @@ class CodexSession(TransportReplacementMixin):
         # resurrects on the next inbound, never leaving a leaked owner token.
         try:
             await self._bring_up_substrate()
+            self._wake_context_delivery.new_process()
         except BaseException as e:
             _log(f"codex[{self.agent_name}]: substrate bring-up failed: {e}")
             if cold_start_token is not None:
@@ -483,13 +486,18 @@ class CodexSession(TransportReplacementMixin):
         # only — relying on it here would re-emit a stale manifest on
         # warm Codex resumes. TypeError fallback keeps legacy 1-arg
         # builders working.
+        snapshot = self._wake_context_delivery.snapshot()
+
         def _build_initial_prompt():
             wake_context_body = self._config.wake_context or ""
+            snapshot.rendered_at = self._config.wake_context_rendered_at
             if self._config.wake_context_builder:
+                started_at = time.time()
                 try:
                     wake_context_body = self._config.wake_context_builder(
                         self.agent_name, wake_reason
                     )
+                    snapshot.rendered_at = started_at
                 except TypeError:
                     pass
                 except Exception as e:
@@ -530,15 +538,12 @@ class CodexSession(TransportReplacementMixin):
         # advance the cycle-gate boundary against a wake that may
         # never reach the model (exec failure, subprocess crash, etc.),
         # eating the directive on the next RESUME.
-        if self._config.on_wake_delivered:
-            _config_cb = self._config.on_wake_delivered
-            _agent_name = self.agent_name
-            _wake_reason = wake_reason
+        def _wake_delivered_cb() -> None:
+            snapshot.delivered()
+            if self._config.on_wake_delivered:
+                self._config.on_wake_delivered(self.agent_name, wake_reason)
 
-            def _wake_delivered_cb() -> None:
-                _config_cb(_agent_name, _wake_reason)
-
-            self._pending_wake_callback = _wake_delivered_cb
+        self._pending_wake_callback = _wake_delivered_cb
 
         # Queue wake prompt (no chat routing — internal)
         await self._message_queue.put((wake_prompt, "", "", ""))
@@ -2384,6 +2389,7 @@ class CodexSession(TransportReplacementMixin):
             self.resume_handle = ""
 
             await self._bring_up_substrate()
+            self._wake_context_delivery.new_process()
             self._check_force_restart_authority()
             publication_started = True
             await self._state_machine.transition_complete(
@@ -2540,6 +2546,7 @@ class CodexSession(TransportReplacementMixin):
                 self._check_recovery_owner()
                 try:
                     await self._bring_up_substrate()
+                    self._wake_context_delivery.new_process()
                 except Exception as e:
                     last_error = e
                     _log(f"codex[{self.agent_name}]: reconnect attempt {attempt_idx} failed: {e}")
