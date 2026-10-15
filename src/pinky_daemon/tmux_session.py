@@ -4042,8 +4042,8 @@ class TmuxSession(TransportReplacementMixin):
         # transcript turn-start receipt; a successful paste/Enter command is
         # not enough. Otherwise the cycle-gate could advance against a wake
         # that never reached the model, eating the directive on next RESUME.
-        # The closure carries agent name + reason so _deliver_turn need not
-        # re-read them. ``None`` when no callback is wired (tests).
+        # The snapshot uses that same receipt even when activity logging has
+        # no callback configured.
         def _wake_delivered_cb() -> None:
             snapshot.delivered()
             if self._config.on_wake_delivered:

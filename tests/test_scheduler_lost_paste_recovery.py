@@ -405,6 +405,7 @@ async def test_codex_records_snapshot_after_successful_exec_only(api_session, mo
 def api_function(app, name):
     pending = [r.endpoint for r in app.routes if hasattr(r, "endpoint")]
     pending += [app.state.broker._ensure_session_callback]
+    pending += [app.state.scheduler._heartbeat_callback]
     pending += list(vars(app.state.watchdog).values())
     visited = set()
     while pending:
@@ -424,7 +425,9 @@ def api_function(app, name):
     raise AssertionError(f"API helper {name} is unreachable")
 
 
-@pytest.mark.parametrize("path", ["retained", "ensure", "rebuild", "watchdog", "container"])
+@pytest.mark.parametrize("path", [
+    "retained", "ensure", "rebuild", "watchdog", "container", "skills", "heartbeat", "start",
+])
 @pytest.mark.parametrize("ending", ["success", "exception", "cancel"])
 async def test_api_replacement_paths_share_bound_and_release_marker(
     api_session, monkeypatch, path, ending,
@@ -462,6 +465,26 @@ async def test_api_replacement_paths_share_bound_and_release_marker(
         )
     elif path == "watchdog":
         operation = api_function(app, "_watchdog_recover")("worker", "main", "reconnect")
+    elif path == "skills":
+        app.state.agents.set_context(
+            "worker", task="continue work", metadata={"source": "save_my_context"},
+            updated_by=ss.resume_handle,
+        )
+        monkeypatch.setattr(ss, "disconnect", replace)
+        operation = api_function(app, "apply_agent_skills")("worker")
+    elif path == "heartbeat":
+        ss._state_machine._state = SessionState.DEAD
+        monkeypatch.setattr(ss, "attempt_reconnect", replace)
+        operation = api_function(app, "_heartbeat_resurrect")("worker", "")
+    elif path == "start":
+        from pinky_daemon.streaming_session import StreamingSession
+
+        async def connect_candidate(candidate):
+            await replace()
+            candidate._state_machine._state = SessionState.CONNECTED
+
+        monkeypatch.setattr(StreamingSession, "connect", connect_candidate)
+        operation = api_function(app, "_start_streaming_session")("worker", label="main")
     else:
         async def container_apply():
             async with api_function(app, "_container_replacement_scope")("worker"):
@@ -484,6 +507,9 @@ async def test_api_replacement_paths_share_bound_and_release_marker(
         if ending == "cancel":
             task.cancel()
         await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=2)
+        if engine._pending_replay_tasks:
+            await asyncio.gather(*engine._pending_replay_tasks.values(), return_exceptions=True)
+        await drain_notices(engine)
     reservations = inspect.getclosurevars(
         engine._delivery_replacement_pending_fn,
     ).nonlocals["_scheduler_replacements"]

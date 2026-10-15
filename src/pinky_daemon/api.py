@@ -4664,13 +4664,14 @@ def create_api(
         return ss
 
     async def _start_streaming_session(agent_name: str, *, label="main", resume_id=""):
-        if _startup_fencing_enabled():
-            async with _session_scope(agent_name, label):
-                await _settle_startup_debt(agent_name, label)
-                return await _start_streaming_session_unchecked(
-                    agent_name, label=label, resume_id=resume_id,
-                )
-        return await _start_streaming_session_unchecked(agent_name, label=label, resume_id=resume_id)
+        async with _scheduler_replacement_scope(agent_name, label):
+            if _startup_fencing_enabled():
+                async with _session_scope(agent_name, label):
+                    await _settle_startup_debt(agent_name, label)
+                    return await _start_streaming_session_unchecked(
+                        agent_name, label=label, resume_id=resume_id,
+                    )
+            return await _start_streaming_session_unchecked(agent_name, label=label, resume_id=resume_id)
 
     async def _start_streaming_session_unchecked(agent_name: str, *, label="main", resume_id=""):
         ss = await _prepare_streaming_session(agent_name, label=label, resume_id=resume_id)
@@ -7576,10 +7577,11 @@ npm run build</pre>
             if not guard["restart_safe"]:
                 raise HTTPException(409, _guard_message("restart", guard))
 
-            # Close and restart
-            await _disconnect_streaming_sessions(name)
-            await _start_streaming_session(name)
-            restarted = True
+            # Keep settlement deferred across unregister and fresh startup.
+            async with _scheduler_replacement_scope(name):
+                await _disconnect_streaming_sessions(name)
+                await _start_streaming_session(name)
+                restarted = True
 
         return {
             "applied": True,
@@ -13380,69 +13382,70 @@ npm run build</pre>
         silent" case (reader loop wedged on a stalled LLM call) — see the
         follow-up issue noted on #338.
         """
-        ss = broker._get_streaming_session(agent_name)
-        if not ss:
-            _log(
-                f"api: resurrection skipped for {agent_name} — no streaming "
-                f"session registered"
-            )
-            return
-        if getattr(ss, "state", None) == TransportSessionState.CONNECTED:
-            # Race: the in-process retry recovered between heartbeat tick and
-            # the callback running. Also the load-bearing guard for bypassing
-            # the save_my_context restart guard — see docstring above.
-            return
-        if getattr(ss, "state", None) == TransportSessionState.IDLE_SLEEPING:
-            # Session was deliberately disconnected by idle_sleep(). Resurrecting
-            # it here would fight the idle-sleep state and cause an immediate
-            # reconnect/sleep churn cycle. The next genuine wake (scheduler or
-            # incoming message) will reconnect via connect(). See #348.
-            _log(
-                f"api: resurrection skipped for {agent_name} — session is "
-                f"idle-sleeping (will wake on next scheduled/incoming event)"
-            )
-            return
-        _log(f"api: watchdog resurrection — reconnecting {agent_name}")
-        if _rebuild_enabled():
-            label = getattr(ss._config, "label", "main") or "main"
-            async with _label_scope(agent_name, label):
-                if type(ss) is not _expected_session_class(agents.get(agent_name)):
-                    await _replace_session_locked(agent_name, label, ss, reason="heartbeat_resurrect")
-                    return
-        try:
-            _refresh_streaming_launch_config(agent_name, ss)
-            # #202: serialize the fresh boot behind the process-global cold-start
-            # gate so a watchdog batch-resurrection doesn't race the shared
-            # single-use OAuth refresh token (no-op unless PINKY_COLDSTART_SERIALIZE).
-            async with _coldstart_gate(agent_name, "main"):
-                # TODO(#338-followup): wrap in asyncio.create_task so the scheduler
-                # tick isn't blocked for up to ~40s during the internal backoff.
-                attempt_reconnect = getattr(ss, "attempt_reconnect", None)
-                if callable(attempt_reconnect):
-                    await attempt_reconnect()
-                else:
-                    # Runtime-tolerant fallback for future StreamingSession-compatible
-                    # implementations that have connect/disconnect but not the richer
-                    # watchdog reconnect helper yet.
-                    try:
-                        disconnect = getattr(ss, "disconnect", None)
-                        if callable(disconnect):
-                            await disconnect()
-                    except Exception as e:
-                        _log(f"api: resurrection pre-disconnect failed for {agent_name}: {e}")
-                    connect = getattr(ss, "connect", None)
-                    if not callable(connect):
-                        raise AttributeError(
-                            f"{ss.__class__.__name__} has no attempt_reconnect or connect"
-                        )
-                    await connect()
-            if getattr(ss, "state", None) == TransportSessionState.CONNECTED:
-                activity.log(
-                    agent_name, "watchdog_resurrect",
-                    f"{agent_name} restored by heartbeat watchdog",
+        async with _scheduler_replacement_scope(agent_name, "main"):
+            ss = broker._get_streaming_session(agent_name)
+            if not ss:
+                _log(
+                    f"api: resurrection skipped for {agent_name} — no streaming "
+                    f"session registered"
                 )
-        except Exception as e:
-            _log(f"api: resurrection failed for {agent_name}: {e}")
+                return
+            if getattr(ss, "state", None) == TransportSessionState.CONNECTED:
+                # Race: the in-process retry recovered between heartbeat tick and
+                # the callback running. Also the load-bearing guard for bypassing
+                # the save_my_context restart guard — see docstring above.
+                return
+            if getattr(ss, "state", None) == TransportSessionState.IDLE_SLEEPING:
+                # Session was deliberately disconnected by idle_sleep(). Resurrecting
+                # it here would fight the idle-sleep state and cause an immediate
+                # reconnect/sleep churn cycle. The next genuine wake (scheduler or
+                # incoming message) will reconnect via connect(). See #348.
+                _log(
+                    f"api: resurrection skipped for {agent_name} — session is "
+                    f"idle-sleeping (will wake on next scheduled/incoming event)"
+                )
+                return
+            _log(f"api: watchdog resurrection — reconnecting {agent_name}")
+            if _rebuild_enabled():
+                label = getattr(ss._config, "label", "main") or "main"
+                async with _label_scope(agent_name, label):
+                    if type(ss) is not _expected_session_class(agents.get(agent_name)):
+                        await _replace_session_locked(agent_name, label, ss, reason="heartbeat_resurrect")
+                        return
+            try:
+                _refresh_streaming_launch_config(agent_name, ss)
+                # #202: serialize the fresh boot behind the process-global cold-start
+                # gate so a watchdog batch-resurrection doesn't race the shared
+                # single-use OAuth refresh token (no-op unless PINKY_COLDSTART_SERIALIZE).
+                async with _coldstart_gate(agent_name, "main"):
+                    # TODO(#338-followup): wrap in asyncio.create_task so the scheduler
+                    # tick isn't blocked for up to ~40s during the internal backoff.
+                    attempt_reconnect = getattr(ss, "attempt_reconnect", None)
+                    if callable(attempt_reconnect):
+                        await attempt_reconnect()
+                    else:
+                        # Runtime-tolerant fallback for future StreamingSession-compatible
+                        # implementations that have connect/disconnect but not the richer
+                        # watchdog reconnect helper yet.
+                        try:
+                            disconnect = getattr(ss, "disconnect", None)
+                            if callable(disconnect):
+                                await disconnect()
+                        except Exception as e:
+                            _log(f"api: resurrection pre-disconnect failed for {agent_name}: {e}")
+                        connect = getattr(ss, "connect", None)
+                        if not callable(connect):
+                            raise AttributeError(
+                                f"{ss.__class__.__name__} has no attempt_reconnect or connect"
+                            )
+                        await connect()
+                if getattr(ss, "state", None) == TransportSessionState.CONNECTED:
+                    activity.log(
+                        agent_name, "watchdog_resurrect",
+                        f"{agent_name} restored by heartbeat watchdog",
+                    )
+            except Exception as e:
+                _log(f"api: resurrection failed for {agent_name}: {e}")
 
     def _is_resurrectable(agent_name: str) -> bool:
         """Scheduler precondition: True iff resurrection should be attempted.
