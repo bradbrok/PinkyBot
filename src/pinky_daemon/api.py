@@ -611,7 +611,6 @@ SLOW_REQUEST_MS = 500
 CONTEXT_SAVE_SOURCE_SELF_TOOL = "save_my_context"
 CONTEXT_ACTIVITY_SAVE_BUFFER_SECONDS = 5 * 60
 CONTEXT_STALE_WARNING_SECONDS = 12 * 60 * 60
-SCHEDULER_REPLACEMENT_DEFER_MAX_SECONDS = 300.0
 FRONTEND_BUILD_MANIFEST = "build-manifest.json"
 
 # StopFailure hook (CC typed turn-failure signal). Auth-class failures are
@@ -4664,14 +4663,13 @@ def create_api(
         return ss
 
     async def _start_streaming_session(agent_name: str, *, label="main", resume_id=""):
-        async with _scheduler_replacement_scope(agent_name, label):
-            if _startup_fencing_enabled():
-                async with _session_scope(agent_name, label):
-                    await _settle_startup_debt(agent_name, label)
-                    return await _start_streaming_session_unchecked(
-                        agent_name, label=label, resume_id=resume_id,
-                    )
-            return await _start_streaming_session_unchecked(agent_name, label=label, resume_id=resume_id)
+        if _startup_fencing_enabled():
+            async with _session_scope(agent_name, label):
+                await _settle_startup_debt(agent_name, label)
+                return await _start_streaming_session_unchecked(
+                    agent_name, label=label, resume_id=resume_id,
+                )
+        return await _start_streaming_session_unchecked(agent_name, label=label, resume_id=resume_id)
 
     async def _start_streaming_session_unchecked(agent_name: str, *, label="main", resume_id=""):
         ss = await _prepare_streaming_session(agent_name, label=label, resume_id=resume_id)
@@ -4700,34 +4698,6 @@ def create_api(
     _lifecycle_owners = {}
     _candidate_cleanup_debts = {}
     _label_owners = {}
-    _scheduler_replacements: dict[str, dict[object, float]] = {}
-
-    def _reserve_scheduler_replacement(name, label, token):
-        if label == "main":
-            _scheduler_replacements.setdefault(name, {})[token] = time.monotonic()
-
-    def _release_scheduler_replacement(name, token):
-        reservations = _scheduler_replacements.get(name)
-        if reservations is not None:
-            reservations.pop(token, None)
-            if not reservations:
-                _scheduler_replacements.pop(name, None)
-
-    @contextlib.asynccontextmanager
-    async def _scheduler_replacement_scope(name, label="main"):
-        token = object()
-        _reserve_scheduler_replacement(name, label, token)
-        try:
-            yield
-        finally:
-            _release_scheduler_replacement(name, token)
-
-    def _scheduler_replacement_pending(name):
-        now = time.monotonic()
-        return any(
-            0 <= now - started < SCHEDULER_REPLACEMENT_DEFER_MAX_SECONDS
-            for started in _scheduler_replacements.get(name, {}).values()
-        )
 
     def _startup_fencing_enabled():
         return _rebuild_enabled() or os.environ.get("PINKY_RESUME_FAILSAFE", "0") == "1"
@@ -4806,49 +4776,48 @@ def create_api(
             ss._pending_resume_handle_update = ""
 
     async def _replace_session_locked(name, label, old, *, reason, implicit=False, launch_agent=None, updates=None):
-        async with _scheduler_replacement_scope(name, label):
-            agent = agents.get(name)
-            if not agent or not agent.enabled:
-                raise HTTPException(409, "Agent missing or disabled")
-            _expected_session_class(agent)
-            if implicit:
-                queue = getattr(old, "_message_queue", None)
-                busy = (old.state in {TransportSessionState.BOOTING, TransportSessionState.RECONNECTING}
-                        or getattr(old, "_processing", False) or getattr(old, "_inflight", None)
-                        or getattr(old, "_pending_chats", None)
-                        or getattr(old, "_inflight_metas", None)
-                        or getattr(old, "_inflight_turn", None)
-                        or (queue is not None and not queue.empty()))
-                if busy or not _get_streaming_restart_guard(name, old)["restart_safe"]:
-                    raise HTTPException(409, "Session replacement must wait for a safe idle boundary")
-            await _settle_startup_debt(name, label)
-            original_fingerprint = copy.deepcopy(_launch_fingerprint(agent))
-            candidate = await _prepare_streaming_session(name, label=label, agent_snapshot=launch_agent)
-            if candidate is None:
-                raise HTTPException(503, "Candidate unavailable")
-            candidate._config.force_fresh_context_once = True
-            candidate._config.restart_reason = reason
-            _refresh_streaming_wake_context(name, candidate._config, commit=False)
+        agent = agents.get(name)
+        if not agent or not agent.enabled:
+            raise HTTPException(409, "Agent missing or disabled")
+        _expected_session_class(agent)
+        if implicit:
+            queue = getattr(old, "_message_queue", None)
+            busy = (old.state in {TransportSessionState.BOOTING, TransportSessionState.RECONNECTING}
+                    or getattr(old, "_processing", False) or getattr(old, "_inflight", None)
+                    or getattr(old, "_pending_chats", None)
+                    or getattr(old, "_inflight_metas", None)
+                    or getattr(old, "_inflight_turn", None)
+                    or (queue is not None and not queue.empty()))
+            if busy or not _get_streaming_restart_guard(name, old)["restart_safe"]:
+                raise HTTPException(409, "Session replacement must wait for a safe idle boundary")
+        await _settle_startup_debt(name, label)
+        original_fingerprint = copy.deepcopy(_launch_fingerprint(agent))
+        candidate = await _prepare_streaming_session(name, label=label, agent_snapshot=launch_agent)
+        if candidate is None:
+            raise HTTPException(503, "Candidate unavailable")
+        candidate._config.force_fresh_context_once = True
+        candidate._config.restart_reason = reason
+        _refresh_streaming_wake_context(name, candidate._config, commit=False)
 
-            def configure():
-                if (_launch_fingerprint(agents.get(name)) != original_fingerprint or
-                        _effective_launch_model(launch_agent or agents.get(name)) != candidate._launch_provider_snapshot):
-                    raise HTTPException(409, "Launch configuration changed during preparation")
-                if updates:
-                    agents.register(name, **updates)
-                _clear_resume(name, label, old)
+        def configure():
+            if (_launch_fingerprint(agents.get(name)) != original_fingerprint or
+                    _effective_launch_model(launch_agent or agents.get(name)) != candidate._launch_provider_snapshot):
+                raise HTTPException(409, "Launch configuration changed during preparation")
+            if updates:
+                agents.register(name, **updates)
+            _clear_resume(name, label, old)
 
-            async def bring_up():
-                if broker._streaming.get(name, {}).get(label) is not old:
-                    raise HTTPException(409, "Session replacement superseded")
-                broker.unregister_streaming(name, label=label)
-                await _connect_prepared_session(candidate)
+        async def bring_up():
+            if broker._streaming.get(name, {}).get(label) is not old:
+                raise HTTPException(409, "Session replacement superseded")
+            broker.unregister_streaming(name, label=label)
+            await _connect_prepared_session(candidate)
 
-            await old.restart_transport(
-                target_preflight=candidate._preflight_transport_replacement,
-                configure=configure, bring_up=bring_up,
-            )
-            return candidate
+        await old.restart_transport(
+            target_preflight=candidate._preflight_transport_replacement,
+            configure=configure, bring_up=bring_up,
+        )
+        return candidate
 
     async def _bind_retained_resume_owner(name, label, ss):
         """Publish one epoch and both callbacks before retained startup emits."""
@@ -4869,47 +4838,46 @@ def create_api(
         await (connect or ss.connect)()
 
     async def _restart_compatible(name, ss, *, configure, reason, **kwargs):
-        async with _scheduler_replacement_scope(name, getattr(ss._config, "label", "main") or "main"):
-            if not _startup_fencing_enabled():
+        if not _startup_fencing_enabled():
+            await ss.restart_transport(configure=configure, **kwargs)
+            return ss
+        label = getattr(ss._config, "label", "main") or "main"
+        async with _session_scope(name, label):
+            current = broker._streaming.get(name, {}).get(label)
+            if current is not ss:
+                if current is not None and current.state == TransportSessionState.CONNECTED:
+                    return current
+                raise HTTPException(409, "Session restart superseded")
+            if _rebuild_enabled():
+                agent = agents.get(name)
+                if not agent or not agent.enabled:
+                    raise HTTPException(409, "Agent missing or disabled")
+                if type(ss) is not _expected_session_class(agent):
+                    return await _replace_session_locked(name, label, ss, reason=reason)
+            if _startup_fencing_enabled():
+                async def configure_retained():
+                    _resume_epochs[(name, label)] = object()
+                    _resume_owners.pop((name, label), None)
+                    await ss._run_replacement_step(configure)
+
+                outer_connect = kwargs.pop("connect_wrapper", None)
+
+                async def connect_retained(connect):
+                    await _bind_retained_resume_owner(name, label, ss)
+                    if outer_connect is not None:
+                        await outer_connect(connect)
+                    else:
+                        await connect()
+
+                await ss.restart_transport(
+                    configure=configure_retained, target_preflight=ss._preflight_transport_replacement,
+                    connect_wrapper=connect_retained, **kwargs,
+                )
+            else:
                 await ss.restart_transport(configure=configure, **kwargs)
-                return ss
-            label = getattr(ss._config, "label", "main") or "main"
-            async with _session_scope(name, label):
-                current = broker._streaming.get(name, {}).get(label)
-                if current is not ss:
-                    if current is not None and current.state == TransportSessionState.CONNECTED:
-                        return current
-                    raise HTTPException(409, "Session restart superseded")
-                if _rebuild_enabled():
-                    agent = agents.get(name)
-                    if not agent or not agent.enabled:
-                        raise HTTPException(409, "Agent missing or disabled")
-                    if type(ss) is not _expected_session_class(agent):
-                        return await _replace_session_locked(name, label, ss, reason=reason)
-                if _startup_fencing_enabled():
-                    async def configure_retained():
-                        _resume_epochs[(name, label)] = object()
-                        _resume_owners.pop((name, label), None)
-                        await ss._run_replacement_step(configure)
-
-                    outer_connect = kwargs.pop("connect_wrapper", None)
-
-                    async def connect_retained(connect):
-                        await _bind_retained_resume_owner(name, label, ss)
-                        if outer_connect is not None:
-                            await outer_connect(connect)
-                        else:
-                            await connect()
-
-                    await ss.restart_transport(
-                        configure=configure_retained, target_preflight=ss._preflight_transport_replacement,
-                        connect_wrapper=connect_retained, **kwargs,
-                    )
-                else:
-                    await ss.restart_transport(configure=configure, **kwargs)
-                if ss.state != TransportSessionState.CONNECTED:
-                    raise HTTPException(503, "Restart did not connect")
-                return ss
+            if ss.state != TransportSessionState.CONNECTED:
+                raise HTTPException(503, "Restart did not connect")
+            return ss
 
     async def _ensure_streaming_session(agent_name: str, *, label: str = "main"):
         """Return a connected streaming session for an agent label.
@@ -4929,111 +4897,107 @@ def create_api(
         Cold starts / reconnects are serialized per (agent, label); the
         connected fast path stays lock-free.
         """
-        async with _scheduler_replacement_scope(agent_name, label):
-            if _rebuild_enabled():
-                from pinky_daemon.broker import (
-                    _INBOUND_RECONNECT_POLL_SEC,
-                    _INBOUND_RECONNECT_WAIT_SEC,
-                )
+        if _rebuild_enabled():
+            from pinky_daemon.broker import _INBOUND_RECONNECT_POLL_SEC, _INBOUND_RECONNECT_WAIT_SEC
 
-                deadline = time.monotonic() + _INBOUND_RECONNECT_WAIT_SEC
-                while True:
-                    async with _session_scope(agent_name, label):
-                        await _settle_startup_debt(agent_name, label)
-                        ss = broker._streaming.get(agent_name, {}).get(label)
-                        agent = agents.get(agent_name)
-                        if not agent or not agent.enabled:
-                            raise HTTPException(409, "Agent missing or disabled")
-                        target = _expected_session_class(agent)
-                        if ss is None:
-                            return await _start_streaming_session(
-                                agent_name, label=label,
-                                resume_id=agents.get_streaming_session_id(agent_name, label=label),
-                            )
-                        if ss.state not in {TransportSessionState.RECONNECTING,
-                                            TransportSessionState.BOOTING}:
-                            if type(ss) is not target:
-                                return await _replace_session_locked(
-                                    agent_name, label, ss, reason="context_restart", implicit=True,
-                                )
-                            if ss.state != TransportSessionState.CONNECTED:
-                                _enforce_isolation_runnable(agent_name)
-                                await ss.restart_transport(
-                                    target_preflight=ss._preflight_transport_replacement,
-                                    configure=lambda: _refresh_streaming_launch_config(agent_name, ss),
-                                    connect_wrapper=lambda connect: _connect_retained_session(
-                                        agent_name, label, ss, connect,
-                                    ),
-                                )
-                            return ss
-                    if time.monotonic() >= deadline:
-                        raise HTTPException(409, "Session transition still in progress")
-                    await asyncio.sleep(_INBOUND_RECONNECT_POLL_SEC)
-
-            sessions = broker._streaming.get(agent_name, {})
-            ss = sessions.get(label)
-            if ss and ss.state == TransportSessionState.CONNECTED:
-                # #204: the connected fast path stays lock-free EXCEPT while a
-                # containerize/decontainerize apply holds this agent's lifecycle
-                # lock — then returning the live session would let a new turn start
-                # on a session that's about to be torn down at cutover. If the lock
-                # is held, fall through to the slow path, which awaits it and then
-                # re-reads (picking up the freshly-started post-cutover session).
-                if not _container_lifecycle_lock(agent_name).locked():
-                    return ss
-
-            lock = _streaming_ensure_locks.setdefault((agent_name, label), asyncio.Lock())
-            # #204: lifecycle (outer) → ensure (inner). The lifecycle lock blocks
-            # the slow start/reconnect path while a containerize/decontainerize apply
-            # is in flight for this agent, so we never start a session against a
-            # half-applied isolation row. The CONNECTED fast path above stays
-            # lock-free, so this adds no contention on the hot inbound path.
-            async with _lifecycle(agent_name), (_label_scope(agent_name, label) if _startup_fencing_enabled() else lock):
-                # Re-check under the lock: a concurrent caller may have started
-                # or reconnected the session while we waited.
-                sessions = broker._streaming.get(agent_name, {})
-                ss = sessions.get(label)
-                if ss:
-                    state = ss.state
-                    if state == TransportSessionState.CONNECTED:
-                        return ss
-                    if state == TransportSessionState.RECONNECTING:
-                        # Wait for the in-flight reconnect to land. Use the same
-                        # bounded poll the broker uses on the inbound path so the
-                        # waits stay consistent.
-                        from pinky_daemon.broker import (
-                            _INBOUND_RECONNECT_POLL_SEC,
-                            _INBOUND_RECONNECT_WAIT_SEC,
+            deadline = time.monotonic() + _INBOUND_RECONNECT_WAIT_SEC
+            while True:
+                async with _session_scope(agent_name, label):
+                    await _settle_startup_debt(agent_name, label)
+                    ss = broker._streaming.get(agent_name, {}).get(label)
+                    agent = agents.get(agent_name)
+                    if not agent or not agent.enabled:
+                        raise HTTPException(409, "Agent missing or disabled")
+                    target = _expected_session_class(agent)
+                    if ss is None:
+                        return await _start_streaming_session(
+                            agent_name, label=label,
+                            resume_id=agents.get_streaming_session_id(agent_name, label=label),
                         )
-                        deadline = time.monotonic() + _INBOUND_RECONNECT_WAIT_SEC
-                        while time.monotonic() < deadline:
-                            await asyncio.sleep(_INBOUND_RECONNECT_POLL_SEC)
-                            if ss.state == TransportSessionState.CONNECTED:
-                                break
-                        return ss
-                    # IDLE_SLEEPING / DEAD / UNINITIALIZED → explicit connect().
-                    # #149 P1: this relaunches the transport for an existing session
-                    # object — guard it too, else a local→unix_user update could wake
-                    # the old local session under the daemon uid (Murzik #642 review).
-                    _enforce_isolation_runnable(agent_name)
-                    _refresh_streaming_launch_config(agent_name, ss)
-                    if _startup_fencing_enabled():
-                        if getattr(ss, "_recovery_inhibited", False):
+                    if ss.state not in {TransportSessionState.RECONNECTING,
+                                        TransportSessionState.BOOTING}:
+                        if type(ss) is not target:
+                            return await _replace_session_locked(
+                                agent_name, label, ss, reason="context_restart", implicit=True,
+                            )
+                        if ss.state != TransportSessionState.CONNECTED:
+                            _enforce_isolation_runnable(agent_name)
                             await ss.restart_transport(
+                                target_preflight=ss._preflight_transport_replacement,
+                                configure=lambda: _refresh_streaming_launch_config(agent_name, ss),
                                 connect_wrapper=lambda connect: _connect_retained_session(
                                     agent_name, label, ss, connect,
                                 ),
                             )
-                        else:
-                            await _connect_retained_session(agent_name, label, ss)
-                    else:
-                        await ss.connect()
-                    return ss
+                        return ss
+                if time.monotonic() >= deadline:
+                    raise HTTPException(409, "Session transition still in progress")
+                await asyncio.sleep(_INBOUND_RECONNECT_POLL_SEC)
 
-                resume_id = agents.get_streaming_session_id(agent_name, label=label)
-                return await _start_streaming_session(
-                    agent_name, label=label, resume_id=resume_id
-                )
+        sessions = broker._streaming.get(agent_name, {})
+        ss = sessions.get(label)
+        if ss and ss.state == TransportSessionState.CONNECTED:
+            # #204: the connected fast path stays lock-free EXCEPT while a
+            # containerize/decontainerize apply holds this agent's lifecycle
+            # lock — then returning the live session would let a new turn start
+            # on a session that's about to be torn down at cutover. If the lock
+            # is held, fall through to the slow path, which awaits it and then
+            # re-reads (picking up the freshly-started post-cutover session).
+            if not _container_lifecycle_lock(agent_name).locked():
+                return ss
+
+        lock = _streaming_ensure_locks.setdefault((agent_name, label), asyncio.Lock())
+        # #204: lifecycle (outer) → ensure (inner). The lifecycle lock blocks
+        # the slow start/reconnect path while a containerize/decontainerize apply
+        # is in flight for this agent, so we never start a session against a
+        # half-applied isolation row. The CONNECTED fast path above stays
+        # lock-free, so this adds no contention on the hot inbound path.
+        async with _lifecycle(agent_name), (_label_scope(agent_name, label) if _startup_fencing_enabled() else lock):
+            # Re-check under the lock: a concurrent caller may have started
+            # or reconnected the session while we waited.
+            sessions = broker._streaming.get(agent_name, {})
+            ss = sessions.get(label)
+            if ss:
+                state = ss.state
+                if state == TransportSessionState.CONNECTED:
+                    return ss
+                if state == TransportSessionState.RECONNECTING:
+                    # Wait for the in-flight reconnect to land. Use the same
+                    # bounded poll the broker uses on the inbound path so the
+                    # waits stay consistent.
+                    from pinky_daemon.broker import (
+                        _INBOUND_RECONNECT_POLL_SEC,
+                        _INBOUND_RECONNECT_WAIT_SEC,
+                    )
+                    deadline = time.monotonic() + _INBOUND_RECONNECT_WAIT_SEC
+                    while time.monotonic() < deadline:
+                        await asyncio.sleep(_INBOUND_RECONNECT_POLL_SEC)
+                        if ss.state == TransportSessionState.CONNECTED:
+                            break
+                    return ss
+                # IDLE_SLEEPING / DEAD / UNINITIALIZED → explicit connect().
+                # #149 P1: this relaunches the transport for an existing session
+                # object — guard it too, else a local→unix_user update could wake
+                # the old local session under the daemon uid (Murzik #642 review).
+                _enforce_isolation_runnable(agent_name)
+                _refresh_streaming_launch_config(agent_name, ss)
+                if _startup_fencing_enabled():
+                    if getattr(ss, "_recovery_inhibited", False):
+                        await ss.restart_transport(
+                            connect_wrapper=lambda connect: _connect_retained_session(
+                                agent_name, label, ss, connect,
+                            ),
+                        )
+                    else:
+                        await _connect_retained_session(agent_name, label, ss)
+                else:
+                    await ss.connect()
+                return ss
+
+            resume_id = agents.get_streaming_session_id(agent_name, label=label)
+            return await _start_streaming_session(
+                agent_name, label=label, resume_id=resume_id
+            )
 
     def _trace_sdk_submission(session, receipt):
         if receipt is None:
@@ -7577,11 +7541,10 @@ npm run build</pre>
             if not guard["restart_safe"]:
                 raise HTTPException(409, _guard_message("restart", guard))
 
-            # Keep settlement deferred across unregister and fresh startup.
-            async with _scheduler_replacement_scope(name):
-                await _disconnect_streaming_sessions(name)
-                await _start_streaming_session(name)
-                restarted = True
+            # Close and restart
+            await _disconnect_streaming_sessions(name)
+            await _start_streaming_session(name)
+            restarted = True
 
         return {
             "applied": True,
@@ -9515,13 +9478,6 @@ npm run build</pre>
                 return True, f"agent is {live.get('status')}"
         return False, ""
 
-    @contextlib.asynccontextmanager
-    async def _container_replacement_scope(name):
-        async with _scheduler_replacement_scope(name):
-            async with (_lifecycle(name) if _startup_fencing_enabled()
-                        else _container_lifecycle_lock(name)):
-                yield
-
     _container_lifecycle = _cops.ContainerLifecycle(
         _cops.ContainerLifecycleDeps(
             registry=agents,
@@ -9530,7 +9486,7 @@ npm run build</pre>
             disconnect_sessions=_disconnect_streaming_sessions,
             start_session=_container_start_main,
             has_live_session=lambda n: bool(broker._streaming.get(n)),
-            lifecycle_lock=_container_replacement_scope,
+            lifecycle_lock=lambda name: (_lifecycle(name) if _startup_fencing_enabled() else _container_lifecycle_lock(name)),
             op_registry=_container_op_registry,
             is_busy=_container_agent_busy,
             log=_log,
@@ -11737,7 +11693,6 @@ npm run build</pre>
 
     def _release_context_restart(name: str, token: object) -> None:
         """Release the reservation only while ``token`` still owns it."""
-        _release_scheduler_replacement(name, token)
         if _context_restarts_inflight.get(name) is token:
             del _context_restarts_inflight[name]
 
@@ -11838,7 +11793,6 @@ npm run build</pre>
         old_turns = ss._stats["turns"]
         restart_token = object()
         _context_restarts_inflight[name] = restart_token
-        _reserve_scheduler_replacement(name, "main", restart_token)
 
         def _schedule_restart() -> None:
             task = asyncio.create_task(
@@ -13382,70 +13336,69 @@ npm run build</pre>
         silent" case (reader loop wedged on a stalled LLM call) — see the
         follow-up issue noted on #338.
         """
-        async with _scheduler_replacement_scope(agent_name, "main"):
-            ss = broker._get_streaming_session(agent_name)
-            if not ss:
-                _log(
-                    f"api: resurrection skipped for {agent_name} — no streaming "
-                    f"session registered"
-                )
-                return
+        ss = broker._get_streaming_session(agent_name)
+        if not ss:
+            _log(
+                f"api: resurrection skipped for {agent_name} — no streaming "
+                f"session registered"
+            )
+            return
+        if getattr(ss, "state", None) == TransportSessionState.CONNECTED:
+            # Race: the in-process retry recovered between heartbeat tick and
+            # the callback running. Also the load-bearing guard for bypassing
+            # the save_my_context restart guard — see docstring above.
+            return
+        if getattr(ss, "state", None) == TransportSessionState.IDLE_SLEEPING:
+            # Session was deliberately disconnected by idle_sleep(). Resurrecting
+            # it here would fight the idle-sleep state and cause an immediate
+            # reconnect/sleep churn cycle. The next genuine wake (scheduler or
+            # incoming message) will reconnect via connect(). See #348.
+            _log(
+                f"api: resurrection skipped for {agent_name} — session is "
+                f"idle-sleeping (will wake on next scheduled/incoming event)"
+            )
+            return
+        _log(f"api: watchdog resurrection — reconnecting {agent_name}")
+        if _rebuild_enabled():
+            label = getattr(ss._config, "label", "main") or "main"
+            async with _label_scope(agent_name, label):
+                if type(ss) is not _expected_session_class(agents.get(agent_name)):
+                    await _replace_session_locked(agent_name, label, ss, reason="heartbeat_resurrect")
+                    return
+        try:
+            _refresh_streaming_launch_config(agent_name, ss)
+            # #202: serialize the fresh boot behind the process-global cold-start
+            # gate so a watchdog batch-resurrection doesn't race the shared
+            # single-use OAuth refresh token (no-op unless PINKY_COLDSTART_SERIALIZE).
+            async with _coldstart_gate(agent_name, "main"):
+                # TODO(#338-followup): wrap in asyncio.create_task so the scheduler
+                # tick isn't blocked for up to ~40s during the internal backoff.
+                attempt_reconnect = getattr(ss, "attempt_reconnect", None)
+                if callable(attempt_reconnect):
+                    await attempt_reconnect()
+                else:
+                    # Runtime-tolerant fallback for future StreamingSession-compatible
+                    # implementations that have connect/disconnect but not the richer
+                    # watchdog reconnect helper yet.
+                    try:
+                        disconnect = getattr(ss, "disconnect", None)
+                        if callable(disconnect):
+                            await disconnect()
+                    except Exception as e:
+                        _log(f"api: resurrection pre-disconnect failed for {agent_name}: {e}")
+                    connect = getattr(ss, "connect", None)
+                    if not callable(connect):
+                        raise AttributeError(
+                            f"{ss.__class__.__name__} has no attempt_reconnect or connect"
+                        )
+                    await connect()
             if getattr(ss, "state", None) == TransportSessionState.CONNECTED:
-                # Race: the in-process retry recovered between heartbeat tick and
-                # the callback running. Also the load-bearing guard for bypassing
-                # the save_my_context restart guard — see docstring above.
-                return
-            if getattr(ss, "state", None) == TransportSessionState.IDLE_SLEEPING:
-                # Session was deliberately disconnected by idle_sleep(). Resurrecting
-                # it here would fight the idle-sleep state and cause an immediate
-                # reconnect/sleep churn cycle. The next genuine wake (scheduler or
-                # incoming message) will reconnect via connect(). See #348.
-                _log(
-                    f"api: resurrection skipped for {agent_name} — session is "
-                    f"idle-sleeping (will wake on next scheduled/incoming event)"
+                activity.log(
+                    agent_name, "watchdog_resurrect",
+                    f"{agent_name} restored by heartbeat watchdog",
                 )
-                return
-            _log(f"api: watchdog resurrection — reconnecting {agent_name}")
-            if _rebuild_enabled():
-                label = getattr(ss._config, "label", "main") or "main"
-                async with _label_scope(agent_name, label):
-                    if type(ss) is not _expected_session_class(agents.get(agent_name)):
-                        await _replace_session_locked(agent_name, label, ss, reason="heartbeat_resurrect")
-                        return
-            try:
-                _refresh_streaming_launch_config(agent_name, ss)
-                # #202: serialize the fresh boot behind the process-global cold-start
-                # gate so a watchdog batch-resurrection doesn't race the shared
-                # single-use OAuth refresh token (no-op unless PINKY_COLDSTART_SERIALIZE).
-                async with _coldstart_gate(agent_name, "main"):
-                    # TODO(#338-followup): wrap in asyncio.create_task so the scheduler
-                    # tick isn't blocked for up to ~40s during the internal backoff.
-                    attempt_reconnect = getattr(ss, "attempt_reconnect", None)
-                    if callable(attempt_reconnect):
-                        await attempt_reconnect()
-                    else:
-                        # Runtime-tolerant fallback for future StreamingSession-compatible
-                        # implementations that have connect/disconnect but not the richer
-                        # watchdog reconnect helper yet.
-                        try:
-                            disconnect = getattr(ss, "disconnect", None)
-                            if callable(disconnect):
-                                await disconnect()
-                        except Exception as e:
-                            _log(f"api: resurrection pre-disconnect failed for {agent_name}: {e}")
-                        connect = getattr(ss, "connect", None)
-                        if not callable(connect):
-                            raise AttributeError(
-                                f"{ss.__class__.__name__} has no attempt_reconnect or connect"
-                            )
-                        await connect()
-                if getattr(ss, "state", None) == TransportSessionState.CONNECTED:
-                    activity.log(
-                        agent_name, "watchdog_resurrect",
-                        f"{agent_name} restored by heartbeat watchdog",
-                    )
-            except Exception as e:
-                _log(f"api: resurrection failed for {agent_name}: {e}")
+        except Exception as e:
+            _log(f"api: resurrection failed for {agent_name}: {e}")
 
     def _is_resurrectable(agent_name: str) -> bool:
         """Scheduler precondition: True iff resurrection should be attempted.
@@ -13490,7 +13443,11 @@ npm run build</pre>
         return getattr(ss, "_scheduler_paste_session_id", "") or f"session:{id(ss)}"
 
     def _scheduler_context_rendered_at(agent_name: str) -> float:
+        from pinky_daemon.tmux_session import TmuxSession
+
         ss = broker._streaming.get(agent_name, {}).get("main")
+        if not isinstance(ss, TmuxSession):
+            return 0.0
         return getattr(getattr(ss, "_wake_context_delivery", None), "rendered_at", 0.0)
 
     def _scheduler_delivery_timezone(agent_name: str) -> str:
@@ -13702,7 +13659,6 @@ npm run build</pre>
         delivery_inflight_fn=_scheduler_wake_inflight,
         delivery_session_fn=_scheduler_paste_session,
         delivery_context_rendered_at_fn=_scheduler_context_rendered_at,
-        delivery_replacement_pending_fn=_scheduler_replacement_pending,
         delivery_timezone_fn=_scheduler_delivery_timezone,
         delivery_queued_fn=_scheduler_wake_queued,
         delivery_cancel_queued_fn=_cancel_scheduler_wake,
@@ -13733,46 +13689,45 @@ npm run build</pre>
     @_locked_agent
     async def _watchdog_recover(agent_name: str, label: str, reason: str) -> None:
         """Recovery callback: stop + reconnect a single stuck streaming session."""
-        async with _scheduler_replacement_scope(agent_name, label):
-            _log(f"watchdog: recovering {agent_name}/{label} — {reason}")
-            try:
-                activity.log(
-                    agent_name=agent_name,
-                    event_type="watchdog_recover",
-                    title=f"Watchdog auto-recovery ({label}): {reason}",
+        _log(f"watchdog: recovering {agent_name}/{label} — {reason}")
+        try:
+            activity.log(
+                agent_name=agent_name,
+                event_type="watchdog_recover",
+                title=f"Watchdog auto-recovery ({label}): {reason}",
+            )
+            # Disconnect only the stuck session, not siblings
+            sessions = broker._streaming.get(agent_name, {})
+            ss = sessions.get(label)
+            if ss and _rebuild_enabled():
+                def configure_watchdog():
+                    _clear_resume(agent_name, label, ss)
+                    _refresh_streaming_launch_config(agent_name, ss)
+                    ss._config.force_fresh_context_once = True
+                    ss._config.restart_reason = "watchdog_recover"
+                ss = await _restart_compatible(
+                    agent_name, ss, configure=configure_watchdog, reason="watchdog_recover",
                 )
-                # Disconnect only the stuck session, not siblings
-                sessions = broker._streaming.get(agent_name, {})
-                ss = sessions.get(label)
-                if ss and _rebuild_enabled():
-                    def configure_watchdog():
-                        _clear_resume(agent_name, label, ss)
-                        _refresh_streaming_launch_config(agent_name, ss)
-                        ss._config.force_fresh_context_once = True
-                        ss._config.restart_reason = "watchdog_recover"
-                    ss = await _restart_compatible(
-                        agent_name, ss, configure=configure_watchdog, reason="watchdog_recover",
-                    )
-                elif ss:
-                    async def _rebuild_watchdog_transport() -> None:
-                        if _startup_fencing_enabled():
-                            _resume_owners.pop((agent_name, label), None)
-                            _resume_epochs[(agent_name, label)] = object()
-                        agents.set_streaming_session_id(agent_name, "", label=label)
-                        broker.unregister_streaming(agent_name, label=label)
-                        await asyncio.sleep(2)
-                        await _ensure_streaming_session(agent_name, label=label)
-
-                    await ss.restart_transport(
-                        bring_up=_rebuild_watchdog_transport,
-                        suppress_teardown_errors=True,
-                    )
-                else:
+            elif ss:
+                async def _rebuild_watchdog_transport() -> None:
+                    if _startup_fencing_enabled():
+                        _resume_owners.pop((agent_name, label), None)
+                        _resume_epochs[(agent_name, label)] = object()
+                    agents.set_streaming_session_id(agent_name, "", label=label)
+                    broker.unregister_streaming(agent_name, label=label)
                     await asyncio.sleep(2)
                     await _ensure_streaming_session(agent_name, label=label)
-                _log(f"watchdog: {agent_name}/{label} recovered successfully")
-            except Exception as exc:
-                _log(f"watchdog: recovery failed for {agent_name}/{label}: {exc}")
+
+                await ss.restart_transport(
+                    bring_up=_rebuild_watchdog_transport,
+                    suppress_teardown_errors=True,
+                )
+            else:
+                await asyncio.sleep(2)
+                await _ensure_streaming_session(agent_name, label=label)
+            _log(f"watchdog: {agent_name}/{label} recovered successfully")
+        except Exception as exc:
+            _log(f"watchdog: recovery failed for {agent_name}/{label}: {exc}")
 
     async def _watchdog_alert(agent_name: str, message: str) -> bool:
         """Alert callback: notify the owner over configured destinations."""

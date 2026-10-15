@@ -20,10 +20,11 @@ REASON = "PASTED_UNCONFIRMED_SESSION_LOST"
 
 @pytest.fixture
 def rig(tmp_path, monkeypatch):
-    clock = SimpleNamespace(now=NOW)
+    clock = SimpleNamespace(now=NOW, monotonic=10_000.0)
     for module in (scheduler, agent_registry):
         monkeypatch.setattr(module, "time", SimpleNamespace(
-            **{**vars(module.time), "time": lambda: clock.now},
+            **{**vars(module.time), "time": lambda: clock.now,
+               "monotonic": lambda: clock.monotonic},
         ))
     registry = AgentRegistry(db_path=str(tmp_path / "registry.db"))
     registry.register("worker", working_dir=str(tmp_path / "worker"))
@@ -143,6 +144,8 @@ async def test_no_live_session_alerts_owner_in_plain_local_words(rig, reaper):
     row = rig.pasted("morning check")
     rig.registry.set_owner_profile({"timezone": "Europe/Paris"})
     engine, wake = rig.engine(live="", rendered=NOW, timezone="America/New_York")
+    engine._settle_lost_pastes("worker")
+    rig.clock.monotonic += 300
     for _ in range(2):
         if reaper:
             engine._run_outbox_reaper_if_due(NOW)
@@ -179,6 +182,8 @@ async def test_owner_notice_invalid_timezone_uses_named_utc(rig):
     rig.pasted()
     rig.registry.set_owner_profile({"timezone": "invalid/owner"})
     engine, _ = rig.engine(live="")
+    engine._settle_lost_pastes("worker")
+    rig.clock.monotonic += 300
     engine._settle_lost_pastes("worker")
     await finish_notices(engine)
     assert rig.notices == []
@@ -247,8 +252,9 @@ def test_session_keeps_preview_separate_from_committed_context(api_session):
 
 
 @pytest.mark.parametrize("after_render", [False, True])
-async def test_api_uses_live_session_render_and_normal_notice_route(api_session, after_render):
+async def test_api_uses_non_tmux_session_normal_notice_route(api_session, after_render):
     app, ss, clock, sent = api_session
+    ss._config.timezone = "America/New_York"
     registry = app.state.agents
     schedule = registry.add_schedule("worker", "0 * * * *", name="periodic", prompt="check work")
     row, _ = registry.persist_schedule_wake(
@@ -279,7 +285,6 @@ async def test_api_uses_live_session_render_and_normal_notice_route(api_session,
         # Deliver that rebuilt context through the SDK's actual wake hook.
         await ss.connect()
         await ss._initial_wake_task
-    ss._config.timezone = "America/New_York"
     engine = app.state.scheduler
     owner = AsyncMock(return_value=True)
     engine._owner_notify_callback = owner
@@ -290,9 +295,8 @@ async def test_api_uses_live_session_render_and_normal_notice_route(api_session,
     await finish_notices(engine)
     owner.assert_not_awaited()
     wake.assert_not_awaited()
-    if after_render:
-        assert len(sent) == 1 and sent[0].startswith("[agent | system | internal | ")
-        assert "2023-11-14 17:13 EST" in sent[0]
-        assert "may not have run; check before redoing." in sent[0]
-    else:
-        assert sent == []
+    assert engine._delivery_context_rendered_at_fn("worker") == 0
+    assert len(sent) == (1 if after_render else 2)
+    assert all(text.startswith("[agent | system | internal | ") for text in sent)
+    assert all("2023-11-14 17:13 EST" in text for text in sent)
+    assert all("may not have run; check before redoing." in text for text in sent)

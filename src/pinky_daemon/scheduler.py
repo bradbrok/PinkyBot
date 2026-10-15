@@ -109,6 +109,7 @@ _OUTBOX_REAPER_FAILURE_BACKOFF_ENV = (
     "PINKY_OUTBOX_REAPER_FAILURE_BACKOFF_SEC"
 )
 _OUTBOX_REAPER_RETAIN_ACCEPTED_SEC = 7 * 24 * 60 * 60
+LOST_PASTE_OFFLINE_GRACE_S = 300
 _OUTBOX_REAPER_RETAIN_ABANDONED_SEC = 14 * 24 * 60 * 60
 _OUTBOX_REAPER_RETAIN_PARKED_SEC = 30 * 24 * 60 * 60
 _OUTBOX_REAPER_PAYLOAD_TRIM_AFTER_SEC = 48 * 60 * 60
@@ -401,7 +402,6 @@ class AgentScheduler:
         delivery_inflight_fn=None,
         delivery_session_fn=None,
         delivery_context_rendered_at_fn=None,
-        delivery_replacement_pending_fn=None,
         delivery_timezone_fn=None,
         scheduler_busy_deliver_after_s: float | None = None,
         delivery_queued_fn=None,
@@ -422,7 +422,6 @@ class AgentScheduler:
         self._registry = registry
         self._delivery_session_fn = delivery_session_fn
         self._delivery_context_rendered_at_fn = delivery_context_rendered_at_fn
-        self._delivery_replacement_pending_fn = delivery_replacement_pending_fn
         self._delivery_timezone_fn = delivery_timezone_fn
         self._scheduler_busy_deliver_after_s = scheduler_busy_delay(
             scheduler_busy_deliver_after_s if scheduler_busy_deliver_after_s is not None
@@ -664,6 +663,7 @@ class AgentScheduler:
         self._outbox_drain_notified_through: dict[str, float] = {}
         self._owner_alert_tasks: set[asyncio.Task] = set()
         self._agent_notice_tasks: set[asyncio.Task] = set()
+        self._lost_paste_offline_since: dict[str, float] = {}
         self._last_schedule_prompt_warn_at: float | None = None
         self._last_pending_wake_liveness_drain_at: float | None = None
         self._last_outbox_reaper_day: date | None = None
@@ -2153,12 +2153,17 @@ class AgentScheduler:
 
     def _settle_lost_pastes(self, agent_name: str) -> None:
         """Never replay a write-ahead paste whose owning session is gone."""
-        if self._delivery_replacement_pending_fn is not None:
-            try:
-                if self._delivery_replacement_pending_fn(agent_name):
-                    return
-            except Exception as exc:
-                _log(f"scheduler: replacement check deferred: {type(exc).__name__}")
+        try:
+            session_id = self._delivery_session_fn(agent_name) if self._delivery_session_fn else ""
+        except Exception:
+            # An unavailable probe is not proof of session loss.
+            return
+        if session_id:
+            self._lost_paste_offline_since.pop(agent_name, None)
+        else:
+            now = time.monotonic()
+            since = self._lost_paste_offline_since.setdefault(agent_name, now)
+            if now - since < LOST_PASTE_OFFLINE_GRACE_S:
                 return
         try:
             rows = self._registry.list_pending_schedule_wakes(agent_name, include_parked=True)
@@ -2167,11 +2172,6 @@ class AgentScheduler:
             return
         for row in rows:
             if row.abandoned_at or row.parked_at or not row.pasted_at:
-                continue
-            try:
-                session_id = self._delivery_session_fn(agent_name) if self._delivery_session_fn else ""
-            except Exception:
-                # An unavailable probe is not proof of session loss.
                 continue
             if session_id == row.pasted_session_id and session_id:
                 continue
