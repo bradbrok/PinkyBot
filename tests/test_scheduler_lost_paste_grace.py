@@ -308,3 +308,21 @@ async def test_sibling_context_cannot_cover_the_main_sessions_lost_paste(api_ses
     assert notice.await_args.args[0] == "worker"
     assert notice.await_args.args[1].startswith("Scheduled prompt 'periodic'")
     assert "was pasted into your previous session and may not have run" in notice.await_args.args[1]
+
+
+async def test_failed_session_lookup_does_not_start_an_offline_grace(offline):
+    case = offline
+
+    def unavailable(_):
+        raise RuntimeError("session lookup unavailable")
+
+    case.engine._delivery_session_fn = unavailable
+    case.engine._settle_lost_pastes("worker")
+    case.clock.now += 301
+    case.engine._settle_lost_pastes("worker")
+    await drain_notices(case.engine)
+    assert not saved_row(case).abandoned_at
+    assert not saved_row(case).accepted_at
+    assert case.rig.owners == case.rig.notices == []
+    assert "worker" not in case.engine._lost_paste_offline_since
+    case.wake.assert_not_awaited()

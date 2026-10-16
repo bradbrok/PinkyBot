@@ -152,7 +152,7 @@ async def test_new_process_drops_earlier_delivery_and_late_callback(wake_transpo
     await asyncio.gather(ss._worker_task, ss._watchdog_task)
 
 
-@pytest.mark.parametrize("failure", ["missing", "false", "exception"])
+@pytest.mark.parametrize("failure", ["missing", "false", "exception", "none", "truthy"])
 async def test_failed_agent_handoff_alerts_owner_once_in_plain_words(rig, failure):
     row = rig.pasted("morning check")
     rig.registry.set_owner_profile({"timezone": "Europe/Paris"})
@@ -161,6 +161,8 @@ async def test_failed_agent_handoff_alerts_owner_once_in_plain_words(rig, failur
         "missing": None,
         "false": AsyncMock(return_value=False),
         "exception": AsyncMock(side_effect=RuntimeError("delivery failed")),
+        "none": AsyncMock(return_value=None),
+        "truthy": AsyncMock(return_value=1),
     }[failure]
     for _ in range(2):
         engine._settle_lost_pastes("worker")
@@ -279,3 +281,103 @@ async def test_stop_also_waits_for_owner_fallback_created_by_agent_failure(rig):
     finally:
         release.set()
         await asyncio.wait_for(stopping, timeout=2)
+
+
+async def restart_preview(app, ss, monkeypatch):
+    monkeypatch.setenv("PINKY_RESUME_FAILSAFE", "1")
+    app.state.agents.set_context(
+        "worker", task="continue work", metadata={"source": "save_my_context"},
+        updated_by=ss.resume_handle,
+    )
+
+    async def configure_only(**kwargs):
+        await ss._run_replacement_step(kwargs["configure"])
+
+    monkeypatch.setattr(ss, "restart_transport", configure_only)
+    endpoint = next(r.endpoint for r in app.routes
+                    if getattr(r, "path", "") == "/agents/{name}/streaming/restart")
+    scope = {"type": "http"}
+    response = await endpoint("worker", SimpleNamespace(scope=scope))
+    assert response["accepted"] and response["restart_scheduled"]
+    scope["pinky.response_sent_handoff"]["schedule"]()
+    await asyncio.gather(*app.state._context_restart_tasks)
+    assert ss._config.restart_reason == "context_restart"
+
+
+async def test_preview_render_time_precedes_the_channel_context_build(wake_transport, monkeypatch):
+    app, ss, clock, _ = wake_transport
+    clock.now = NOW + 10
+    starts = []
+    original = app.state.broker.build_channel_context
+
+    def slow_channels(name):
+        starts.append(clock.now)
+        clock.now += 7
+        return original(name)
+
+    monkeypatch.setattr(app.state.broker, "build_channel_context", slow_channels)
+    await restart_preview(app, ss, monkeypatch)
+    assert starts == [NOW + 10]
+    assert clock.now == NOW + 17
+    assert ss._config.wake_context_rendered_at == NOW + 10
+
+
+async def test_context_restart_refreshes_the_preview_render_time(wake_transport, monkeypatch):
+    app, ss, clock, _ = wake_transport
+    assert ss._config.wake_context_rendered_at == NOW
+    clock.now += 20
+    await restart_preview(app, ss, monkeypatch)
+    assert ss._config.wake_context_rendered_at == NOW + 20
+
+
+async def test_cancelled_agent_notice_alerts_owner_once(rig):
+    rig.pasted()
+    engine, _ = rig.engine()
+    entered = asyncio.Event()
+
+    async def blocked(*args):
+        entered.set()
+        await asyncio.Future()
+
+    engine._agent_notify_callback = blocked
+    engine._settle_lost_pastes("worker")
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    assert len(engine._agent_notice_tasks) == 1
+    notice = next(iter(engine._agent_notice_tasks))
+    notice.cancel()
+    await asyncio.gather(notice, return_exceptions=True)
+    assert notice.cancelled()
+    await asyncio.gather(*engine._owner_alert_tasks)
+    engine._settle_lost_pastes("worker")
+    assert rig.owners == [(
+        "worker", "Scheduled prompt 'periodic' for worker (fired 2023-11-14 22:13 UTC) "
+        "may not have run, and worker could not be told; check before redoing.",
+    )]
+
+
+def test_agent_notice_without_a_loop_logs_both_failures(rig):
+    engine, _ = rig.engine()
+    owner, agent = AsyncMock(return_value=True), AsyncMock(return_value=True)
+    engine._owner_notify_callback, engine._agent_notify_callback = owner, agent
+    engine._queue_agent_notice(
+        "worker", "Scheduled prompt may not have run; check before redoing.",
+        fallback_message="worker could not be told; check before redoing.",
+    )
+    agent_failures = [line for line in rig.logs if "AGENT_NOTIFY_FAILURE" in line]
+    owner_failures = [line for line in rig.logs if "OWNER_NOTIFY_FAILURE" in line]
+    assert len(agent_failures) == len(owner_failures) == 1
+    assert "agent 'worker': no running event loop" in agent_failures[0]
+    assert "agent 'worker': no running event loop" in owner_failures[0]
+    agent.assert_not_called()
+    owner.assert_not_called()
+
+
+async def test_completed_agent_notice_task_is_removed(rig):
+    rig.pasted()
+    engine, _ = rig.engine()
+    engine._settle_lost_pastes("worker")
+    notices = tuple(engine._agent_notice_tasks)
+    assert len(notices) == 1
+    await asyncio.gather(*notices)
+    assert len(rig.notices) == 1
+    assert not engine._agent_notice_tasks
