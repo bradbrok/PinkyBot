@@ -3733,6 +3733,24 @@ def create_api(
     # Not part of the public API; harness should not depend on it.
     app.state._build_streaming_wake_context = _build_streaming_wake_context
 
+    def _refresh_streaming_wake_context(
+        agent_name: str,
+        config,
+        reason: WakeReason = WakeReason.NEW_SESSION,
+        *,
+        commit: bool = False,
+        builder=None,
+    ) -> str:
+        # Stamp the snapshot's start so a paste racing the render is never
+        # mistaken for one that the continuation text already covered.
+        rendered_at = time.time()
+        build = builder if builder is not None else _build_streaming_wake_context
+        text = build(agent_name, reason, commit=commit)
+        if not commit:
+            config.wake_context = text
+            config.wake_context_rendered_at = rendered_at
+        return text
+
     _scheduler_holder: dict[str, AgentScheduler] = {}
 
     def _log_agent_wake_event(agent_name: str, reason: WakeReason) -> None:
@@ -4397,9 +4415,8 @@ def create_api(
             system_prompt=("" if is_tmux else
                            agents.build_system_prompt(agent_name, skill_store=skills)),
             resume_handle=resume_id,
-            # Preview only: daemon transports rebuild committed wake text at
-            # submission, so an unavailable listener cannot consume the manifest.
-            wake_context=_build_streaming_wake_context(agent_name, commit=False),
+            # Rebuild committed text at submission. The initial preview below
+            # leaves the manifest intact while the listener is unavailable.
             wake_context_builder=_build_streaming_wake_context,
             api_readiness=app.state.api_readiness,
             on_wake_delivered=_log_agent_wake_event,
@@ -4434,6 +4451,9 @@ def create_api(
                 getattr(agent, "strict_effort_enforcement", False)
             ),
             idle_timeout=max(0, agent.auto_sleep_hours) * 3600,
+        )
+        _refresh_streaming_wake_context(
+            agent_name, config, commit=False, builder=_build_streaming_wake_context,
         )
 
         callback = await _make_streaming_response_callback()
@@ -4777,7 +4797,7 @@ def create_api(
             raise HTTPException(503, "Candidate unavailable")
         candidate._config.force_fresh_context_once = True
         candidate._config.restart_reason = reason
-        candidate._config.wake_context = _build_streaming_wake_context(name, commit=False)
+        _refresh_streaming_wake_context(name, candidate._config, commit=False)
 
         def configure():
             if (_launch_fingerprint(agents.get(name)) != original_fingerprint or
@@ -11706,9 +11726,7 @@ npm run build</pre>
                     # racing wake therefore inherits force-fresh intent without
                     # a refusal corrupting the still-live transport.
                     _refresh_streaming_launch_config(name, ss)
-                    ss._config.wake_context = _build_streaming_wake_context(
-                        name, commit=False
-                    )
+                    _refresh_streaming_wake_context(name, ss._config, commit=False)
                     ss._config.resume_handle = ""
                     ss._config.restart_reason = "context_restart"
                     ss._config.force_fresh_context_once = True
@@ -12006,9 +12024,7 @@ npm run build</pre>
 
         def _configure_archive_restart() -> None:
             agents.set_streaming_session_id(name, "", label="main")
-            ss._config.wake_context = _build_streaming_wake_context(
-                name, commit=False
-            )
+            _refresh_streaming_wake_context(name, ss._config, commit=False)
             _refresh_streaming_launch_config(name, ss)
             ss._config.resume_handle = ""
             ss.resume_handle = ""
@@ -13424,7 +13440,23 @@ npm run build</pre>
         ss = broker._streaming.get(agent_name, {}).get("main")
         if ss is None or ss.state != TransportSessionState.CONNECTED:
             return ""
-        return getattr(ss, "_scheduler_paste_session_id", "")
+        return getattr(ss, "_scheduler_paste_session_id", "") or f"session:{id(ss)}"
+
+    def _scheduler_context_rendered_at(agent_name: str) -> float:
+        from pinky_daemon.tmux_session import TmuxSession
+
+        ss = broker._streaming.get(agent_name, {}).get("main")
+        if not isinstance(ss, TmuxSession):
+            return 0.0
+        return getattr(getattr(ss, "_wake_context_delivery", None), "rendered_at", 0.0)
+
+    def _scheduler_delivery_timezone(agent_name: str) -> str:
+        ss = broker._streaming.get(agent_name, {}).get("main")
+        return getattr(ss._config, "timezone", "") if ss else ""
+
+    async def _notify_scheduler_agent(agent_name: str, message: str) -> bool:
+        result = await broker.inject_agent_message("system", agent_name, message)
+        return result.delivered
 
     def _scheduler_wake_inflight(agent_name: str, prompt: str) -> bool:
         """Per-turn execution state: is this wake pasted with an open receipt?
@@ -13626,9 +13658,12 @@ npm run build</pre>
         delivery_drain_busy_fn=_scheduler_drain_busy,
         delivery_inflight_fn=_scheduler_wake_inflight,
         delivery_session_fn=_scheduler_paste_session,
+        delivery_context_rendered_at_fn=_scheduler_context_rendered_at,
+        delivery_timezone_fn=_scheduler_delivery_timezone,
         delivery_queued_fn=_scheduler_wake_queued,
         delivery_cancel_queued_fn=_cancel_scheduler_wake,
         owner_notify_callback=_notify_owner_alert,
+        agent_notify_callback=_notify_scheduler_agent,
         trigger_store=trigger_store,
         activity=activity,
     )
@@ -13998,9 +14033,7 @@ npm run build</pre>
                 agents.bump_context_updated_at(agent_name)
             except Exception:
                 pass
-            ss._config.wake_context = _build_streaming_wake_context(
-                agent_name, commit=False
-            )
+            _refresh_streaming_wake_context(agent_name, ss._config, commit=False)
             _refresh_streaming_launch_config(agent_name, ss)
             ss._config.resume_handle = ""
             ss._config.restart_reason = "mcp_epoch_unbound"
@@ -15537,9 +15570,7 @@ npm run build</pre>
 
         def _configure_forced_restart() -> None:
             agents.set_streaming_session_id(name, "", label="main")
-            ss._config.wake_context = _build_streaming_wake_context(
-                name, commit=False
-            )
+            _refresh_streaming_wake_context(name, ss._config, commit=False)
             _refresh_streaming_launch_config(name, ss)
             ss._config.resume_handle = ""
             ss._config.restart_reason = "force_restart"

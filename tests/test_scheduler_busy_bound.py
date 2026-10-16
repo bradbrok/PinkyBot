@@ -512,6 +512,10 @@ async def test_pasted_then_restart_before_consumption_never_replays(registry, tm
     restarted = AgentScheduler(
         registry, wake_callback=wake, owner_notify_callback=lambda *args: alerts.append(args),
     )
+    monkeypatch.setattr(scheduler.time, "monotonic", lambda: clock.now)
+    await restarted._replay_pending_locked("worker")
+    assert registry.get_schedule_wake_by_fire(pending.schedule_id, pending.fired_at).abandoned_at == 0
+    clock.now += 300
     await restarted._replay_pending_locked("worker")
     assert calls == []
     row = registry.get_schedule_wake_by_fire(pending.schedule_id, pending.fired_at)
@@ -520,7 +524,9 @@ async def test_pasted_then_restart_before_consumption_never_replays(registry, tm
     if restarted._owner_alert_tasks:
         await asyncio.gather(*restarted._owner_alert_tasks)
     assert len(alerts) == 1
-    assert "PASTED_UNCONFIRMED_SESSION_LOST" in alerts[0][1]
+    # With no replacement session, the owner receives the plain offline notice.
+    assert "went offline before it confirmed the scheduled prompt" in alerts[0][1]
+    assert "PASTED_UNCONFIRMED_SESSION_LOST" not in alerts[0][1]
 
 
 async def test_midturn_queue_consumed_at_boundary_receipted_once(registry, tmp_path, monkeypatch, clock):
@@ -781,7 +787,7 @@ async def test_live_paste_survives_reaper_and_replay(registry, clock):
     assert calls == []
 
 
-async def test_write_ahead_crash_cannot_replay_or_accept(registry, clock):
+async def test_write_ahead_crash_cannot_replay_or_accept(registry, clock, monkeypatch):
     pending = fire(registry)
     assert callable(getattr(registry, "mark_schedule_wake_pasted", None)), "missing write-ahead paste marker"
     assert registry.mark_schedule_wake_pasted(
@@ -798,7 +804,10 @@ async def test_write_ahead_crash_cannot_replay_or_accept(registry, clock):
         return True
 
     engine = AgentScheduler(registry, wake_callback=wake, owner_notify_callback=lambda *args: alerts.append(args))
+    monkeypatch.setattr(scheduler.time, "monotonic", lambda: clock.now)
     await engine._replay_pending_locked("worker")
+    assert registry.get_schedule_wake_by_fire(pending.schedule_id, pending.fired_at).abandoned_at == 0
+    clock.now += 300
     await engine._replay_pending_locked("worker")
     if engine._owner_alert_tasks:
         await asyncio.gather(*engine._owner_alert_tasks)

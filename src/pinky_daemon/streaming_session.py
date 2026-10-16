@@ -115,6 +115,7 @@ class StreamingSessionConfig:
     system_prompt: str = ""
     resume_handle: str = ""  # SDK resume token (opaque session-continuation handle) from previous run
     wake_context: str = ""  # Saved continuation context to inject on wake
+    wake_context_rendered_at: float = 0.0  # Render start of the non-committing fallback preview
     wake_context_builder: object = None  # Callable(agent_name) -> str; refreshes wake_context on restart
     api_readiness: object = None  # Shared daemon listener gate; None keeps embedders open.
     # Fires AFTER successful wake-prompt delivery (paste/query landed).

@@ -131,6 +131,7 @@ from pinky_daemon.transport_state import (
     StateMachine,
     Trigger,
 )
+from pinky_daemon.wake_context import WakeContextDelivery
 from pinky_daemon.wake_prompt import (
     WakePromptInput,
     WakeReason,
@@ -2445,6 +2446,7 @@ class TmuxSession(TransportReplacementMixin):
         prepare_spawn_callback=None,
     ) -> None:
         self._config = config
+        self._wake_context_delivery = WakeContextDelivery()
         self._scheduler_paste_session_id = uuid.uuid4().hex
         self._wake_launch_history = config.wake_launch_history
         self._wake_owner_alerted = False
@@ -3836,6 +3838,7 @@ class TmuxSession(TransportReplacementMixin):
 
         try:
             await self._spawn_tmux_repl()
+            self._wake_context_delivery.new_process()
         except BaseException:
             # Cold-start or warm-wake failed. Drive the in-flight transition
             # to DEAD with the correct completion trigger (BOOT_FAILED for
@@ -4004,13 +4007,18 @@ class TmuxSession(TransportReplacementMixin):
         # the exact symptom #591 was filed for. Falls back to the stored
         # body when no builder is wired (tests). Trailing positional
         # kwarg keeps legacy 1-arg builders working.
+        snapshot = self._wake_context_delivery.snapshot()
+
         def _build_initial_prompt():
             wake_context_body = self._config.wake_context or ""
+            snapshot.rendered_at = self._config.wake_context_rendered_at
             if self._config.wake_context_builder:
+                started_at = time.time()
                 try:
                     wake_context_body = self._config.wake_context_builder(
                         self.agent_name, reason
                     )
+                    snapshot.rendered_at = started_at
                 except TypeError:
                     pass
                 except Exception as e:
@@ -4034,16 +4042,12 @@ class TmuxSession(TransportReplacementMixin):
         # transcript turn-start receipt; a successful paste/Enter command is
         # not enough. Otherwise the cycle-gate could advance against a wake
         # that never reached the model, eating the directive on next RESUME.
-        # The closure carries agent name + reason so _deliver_turn need not
-        # re-read them. ``None`` when no callback is wired (tests).
-        _wake_delivered_cb: object = None
-        if self._config.on_wake_delivered:
-            _config_cb = self._config.on_wake_delivered
-            _agent_name = self.agent_name
-            _reason = reason
-
-            def _wake_delivered_cb() -> None:  # type: ignore[no-redef]
-                _config_cb(_agent_name, _reason)
+        # The snapshot uses that same receipt even when activity logging has
+        # no callback configured.
+        def _wake_delivered_cb() -> None:
+            snapshot.delivered()
+            if self._config.on_wake_delivered:
+                self._config.on_wake_delivered(self.agent_name, reason)
 
         try:
             await self._enqueue_internal_prompt(
@@ -12530,6 +12534,7 @@ class TmuxSession(TransportReplacementMixin):
             # disconnect's default → DEAD path triggers ONLY from CONNECTED;
             # we pre-set RECONNECTING above so it stays put. Now spawn fresh.
             await self._spawn_tmux_repl()
+            self._wake_context_delivery.new_process()
             self._check_force_restart_authority()
             await self._state_machine.transition_complete(
                 token,
@@ -12792,6 +12797,7 @@ class TmuxSession(TransportReplacementMixin):
                 self._check_recovery_owner()
                 try:
                     await self._spawn_tmux_repl()
+                    self._wake_context_delivery.new_process()
                     await self._state_machine.transition_complete(
                         token,
                         SessionState.CONNECTED,
