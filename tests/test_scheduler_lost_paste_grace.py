@@ -183,3 +183,125 @@ async def test_transport_owned_restart_gap_uses_the_same_grace(api_session, monk
     await drain_notices(engine)
     owner.assert_not_awaited()
     notice.assert_awaited_once()
+
+
+@pytest.fixture
+def offline_agents(rig, tmp_path):
+    rows = {"worker": rig.pasted()}
+    rig.registry.register("peer", working_dir=str(tmp_path / "peer"))
+    schedule = rig.registry.add_schedule(
+        "peer", "0 * * * *", name="peer check", prompt="check more work",
+    )
+    row, created = rig.registry.persist_schedule_wake(
+        schedule.id, agent_name="peer", schedule_name=schedule.name,
+        prompt=schedule.prompt, fired_at=FIRED,
+    )
+    assert created
+    assert rig.registry.mark_schedule_wake_pasted(
+        row.schedule_id, row.fired_at, pasted_at=NOW, session_id="old-session",
+        pasted_prompt=row.prompt,
+    )
+    rows["peer"] = row
+    engine, wake = rig.engine(live="")
+    live = {"worker": "", "peer": ""}
+    engine._delivery_session_fn = live.__getitem__
+    return SimpleNamespace(rig=rig, rows=rows, engine=engine, live=live, wake=wake)
+
+
+def agent_row(case, name):
+    row = case.rows[name]
+    return case.rig.registry.get_schedule_wake_by_fire(row.schedule_id, row.fired_at)
+
+
+async def test_live_agent_does_not_clear_another_agents_offline_grace(offline_agents):
+    case = offline_agents
+    case.engine._settle_lost_pastes("worker")
+    case.rig.clock.monotonic += 200
+    case.live["peer"] = "old-session"
+    case.engine._settle_lost_pastes("peer")
+    await drain_notices(case.engine)
+    assert not agent_row(case, "worker").abandoned_at
+    assert not agent_row(case, "peer").abandoned_at
+    assert case.rig.owners == case.rig.notices == []
+
+    case.rig.clock.monotonic += 100
+    case.engine._settle_lost_pastes("worker")
+    case.engine._settle_lost_pastes("worker")
+    await drain_notices(case.engine)
+    assert agent_row(case, "worker").abandoned_at
+    assert not agent_row(case, "worker").accepted_at
+    assert not agent_row(case, "peer").abandoned_at
+    assert case.rig.owners == [(
+        "worker", "worker went offline before it confirmed the scheduled prompt 'periodic' "
+        "(fired 2023-11-14 22:13 UTC); it may not have run.",
+    )]
+    assert case.rig.notices == []
+    case.wake.assert_not_awaited()
+
+
+async def test_offline_grace_starts_at_each_agents_first_observation(offline_agents):
+    case = offline_agents
+    case.engine._settle_lost_pastes("worker")
+    case.rig.clock.monotonic += 200
+    case.engine._settle_lost_pastes("peer")
+    await drain_notices(case.engine)
+    assert not agent_row(case, "worker").abandoned_at
+    assert not agent_row(case, "peer").abandoned_at
+    assert case.rig.owners == case.rig.notices == []
+
+    case.rig.clock.monotonic += 100
+    for name in ("worker", "peer"):
+        case.engine._settle_lost_pastes(name)
+    await drain_notices(case.engine)
+    assert agent_row(case, "worker").abandoned_at
+    assert not agent_row(case, "peer").abandoned_at
+    assert [name for name, _ in case.rig.owners] == ["worker"]
+    assert case.rig.notices == []
+
+    case.rig.clock.monotonic += 200
+    case.engine._settle_lost_pastes("peer")
+    case.engine._settle_lost_pastes("peer")
+    await drain_notices(case.engine)
+    assert agent_row(case, "peer").abandoned_at
+    assert not agent_row(case, "peer").accepted_at
+    assert case.rig.owners == [
+        ("worker", "worker went offline before it confirmed the scheduled prompt 'periodic' "
+         "(fired 2023-11-14 22:13 UTC); it may not have run."),
+        ("peer", "peer went offline before it confirmed the scheduled prompt 'peer check' "
+         "(fired 2023-11-14 22:13 UTC); it may not have run."),
+    ]
+    assert case.rig.notices == []
+    case.wake.assert_not_awaited()
+
+
+@pytest.mark.parametrize("main_kind", [StreamingSession, TmuxSession])
+async def test_sibling_context_cannot_cover_the_main_sessions_lost_paste(api_session, main_kind):
+    app, original, _, _ = api_session
+
+    def session_with_receipt(kind, rendered_at):
+        session = kind(original._config)
+        session._state_machine._state = SessionState.CONNECTED
+        session._wake_context_delivery = WakeContextDelivery()
+        snapshot = session._wake_context_delivery.snapshot()
+        snapshot.rendered_at = rendered_at
+        snapshot.delivered()
+        return session
+
+    main = session_with_receipt(main_kind, NOW - 1)
+    sibling = session_with_receipt(TmuxSession, NOW + 1)
+    # Insertion order must not let another label supply main's context.
+    app.state.broker._streaming["worker"] = {"background": sibling, "main": main}
+    row = api_paste(app, pasted_at=NOW)
+    engine = app.state.scheduler
+    owner, notice = AsyncMock(return_value=True), AsyncMock(return_value=True)
+    engine._owner_notify_callback, engine._agent_notify_callback = owner, notice
+    engine._settle_lost_pastes("worker")
+    engine._settle_lost_pastes("worker")
+    await drain_notices(engine)
+    saved = app.state.agents.get_schedule_wake_by_fire(row.schedule_id, FIRED)
+    assert saved.abandoned_at and not saved.accepted_at
+    owner.assert_not_awaited()
+    notice.assert_awaited_once()
+    assert notice.await_args.args[0] == "worker"
+    assert notice.await_args.args[1].startswith("Scheduled prompt 'periodic'")
+    assert "was pasted into your previous session and may not have run" in notice.await_args.args[1]
