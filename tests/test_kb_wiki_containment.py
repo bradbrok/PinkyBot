@@ -28,7 +28,7 @@ def test_wiki_save_refuses_invalid_slugs_before_writing(tmp_path, slug):
     assert outside_inventory(tmp_path, kb.kb_dir) == before
     assert kb.list_wiki() == []
     assert not list((kb.kb_dir / "wiki").rglob("*.md"))
-    page = kb.save_wiki("topics/reference", "A reference", "Valid content")
+    page = kb.save_wiki("topics/claude-code", "A reference", "Valid content")
     assert (kb.kb_dir / page.file_path).is_file()
 
 
@@ -82,7 +82,8 @@ def stored_outside_page(tmp_path, stored_path):
     if stored_path == "absolute":
         path = str(outside)
     elif stored_path == "sibling":
-        path = "raw/outside.md"
+        path = "wiki-adjacent/outside.md"
+        (kb.kb_dir / path).parent.mkdir()
         (kb.kb_dir / path).write_text(outside.read_text())
     elif stored_path == "symlink":
         path = "wiki/alias.md"

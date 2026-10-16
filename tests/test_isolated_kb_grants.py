@@ -205,7 +205,13 @@ async def test_uncertain_isolation_flags_do_not_activate_stored_grants(daemon, m
             await assert_refused(client, "kb_save_wiki", {"slug": "x", **PAGE}, service)
 
 
-@pytest.mark.parametrize("row", [None, SimpleNamespace(isolated=True), SimpleNamespace(isolated_grants="kb_writer")])
+@pytest.mark.parametrize("row", [
+    None,
+    SimpleNamespace(isolated=True),
+    SimpleNamespace(isolated_grants="kb_writer"),
+    SimpleNamespace(isolated_grants={"kb_writer": True}),
+    SimpleNamespace(isolated_grants=("kb_writer",)),
+])
 def test_missing_or_nonlist_grant_attributes_are_closed(row):
     registry = SimpleNamespace(get=lambda name: row, _rmw_lock=nullcontext())
     assert grant_reader(registry) == frozenset()
@@ -293,6 +299,16 @@ async def test_internal_callers_cannot_set_grants_in_any_mode(daemon, mode, acto
         assert response.json() == {"detail": "authenticated owner session required"}
     assert d.agents.get(target).to_dict() == before
     assert getattr(d.agents.get(target), "isolated_grants", []) == []
+    if actor == target and mode in {"off", "shadow"}:
+        stored_grants(d, ["kb_writer"], target)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=d.app), base_url="http://test") as c:
+            response = await c.put(path, headers=signed(d, "PUT", path, actor), json={"isolated_grants": []})
+        assert response.status_code == 403, response.text
+        assert response.json() == {"detail": "authenticated owner session required"}
+        raw = d.agents._db.execute(
+            "SELECT isolated_grants FROM agents WHERE name=?", (target,),
+        ).fetchone()[0]
+        assert json.loads(raw) == ["kb_writer"]
 
 
 def test_grants_have_a_dedicated_canonical_setter_and_are_not_generic_updates(daemon):
@@ -327,4 +343,3 @@ def test_migration_adds_default_empty_grants_to_existing_agents(daemon):
     assert "isolated_grants" in columns
     assert columns["isolated_grants"][2:5] == ("TEXT", 1, "'[]'")
     assert d.agents.get("tenant").isolated_grants == []
-
