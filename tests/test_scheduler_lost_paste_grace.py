@@ -165,6 +165,8 @@ async def test_transport_owned_restart_gap_uses_the_same_grace(api_session, monk
     monkeypatch.setattr(scheduler, "time", SimpleNamespace(
         **{**vars(scheduler.time), "monotonic": lambda: clock.now},
     ))
+    # A settle queued by the fixture's wake can run before the fake clock is installed.
+    app.state.scheduler._lost_paste_offline_since.pop("worker", None)
     row = api_paste(app, pasted_at=NOW + 1)
     engine = app.state.scheduler
     owner, notice = AsyncMock(return_value=True), AsyncMock(return_value=True)
@@ -172,6 +174,7 @@ async def test_transport_owned_restart_gap_uses_the_same_grace(api_session, monk
     # The transport's replacement stand-in never enters an API endpoint.
     ss._state_machine._state = SessionState.DEAD
     engine._settle_lost_pastes("worker")
+    assert engine._lost_paste_offline_since["worker"] == 10_000.0
     clock.now += 299
     engine._settle_lost_pastes("worker")
     await drain_notices(engine)
