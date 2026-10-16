@@ -28,6 +28,7 @@ import json
 import re
 import sqlite3
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -761,6 +762,30 @@ class KBStore:
 
     # ── Wiki Management ─────────────────────────────────────
 
+    def _resolve_wiki_file(self, path: Path) -> Path | None:
+        try:
+            resolved = path.resolve()
+            if resolved.is_relative_to((self.kb_dir / "wiki").resolve()):
+                return resolved
+        except (OSError, RuntimeError, ValueError):
+            pass
+        return None
+
+    def wiki_path(self, slug: str) -> Path:
+        """Validate a nested slug and return its contained wiki file path."""
+        if (
+            not slug
+            or slug.startswith("/")
+            or any(part in {".", ".."} for part in slug.split("/"))
+            or "\\" in slug
+            or any(unicodedata.category(char) == "Cc" for char in slug)
+        ):
+            raise ValueError("invalid wiki slug")
+        path = self._resolve_wiki_file(self.kb_dir / f"wiki/{slug}.md")
+        if path is None:
+            raise ValueError("invalid wiki slug")
+        return path
+
     def save_wiki(
         self,
         slug: str,
@@ -788,7 +813,7 @@ class KBStore:
         related = related or []
         now = datetime.now(timezone.utc).isoformat()
         file_path = f"wiki/{slug}.md"
-        full_path = self.kb_dir / file_path
+        full_path = self.wiki_path(slug)
 
         # Ensure parent directory exists
         full_path.parent.mkdir(parents=True, exist_ok=True)
@@ -858,7 +883,9 @@ class KBStore:
 
         # Remove file
         full_path = self.kb_dir / page.file_path
-        if full_path.exists():
+        if self._resolve_wiki_file(full_path) is None:
+            _log("[KB] Skipping file outside wiki directory during delete")
+        elif full_path.exists():
             full_path.unlink()
 
         # Remove DB + FTS
@@ -889,8 +916,8 @@ class KBStore:
         page = self.get_wiki(slug)
         if not page:
             return None
-        full_path = self.kb_dir / page.file_path
-        if not full_path.exists():
+        full_path = self._resolve_wiki_file(self.kb_dir / page.file_path)
+        if full_path is None or not full_path.exists():
             return None
         return full_path.read_text(encoding="utf-8")
 

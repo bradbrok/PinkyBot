@@ -136,6 +136,8 @@ async def test_shadow_logs_only_ungranted_wiki_requests(daemon, monkeypatch):
 @pytest.mark.parametrize("gate_error", [False, True])
 async def test_wiki_grant_requires_the_registering_gate(daemon, monkeypatch, gate_error):
     d = daemon()
+    assert d.skills.assign_to_agent("tenant", "pinky-memory", enabled=False)
+    assert "kb" not in isolated_policy.agent_tool_gates("tenant", d.skills, d.agents)
     stored_grants(d, ["kb_writer"])
     assert grant_reader(d.agents) == frozenset({"kb_writer"})
     if gate_error:
@@ -156,6 +158,8 @@ async def test_invalid_stored_grants_fail_closed_in_both_layers(daemon, monkeypa
     memory_gate(d)
     stored_grants(d, value, raw=True)
     assert grant_reader(d.agents) == frozenset()
+    assert d.agents.get_isolated_grants("tenant") == []
+    assert d.agents.get("tenant").isolated_grants == []
     assert (await put_page(d)).status_code == 403
     async with shared_service(d, monkeypatch) as service:
         async with protocol(service, "http", auth_headers(d)) as client:
@@ -177,6 +181,23 @@ async def test_grant_read_errors_fail_closed_in_both_layers(daemon, monkeypatch)
 
     monkeypatch.setattr(d.agents, "get", fail)
     assert grant_reader(d.agents) == frozenset()
+    assert (await put_page(d)).status_code == 403
+    async with shared_service(d, monkeypatch) as service:
+        async with protocol(service, "http", auth_headers(d)) as client:
+            assert "kb_save_wiki" not in await names(client)
+            await assert_refused(client, "kb_save_wiki", {"slug": "x", **PAGE}, service)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", [None, 1, "true"])
+async def test_uncertain_isolation_flags_do_not_activate_stored_grants(daemon, monkeypatch, flag):
+    d = daemon()
+    memory_gate(d)
+    stored_grants(d, ["kb_writer"])
+    original = d.agents.get
+    row = SimpleNamespace(**{**vars(original("tenant")), "isolated": flag})
+    monkeypatch.setattr(d.agents, "get", lambda name: row if name == "tenant" else original(name))
+    assert grant_reader(d.agents) == frozenset({"kb_writer"})
     assert (await put_page(d)).status_code == 403
     async with shared_service(d, monkeypatch) as service:
         async with protocol(service, "http", auth_headers(d)) as client:
@@ -243,7 +264,7 @@ async def test_grants_are_reread_on_an_established_mcp_connection(daemon, monkey
 @pytest.mark.asyncio
 async def test_owner_sets_and_clears_grants_and_unknown_names_change_nothing(daemon):
     d = daemon()
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=d.app), base_url="http://test", headers=owner_headers()) as c:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=d.app, raise_app_exceptions=False), base_url="http://test", headers=owner_headers()) as c:
         response = await c.put("/agents/tenant", json={"isolated_grants": ["kb_writer", "kb_writer"]})
         assert response.status_code == 200, response.text
         assert response.json().get("isolated_grants") == ["kb_writer"]
@@ -268,7 +289,7 @@ async def test_internal_callers_cannot_set_grants_in_any_mode(daemon, mode, acto
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=d.app), base_url="http://test") as c:
         response = await c.put(path, headers=signed(d, "PUT", path, actor), json={"display_name": "Uncommitted", "isolated_grants": ["kb_writer"]})
     assert response.status_code == 403, response.text
-    if actor == "normal" or mode in {"off", "shadow"}:
+    if actor == "normal" or (actor == target and mode in {"off", "shadow"}):
         assert response.json() == {"detail": "authenticated owner session required"}
     assert d.agents.get(target).to_dict() == before
     assert getattr(d.agents.get(target), "isolated_grants", []) == []

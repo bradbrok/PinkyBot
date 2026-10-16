@@ -6,12 +6,13 @@ import httpx
 import pytest
 
 from pinky_daemon.kb_store import KBStore
+from pinky_daemon.routes import kb as kb_routes
 from pinky_daemon.wiki_builder import save_wiki_pages
 from tests.isolated_policy_support import daemon as daemon
 from tests.isolated_policy_support import signed
 
 pytestmark = pytest.mark.real_auth
-REFUSED_SLUGS = ["../x", "a/../../x", ".", "a/./b", "/abs", "a\\b", "a\x00b", "a\x1fb", ""]
+REFUSED_SLUGS = ["../x", "a/../../x", "a/../b", ".", "a/./b", "/abs", "a\\b", "a\x00b", "a\x1fb", ""]
 
 
 def outside_inventory(root, kb_dir):
@@ -47,12 +48,12 @@ def test_wiki_save_refuses_a_symlink_escape(tmp_path):
 async def test_wiki_route_returns_a_fixed_bad_slug_error(daemon, slug):
     d = daemon()
     path = f"/kb/wiki/{slug}"
-    before = outside_inventory(d.root, d.root / "kb")
+    before = outside_inventory(d.root, kb_routes._kb.kb_dir)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=d.app), base_url="http://test") as c:
         response = await c.put(path, headers=signed(d, "PUT", path, "normal"), json={"title": "Unsafe page", "content": "A body"})
     assert response.status_code == 400, response.text
     assert response.json() == {"detail": "invalid wiki slug"}
-    assert outside_inventory(d.root, d.root / "kb") == before
+    assert outside_inventory(d.root, kb_routes._kb.kb_dir) == before
 
 
 @pytest.mark.parametrize("slug", ["../escaped", "a/./page", "alias/page"])
@@ -87,7 +88,7 @@ def stored_outside_page(tmp_path, stored_path):
         path = "wiki/alias.md"
         (kb.kb_dir / path).symlink_to(outside)
     else:
-        path = "../outside.md"
+        path = "../../outside.md"
     kb.save_wiki("reference", "A reference", "Valid content")
     with kb._conn() as conn:
         conn.execute("UPDATE wiki_pages SET file_path=? WHERE slug='reference'", (path,))

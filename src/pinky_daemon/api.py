@@ -190,8 +190,12 @@ from pinky_daemon.isolated_policy import (
     GATE_TOOL_NAMES as GATE_TOOL_NAMES,
 )
 from pinky_daemon.isolated_policy import (
+    ISOLATED_GRANTS,
     ISOLATED_MUTATION_ALLOW,
+    granted_mutation_allow,
+    granted_tool_routes,
     isolation_flag,
+    isolation_grants,
     resolve_mutation_route,
 )
 from pinky_daemon.isolated_policy import (
@@ -5875,6 +5879,21 @@ def create_api(
         template, params = resolve_mutation_route(app, request.scope)
         reason = "registry unavailable" if flag is None else "unlisted"
         permitted = flag is True and (request.method, template) in ISOLATED_MUTATION_ALLOW
+        grant_name = ""
+        if flag is True and not permitted:
+            grants = isolation_grants(agents, caller_name)
+            route = (request.method, template)
+            if route in granted_mutation_allow(grants):
+                gates = _get_agent_tool_gates(caller_name, skills, agents)
+                for grant in sorted(grants):
+                    if any(
+                        route in routes and tool in GATE_TOOL_NAMES.get(gate, ())
+                        for (_, tool), routes in granted_tool_routes([grant]).items()
+                        for gate in gates
+                    ):
+                        permitted = True
+                        grant_name = grant
+                        break
         target = params.get("agent_name", params.get("name"))
         if permitted and target is not None and target != caller_name:
             permitted = False
@@ -5892,9 +5911,14 @@ def create_api(
                 except Exception:
                     pass
             reason = "cross-agent"
-        if permitted:
-            return False
         safe_caller = re.sub(r"[^a-zA-Z0-9_-]", "_", caller_name)[:120]
+        if permitted:
+            if grant_name:
+                _log(
+                    f"isolation: GRANT {request.method} {template} for {safe_caller} "
+                    f"grant={grant_name} mode={mode}"
+                )
+            return False
         action = "WOULD DENY" if mode == "shadow" else "DENY"
         _log(
             f"isolation: {action} {request.method} {template or '<unknown>'} "
@@ -9319,6 +9343,12 @@ npm run build</pre>
         if policy_enabled is not None:
             _owner_control_actor(request)
 
+        isolated_grants = kwargs.pop("isolated_grants", None)
+        if isolated_grants is not None:
+            _owner_control_actor(request)
+            if any(grant not in ISOLATED_GRANTS for grant in isolated_grants):
+                raise HTTPException(400, "unknown isolation grant")
+
         force_soul = bool(kwargs.pop("force_soul", False))
         # #638: flipping an agent to a non-local isolation_mode implies
         # isolated=True (same coupling RegisterAgentRequest enforces) — without
@@ -9365,6 +9395,10 @@ npm run build</pre>
 
         if policy_enabled is not None:
             agent = agents.update(name, tool_policy_enabled=policy_enabled)
+
+        if isolated_grants is not None:
+            agents.set_isolated_grants(name, isolated_grants)
+            agent = agents.get(name)
 
         isolation_touched = "isolation_mode" in kwargs or "container_image" in kwargs
         if isolation_touched:

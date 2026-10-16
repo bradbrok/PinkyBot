@@ -46,6 +46,7 @@ from pinky_daemon.agent_signing_key_store import (
 )
 from pinky_daemon.cron_utils import _field_matches
 from pinky_daemon.effort import is_ultracode
+from pinky_daemon.isolated_policy import ISOLATED_GRANTS
 from pinky_daemon.model_roster import load_bundled
 from pinky_daemon.model_roster import parse as parse_model_roster
 from pinky_daemon.model_roster_state import (
@@ -601,6 +602,7 @@ class Agent:
     # ITSELF only. Daemon denies it cross-agent actions + admin/register_agent.
     # Default False = full-trust inner-fleet agent (no behavior change).
     isolated: bool = False
+    isolated_grants: list[str] = field(default_factory=list)
     # #149 phase-3 OS isolation: HOW an isolated tenant is run at the OS level.
     #   "local"     = in-process, shares the daemon's OS user (default; current
     #                 behavior, no isolation beyond the daemon-authz `isolated` flag).
@@ -720,6 +722,7 @@ class Agent:
             "codex_home": self.codex_home,
             "thinking_effort": self.thinking_effort,
             "tool_policy_enabled": self.tool_policy_enabled,
+            "isolated_grants": self.isolated_grants,
             "strict_effort_enforcement": self.strict_effort_enforcement,
             "dedicated_config_dir": self.dedicated_config_dir,
             "watchdog_config": self.watchdog_config,
@@ -2092,6 +2095,7 @@ class AgentRegistry:
         }
         migrations = [
             ("tool_policy_enabled", "INTEGER NOT NULL DEFAULT 0"),
+            ("isolated_grants", "TEXT NOT NULL DEFAULT '[]'"),
             ("auto_start", "INTEGER NOT NULL DEFAULT 0"),
             # HTTP create-only registration commits its ownership claim before
             # fallible provisioning/MCP publication. Pre-upgrade rows are all
@@ -3555,6 +3559,7 @@ except Exception as exc:
     def register(self, name: str, *, create_only: bool = False, **kwargs) -> Agent:
         """Register atomically, including cross-agent workspace ownership."""
         kwargs.pop("tool_policy_enabled", None)
+        kwargs.pop("isolated_grants", None)
         name = _validate_agent_name(name)
         if "restart_tokens_cap" in kwargs:
             validate_restart_tokens_cap(kwargs["restart_tokens_cap"])
@@ -3756,7 +3761,7 @@ except Exception as exc:
         "disallowed_tools, thinking_effort, watchdog_config, last_seen_at, "
         "strict_effort_enforcement, context_nudge_threshold_pct, isolated, "
         "isolation_mode, container_image, dedicated_config_dir, codex_home, restart_tokens_cap, "
-        "tool_policy_enabled"
+        "tool_policy_enabled, isolated_grants"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -9100,7 +9105,39 @@ except Exception as exc:
             codex_home=row[55] if len(row) > 55 and row[55] else "",
             restart_tokens_cap=row[56] if len(row) > 56 else 0,
             tool_policy_enabled=bool(row[57]) if len(row) > 57 else False,
+            isolated_grants=self._decode_isolated_grants(row[58]) if len(row) > 58 else [],
         )
+
+    @staticmethod
+    def _decode_isolated_grants(value) -> list[str]:
+        try:
+            grants = json.loads(value)
+        except (ValueError, TypeError, RecursionError):
+            return []
+        if not isinstance(grants, list):
+            return []
+        return sorted({g for g in grants if isinstance(g, str) and g in ISOLATED_GRANTS})
+
+    def get_isolated_grants(self, name: str) -> list[str]:
+        """Return recognized grants; missing or malformed storage grants nothing."""
+        with self._rmw_lock:
+            row = self._db.execute(
+                "SELECT isolated_grants FROM agents WHERE name=?", (name,),
+            ).fetchone()
+            return self._decode_isolated_grants(row[0]) if row else []
+
+    def set_isolated_grants(self, name: str, grants: list[str]) -> None:
+        """Replace grants with a canonical list after the caller authorizes the change."""
+        if not isinstance(grants, list) or any(
+            not isinstance(g, str) or g not in ISOLATED_GRANTS for g in grants
+        ):
+            raise ValueError("unknown isolation grant")
+        with self._rmw_lock:
+            self._db.execute(
+                "UPDATE agents SET isolated_grants=? WHERE name=?",
+                (json.dumps(sorted(set(grants))), name),
+            )
+            self._db.commit()
 
     # ── Cost Tracking ──────────────────────────────────────
 
