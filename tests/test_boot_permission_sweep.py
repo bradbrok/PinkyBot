@@ -195,6 +195,34 @@ def test_parent_success_logs_elapsed_changed_and_foreign_count(tmp_path, monkeyp
     assert re.search(r"seconds=\d", text)
 
 
+@pytest.mark.parametrize(
+    "extra",
+    ["", json.dumps(_summary()) + "\n", "unexpected output\n"],
+    ids=["two-lines", "extra-summary", "extra-text"],
+)
+def test_parent_rejects_output_beyond_the_progress_and_summary(
+    tmp_path, monkeypatch, caplog, extra
+):
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
+        a[0], 0, stdout=_output() + extra, stderr=""
+    ))
+    with caplog.at_level(logging.INFO, logger="pinky.db_security"):
+        result = db_security.sweep_db_permissions_in_child(tmp_path)
+    assert result is (extra == "")
+    rows = [row for row in caplog.records if row.name == "pinky.db_security"]
+    assert len(rows) == 1
+    assert rows[0].levelno == (logging.WARNING if extra else logging.INFO)
+    if extra:
+        assert "status=failed" in rows[0].getMessage()
+        assert "priority_done=yes" in rows[0].getMessage()
+
+
+def test_background_permission_sweep_has_a_fifteen_minute_cap(tmp_path):
+    assert db_security.SWEEP_TIMEOUT_SECONDS == 900
+    sweep = db_security.PermissionSweep(tmp_path, [], AsyncMock(), lambda text: None)
+    assert sweep.timeout == 900
+
+
 class _Pipe:
     def __init__(self, child, output=b""):
         self.child, self.output = child, output
@@ -306,9 +334,33 @@ async def test_shutdown_ends_the_owned_sweep_child(app, monkeypatch, resistant):
             await asyncio.sleep(0)
         assert calls and not task.done()
     assert task.done()
+    assert task.cancelled()
     assert child.terminated == 1
     assert child.killed == int(resistant)
     assert child.release.is_set()
+
+
+async def test_close_prevents_alert_from_a_finishing_run(tmp_path, monkeypatch):
+    child = _Child(_output(), hold=True)
+    calls = _child_factory(monkeypatch, child)
+    notify = AsyncMock(return_value=True)
+    sweep = db_security.PermissionSweep(tmp_path, [], notify, lambda text: None)
+    run_task = asyncio.create_task(sweep.run())
+    try:
+        for _ in range(10):
+            if calls:
+                break
+            await asyncio.sleep(0)
+        assert calls and not run_task.done()
+        await sweep.close()
+        report = await asyncio.wait_for(run_task, 5)
+        assert not run_task.cancelled()
+        assert report["status"] == "failed"
+        assert sweep.alert_task is None
+        notify.assert_not_awaited()
+        assert child.terminated == 1
+    finally:
+        await sweep.close()
 
 
 @pytest.mark.parametrize("kind", ["clean", "workspace", "foreign", "remaining", "critical"])
@@ -445,6 +497,34 @@ async def test_group_or_other_only_registered_permissions_alert_once(tmp_path, m
         )
         await sweep.notify_owner(report)
         assert notify.await_count == 1
+    finally:
+        await sweep.close()
+
+
+async def test_registered_paths_outside_data_root_keep_their_permissions(tmp_path):
+    root = tmp_path / "data"
+    registered = _file(root, "registered.data", mode=0o640)
+    outside = _file(tmp_path, "outside/tenant/store.db", mode=0o644)
+    sidecar = _file(tmp_path, "outside/tenant/store.db-wal", mode=0o644)
+    notify = AsyncMock(return_value=True)
+    sweep = db_security.PermissionSweep(
+        root, [registered.resolve(), outside.resolve()], notify, lambda text: None,
+    )
+    try:
+        report = await asyncio.wait_for(sweep.run(), 10)
+        await asyncio.wait_for(sweep.alert_task, 5)
+        assert report["ok"] is True
+        assert report["status"] == "ok"
+        assert report["priority_done"] is True
+        assert report["critical_loose"] == ["registered.data"]
+        assert report["remaining_loose"] == []
+        assert registered.stat().st_mode & 0o777 == 0o600
+        assert outside.stat().st_mode & 0o777 == 0o644
+        assert sidecar.stat().st_mode & 0o777 == 0o644
+        notify.assert_awaited_once_with(
+            "admin", "Database permission sweep found files with permissions open to other users."
+            ' Paths: "registered.data"',
+        )
     finally:
         await sweep.close()
 
