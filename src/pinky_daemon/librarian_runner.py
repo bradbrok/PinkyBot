@@ -36,11 +36,11 @@ LIBRARIAN_DEBOUNCE_S = 30 * 60  # 30 minutes
 # Max characters of source content to inject into the prompt
 _MAX_SOURCE_CHARS = 150_000
 
-# Tools the librarian SDK session can use (MCP tools from pinky-self + file read)
+# Tools the librarian SDK session can use (knowledge-base MCP tools only)
 # ToolSearch is required because MCP_CONNECTION_NONBLOCKING=true makes MCP tools
 # deferred — the LLM must call ToolSearch to load their schemas before using them.
 _LIBRARIAN_ALLOWED_TOOLS = (
-    "Read", "Glob", "Grep", "ToolSearch",
+    "ToolSearch",
     "mcp__pinky-self__kb_search",
     "mcp__pinky-self__kb_get_wiki",
     "mcp__pinky-self__kb_stats",
@@ -227,7 +227,7 @@ class LibrarianRunner:
         return SDKRunnerConfig(
             working_dir=work_dir,
             model="sonnet",  # Cost-efficient for curation
-            tools=["Read", "Glob", "Grep", "ToolSearch"],
+            tools=["ToolSearch"],
             allowed_tools=list(_LIBRARIAN_ALLOWED_TOOLS),
             permission_mode="dontAsk",
             system_prompt=system_prompt,

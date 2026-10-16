@@ -176,15 +176,16 @@ async def kb_get_wiki(slug: str, include_content: bool = True):
 async def kb_save_wiki(slug: str, req: WikiSaveRequest):
     """Create or update a wiki page."""
     try:
-        page = _kb.save_wiki(
-            slug=slug,
-            title=req.title,
-            content=req.content,
-            sources=req.sources,
-            related=req.related,
-        )
+        _kb.wiki_path(slug)
     except ValueError:
         raise HTTPException(400, "invalid wiki slug") from None
+    page = _kb.save_wiki(
+        slug=slug,
+        title=req.title,
+        content=req.content,
+        sources=req.sources,
+        related=req.related,
+    )
     return {"status": "saved", **page.to_dict()}
 
 

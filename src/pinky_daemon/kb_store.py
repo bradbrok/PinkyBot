@@ -766,6 +766,10 @@ class KBStore:
         try:
             resolved = path.resolve()
             if resolved.is_relative_to((self.kb_dir / "wiki").resolve()):
+                try:
+                    resolved.stat()
+                except FileNotFoundError:
+                    pass
                 return resolved
         except (OSError, RuntimeError, ValueError):
             pass
@@ -776,7 +780,7 @@ class KBStore:
         if (
             not slug
             or slug.startswith("/")
-            or any(part in {".", ".."} for part in slug.split("/"))
+            or any(part in {"", ".", ".."} for part in slug.split("/"))
             or "\\" in slug
             or any(unicodedata.category(char) == "Cc" for char in slug)
         ):
@@ -964,7 +968,10 @@ class KBStore:
 
             # Reindex wiki pages
             for row in conn.execute("SELECT slug, title, file_path FROM wiki_pages").fetchall():
-                full_path = self.kb_dir / row["file_path"]
+                full_path = self._resolve_wiki_file(self.kb_dir / row["file_path"])
+                if full_path is None:
+                    _log("[KB] Skipping file outside wiki directory during reindex")
+                    continue
                 if full_path.exists():
                     content = full_path.read_text(encoding="utf-8")
                     match = split_frontmatter(content)

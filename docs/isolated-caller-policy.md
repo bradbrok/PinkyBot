@@ -26,8 +26,10 @@ visibility read the stored grant on each request. Other KB writes retain their
 existing restrictions. Granted requests log `isolation: GRANT` in enabled modes.
 
 Wiki saves reject invalid or escaping slugs for every caller. Generated pages
-use the same validation; reads and deletes also check stored file paths against
+use the same validation; reads, reindex and deletes also check stored file paths against
 the wiki directory. A refused stored path is never read or unlinked.
+Pages saved through the grant are shared knowledge-base content that other
+sessions read, including the librarian, whose session holds only knowledge-base tools.
 
 Verified isolated media callers may send photos, documents and videos only from
 inside their own working directory. Both the file and directory are resolved;

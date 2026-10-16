@@ -146,6 +146,55 @@ def test_wiki_symlink_loop_has_a_fixed_slug_error(tmp_path):
     assert kb.list_wiki() == []
 
 
+def test_wiki_target_may_be_a_new_nested_file(tmp_path):
+    kb = KBStore(tmp_path)
+    target = kb.wiki_dir / "topics" / "new-page.md"
+    assert kb._resolve_wiki_file(target) == target.resolve()
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("obstacle", ["loop", "file"])
+def test_unusable_stored_wiki_paths_are_skipped(tmp_path, capsys, obstacle):
+    kb = KBStore(tmp_path)
+    kb.save_wiki("reference", "Reference", "body")
+    blocked = kb.wiki_dir / "blocked"
+    if obstacle == "loop":
+        blocked.symlink_to("blocked")
+        file_path = "wiki/blocked"
+    else:
+        blocked.write_text("keep this file")
+        file_path = "wiki/blocked/child.md"
+    with kb._conn() as conn:
+        conn.execute("UPDATE wiki_pages SET file_path=? WHERE slug='reference'", (file_path,))
+
+    try:
+        content = kb.get_wiki_content("reference")
+    except OSError as exc:
+        content = type(exc).__name__
+    assert content is None
+
+    capsys.readouterr()
+    try:
+        result = kb.reindex()
+    except OSError as exc:
+        result = type(exc).__name__
+    assert result == {"raw": 0, "wiki": 0}
+    assert [line for line in capsys.readouterr().err.splitlines() if "outside wiki" in line] == [
+        "[KB] Skipping file outside wiki directory during reindex"
+    ]
+    assert kb.get_wiki("reference") is not None
+
+    assert kb.delete_wiki("reference") is True
+    assert kb.get_wiki("reference") is None
+    assert [line for line in capsys.readouterr().err.splitlines() if "outside wiki" in line] == [
+        "[KB] Skipping file outside wiki directory during delete"
+    ]
+    if obstacle == "loop":
+        assert blocked.is_symlink()
+    else:
+        assert blocked.read_text() == "keep this file"
+
+
 def test_deeply_nested_stored_grants_fail_closed():
     raw = "[" * 3000 + '"kb_writer"' + "]" * 3000
     try:
