@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
-import time
 
 import pytest
 
 from pinky_daemon import __main__ as entry
-from pinky_daemon import api
-from pinky_daemon import store_authority
+from pinky_daemon import api, store_authority
 
 
 class _Clock:
@@ -77,12 +76,12 @@ def test_entry_point_hands_process_stamp_to_api(tmp_path, monkeypatch):
     app = api.create_api(db_path=str(tmp_path / "data/conversations.db"))
     observed = []
 
-    class StopBeforeListener(Exception):
+    class StopBeforeListenerError(Exception):
         pass
 
     def server(config):
         observed.append(getattr(app.state, "startup_started_at", None))
-        raise StopBeforeListener
+        raise StopBeforeListenerError
 
     monkeypatch.setattr(api, "create_api", lambda **kwargs: app)
     monkeypatch.setattr(uvicorn, "Config", lambda *args, **kwargs: None)
@@ -91,7 +90,7 @@ def test_entry_point_hands_process_stamp_to_api(tmp_path, monkeypatch):
                            db_path=str(tmp_path / "data/conversations.db"),
                            host="127.0.0.1", port=0, _startup_started_at=7.0)
     try:
-        with pytest.raises(StopBeforeListener):
+        with pytest.raises(StopBeforeListenerError):
             entry._run_api_with_authority(args)
         assert observed == [7.0]
     finally:
@@ -99,7 +98,7 @@ def test_entry_point_hands_process_stamp_to_api(tmp_path, monkeypatch):
 
 
 async def test_total_boot_time_is_logged_before_background_sweep(tmp_path, monkeypatch):
-    from tests.test_boot_permission_sweep import _Child, _background_task, _output
+    from tests.test_boot_permission_sweep import _background_task, _Child, _output
 
     monkeypatch.setattr(api, "SHARED_MCP_ENABLED", False)
     monkeypatch.setenv("PINKY_LOG_ROTATION", "off")

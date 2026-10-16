@@ -5,11 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
-from pathlib import Path
 import re
 import subprocess
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -196,6 +195,18 @@ def test_parent_success_logs_elapsed_changed_and_foreign_count(tmp_path, monkeyp
     assert re.search(r"seconds=\d", text)
 
 
+class _Pipe:
+    def __init__(self, child, output=b""):
+        self.child, self.output = child, output
+
+    async def read(self, size):
+        if self.output:
+            output, self.output = self.output, b""
+            return output
+        await self.child.release.wait()
+        return b""
+
+
 class _Child:
     def __init__(self, output, *, hold=False, resistant=False, returncode=0):
         self.output = output.encode()
@@ -206,6 +217,7 @@ class _Child:
         self.final_returncode = returncode
         self.resistant = resistant
         self.terminated = self.killed = 0
+        self.stdout, self.stderr = _Pipe(self, self.output), _Pipe(self)
 
     async def communicate(self):
         await self.release.wait()
@@ -214,6 +226,8 @@ class _Child:
 
     async def wait(self):
         await self.release.wait()
+        if self.returncode is None:
+            self.returncode = self.final_returncode
         return self.returncode
 
     def terminate(self):
@@ -320,7 +334,7 @@ async def test_owner_alert_conditions_and_relative_path_limit(app, monkeypatch, 
             notify.assert_awaited_once()
             agent, text = notify.await_args.args
             assert agent == "admin"
-            assert not str(Path(app.state.agents._db_path).parent) in text
+            assert str(Path(app.state.agents._db_path).parent) not in text
             if kind == "critical":
                 assert "identity/keys.data" in text
             else:
@@ -384,3 +398,30 @@ async def test_owner_delivery_retries_once_inside_one_boot_reservation(
         assert len(calls) == 2
         message = "admin: db permission sweep owner alert was not delivered"
         assert logs.count(message) == (0 if second_success else 1)
+
+
+async def test_owner_reservation_is_taken_before_delivery_waits(app, monkeypatch):
+    child = _Child(_output(_summary(critical_loose=["identity/key.data"])))
+    _child_factory(monkeypatch, child)
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def notify(agent, text):
+        calls.append((agent, text))
+        entered.set()
+        await release.wait()
+        return True
+
+    app.state.scheduler._owner_notify_callback = notify
+    async with app.router.lifespan_context(app):
+        result = await asyncio.wait_for(_background_task(app), 5)
+        sweep = app.state.db_permission_sweep
+        await asyncio.wait_for(entered.wait(), 5)
+        duplicate = asyncio.create_task(sweep.notify_owner(result))
+        try:
+            await asyncio.sleep(0)
+            assert calls and len(calls) == 1
+            assert duplicate.done()
+        finally:
+            release.set()
+            await asyncio.gather(sweep.alert_task, duplicate)

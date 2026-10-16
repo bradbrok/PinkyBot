@@ -71,6 +71,11 @@ async def run():
         for suffix in ("", "-wal", "-shm"):
             os.chmod(str(path) + suffix, 0o644)
     async with app.router.lifespan_context(app):
+        from pinky_daemon.sqlite_lock_check import check_sqlite_locks
+        for path in paths:
+            assert_locks(path)
+        await app.state.db_permission_sweep_task
+        assert check_sqlite_locks(app.state.store_catalog.live_wal_stores())["healthy"] is True
         if scenario == 'locks':
             for path in paths:
                 assert_locks(path)
@@ -322,7 +327,7 @@ async def test_boot_lock_health_is_exposed(tmp_path, monkeypatch):
 
 
 async def test_boot_reports_dropped_locks_on_health_surface(tmp_path, monkeypatch, caplog):
-    from pinky_daemon import api, db_security
+    from pinky_daemon import api, sqlite_lock_check
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(api, "SHARED_MCP_ENABLED", False)
@@ -330,15 +335,14 @@ async def test_boot_reports_dropped_locks_on_health_surface(tmp_path, monkeypatc
     path = next(
         r.resolved_path for r in app.state.store_catalog.snapshot() if r.logical_name == "tasks"
     )
-    sweep = db_security.sweep_db_permissions_in_child
+    check = sqlite_lock_check.check_sqlite_locks
 
-    def drop_after_sweep(root):
-        result = sweep(root)
+    def drop_before_check(*args, **kwargs):
         os.close(os.open(path, os.O_RDONLY))
         os.close(os.open(path + "-shm", os.O_RDONLY))
-        return result
+        return check(*args, **kwargs)
 
-    monkeypatch.setattr(db_security, "sweep_db_permissions_in_child", drop_after_sweep)
+    monkeypatch.setattr(sqlite_lock_check, "check_sqlite_locks", drop_before_check)
     async with app.router.lifespan_context(app):
         endpoint = next(
             r.endpoint for r in app.routes if getattr(r, "path", "") == "/system/health"
@@ -637,7 +641,9 @@ def test_changed_probe_result_logs_missing_once(monkeypatch, caplog):
 
 
 def test_child_sweep_uses_exit_status_and_initial_healthy_check_logs_once(tmp_path, caplog):
+    import json
     import logging
+    import re
 
     from pinky_daemon.db_security import sweep_db_permissions_in_child
     from pinky_daemon.sqlite_lock_check import check_sqlite_locks
@@ -647,7 +653,13 @@ def test_child_sweep_uses_exit_status_and_initial_healthy_check_logs_once(tmp_pa
     assert "SQLite permission sweep completed in child process" in caplog.text
     command = [sys.executable, "-m", "pinky_daemon.db_security", str(tmp_path)]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
-    assert result.stdout == ""
+    lines = result.stdout.splitlines()
+    assert len(lines) == 2
+    assert re.fullmatch(r"priority-done changed=0", lines[0]) is not None
+    assert json.loads(lines[1]) == {
+        "changed": 0, "foreign_owned": 0, "priority_done": True,
+        "critical_loose": [], "remaining_loose": [],
+    }
     healthy = check_sqlite_locks([])
     assert healthy["healthy"] is True
     check_sqlite_locks([], previous=healthy)

@@ -168,7 +168,9 @@ def test_layout_matches_frozen_walk_on_mixed_metadata(tmp_path, monkeypatch):
 
 
 def test_ordinary_entries_need_no_realpath_or_stat(tmp_path, monkeypatch):
-    root = tmp_path.resolve()
+    root = tmp_path / "data"
+    root.mkdir()
+    root = root.resolve()
     leaf = root
     for level in range(12):
         leaf /= f"level-{level}"
@@ -201,6 +203,25 @@ def test_ordinary_entries_need_no_realpath_or_stat(tmp_path, monkeypatch):
     assert not any("ordinary-" in path or path.endswith(("-wal", "-shm", "-journal"))
                    for path in inspected)
     assert len(report.warnings) == 1
+
+
+def test_only_symlink_children_are_resolved_again(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    registered = _write(root, "registered.db")
+    alias = root / "link.db"
+    alias.symlink_to(registered)
+    identities = _identities(registered)
+    original, calls = os.path.realpath, []
+
+    def realpath(path, *args, **kwargs):
+        calls.append(os.fspath(path))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
+    report = _inspect(root, identities)
+    assert calls == [str(root), str(alias)]
+    assert str(registered) not in calls
+    assert report.findings == [] and report.warnings == []
 
 
 def test_unreadable_ordinary_file_is_no_longer_inspected(tmp_path, monkeypatch):
