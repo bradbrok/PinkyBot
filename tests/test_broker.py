@@ -1404,6 +1404,7 @@ class TestMessageBrokerRouting:
             assert request["notification_destination"] == {
                 "platform": "slack", "account_id": "T_OWNER",
                 "conversation_id": "D_OWNER", "principal_id": "U_OWNER",
+                "sender": request["agent_name"],
             }
             assert sends[0][0:3] == ("slack", "T_OWNER", "D_OWNER")
 

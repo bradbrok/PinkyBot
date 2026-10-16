@@ -928,11 +928,41 @@ class MessageBroker:
             return False
 
         text = message.content.strip()
+        request_command = re.search(r"^/(approve|deny)_req([0-9]+)$", text, re.IGNORECASE)
+        agent_name = message.agent_name
+        if request_command:
+            action, request_id = request_command.groups()
+            action = action.lower()
+            request = self._registry.get_approval_request_by_id(request_id)
+            reply = ""
+            if request is None:
+                reply = "No such approval request."
+            elif request["gate_state"] != "pending":
+                reply = f"Approval request {request_id} is already {request['gate_state']}."
+            if reply:
+                if self._send_callback:
+                    await self._send_callback(
+                        message.agent_name, message.platform, message.chat_id, reply,
+                    )
+                return True
+            agent_name = request["agent_name"]
+            target_chat_id = request["chat_id"]
+        elif re.match(r"^/(approve|deny)_req", text, re.IGNORECASE):
+            # Reserved request commands must never become legacy chat ids.
+            return False
+        else:
+            return await self._handle_legacy_approval_command(message, text)
+
+        return await self._apply_approval_command(message, agent_name, target_chat_id, action)
+
+    async def _handle_legacy_approval_command(self, message: BrokerMessage, text: str) -> bool:
         # Match the command prefix case-insensitively, but preserve the RAW case
         # of the target id — Slack user ids are uppercase (e.g. U0EXAMPLE1) and the
         # pending row is keyed under the exact id. Lowercasing the whole token
         # approved a phantom lowercased user, delivered 0 held messages, and left
         # the real user pending (so the channel reply never went out).
+        if not text:
+            return False
         raw_cmd = text.split()[0]
         cmd = raw_cmd.lower()
 
@@ -948,8 +978,13 @@ class MessageBroker:
         if not target_chat_id:
             return False
 
-        agent_name = message.agent_name
+        return await self._apply_approval_command(
+            message, message.agent_name, target_chat_id, action,
+        )
 
+    async def _apply_approval_command(
+        self, message: BrokerMessage, agent_name: str, target_chat_id: str, action: str,
+    ) -> bool:
         if action == "approve":
             status = self._registry.get_user_status(agent_name, target_chat_id)
             if status == "approved":
@@ -981,13 +1016,20 @@ class MessageBroker:
                 # a channel, the held-message delivery + the owner confirmation
                 # are enough.
                 if self._send_callback and not target_is_channel:
-                    try:
-                        await self._send_callback(
-                            agent_name, message.platform, target_chat_id,
-                            "You've been approved! Your messages are now being delivered.",
+                    platform = next((p["platform"] for p in pending_before if p.get("platform")), "")
+                    if not platform:
+                        _log(
+                            f"broker: skipped approved user notice for {agent_name}/"
+                            f"{target_chat_id}: no held platform"
                         )
-                    except Exception as e:
-                        _log(f"broker: failed to notify approved user {target_chat_id}: {e}")
+                    else:
+                        try:
+                            await self._send_callback(
+                                agent_name, platform, target_chat_id,
+                                "You've been approved! Your messages are now being delivered.",
+                            )
+                        except Exception as e:
+                            _log(f"broker: failed to notify approved user {target_chat_id}: {e}")
         else:
             self._registry.deny_user(agent_name, target_chat_id)
             self._registry.settle_approval_request(
@@ -1056,7 +1098,7 @@ class MessageBroker:
         return True
 
     @staticmethod
-    def _format_approval_notification(request: dict) -> str:
+    def _format_approval_notification(request: dict, *, sender: str = "") -> str:
         approval_key = request["chat_id"]
         agent_name = request["agent_name"]
         held_count = request.get("undelivered_count", request["held_count"])
@@ -1083,12 +1125,21 @@ class MessageBroker:
                 f"{name_display} (ID: {approval_key})"
             )
             action = "Review the request:"
+        route_notice = ""
+        command_key = approval_key
+        if sender and sender != agent_name:
+            route_notice = (
+                f"Approval request for {agent_name} (sent by {sender}'s bot; "
+                f"{agent_name} has no bot in this chat):\n"
+            )
+            command_key = f"req{request['id']}"
         return (
+            f"{route_notice}"
             f"{alert}🆕 {subject}\n\n"
             f"Held messages: {held_count}; oldest: {oldest_age}s\n"
             f"{action}\n"
-            f"/approve_{approval_key}\n"
-            f"/deny_{approval_key}"
+            f"/approve_{command_key}\n"
+            f"/deny_{command_key}"
         )
 
     @staticmethod
@@ -1150,14 +1201,24 @@ class MessageBroker:
 
             destinations = self._registry.get_owner_notification_destinations()
             fallback_path: list[dict] = []
-            notification = self._format_approval_notification(current)
             last_error = "owner notification destination is not configured"
 
             if self._send_callback:
                 for destination in destinations:
+                    sender, _ = self._registry.resolve_owner_notification_sender(
+                        current["agent_name"], destination["platform"], destination["account_id"],
+                    )
+                    # Preserve the existing send failure and retry when nobody is bound.
+                    sender = sender or current["agent_name"]
+                    notification = self._format_approval_notification(current, sender=sender)
+                    if sender != current["agent_name"]:
+                        _log(
+                            f"OWNER_NOTIFY_ROUTE_FALLBACK for approval request {request_id} "
+                            f"agent '{current['agent_name']}' via sender '{sender}'"
+                        )
                     try:
                         await self._send_callback(
-                            current["agent_name"],
+                            sender,
                             destination["platform"],
                             destination["conversation_id"],
                             notification,
@@ -1167,12 +1228,13 @@ class MessageBroker:
                         last_error = f"{type(exc).__name__}: {exc}"
                         fallback_path.append({
                             "destination": destination,
+                            "sender": sender,
                             "error": last_error[:500],
                         })
                         continue
                     self._registry.record_approval_notification_delivered(
                         request_id,
-                        destination=destination,
+                        destination={**destination, "sender": sender},
                         fallback_path=fallback_path,
                         high_signal=bool(current.get("high_signal")),
                     )
