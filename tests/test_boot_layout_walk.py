@@ -368,3 +368,49 @@ def test_reconcile_reports_skipped_workspace_count(tmp_path, caplog):
         assert "skipped" in messages[0] and "1" in messages[0]
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("failed_probe", ["symlink", "directory"])
+def test_entry_type_failure_keeps_the_carried_resolved_path(tmp_path, monkeypatch, failed_probe):
+    root = tmp_path / "data"
+    registered = _write(root, "protected/store.data")
+    directory = registered.parent
+    identities = _identities(registered)
+    scan, metadata = os.scandir, os.stat
+
+    def denied():
+        raise PermissionError("entry metadata unavailable")
+
+    class Entry:
+        def __init__(self, entry):
+            self.entry, self.path, self.name = entry, entry.path, entry.name
+
+        def is_symlink(self):
+            return denied() if failed_probe == "symlink" else self.entry.is_symlink()
+
+        def is_dir(self, *, follow_symlinks):
+            return denied()
+
+    class Listing:
+        def __init__(self, path):
+            self.listing = scan(path)
+
+        def __enter__(self):
+            return (Entry(entry) if entry.path == str(directory) else entry
+                    for entry in self.listing.__enter__())
+
+        def __exit__(self, *args):
+            return self.listing.__exit__(*args)
+
+    def inspect(path, *args, **kwargs):
+        if not isinstance(path, int) and os.fspath(path) == str(directory):
+            denied()
+        return metadata(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", Listing)
+    monkeypatch.setattr(os, "stat", inspect)
+    old = _reference(root, identities)
+    new = _inspect(root, identities)
+    assert _semantics(new) == _semantics(old)
+    assert len(new.findings) == 1
+    assert new.findings[0]["resolved_path"] == str(directory)

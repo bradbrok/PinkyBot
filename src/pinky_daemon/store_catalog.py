@@ -915,14 +915,18 @@ class _FilesystemLayoutInspector:
                 resolved_path = os.path.join(resolved_directory, entry.name)
                 try:
                     is_symlink = entry.is_symlink()
-                    if is_symlink:
-                        resolved_path = os.path.realpath(discovered_path)
-                    elif entry.is_dir(follow_symlinks=False):
+                    if not is_symlink and entry.is_dir(follow_symlinks=False):
                         child_directories.append((discovered_path, resolved_path))
                         continue
                 except OSError as exc:
-                    self._inspection_error("file or directory", discovered_path, None, exc)
+                    self._inspection_error("file or directory", discovered_path, resolved_path, exc)
                     continue
+                if is_symlink:
+                    try:
+                        resolved_path = os.path.realpath(discovered_path)
+                    except OSError as exc:
+                        self._inspection_error("file or directory", discovered_path, None, exc)
+                        continue
                 if not is_symlink and not (
                     (entry.name.endswith(".db") and not entry.name.endswith(_SQLITE_SIDECAR_SUFFIXES))
                     or resolved_path in self.registered_realpaths
