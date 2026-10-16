@@ -80,7 +80,6 @@ Once loaded, the tools are:
 - `mcp__pinky-self__kb_save_wiki(slug, title, content, sources, related)` — create/update a wiki page
 - `mcp__pinky-self__kb_delete_wiki(slug)` — delete a wiki page (only for merging duplicates)
 
-You also have `Read`, `Glob`, and `Grep` for file access if needed.
 
 When done, output a brief summary of what you did:
 - How many sources processed

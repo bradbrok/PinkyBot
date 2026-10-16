@@ -287,7 +287,11 @@ def save_wiki_pages(kb: KBStore, pages: list[dict]) -> list[str]:
 
             # Ensure directory exists
             file_path = f"wiki/{slug}.md"
-            full_path = kb.kb_dir / file_path
+            try:
+                full_path = kb.wiki_path(slug)
+            except ValueError:
+                _log("[WikiBuilder] Skipping page with invalid wiki slug")
+                continue
             full_path.parent.mkdir(parents=True, exist_ok=True)
 
             # Write file

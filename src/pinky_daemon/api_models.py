@@ -457,6 +457,7 @@ class UpdateAgentRequest(BaseModel):
     """Update an agent's config."""
 
     tool_policy_enabled: bool | None = None
+    isolated_grants: list[str] | None = None
 
     display_name: str | None = None
     model: str | None = None

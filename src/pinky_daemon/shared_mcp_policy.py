@@ -11,7 +11,9 @@ from pinky_daemon.isolated_policy import (
     GATE_TOOL_NAMES,
     ISOLATED_TOOL_ROUTES,
     agent_tool_gates,
+    granted_tool_routes,
     isolation_flag,
+    isolation_grants,
     policy_mode,
 )
 
@@ -63,16 +65,26 @@ def install_tool_policy(mcp, mount, registry, skills, signing_key_resolver):
         if not principal.verified:
             return set()
         allowed = set(CORE_TOOLS[mount])
+        flag = isolation_flag(registry, principal.name)
         if mount == "self":
             for gate in agent_tool_gates(principal.name, skills, registry):
                 allowed.update(GATE_TOOL_NAMES[gate])
-        elif mount == "memory" and isolation_flag(registry, principal.name) is False:
+        elif mount == "memory" and flag is False:
             # The memory server independently applies its dreamer entitlement.
             allowed.update({"reflect_for", "kg_add_for", "recall_for"})
-        if mount in {"self", "messaging"} and isolation_flag(registry, principal.name) is not False:
+        if mount in {"self", "messaging"} and flag is not False:
+            visible = allowed.copy()
             allowed.intersection_update(
                 name for group, name in ISOLATED_TOOL_ROUTES if group == mount
             )
+            if flag is True:
+                allowed.update(
+                    name
+                    for group, name in granted_tool_routes(
+                        isolation_grants(registry, principal.name)
+                    )
+                    if group == mount and name in visible
+                )
         return allowed
 
     def notice(mode, principal, operation, name):

@@ -14,10 +14,12 @@ def test_librarian_config_preserves_other_curation_settings(tmp_path):
     (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": expected["mcp_servers"]}))
     config = LibrarianRunner._build_sdk_config(str(tmp_path), expected["system_prompt"])
     expected["working_dir"] = str(tmp_path)
-    # The bounds intentionally change the MCP surface and permission mode.
+    # The bounds intentionally change the MCP surface and permission mode;
+    # the librarian also holds no file tools.
     # All other pre-extraction curation settings retain their captured values;
     # test_librarian_config_is_bounded independently pins the new bound fields.
     expected["mcp_servers"] = {"pinky-self": expected["mcp_servers"]["pinky-self"]}
     expected["permission_mode"] = "dontAsk"
+    expected["allowed_tools"] = [t for t in expected["allowed_tools"] if t not in {"Read", "Glob", "Grep"}]
     actual = asdict(config)
     assert {name: actual[name] for name in expected} == expected

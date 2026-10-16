@@ -13,9 +13,9 @@ from pinky_daemon.claude_runner import RunResult
 from pinky_daemon.kb_store import KBStore
 from pinky_daemon.librarian_runner import LibrarianRunner
 
-BUILTINS = ["Read", "Glob", "Grep", "ToolSearch"]
+BUILTINS = ["ToolSearch"]
 ALLOWED = (
-    "Read", "Glob", "Grep", "ToolSearch",
+    "ToolSearch",
     "mcp__pinky-self__kb_search",
     "mcp__pinky-self__kb_get_wiki",
     "mcp__pinky-self__kb_stats",
@@ -43,7 +43,7 @@ def test_librarian_config_is_bounded(bounded_runner, tmp_path):
     assert cfg.permission_mode == "dontAsk"
     assert librarian_runner._LIBRARIAN_ALLOWED_TOOLS == ALLOWED
     assert set(cfg.allowed_tools) == set(ALLOWED)
-    assert len(cfg.allowed_tools) == 9
+    assert len(cfg.allowed_tools) == 6
     assert list(cfg.mcp_servers) == ["pinky-self"]
     assert cfg.mcp_servers["pinky-self"] == SELF_SERVER
     assert cfg.strict_mcp_config is True
@@ -94,6 +94,7 @@ async def test_missing_pinky_self_entry_fails_closed(
 
 
 @pytest.mark.parametrize("tool_name", [
+    "Read", "Glob", "Grep",
     "Bash", "Agent", "mcp__pinky-self__update_and_restart",
     "mcp__pinky-self__kb_searchX", "mcp__pinky-self__who_am_i", "", *ALLOWED,
 ])

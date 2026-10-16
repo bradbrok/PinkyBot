@@ -32,6 +32,37 @@ def isolation_flag(registry, name):
         return None
 
 
+ISOLATED_GRANTS = {
+    "kb_writer": {("self", "kb_save_wiki"): (("PUT", "/kb/wiki/{slug:path}"),)},
+}
+
+
+def isolation_grants(registry, name) -> frozenset[str]:
+    """Read only recognized, explicitly stored grants under the registry lock."""
+    try:
+        with getattr(registry, "_rmw_lock", nullcontext()):
+            row = registry.get(name)
+            value = getattr(row, "isolated_grants", [])
+        if not isinstance(value, list):
+            return frozenset()
+        return frozenset(g for g in value if isinstance(g, str) and g in ISOLATED_GRANTS)
+    except Exception:
+        return frozenset()
+
+
+def granted_tool_routes(grants) -> dict:
+    """Return the reviewed tools and routes held by these grants."""
+    allowed = {}
+    for grant in grants:
+        for tool, routes in ISOLATED_GRANTS.get(grant, {}).items():
+            allowed[tool] = tuple(dict.fromkeys((*allowed.get(tool, ()), *routes)))
+    return allowed
+
+
+def granted_mutation_allow(grants) -> frozenset[tuple[str, str]]:
+    return frozenset(route for routes in granted_tool_routes(grants).values() for route in routes)
+
+
 def isolated_caller_policy(request):
     """Return a verified isolated caller and mode, with uncertain flags closed."""
     caller = getattr(request.state, "internal_caller", "")

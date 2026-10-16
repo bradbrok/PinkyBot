@@ -18,6 +18,19 @@ automatically grant it to isolated agents. Trigger creation remains held, and
 other unreviewed mutations, including animation attachments, remain unavailable
 to isolated callers in enforce mode.
 
+An owner browser session can set or clear an agent's `isolated_grants` through
+`PUT /agents/{name}`. The `kb_writer` grant permits only `kb_save_wiki` and
+`PUT /kb/wiki/{slug:path}`, and only while the agent holds the existing `kb`
+tool gate through `pinky-memory`. Both HTTP authorization and shared MCP
+visibility read the stored grant on each request. Other KB writes retain their
+existing restrictions. Granted requests log `isolation: GRANT` in enabled modes.
+
+Wiki saves reject invalid or escaping slugs for every caller. Generated pages
+use the same validation; reads, reindex and deletes also check stored file paths against
+the wiki directory. A refused stored path is never read or unlinked.
+Pages saved through the grant are shared knowledge-base content that other
+sessions read, including the librarian, whose session holds only knowledge-base tools.
+
 Verified isolated media callers may send photos, documents and videos only from
 inside their own working directory. Both the file and directory are resolved;
 containment follows path components, and the resolved file is passed to the
