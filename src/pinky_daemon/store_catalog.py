@@ -868,14 +868,13 @@ class _FilesystemLayoutInspector:
         self.skipped_unmanaged_subtrees = 0
 
     def inspect(self) -> LayoutInspection:
-        pending_directories: list[tuple[str, str | None]] = [(self.root, self.root)]
+        pending_directories: list[str] = [self.root]
         # Cycles are guarded by inode; warning policy follows each file realpath.
         visited_directories: set[tuple[int, int]] = set()
         while pending_directories:
-            directory, resolved_directory = pending_directories.pop()
+            directory = pending_directories.pop()
             try:
-                if resolved_directory is None:
-                    resolved_directory = os.path.realpath(directory)
+                resolved_directory = os.path.realpath(directory)
             except OSError as exc:
                 self._inspection_error("directory", directory, None, exc)
                 continue
@@ -895,8 +894,15 @@ class _FilesystemLayoutInspector:
                 continue
             visited_directories.add(directory_identity)
             relative_directory = os.path.relpath(resolved_directory, self.root).replace(os.sep, "/")
-            if any(fnmatch.fnmatchcase(relative_directory, pattern)
-                   for pattern in _UNMANAGED_SUBTREES):
+            relative_segments = relative_directory.split("/")
+            if any(
+                len(relative_segments) == len(pattern_segments)
+                and all(fnmatch.fnmatchcase(part, pattern_part)
+                        for part, pattern_part in zip(relative_segments, pattern_segments))
+                for pattern_segments in (
+                    pattern.split("/") for pattern in _UNMANAGED_SUBTREES
+                )
+            ):
                 prefix = resolved_directory + os.sep
                 if not any(path == resolved_directory or path.startswith(prefix)
                            for path in self.registered_realpaths):
@@ -909,14 +915,14 @@ class _FilesystemLayoutInspector:
                 self._inspection_error("directory", directory, resolved_directory, exc)
                 continue
 
-            child_directories: list[tuple[str, str | None]] = []
+            child_directories: list[str] = []
             for entry in entries:
                 discovered_path = entry.path
                 resolved_path = os.path.join(resolved_directory, entry.name)
                 try:
                     is_symlink = entry.is_symlink()
                     if not is_symlink and entry.is_dir(follow_symlinks=False):
-                        child_directories.append((discovered_path, resolved_path))
+                        child_directories.append(discovered_path)
                         continue
                 except OSError as exc:
                     self._inspection_error("file or directory", discovered_path, resolved_path, exc)
@@ -943,7 +949,7 @@ class _FilesystemLayoutInspector:
                     if not self._under_root(resolved_path):
                         self._outside_root("directory", discovered_path, resolved_path)
                         continue
-                    child_directories.append((discovered_path, None))
+                    child_directories.append(discovered_path)
                     continue
                 self._record_database(discovered_path, resolved_path, entry_stat)
             pending_directories.extend(reversed(child_directories))
