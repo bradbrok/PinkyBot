@@ -232,6 +232,10 @@ def test_unresolved_footprint_finding_has_null_resolved_path(
     store = tmp_path / "tasks.db"
     store.touch()
     identities = _identities(store)
+    if resolution_fails:
+        target = tmp_path / "target.data"
+        store.rename(target)
+        store.symlink_to(target)
     real_realpath = os.path.realpath
 
     def resolve(path, *args, **kwargs):

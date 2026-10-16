@@ -25,6 +25,7 @@ import json
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 
 
@@ -179,6 +180,7 @@ def _run_startup_check(args) -> int:
 
 def _run_api(args) -> None:
     """Start the stateful API server under the lifetime store-authority lock."""
+    args._startup_started_at = time.monotonic()
     from pinky_daemon.store_authority import store_authority_lock
 
     with store_authority_lock(args.db_path):
@@ -212,6 +214,8 @@ def _run_api_with_authority(args) -> None:
         default_working_dir=working_dir,
         db_path=args.db_path,
     )
+    if hasattr(args, "_startup_started_at"):
+        app.state.startup_started_at = args._startup_started_at
 
     readiness = getattr(app.state, "api_readiness", None)
     if not isinstance(readiness, ApiReadiness):

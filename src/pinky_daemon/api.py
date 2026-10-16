@@ -1986,6 +1986,7 @@ def create_api(
     access_log_path: str | Path | None = None,
 ) -> FastAPI:
     """Create the FastAPI application."""
+    startup_started_at = time.monotonic()
     from pinky_daemon.tmux_session import _WakeLaunchHistory
 
     wake_launch_history = _WakeLaunchHistory()
@@ -2013,6 +2014,7 @@ def create_api(
     store_catalog.configure_manifest(store_manifest)
     storage_observability = StorageObservability(store_manifest)
     store_catalog.configure_observability(storage_observability)
+    phase_started = time.monotonic()
     try:
         store_catalog.preflight_integrity(
             store_manifest.values(),
@@ -2023,6 +2025,8 @@ def create_api(
         store_catalog.close()
         storage_observability.record_boot_failure()
         raise
+    finally:
+        _log(f"startup: phase preflight_integrity {int((time.monotonic() - phase_started) * 1000)} ms")
     store_snapshot_service = StoreSnapshotService(
         store_catalog,
         observability=storage_observability,
@@ -2036,6 +2040,7 @@ def create_api(
     from pinky_daemon.api_readiness import ApiReadiness
 
     app.state.api_readiness = ApiReadiness()
+    app.state.startup_started_at = startup_started_at
     app.state.store_snapshot_service = store_snapshot_service
     app.state.storage_observability = storage_observability
     app.state.ferry_listener = FerryListenerState.from_config(FerryConfig.from_env())
@@ -14266,15 +14271,6 @@ npm run build</pre>
 
         storage_observability.enable_runtime()
 
-        # Lock down SQLite file permissions to owner-only. Runs here (not in
-        # create_api) so every store's __init__ has already created its DB
-        # file. A child performs raw opens/closes to preserve our SQLite locks.
-        try:
-            from pinky_daemon.db_security import sweep_db_permissions_in_child
-            await asyncio.to_thread(sweep_db_permissions_in_child, Path(db_path).resolve().parent)
-        except Exception as exc:  # never let hardening abort startup
-            _log(f"startup: db permission sweep skipped ({exc})")
-
         # Migrate only exact registered legacy sessions before any boot launch.
         try:
             from pinky_daemon.tmux_session import reap_legacy_tmux_sessions
@@ -14696,9 +14692,33 @@ npm run build</pre>
                 app.state.sqlite_lock_health,
             ))
 
+        _log(
+            "startup: phase startup_complete "
+            f"{int((time.monotonic() - app.state.startup_started_at) * 1000)} ms"
+        )
+        from pinky_daemon.db_security import PermissionSweep
+
+        async def notify_permission_owner(agent_name, text):
+            return await scheduler._owner_notify_callback(agent_name, text)
+
+        registered_paths = list(dict.fromkeys(
+            record.resolved_path
+            for catalog in (store_catalog, *tenant_store_catalogs.values())
+            for record in catalog.snapshot() if not record.is_memory
+        ))
+        app.state.db_permission_sweep = PermissionSweep(
+            _data_dir, registered_paths, notify_permission_owner, _log,
+        )
+        app.state.db_permission_sweep_task = asyncio.create_task(app.state.db_permission_sweep.run())
+
     @app.on_event("shutdown")
     async def on_shutdown():
         """Stop scheduler, autonomy, broker pollers, and streaming sessions on shutdown."""
+        permission_task = getattr(app.state, "db_permission_sweep_task", None)
+        if permission_task is not None:
+            permission_task.cancel()
+            await asyncio.wait({permission_task}, timeout=1.5)
+            await app.state.db_permission_sweep.close()
         roster_sync = getattr(app.state, "model_roster_sync", None)
         if roster_sync is not None:
             roster_sync.mark_closing()
@@ -16337,12 +16357,15 @@ npm run build</pre>
     # Every authoritative store has opened by this point. Validate once before
     # returning the application so an incoherent physical layout cannot serve.
     app.state.store_catalog = store_catalog
+    phase_started = time.monotonic()
     try:
         warnings = store_catalog.validate() or []
     except StoreCatalogError as exc:
         storage_observability.record_boot_failure()
         _log(f"ERROR startup: store catalog validation failed: {exc}")
         raise
+    finally:
+        _log(f"startup: phase store_catalog_validate {int((time.monotonic() - phase_started) * 1000)} ms")
     storage_observability.record_boot_success(store_catalog.snapshot(), warnings)
     storage_observability.arm_runtime()
 

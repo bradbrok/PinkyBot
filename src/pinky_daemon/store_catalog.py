@@ -72,6 +72,7 @@ DEFAULT_FILESYSTEM_SILENCE_ALLOWLIST: dict[str, str] = {
 
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _IGNORED_DIRECTORY_KINDS = frozenset({"snapshot", "snapshots", "temp", "temporary", "tmp"})
+_UNMANAGED_SUBTREES = ("agents/*/workspace",)
 _SQLITE_HEADER_PREFIX = b"SQLite format 3\x00"
 _SQLITE_HEADER_JOURNAL_BYTES = slice(18, 20)
 _READ_ONLY_SQL_TOKENS = frozenset({"EXPLAIN", "PRAGMA", "SELECT", "VALUES"})
@@ -808,6 +809,7 @@ class LayoutInspection:
 
     findings: list[dict[str, str | None]]
     warnings: list[str]
+    skipped_unmanaged_subtrees: int = 0
 
 
 def read_store_identities(
@@ -863,9 +865,10 @@ class _FilesystemLayoutInspector:
         self.findings: list[dict[str, str | None]] = []
         self.warnings: list[str] = []
         self.unclaimed_databases: list[_FilesystemDatabase] = []
+        self.skipped_unmanaged_subtrees = 0
 
     def inspect(self) -> LayoutInspection:
-        pending_directories = [self.root]
+        pending_directories: list[str] = [self.root]
         # Cycles are guarded by inode; warning policy follows each file realpath.
         visited_directories: set[tuple[int, int]] = set()
         while pending_directories:
@@ -890,6 +893,21 @@ class _FilesystemLayoutInspector:
             if directory_identity in visited_directories:
                 continue
             visited_directories.add(directory_identity)
+            relative_directory = os.path.relpath(resolved_directory, self.root).replace(os.sep, "/")
+            relative_segments = relative_directory.split("/")
+            if any(
+                len(relative_segments) == len(pattern_segments)
+                and all(fnmatch.fnmatchcase(part, pattern_part)
+                        for part, pattern_part in zip(relative_segments, pattern_segments))
+                for pattern_segments in (
+                    pattern.split("/") for pattern in _UNMANAGED_SUBTREES
+                )
+            ):
+                prefix = resolved_directory + os.sep
+                if not any(path == resolved_directory or path.startswith(prefix)
+                           for path in self.registered_realpaths):
+                    self.skipped_unmanaged_subtrees += 1
+                    continue
             try:
                 with os.scandir(resolved_directory) as iterator:
                     entries = sorted(iterator, key=lambda entry: entry.name)
@@ -900,10 +918,25 @@ class _FilesystemLayoutInspector:
             child_directories: list[str] = []
             for entry in entries:
                 discovered_path = entry.path
+                resolved_path = os.path.join(resolved_directory, entry.name)
                 try:
-                    resolved_path = os.path.realpath(discovered_path)
+                    is_symlink = entry.is_symlink()
+                    if not is_symlink and entry.is_dir(follow_symlinks=False):
+                        child_directories.append(discovered_path)
+                        continue
                 except OSError as exc:
-                    self._inspection_error("file or directory", discovered_path, None, exc)
+                    self._inspection_error("file or directory", discovered_path, resolved_path, exc)
+                    continue
+                if is_symlink:
+                    try:
+                        resolved_path = os.path.realpath(discovered_path)
+                    except OSError as exc:
+                        self._inspection_error("file or directory", discovered_path, None, exc)
+                        continue
+                if not is_symlink and not (
+                    (entry.name.endswith(".db") and not entry.name.endswith(_SQLITE_SIDECAR_SUFFIXES))
+                    or resolved_path in self.registered_realpaths
+                ):
                     continue
                 try:
                     entry_stat = os.stat(resolved_path)
@@ -941,7 +974,9 @@ class _FilesystemLayoutInspector:
                     f"dead silence-allowlist entry {pattern!r} matched no database files "
                     f"(reason: {reason})"
                 )
-        return LayoutInspection(self.findings, self.warnings)
+        return LayoutInspection(
+            self.findings, self.warnings, self.skipped_unmanaged_subtrees
+        )
 
     def _record_database(self, discovered_path, resolved_path, path_stat) -> None:
         name = os.path.basename(discovered_path)
@@ -1921,6 +1956,9 @@ class StoreCatalog:
 
         report = inspect_filesystem_layout(
             self._expected_root, identities, silence_allowlist=allowlist
+        )
+        logger.info(
+            "STORE CATALOG: skipped %d unmanaged subtree(s)", report.skipped_unmanaged_subtrees
         )
         # Traversal failures preceded deferred inode-alias checks historically.
         for finding in report.findings:
