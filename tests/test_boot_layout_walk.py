@@ -337,7 +337,7 @@ def test_sibling_store_does_not_claim_an_unmanaged_workspace(tmp_path):
 def test_symlink_into_workspace_uses_the_resolved_skip_rule(tmp_path):
     workspace = tmp_path / "agents/worker/workspace"
     _write(workspace, "copy.db")
-    (tmp_path / "alias").symlink_to(workspace, target_is_directory=True)
+    (tmp_path / "000-link").symlink_to(workspace, target_is_directory=True)
     report = _inspect(tmp_path, {})
     assert report.findings == [] and report.warnings == []
     assert getattr(report, "skipped_unmanaged_subtrees", 0) == 1
