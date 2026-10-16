@@ -425,3 +425,53 @@ async def test_owner_reservation_is_taken_before_delivery_waits(app, monkeypatch
         finally:
             release.set()
             await asyncio.gather(sweep.alert_task, duplicate)
+
+
+@pytest.mark.parametrize("mode", [0o640, 0o604])
+async def test_group_or_other_only_registered_permissions_alert_once(tmp_path, mode):
+    root = tmp_path / "data"
+    registered = _file(root, "registered.data", mode=mode)
+    notify = AsyncMock(return_value=True)
+    sweep = db_security.PermissionSweep(root, [registered], notify, lambda text: None)
+    try:
+        report = await asyncio.wait_for(sweep.run(), 10)
+        await asyncio.wait_for(sweep.alert_task, 5)
+        assert report["ok"] is True and report["critical_loose"] == ["registered.data"]
+        assert report["remaining_loose"] == []
+        assert registered.stat().st_mode & 0o777 == 0o600
+        notify.assert_awaited_once_with(
+            "admin", "Database permission sweep found files with permissions open to other users."
+            ' Paths: "registered.data"',
+        )
+        await sweep.notify_owner(report)
+        assert notify.await_count == 1
+    finally:
+        await sweep.close()
+
+
+async def test_owner_alert_quotes_control_characters_in_relative_path(tmp_path):
+    root = tmp_path / "data"
+    relative = 'critical/line\n"quoted"\\escape\x1b\x85\u2028.data'
+    registered = _file(root, relative, mode=0o640)
+    contents = b"synthetic contents must remain private"
+    registered.write_bytes(contents)
+    notify = AsyncMock(return_value=True)
+    sweep = db_security.PermissionSweep(root, [registered], notify, lambda text: None)
+    try:
+        report = await asyncio.wait_for(sweep.run(), 10)
+        await asyncio.wait_for(sweep.alert_task, 5)
+        assert report["ok"] is True and report["critical_loose"] == [relative]
+        assert registered.stat().st_mode & 0o777 == 0o600
+        notify.assert_awaited_once()
+        agent, text = notify.await_args.args
+        assert agent == "admin"
+        quoted = r'"critical/line\n\"quoted\"\\escape\u001b\u0085\u2028.data"'
+        assert text == (
+            "Database permission sweep found files with permissions open to other users. Paths: "
+            + quoted
+        )
+        assert all(character not in text for character in ("\n", "\x1b", "\x85", "\u2028"))
+        assert str(root) not in text and contents.decode() not in text
+        assert relative not in text
+    finally:
+        await sweep.close()

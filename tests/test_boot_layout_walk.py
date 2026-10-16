@@ -172,9 +172,11 @@ def test_ordinary_entries_need_no_realpath_or_stat(tmp_path, monkeypatch):
     root.mkdir()
     root = root.resolve()
     leaf = root
+    directories = [str(root)]
     for level in range(12):
         leaf /= f"level-{level}"
         leaf.mkdir()
+        directories.append(str(leaf))
     for index in range(20):
         _write(leaf, f"ordinary-{index}.txt")
     database = _write(leaf, "orphan.db")
@@ -197,7 +199,7 @@ def test_ordinary_entries_need_no_realpath_or_stat(tmp_path, monkeypatch):
     monkeypatch.setattr(os.path, "realpath", resolve)
     monkeypatch.setattr(os, "stat", inspect)
     report = _inspect(root, identities)
-    assert resolved == [str(root)]
+    assert resolved == [str(root), *directories]  # Initial root and every directory pop.
     assert len(inspected) == 15  # Root, twelve directories, a DB and a registered path.
     assert inspected.count(str(database)) == inspected.count(str(custom)) == 1
     assert not any("ordinary-" in path or path.endswith(("-wal", "-shm", "-journal"))
@@ -219,7 +221,7 @@ def test_only_symlink_children_are_resolved_again(tmp_path, monkeypatch):
 
     monkeypatch.setattr(os.path, "realpath", realpath)
     report = _inspect(root, identities)
-    assert calls == [str(root), str(alias)]
+    assert calls == [str(root), str(root), str(alias)]
     assert str(registered) not in calls
     assert report.findings == [] and report.warnings == []
 
@@ -414,3 +416,100 @@ def test_entry_type_failure_keeps_the_carried_resolved_path(tmp_path, monkeypatc
     assert _semantics(new) == _semantics(old)
     assert len(new.findings) == 1
     assert new.findings[0]["resolved_path"] == str(directory)
+
+
+@pytest.mark.parametrize("replacement", ["outside", "parent-outside", "inside", "file"])
+def test_queued_directory_changes_match_frozen_walk(tmp_path, monkeypatch, replacement):
+    root = tmp_path / "data"
+    root.mkdir()
+    parent = root / "parent" if replacement == "parent-outside" else root
+    trigger = parent / "000-trigger"
+    queued = parent / "queued"
+    trigger.mkdir(parents=True)
+    queued.mkdir()
+    retired = root / "retired"
+    outside = tmp_path / "outside"
+    inside = root / "zz-target"
+    if replacement == "parent-outside":
+        _write(queued, "escaped.db")
+    elif replacement == "outside":
+        _write(outside, "escaped.db")
+    elif replacement == "inside":
+        _write(inside, "unclaimed.db")
+    original_scandir = os.scandir
+
+    def run(inspector):
+        swaps = []
+
+        def scandir(path):
+            if os.fspath(path) == str(trigger) and not swaps:
+                if replacement == "parent-outside":
+                    parent.rename(outside)
+                    parent.symlink_to(outside, target_is_directory=True)
+                else:
+                    queued.rename(retired)
+                    if replacement == "file":
+                        queued.write_bytes(b"ordinary replacement")
+                    else:
+                        queued.symlink_to(
+                            outside if replacement == "outside" else inside,
+                            target_is_directory=True,
+                        )
+                swaps.append(path)
+            return original_scandir(path)
+
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(os, "scandir", scandir)
+                report = inspector(root, {})
+            assert swaps == [str(trigger)], "The replacement must happen after enqueue"
+            return report
+        finally:
+            if swaps:
+                if replacement == "parent-outside":
+                    parent.unlink()
+                    outside.rename(parent)
+                else:
+                    queued.unlink()
+                    retired.rename(queued)
+
+    observed = run(_inspect)
+    expected = run(_reference)
+    assert _semantics(observed) == _semantics(expected)
+    if replacement in {"outside", "parent-outside"}:
+        assert [row["kind"] for row in observed.findings] == ["directory_outside_root"]
+        assert observed.findings[0]["resolved_path"] == str(
+            outside / "queued" if replacement == "parent-outside" else outside
+        )
+        assert observed.warnings == []
+    elif replacement == "inside":
+        assert observed.findings == []
+        assert len(observed.warnings) == 1 and "zz-target/unclaimed.db" in observed.warnings[0]
+    else:
+        assert observed.findings == [] and observed.warnings == []
+
+
+@pytest.mark.parametrize("relative", [
+    "agents/a/workspace", "agents/a/b/workspace",
+    "agents/a/build/cache/workspace", "agents/workspace",
+])
+def test_unmanaged_pattern_matches_exact_path_segments(tmp_path, relative):
+    root = tmp_path / "data"
+    registered = _write(root, "registered.db")
+    workspace = root / relative
+    workspace.mkdir(parents=True)
+    os.link(registered, workspace / "alias.db")
+    outside = _write(tmp_path, "outside/escaped.db").parent
+    (workspace / "escape").symlink_to(outside, target_is_directory=True)
+    identities = _identities(registered)
+    report = _inspect(root, identities)
+    if relative == "agents/a/workspace":
+        assert report.findings == [] and report.warnings == []
+        assert report.skipped_unmanaged_subtrees == 1
+    else:
+        assert _semantics(report) == _semantics(_reference(root, identities))
+        assert {row["kind"] for row in report.findings} == {
+            "alias_of_registered_store", "directory_outside_root",
+        }
+        assert report.warnings == []
+        assert report.skipped_unmanaged_subtrees == 0
