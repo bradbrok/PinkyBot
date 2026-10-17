@@ -506,3 +506,45 @@ def test_hard_ceiling_is_raised_to_count_limit(tmp_path, context_clock):
         assert store.hard_cap_per_agent == 10
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("full_sweep", ["explicit", "constructor"])
+@pytest.mark.parametrize("age_days", [1, 8], ids=["ceiling", "age-cap"])
+def test_put_trims_written_agent_and_full_sweep_trims_every_agent(
+    tmp_path, context_clock, full_sweep, age_days,
+):
+    path = str(tmp_path / "context.db")
+    store = MessageContextStore(path, max_per_agent=2, hard_cap_per_agent=4)
+    try:
+        # Bulk fixtures leave each agent over its limit before the next write.
+        store._db.executemany(
+            "INSERT INTO message_contexts "
+            "(agent_name, message_id, platform, chat_id, message_ts, stored_at) "
+            "VALUES (?, ?, 'test', 'chat', ?, ?)",
+            [(agent, str(index), context_clock, context_clock - age_days * DAY + index)
+             for agent in ("agent-a", "agent-b", "agent-c") for index in range(5)]
+            + [("expired-agent", "expired", context_clock, context_clock - 31 * DAY)],
+        )
+        store._db.commit()
+
+        store.put(_age_context("new", agent_name="agent-a"), stored_at=context_clock)
+
+        assert _age_row_ids(store, "agent-b") == [str(index) for index in range(5)]
+        assert _age_row_ids(store, "agent-c") == [str(index) for index in range(5)]
+        first_kept = 2 if age_days == 1 else 4
+        assert _age_row_ids(store, "agent-a") == [
+            *(str(index) for index in range(first_kept, 5)), "new",
+        ]
+        assert _age_row_ids(store, "expired-agent") == []
+
+        if full_sweep == "constructor":
+            store.close()
+            store = MessageContextStore(path, max_per_agent=2, hard_cap_per_agent=4)
+        else:
+            assert store.sweep_retention(now=context_clock) == (2 if age_days == 1 else 6)
+
+        first_kept = 1 if age_days == 1 else 3
+        for agent in ("agent-b", "agent-c"):
+            assert _age_row_ids(store, agent) == [str(index) for index in range(first_kept, 5)]
+    finally:
+        store.close()

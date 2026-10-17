@@ -278,6 +278,7 @@ class MessageContextStore:
                     ),
                 )
                 self._sweep_retention_locked(now)
+                self._trim_agent_locked(agent_name, now)
                 self._db.commit()
             except Exception:
                 self._db.rollback()
@@ -369,42 +370,43 @@ class MessageContextStore:
             return tuple(row) if row is not None else None
 
     def _sweep_retention_locked(self, now: float) -> int:
-        """Prune rows while the caller owns ``_lock`` and the transaction."""
+        """Prune expired rows while the caller owns ``_lock`` and the transaction."""
         cutoff = now - self.retention_seconds
-        min_age_cutoff = now - self.min_age_seconds
         before = self._db.total_changes
         self._db.execute(
             "DELETE FROM message_contexts WHERE stored_at < ?",
             (cutoff,),
         )
-        agent_rows = self._db.execute(
-            "SELECT DISTINCT agent_name FROM message_contexts"
-        ).fetchall()
-        for row in agent_rows:
-            self._db.execute(
-                """
-                DELETE FROM message_contexts
-                WHERE stored_at < ? AND rowid IN (
-                    SELECT rowid FROM message_contexts
-                    WHERE agent_name=?
-                    ORDER BY stored_at DESC, rowid DESC
-                    LIMIT -1 OFFSET ?
-                )
-                """,
-                (min_age_cutoff, row["agent_name"], self.max_per_agent),
+        return self._db.total_changes - before
+
+    def _trim_agent_locked(self, agent_name: str, now: float) -> int:
+        """Apply one agent's count limits within the caller's lock and transaction."""
+        min_age_cutoff = now - self.min_age_seconds
+        before = self._db.total_changes
+        self._db.execute(
+            """
+            DELETE FROM message_contexts
+            WHERE stored_at < ? AND rowid IN (
+                SELECT rowid FROM message_contexts
+                WHERE agent_name=?
+                ORDER BY stored_at DESC, rowid DESC
+                LIMIT -1 OFFSET ?
             )
-            self._db.execute(
-                """
-                DELETE FROM message_contexts
-                WHERE rowid IN (
-                    SELECT rowid FROM message_contexts
-                    WHERE agent_name=?
-                    ORDER BY stored_at DESC, rowid DESC
-                    LIMIT -1 OFFSET ?
-                )
-                """,
-                (row["agent_name"], self.hard_cap_per_agent),
+            """,
+            (min_age_cutoff, agent_name, self.max_per_agent),
+        )
+        self._db.execute(
+            """
+            DELETE FROM message_contexts
+            WHERE rowid IN (
+                SELECT rowid FROM message_contexts
+                WHERE agent_name=?
+                ORDER BY stored_at DESC, rowid DESC
+                LIMIT -1 OFFSET ?
             )
+            """,
+            (agent_name, self.hard_cap_per_agent),
+        )
         return self._db.total_changes - before
 
     def sweep_retention(self, *, now: float | None = None) -> int:
@@ -413,6 +415,11 @@ class MessageContextStore:
         with self._lock:
             try:
                 deleted = self._sweep_retention_locked(current)
+                agent_rows = self._db.execute(
+                    "SELECT DISTINCT agent_name FROM message_contexts"
+                ).fetchall()
+                for row in agent_rows:
+                    deleted += self._trim_agent_locked(row["agent_name"], current)
                 self._db.commit()
                 return deleted
             except Exception:
