@@ -192,30 +192,32 @@ def test_large_telegram_ids_keep_exact_decimal_digits():
                for key in FIELDS if key.endswith("_id") or key == "reply_to")
 
 
-def _telegram_batch(data):
+def _telegram_batch(data, *, first_update_id=100, read_stderr=None):
     offsets = []
 
     def response(request):
         body = json.loads(request.content)
         assert body["allowed_updates"] == ["message"]
         offsets.append(body.get("offset"))
-        updates = [{"update_id": 100 + index, "message": message}
+        updates = [{"update_id": first_update_id + index, "message": message}
                    for index, message in enumerate(data)] if len(offsets) == 1 else []
         return httpx.Response(200, json={"ok": True, "result": updates})
 
     adapter = TelegramAdapter("fixture-token")
     adapter._client.close()
     adapter._client = httpx.Client(transport=httpx.MockTransport(response))
-    messages, error = [], None
+    messages, error, first_stderr = [], None, None
     try:
         try:
             messages = adapter.get_updates()
         except Exception as exc:
             error = type(exc).__name__
+        if read_stderr is not None:
+            first_stderr = read_stderr()
         assert adapter.get_updates() == []
     finally:
         adapter.close()
-    return SimpleNamespace(messages=messages, error=error, offsets=offsets)
+    return SimpleNamespace(messages=messages, error=error, offsets=offsets, first_stderr=first_stderr)
 
 
 def _batch_with_middle(**changes):
@@ -308,6 +310,27 @@ def test_well_formed_update_batch_preserves_every_mapped_field(capsys):
                          "metadata": metadata})
     assert [message.to_dict() for message in outcome.messages] == expected
     assert capsys.readouterr().err == ""
+
+
+def test_skipped_last_update_advances_cursor_without_logging_again(capsys):
+    data = [_telegram_data(message_id=10, text="first"),
+            _telegram_data(message_id=11, text="second"),
+            _telegram_data(message_id=12, via_bot="bad")]
+    outcome = _telegram_batch(data, read_stderr=lambda: capsys.readouterr().err)
+    assert outcome.error is None
+    assert [message.message_id for message in outcome.messages] == ["10", "11"]
+    assert [message.content for message in outcome.messages] == ["first", "second"]
+    assert outcome.offsets == [None, 103]
+    assert outcome.first_stderr.splitlines() == ["Telegram update 102 skipped: ValueError"]
+    assert capsys.readouterr().err == ""
+
+
+def test_single_skipped_update_advances_cursor(capsys):
+    outcome = _telegram_batch([_telegram_data(message_id=11, via_bot="bad")], first_update_id=101)
+    assert outcome.error is None
+    assert outcome.messages == []
+    assert outcome.offsets == [None, 102]
+    assert capsys.readouterr().err.splitlines() == ["Telegram update 101 skipped: ValueError"]
 
 
 async def _slack(monkeypatch, event):
