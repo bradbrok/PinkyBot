@@ -75,7 +75,9 @@ async def run():
         for path in paths:
             assert_locks(path)
         await app.state.db_permission_sweep_task
-        assert check_sqlite_locks(app.state.store_catalog.live_wal_stores())["healthy"] is True
+        assert check_sqlite_locks(
+            [(n, records[n].resolved_path) for n in ('tasks', 'sessions')]
+        )["healthy"] is True
         if scenario == 'locks':
             for path in paths:
                 assert_locks(path)
