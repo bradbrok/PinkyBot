@@ -29,15 +29,20 @@ def _stores(tmp_path, names=("s",)):
     return stores
 
 
-def _line(store, label, *, pid=None, kind="READ", waiter=False, device=None, end=None):
-    suffix, start, length = ("", 1073741826, 510) if label == "SHARED" else ("-shm", 128, 1)
+def _line(
+    store, label, *, pid=None, kind="READ", waiter=False, device=None, end=None,
+    start=None, inode=None,
+):
+    suffix, offset, length = ("", 1073741826, 510) if label == "SHARED" else ("-shm", 128, 1)
     info = Path(store[1] + suffix).stat()
     major, minor = device or (os.major(info.st_dev), os.minor(info.st_dev))
     owner = os.getpid() if pid is None else pid
+    start = offset if start is None else start
+    inode = info.st_ino if inode is None else inode
     stop = start + length - 1 if end is None else end
     return (
         f"1: {'-> ' if waiter else ''}POSIX  ADVISORY  {kind}  {owner} "
-        f"{major:02x}:{minor:02x}:{info.st_ino} {start} {stop}"
+        f"{major:02x}:{minor:02x}:{inode} {start} {stop}"
     )
 
 
@@ -146,6 +151,63 @@ def test_noncovering_or_ineligible_lines_remain_missing(tmp_path, invalid):
         "short_range": {"end": 1073742334},
     }[invalid]
     text = _line(stores[0], "DMS") + "\n" + _line(stores[0], "SHARED", **kwargs)
+    result, calls, pauses = _probe(stores, [text])
+    assert result == _expected(["s:SHARED"])
+    assert len(calls) == 5
+    assert pauses == [0.02] * 4
+
+
+def test_truncated_read_record_is_ignored(tmp_path):
+    stores = _stores(tmp_path)
+    truncated = _line(stores[0], "SHARED").rsplit(" ", 1)[0]
+    assert len(truncated.split()) == 7
+    text = _line(stores[0], "DMS") + "\n" + truncated
+    result, calls, pauses = _probe(stores, [text])
+    assert result == _expected(["s:SHARED"])
+    assert len(calls) == 5
+    assert pauses == [0.02] * 4
+
+
+def test_read_starting_after_offset_remains_missing(tmp_path):
+    stores = _stores(tmp_path)
+    text = "\n".join([
+        _line(stores[0], "DMS"),
+        _line(stores[0], "SHARED", start=1073741827, end=1073742335),
+    ])
+    result, calls, pauses = _probe(stores, [text])
+    assert result == _expected(["s:SHARED"])
+    assert len(calls) == 5
+    assert pauses == [0.02] * 4
+
+
+def test_covering_identity_wins_over_foreign_device_match(tmp_path):
+    stores = _stores(tmp_path)
+    info = Path(stores[0][1]).stat()
+    foreign = (os.major(info.st_dev) + 1, os.minor(info.st_dev))
+    text = "\n".join([
+        _line(stores[0], "SHARED", device=foreign),
+        _line(stores[0], "SHARED"),
+        _line(stores[0], "DMS"),
+    ])
+    result, calls, pauses = _probe(stores, [text])
+    assert result == _expected()
+    assert len(calls) == 1
+    assert pauses == []
+
+
+@pytest.mark.parametrize("invalid", ["other_inode", "late_start", "short_end"])
+def test_foreign_device_match_must_cover_the_same_inode(tmp_path, invalid):
+    stores = _stores(tmp_path)
+    info = Path(stores[0][1]).stat()
+    foreign = (os.major(info.st_dev) + 1, os.minor(info.st_dev))
+    kwargs = {
+        "other_inode": {"inode": info.st_ino + 1},
+        "late_start": {"start": 1073741827, "end": 1073742335},
+        "short_end": {"end": 1073742334},
+    }[invalid]
+    text = _line(stores[0], "DMS") + "\n" + _line(
+        stores[0], "SHARED", device=foreign, **kwargs,
+    )
     result, calls, pauses = _probe(stores, [text])
     assert result == _expected(["s:SHARED"])
     assert len(calls) == 5
