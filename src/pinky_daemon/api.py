@@ -316,7 +316,11 @@ def _log(msg: str) -> None:
 
 
 _STATUS_HOOK_RECEIPT_LOG_INTERVAL_SEC = 60.0
-_EARLY_TRANSCRIPT_REPORT_TTL_SEC = 120.0
+_EARLY_TRANSCRIPT_REPORT_MAX_LABELS_PER_AGENT = 8
+_EARLY_TRANSCRIPT_REPORT_MAX_LABEL_LENGTH = 128
+_EARLY_TRANSCRIPT_REPORT_MAX_SESSION_ID_LENGTH = 256
+_EARLY_TRANSCRIPT_REPORT_MAX_PATH_LENGTH = 4096
+_EARLY_TRANSCRIPT_REPORT_TTL_MARGIN_SEC = 60.0
 
 
 def _validate_path(path: str) -> None:
@@ -510,6 +514,15 @@ COLDSTART_SERIALIZE = os.environ.get(
     "PINKY_COLDSTART_SERIALIZE", "0"
 ).strip().lower() in ("1", "true", "yes", "on")
 COLDSTART_SETTLE_SEC = float(os.environ.get("PINKY_COLDSTART_SETTLE_SEC", "3.0"))
+
+
+def _early_transcript_report_ttl() -> float:
+    return (
+        COLD_START_CONNECT_TIMEOUT_SEC
+        + max(0.0, COLDSTART_SETTLE_SEC)
+        + _EARLY_TRANSCRIPT_REPORT_TTL_MARGIN_SEC
+    )
+
 
 # Process-global gate. Lazily created and rebound if the running loop changes
 # (keeps a single instance in the daemon's one loop; stays correct under
@@ -4645,7 +4658,7 @@ def create_api(
             path, session_id, own_projects, received = pending
             if (
                 received < launch_started
-                or time.monotonic() - received > _EARLY_TRANSCRIPT_REPORT_TTL_SEC
+                or time.monotonic() - received > _early_transcript_report_ttl()
             ):
                 _log(f"api: early transcript report stale for {agent_name} ({label}); dropped")
             else:
@@ -8779,10 +8792,40 @@ npm run build</pre>
 
         session = broker.get_streaming_session(name, label=req.label)
         if session is None:
+            if not (
+                1 <= len(req.label) <= _EARLY_TRANSCRIPT_REPORT_MAX_LABEL_LENGTH
+                and req.label.isprintable()
+                and len(req.session_id) <= _EARLY_TRANSCRIPT_REPORT_MAX_SESSION_ID_LENGTH
+                and len(str(normalised)) <= _EARLY_TRANSCRIPT_REPORT_MAX_PATH_LENGTH
+            ):
+                _log(
+                    f"api: early transcript report not held for {name}: "
+                    "field too long or not printable"
+                )
+                return {"ok": True, "agent": name, "session": None}
+            now = time.monotonic()
+            ttl = _early_transcript_report_ttl()
+            expired = [key for key, report in _pending_transcript_reports.items()
+                       if now - report[3] > ttl]
+            for key in expired:
+                del _pending_transcript_reports[key]
+            if expired:
+                _log(f"api: early transcript reports expired: {len(expired)}")
+            if (name, req.label) not in _pending_transcript_reports:
+                agent_reports = [(key, report[3])
+                                 for key, report in _pending_transcript_reports.items()
+                                 if key[0] == name]
+                if len(agent_reports) >= _EARLY_TRANSCRIPT_REPORT_MAX_LABELS_PER_AGENT:
+                    oldest = min(agent_reports, key=lambda item: item[1])[0]
+                    del _pending_transcript_reports[oldest]
+                    _log(
+                        f"api: early transcript report for {name} ({oldest[1]}) "
+                        "dropped: per-agent limit"
+                    )
             _pending_transcript_reports[(name, req.label)] = (
                 normalised, req.session_id,
                 set(own_projects) if caller_agent is not None else None,
-                time.monotonic(),
+                now,
             )
             _log(f"api: early transcript report held for {name} ({req.label})")
             return {"ok": True, "agent": name, "session": None, "held": True}

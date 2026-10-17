@@ -27,6 +27,9 @@ def rig(tmp_path, monkeypatch):
     monkeypatch.setenv("PINKY_ISOLATED_POLICY_MODE", "enforce")
     monkeypatch.setenv("PINKY_SESSION_CLASS_REBUILD", "0")
     monkeypatch.setenv("PINKY_RESUME_FAILSAFE", "0")
+    monkeypatch.setattr(api, "COLD_START_CONNECT_TIMEOUT_SEC", 120.0)
+    monkeypatch.setattr(api, "COLDSTART_SETTLE_SEC", 3.0)
+    monkeypatch.setattr(api, "COLDSTART_SERIALIZE", False)
     app = api.create_api(db_path=str(tmp_path / "memory.db"), default_working_dir=str(tmp_path))
     for name in ("worker", "peer"):
         work = tmp_path / name
@@ -119,6 +122,10 @@ def _pending(rig):
     return inspect.getclosurevars(endpoint).nonlocals.get("_pending_transcript_reports", {})
 
 
+def _expected_report_ttl():
+    return api.COLD_START_CONNECT_TIMEOUT_SEC + max(0.0, api.COLDSTART_SETTLE_SEC) + 60.0
+
+
 async def _idle_check(rig, now):
     scheduler = rig.app.state.scheduler
     await scheduler._check_idle_sessions(now)
@@ -184,7 +191,7 @@ async def test_report_past_its_ttl_is_dropped(rig, monkeypatch):
 
     def report_then_wait():
         assert _post(rig, _path(rig)).json()["held"] is True
-        rig.clock[0] += 121
+        rig.clock[0] += _expected_report_ttl() + 1
 
     await _launch(rig, monkeypatch, holder, report_then_wait)
     holder.bind.assert_not_called()
@@ -341,3 +348,187 @@ async def test_idle_update_preserves_other_settings_and_other_agents(rig, monkey
     assert peer.session._config.idle_timeout == 8 * 3600
     holder.pane.kill_session.assert_not_awaited()
     peer.pane.kill_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("excess,applied", [(0.0, True), (0.001, False)], ids=["equal", "past"])
+async def test_report_ttl_boundary(rig, monkeypatch, excess, applied):
+    holder = _session(rig, monkeypatch)
+    path = _path(rig)
+
+    def report_and_age():
+        rig.clock[0] += 0.5
+        assert _post(rig, path).json()["held"] is True
+        rig.clock[0] += _expected_report_ttl() + excess
+
+    await _launch(rig, monkeypatch, holder, report_and_age)
+    assert holder.session._session_ready_event.is_set() is applied
+    assert holder.bind.call_args_list == ([call(path, session_id="reported-session")] if applied else [])
+    assert _pending(rig) == {}
+    outcome = "applied" if applied else "stale"
+    assert any(f"early transcript report {outcome} for worker (main)" in line for line in rig.logs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "connect_bound,settle,age", [(300.0, 3.0, 250.0), (120.0, 30.0, 195.0),
+                               (120.0, 3.0, 150.0), (120.0, -30.0, 180.0)],
+    ids=["connect", "settle", "margin", "negative_settle"],
+)
+async def test_current_launch_ttl_includes_each_connect_allowance(
+    rig, monkeypatch, connect_bound, settle, age,
+):
+    monkeypatch.setattr(api, "COLD_START_CONNECT_TIMEOUT_SEC", connect_bound)
+    monkeypatch.setattr(api, "COLDSTART_SETTLE_SEC", settle)
+    holder = _session(rig, monkeypatch)
+    path = _path(rig)
+    assert age <= _expected_report_ttl()
+
+    def report_and_age():
+        rig.clock[0] += 0.5
+        assert _post(rig, path).json()["held"] is True
+        rig.clock[0] += age
+
+    await _launch(rig, monkeypatch, holder, report_and_age)
+    holder.bind.assert_called_once_with(path, session_id="reported-session")
+    assert holder.session._session_ready_event.is_set()
+    assert _pending(rig) == {}
+
+
+@pytest.mark.asyncio
+async def test_early_report_survives_connect_and_serialized_settle(rig, monkeypatch):
+    monkeypatch.setattr(api, "COLDSTART_SERIALIZE", True)
+    sleeps = []
+
+    async def settle(seconds):
+        sleeps.append(seconds)
+        rig.clock[0] += seconds
+
+    monkeypatch.setattr(api, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": settle}))
+    holder = _session(rig, monkeypatch)
+    path = _path(rig)
+    started = rig.clock[0]
+
+    def report_during_connect():
+        rig.clock[0] = started + 0.5
+        assert _post(rig, path).json()["held"] is True
+        rig.clock[0] = started + 118.0
+
+    await _launch(rig, monkeypatch, holder, report_during_connect)
+    assert sleeps == [3.0]
+    assert rig.clock[0] == started + 121.0
+    holder.bind.assert_called_once_with(path, session_id="reported-session")
+    assert holder.session._session_ready_event.is_set()
+    assert _pending(rig) == {}
+
+
+@pytest.mark.parametrize("field", ["long_label", "empty_label", "newline", "nul", "id", "path"])
+def test_invalid_held_report_fields_keep_the_legacy_response(rig, field):
+    path = _path(rig)
+    label, session_id = "main", "reported-session"
+    if field == "long_label":
+        label = "l" * 129
+    elif field == "empty_label":
+        label = ""
+    elif field == "newline":
+        label = "line\nbreak"
+    elif field == "nul":
+        label = "nul\x00label"
+    elif field == "id":
+        session_id = "s" * 257
+    else:
+        path = path.parent.joinpath(*(["missing" * 10] * 60), "tail.jsonl")
+        assert len(str(path)) > 4096
+    response = _post(rig, path, label=label, session_id=session_id)
+    if field == "path" and response.status_code == 400:
+        assert "transcript_path could not be resolved" in response.json()["detail"]
+        assert _pending(rig) == {}
+        return
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True, "agent": "worker", "session": None}
+    assert _pending(rig) == {}
+    assert [line for line in rig.logs if "early transcript report" in line] == [
+        "api: early transcript report not held for worker: field too long or not printable",
+    ]
+
+
+@pytest.mark.parametrize("field", ["label", "id"])
+def test_held_report_field_limits_are_inclusive(rig, field):
+    label = "l" * 128 if field == "label" else "main"
+    session_id = "s" * 256 if field == "id" else "reported-session"
+    response = _post(rig, _path(rig), label=label, session_id=session_id)
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "agent": "worker", "session": None, "held": True}
+    assert set(_pending(rig)) == {("worker", label)}
+    assert f"api: early transcript report held for worker ({label})" in rig.logs
+
+
+@pytest.mark.parametrize("target", ["worker", "peer"])
+def test_store_prunes_expired_reports_across_agents(rig, target):
+    path = _path(rig)
+    peer_path = _path(rig, name="peer")
+    start = rig.clock[0]
+    assert _post(rig, path, label="expired").json()["held"]
+    assert _post(rig, peer_path, name="peer", label="expired").json()["held"]
+    rig.clock[0] += 1
+    assert _post(rig, path, label="kept").json()["held"]
+    kept = _pending(rig)[("worker", "kept")]
+    rig.clock[0] = start + _expected_report_ttl() + 1
+    response = _post(rig, path if target == "worker" else peer_path, name=target, label="new")
+    assert response.status_code == 200
+    assert response.json()["held"] is True
+    assert set(_pending(rig)) == {("worker", "kept"), (target, "new")}
+    assert _pending(rig)[("worker", "kept")] == kept
+    assert rig.logs.count("api: early transcript reports expired: 2") == 1
+
+
+@pytest.mark.parametrize("connect_bound,age", [(120.0, 182.0), (120.0, 183.0), (300.0, 250.0)],
+                         ids=["inside", "equal", "extended"])
+def test_store_keeps_reports_within_the_current_ttl(rig, monkeypatch, connect_bound, age):
+    path = _path(rig)
+    assert _post(rig, path, label="kept").json()["held"]
+    kept = _pending(rig)[("worker", "kept")]
+    monkeypatch.setattr(api, "COLD_START_CONNECT_TIMEOUT_SEC", connect_bound)
+    assert age <= _expected_report_ttl()
+    rig.clock[0] += age
+    response = _post(rig, _path(rig, name="peer"), name="peer")
+    assert response.status_code == 200
+    assert response.json()["held"] is True
+    assert set(_pending(rig)) == {("worker", "kept"), ("peer", "main")}
+    assert _pending(rig)[("worker", "kept")] == kept
+    assert not any("early transcript reports expired:" in line for line in rig.logs)
+
+
+def test_per_agent_limit_evicts_only_the_oldest_label(rig):
+    path = _path(rig)
+    assert _post(rig, _path(rig, name="peer"), name="peer").json()["held"]
+    peer = _pending(rig)[("peer", "main")]
+    for index in range(9):
+        rig.clock[0] += 1
+        response = _post(rig, path, label=f"label-{index}")
+        assert response.status_code == 200
+        assert response.json()["held"] is True
+    assert set(_pending(rig)) == {("peer", "main"), *(
+        ("worker", f"label-{index}") for index in range(1, 9)
+    )}
+    assert _pending(rig)[("peer", "main")] == peer
+    assert rig.logs.count(
+        "api: early transcript report for worker (label-0) dropped: per-agent limit"
+    ) == 1
+
+
+def test_replacing_a_label_at_the_limit_preserves_other_entries(rig):
+    path = _path(rig)
+    for index in range(8):
+        rig.clock[0] += 1
+        assert _post(rig, path, label=f"label-{index}").json()["held"]
+    before = dict(_pending(rig))
+    rig.clock[0] += 1
+    response = _post(rig, path, label="label-3", session_id="replacement")
+    assert response.status_code == 200
+    assert response.json()["held"] is True
+    assert set(_pending(rig)) == set(before)
+    assert _pending(rig)[("worker", "label-3")] != before[("worker", "label-3")]
+    assert all(value == _pending(rig)[key] for key, value in before.items()
+               if key != ("worker", "label-3"))
+    assert not any("dropped: per-agent limit" in line for line in rig.logs)
