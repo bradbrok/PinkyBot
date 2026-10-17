@@ -5,9 +5,11 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
+from pinky_daemon import message_context_store as store_module
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.broker import BrokerMessage, MessageBroker
 from pinky_daemon.message_context_store import MessageContextStore
@@ -134,6 +136,7 @@ def test_retention_prunes_old_rows_and_caps_each_agent(tmp_path):
         str(tmp_path / "message-context.db"),
         retention_days=30,
         max_per_agent=2,
+        hard_cap_per_agent=2,
     )
 
     store.put(_stored_context("expired"), stored_at=now - (31 * 86400))
@@ -340,7 +343,7 @@ def test_text_columns_migrate_twice_and_survive_identity_rebuild(tmp_path, legac
 
 
 def test_text_visibility_matches_retention_cap_and_snapshot(tmp_path, monkeypatch):
-    store = MessageContextStore(str(tmp_path / "context.db"), max_per_agent=2)
+    store = MessageContextStore(str(tmp_path / "context.db"), max_per_agent=2, hard_cap_per_agent=2)
     now = time.time()
     try:
         _put_text(store, _text_context(), content="first", sender_id="sender", stored_at=now)
@@ -372,5 +375,134 @@ def test_private_text_lookup_uses_every_identity_component(tmp_path):
         assert getter("sample", "other", platform="test", chat_id="chat") is None
         assert getter("sample", "record", platform="test", chat_id="other-chat") == ("second", "ok", "sender-2")
         assert _read_text(store) == ("first", "ok", "sender-1")
+    finally:
+        store.close()
+
+
+DAY = 86400
+CONTEXT_NOW = 1_800_000_000.0
+
+
+@pytest.fixture
+def context_clock(monkeypatch):
+    monkeypatch.setattr(store_module, "time", SimpleNamespace(time=lambda: CONTEXT_NOW))
+    return CONTEXT_NOW
+
+
+def _age_context(message_id, *, agent_name="sample", direction="inbound"):
+    return {"agent_name": agent_name, "message_id": message_id, "platform": "test",
+            "chat_id": "chat", "timestamp": CONTEXT_NOW, "metadata": {"direction": direction}}
+
+
+def _age_row_ids(store, agent_name="sample"):
+    return [row[0] for row in store._db.execute(
+        "SELECT message_id FROM message_contexts WHERE agent_name=? "
+        "ORDER BY stored_at ASC, rowid ASC", (agent_name,),
+    )]
+
+
+def test_minimum_age_preserves_young_rows_beyond_count_limit(tmp_path, context_clock):
+    path = str(tmp_path / "context.db")
+    store = MessageContextStore(path, max_per_agent=1000)
+    try:
+        for index in range(1500):
+            store.put(_age_context(str(index), direction="outbound" if index % 2 else "inbound"),
+                      stored_at=context_clock - 6 * DAY + index)
+        assert store.sweep_retention(now=context_clock) == 0
+        assert _age_row_ids(store) == [str(index) for index in range(1500)]
+    finally:
+        store.close()
+    store = MessageContextStore(path, max_per_agent=1000)
+    try:
+        assert _age_row_ids(store) == [str(index) for index in range(1500)]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_age_limited_cap_keeps_newest_overall_and_every_young_row(tmp_path, context_clock, tied):
+    store = MessageContextStore(str(tmp_path / "context.db"), max_per_agent=3)
+    try:
+        for index in range(5):
+            store.put(_age_context(f"old-{index}"),
+                      stored_at=context_clock - 8 * DAY + (0 if tied else index))
+        store.sweep_retention(now=context_clock)
+        assert _age_row_ids(store) == [f"old-{index}" for index in range(2, 5)]
+        for index in range(5):
+            store.put(_age_context(f"young-{index}"), stored_at=context_clock - 60 + index)
+        store.put(_age_context("isolated", agent_name="other"), stored_at=context_clock)
+        store.sweep_retention(now=context_clock)
+        assert _age_row_ids(store) == [f"young-{index}" for index in range(5)]
+        assert _age_row_ids(store, "other") == ["isolated"]
+    finally:
+        store.close()
+
+
+def test_expiry_still_limits_reads_and_removes_rows_below_minimum_age(tmp_path, context_clock):
+    store = MessageContextStore(str(tmp_path / "context.db"), min_age_days=60)
+    try:
+        store.put(_age_context("expired"), stored_at=context_clock - 31 * DAY)
+        assert store.find("sample", "expired") == []
+        assert store.get_text("sample", "expired", platform="test", chat_id="chat") is None
+        assert store.sweep_retention(now=context_clock) == 1
+        assert _age_row_ids(store) == []
+        store.put(_age_context("retained"), stored_at=context_clock - 29 * DAY)
+        assert store.sweep_retention(now=context_clock) == 0
+        assert store.find("sample", "retained")
+        assert store.retention_days == 30
+    finally:
+        store.close()
+
+
+def test_zero_minimum_age_keeps_a_one_day_floor(tmp_path, context_clock):
+    store = MessageContextStore(str(tmp_path / "context.db"), max_per_agent=1, min_age_days=0)
+    try:
+        store.put(_age_context("boundary"), stored_at=context_clock - DAY)
+        store.put(_age_context("young"), stored_at=context_clock - DAY / 2)
+        store.put(_age_context("latest"), stored_at=context_clock)
+        assert store.sweep_retention(now=context_clock) == 0
+        assert _age_row_ids(store) == ["boundary", "young", "latest"]
+        assert store.min_age_days == 1
+        assert store.sweep_retention(now=context_clock + 0.5) == 1
+        assert _age_row_ids(store) == ["young", "latest"]
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("DEFAULT_MIN_AGE_DAYS", 7), ("DEFAULT_MAX_PER_AGENT", 5000),
+    ("DEFAULT_HARD_CAP_PER_AGENT", 20000),
+])
+def test_message_context_retention_defaults(name, expected):
+    assert getattr(store_module, name) == expected
+
+
+@pytest.mark.parametrize("stage", ["put", "constructor"])
+@pytest.mark.parametrize("tied", [False, True])
+def test_hard_ceiling_keeps_newest_young_rows(tmp_path, context_clock, stage, tied):
+    path = str(tmp_path / "context.db")
+    store = MessageContextStore(path, max_per_agent=10,
+                                hard_cap_per_agent=40 if stage == "put" else 100)
+    try:
+        for index in range(50):
+            store.put(_age_context(str(index)),
+                      stored_at=context_clock - 60 + (0 if tied else index))
+        if stage == "constructor":
+            assert len(_age_row_ids(store)) == 50
+            store.close()
+            store = MessageContextStore(path, max_per_agent=10, hard_cap_per_agent=40)
+        assert _age_row_ids(store) == [str(index) for index in range(10, 50)]
+        assert store.hard_cap_per_agent == 40
+    finally:
+        store.close()
+
+
+def test_hard_ceiling_is_raised_to_count_limit(tmp_path, context_clock):
+    store = MessageContextStore(str(tmp_path / "context.db"), max_per_agent=10, hard_cap_per_agent=3)
+    try:
+        for index in range(50):
+            store.put(_age_context(str(index)), stored_at=context_clock - 60 + index)
+        assert _age_row_ids(store) == [str(index) for index in range(40, 50)]
+        assert store.hard_cap_per_agent == 10
     finally:
         store.close()
