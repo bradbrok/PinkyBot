@@ -532,3 +532,62 @@ def test_replacing_a_label_at_the_limit_preserves_other_entries(rig):
     assert all(value == _pending(rig)[key] for key, value in before.items()
                if key != ("worker", "label-3"))
     assert not any("dropped: per-agent limit" in line for line in rig.logs)
+
+
+def _sized_path(rig, length):
+    path = _path(rig).parent
+    while length - len(str(path)) - 1 > 100:
+        path = path / ("x" * 80)
+    path = path / ("y" * (length - len(str(path)) - 1))
+    assert len(str(path)) == length
+    return path
+
+
+def _invalid_report_fields(rig, field):
+    path, label, session_id = _path(rig), "main", "reported-session"
+    if field == "long_label":
+        label = "l" * 129
+    elif field == "empty_label":
+        label = ""
+    elif field == "newline":
+        label = "line\nbreak"
+    elif field == "nul":
+        label = "nul\x00label"
+    elif field == "id":
+        session_id = "s" * 257
+    elif field == "path":
+        path = _sized_path(rig, 4097)
+    return path, label, session_id
+
+
+@pytest.mark.parametrize("field", ["long_label", "empty_label", "newline", "nul", "id", "path"])
+def test_refused_fields_leave_expired_and_full_maps_unchanged(rig, field):
+    assert _post(rig, _path(rig, name="peer"), name="peer").json()["held"]
+    rig.clock[0] += 1
+    path = _path(rig)
+    for index in range(8):
+        assert _post(rig, path, label=f"label-{index}").json()["held"]
+    rig.clock[0] += _expected_report_ttl()
+    before = dict(_pending(rig))
+    assert set(before) == {("peer", "main"), *(
+        ("worker", f"label-{index}") for index in range(8)
+    )}
+    assert rig.clock[0] - before[("peer", "main")][3] > _expected_report_ttl()
+    assert all(rig.clock[0] - row[3] <= _expected_report_ttl()
+               for key, row in before.items() if key[0] == "worker")
+    path, label, session_id = _invalid_report_fields(rig, field)
+    start = len(rig.logs)
+    response = _post(rig, path, label=label, session_id=session_id)
+    assert _pending(rig) == before
+    new_logs = rig.logs[start:]
+    assert not any("expired:" in line for line in new_logs)
+    assert not any("per-agent limit" in line for line in new_logs)
+    if field == "path" and response.status_code == 400:
+        assert "transcript_path could not be resolved" in response.json()["detail"]
+        assert new_logs == []
+        return
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "agent": "worker", "session": None}
+    assert new_logs == [
+        "api: early transcript report not held for worker: field too long or not printable",
+    ]
