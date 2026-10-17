@@ -9,11 +9,14 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 
 import httpx
 
 from pinky_outreach.types import Chat, Message, Platform
+
+CALLBACK_ANSWER_BUDGET = 10.0
 
 
 class TelegramError(Exception):
@@ -479,16 +482,24 @@ class TelegramAdapter:
         )
 
         messages = []
+        answer_time = 0.0
+        skipped_answers = 0
         for update in result:
             self._last_update_id = max(self._last_update_id, update["update_id"])
 
             callback = update.get("callback_query")
             callback_id = callback.get("id") if isinstance(callback, dict) else None
             if isinstance(callback_id, str) and callback_id:
-                try:
-                    self.answer_callback_query(callback_id)
-                except Exception as exc:
-                    print(type(exc).__name__, file=sys.stderr, flush=True)
+                if answer_time >= CALLBACK_ANSWER_BUDGET:
+                    skipped_answers += 1
+                else:
+                    started = time.monotonic()
+                    try:
+                        self.answer_callback_query(callback_id)
+                    except Exception as exc:
+                        print(type(exc).__name__, file=sys.stderr, flush=True)
+                    finally:
+                        answer_time += time.monotonic() - started
 
             try:
                 message = self._message_from_update(update)
@@ -499,6 +510,8 @@ class TelegramAdapter:
             if message is not None:
                 messages.append(message)
 
+        if skipped_answers:
+            print(f"callback answers skipped: {skipped_answers}", file=sys.stderr, flush=True)
         return messages
 
     @staticmethod

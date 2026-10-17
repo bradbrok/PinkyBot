@@ -140,6 +140,7 @@ SettingReader = Callable[..., str]
 class _Pending:
     agent_name: str
     relay_mid: str
+    relay_chat_id: str
     future: "asyncio.Future[str]"
     issued_at: float
 
@@ -217,7 +218,7 @@ class AuthRelayCoordinator:
 
         loop = asyncio.get_running_loop()
         fut: "asyncio.Future[str]" = loop.create_future()
-        self._pending[agent_name] = _Pending(agent_name, relay_mid, fut, time.time())
+        self._pending[agent_name] = _Pending(agent_name, relay_mid, chat_id, fut, time.time())
         try:
             return await asyncio.wait_for(fut, timeout=ttl_sec)
         except asyncio.TimeoutError:
@@ -256,6 +257,10 @@ class AuthRelayCoordinator:
     def pending_relay_mid(self, agent_name: str) -> Optional[str]:
         p = self._pending.get(agent_name)
         return p.relay_mid if p is not None else None
+
+    def pending_relay_chat_id(self, agent_name: str) -> Optional[str]:
+        p = self._pending.get(agent_name)
+        return p.relay_chat_id if p is not None else None
 
     def submit(self, agent_name: str, code: str) -> bool:
         """Deliver ``code`` to a waiting :meth:`open`. True if one was waiting."""

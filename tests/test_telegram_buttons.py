@@ -4,19 +4,22 @@ import asyncio
 import copy
 import json
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
 
+from pinky_daemon import broker as broker_module
 from pinky_daemon import message_context_store as store_module
 from pinky_daemon import pollers
 from pinky_daemon.auth import build_internal_auth_headers
+from pinky_daemon.auth_relay import AuthRelayCoordinator
 from pinky_daemon.transport_state import SessionState
 from pinky_messaging.server import create_server
+from pinky_outreach import telegram as telegram_module
 from pinky_outreach.telegram import TelegramAdapter, TelegramError
 from tests.test_inbound_message_fields import (
     FIELDS,
@@ -495,3 +498,192 @@ async def test_callback_data_never_runs_owner_commands(gateway, monkeypatch, dat
         assert response.json()["text"] == "Button tapped: " + data
         for handler in commands:
             handler.assert_not_awaited()
+
+
+
+def _slow_answers(monkeypatch, adapter):
+    clock = SimpleNamespace(now=100.0, slow=True, attempted=[])
+    monkeypatch.setattr(telegram_module, "time",
+                        SimpleNamespace(monotonic=lambda: clock.now), raising=False)
+
+    def answer(callback_id):
+        clock.attempted.append(callback_id)
+        if clock.slow:
+            clock.now += 5.0
+            raise httpx.ReadTimeout("synthetic answer timeout")
+
+    monkeypatch.setattr(adapter, "answer_callback_query", answer)
+    return clock
+
+
+def _twenty_taps():
+    return [_update(_callback(id=f"tap_{index}"), update_id=index) for index in range(1, 21)]
+
+
+def test_callback_answer_budget_keeps_every_tap_and_counts_skips(monkeypatch, capsys):
+    with _adapter(_twenty_taps()) as state:
+        clock = _slow_answers(monkeypatch, state.adapter)
+        messages = _poll(state.adapter)
+        assert clock.attempted == ["tap_1", "tap_2"]
+        assert [message.message_id for message in messages] == [f"cb-tap_{i}" for i in range(1, 21)]
+        assert state.adapter._last_update_id == 20
+        assert _poll(state.adapter) == []
+        assert state.offsets == [None, 21]
+    assert capsys.readouterr().err.splitlines() == [
+        "ReadTimeout", "ReadTimeout", "callback answers skipped: 18",
+    ]
+
+
+def test_callback_answer_budget_resets_for_instant_answers(monkeypatch, capsys):
+    with _adapter(_twenty_taps(), repeats=2) as state:
+        clock = _slow_answers(monkeypatch, state.adapter)
+        assert len(_poll(state.adapter)) == 20
+        assert clock.attempted == ["tap_1", "tap_2"]
+        assert capsys.readouterr().err.splitlines()[-1] == "callback answers skipped: 18"
+        clock.slow = False
+        clock.attempted.clear()
+        messages = _poll(state.adapter)
+        assert clock.attempted == [f"tap_{i}" for i in range(1, 21)]
+        assert [message.message_id for message in messages] == [f"cb-tap_{i}" for i in range(1, 21)]
+        assert state.offsets == [None, 21]
+        assert capsys.readouterr().err == ""
+
+
+def test_spent_answer_budget_preserves_mixed_batch_order(monkeypatch, capsys):
+    updates = [{"update_id": 0, "message": _telegram_data(message_id=31)}]
+    updates += _twenty_taps()
+    updates += [{"update_id": 21, "message": _telegram_data(message_id=32)}]
+    with _adapter(updates) as state:
+        clock = _slow_answers(monkeypatch, state.adapter)
+        messages = _poll(state.adapter)
+        assert clock.attempted == ["tap_1", "tap_2"]
+        assert [message.message_id for message in messages] == [
+            "31", *[f"cb-tap_{i}" for i in range(1, 21)], "32",
+        ]
+        assert state.adapter._last_update_id == 21
+        assert _poll(state.adapter) == []
+        assert state.offsets == [None, 22]
+    assert capsys.readouterr().err.splitlines() == [
+        "ReadTimeout", "ReadTimeout", "callback answers skipped: 18",
+    ]
+
+
+@asynccontextmanager
+async def _pending_login(gateway, monkeypatch, *, relay_mid="41"):
+    gateway.agents.set_primary_user("202", display_name="Sender")
+    gateway.agents.set_setting("PINKY_TMUX_AUTH_RELAY", "1")
+    relay = AuthRelayCoordinator()
+    sent = AsyncMock(return_value={"message_id": relay_mid})
+    relay.configure(sent, gateway.agents.get_primary_user)
+    monkeypatch.setattr(broker_module, "_auth_relay", relay)
+    replies = AsyncMock()
+    monkeypatch.setattr(gateway.broker, "_send_callback", replies)
+    task = asyncio.create_task(relay.open("sample", "https://example.invalid/login", ttl_sec=30))
+    try:
+        for _ in range(200):
+            if relay.has_pending("sample"):
+                break
+            await asyncio.sleep(0)
+        assert relay.has_pending("sample")
+        assert relay.pending_relay_mid("sample") == relay_mid
+        assert relay.pending_relay_chat_id("sample") == "202"
+        assert sent.await_args.args[2] == "202"
+        yield SimpleNamespace(relay=relay, task=task, replies=replies)
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data,card_id", [(DATA, 41), ("abcdefghijkl", 41), (DATA, 42)])
+async def test_group_tap_routes_while_private_login_relay_waits(
+    gateway, monkeypatch, data, card_id
+):
+    callback = _callback(data=data)
+    callback["message"]["message_id"] = card_id
+    callback["message"]["chat"] = {"id": -101, "type": "supergroup", "title": "Group"}
+    gateway.agents.approve_user("sample", "-101", display_name="Group")
+    with _incoming(gateway, monkeypatch, callback) as state:
+        async with _pending_login(gateway, monkeypatch) as pending:
+            await _deliver(state)
+            response = _text(gateway, chat_id="-101", message_id="cb-tap_1")
+            assert response.status_code == 200
+            assert response.json()["button_data"] == data
+            assert response.json()["button_message_id"] == str(card_id)
+            state.session.send.assert_awaited_once()
+            assert data in state.session.send.await_args.args[0]
+            pending.replies.assert_not_awaited()
+            assert pending.relay.has_pending("sample")
+            assert not pending.task.done()
+
+
+@pytest.mark.asyncio
+async def test_group_quote_with_colliding_number_routes_during_private_login(gateway, monkeypatch):
+    gateway.agents.approve_user("sample", "-101", display_name="Group")
+    with _incoming(gateway, monkeypatch) as state:
+        async with _pending_login(gateway, monkeypatch) as pending:
+            await gateway.broker.handle_inbound(_message(
+                chat_id="-101", is_group=True, reply_to="41", content="abcdefghijkl",
+            ))
+            response = _text(gateway, chat_id="-101", message_id="41")
+            assert response.status_code == 200
+            state.session.send.assert_awaited_once()
+            pending.replies.assert_not_awaited()
+            assert pending.relay.has_pending("sample")
+            assert not pending.task.done()
+
+
+@pytest.mark.asyncio
+async def test_private_quote_submits_code_to_recorded_login_chat(gateway, monkeypatch):
+    async with _pending_login(gateway, monkeypatch) as pending:
+        handled = await gateway.broker._handle_auth_code_reply(_message(
+            chat_id="202", reply_to="41", content="abcdefghijkl",
+        ))
+        assert handled is True
+        assert await asyncio.wait_for(pending.task, timeout=1) == "abcdefghijkl"
+        pending.replies.assert_awaited_once()
+        assert pending.replies.await_args.args[2] == "202"
+        assert pending.relay.pending_relay_chat_id("sample") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recorded_chat", [None, ""])
+async def test_empty_recorded_login_chat_never_matches(gateway, monkeypatch, recorded_chat):
+    async with _pending_login(gateway, monkeypatch) as pending:
+        monkeypatch.setattr(pending.relay, "pending_relay_chat_id", lambda agent: recorded_chat)
+        handled = await gateway.broker._handle_auth_code_reply(_message(
+            chat_id=recorded_chat, sender_id="202", reply_to="41", content="abcdefghijkl",
+        ))
+        assert handled is False
+        pending.replies.assert_not_awaited()
+        assert not pending.task.done()
+
+
+@pytest.mark.asyncio
+async def test_empty_recorded_login_message_never_matches(gateway, monkeypatch):
+    async with _pending_login(gateway, monkeypatch, relay_mid="") as pending:
+        handled = await gateway.broker._handle_auth_code_reply(_message(
+            chat_id="202", reply_to="", content="abcdefghijkl",
+        ))
+        assert handled is False
+        pending.replies.assert_not_awaited()
+        assert not pending.task.done()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("button_data", [None, "", DATA])
+async def test_tap_presence_bypasses_login_reader_before_pending_check(
+    gateway, monkeypatch, button_data
+):
+    async with _pending_login(gateway, monkeypatch) as pending:
+        pending_check = Mock(wraps=pending.relay.has_pending)
+        monkeypatch.setattr(pending.relay, "has_pending", pending_check)
+        handled = await gateway.broker._handle_auth_code_reply(_message(
+            chat_id="202", reply_to="41", content="abcdefghijkl",
+            metadata={"button_data": button_data},
+        ))
+        assert handled is False
+        pending_check.assert_not_called()
+        pending.replies.assert_not_awaited()
+        assert not pending.task.done()
