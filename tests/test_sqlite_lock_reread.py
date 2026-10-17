@@ -69,6 +69,13 @@ def _expected(missing=(), inconclusive=()):
             "reason": "device_mismatch"}
 
 
+def test_empty_store_list_reads_once_without_sleep():
+    result, calls, pauses = _probe([], [""])
+    assert result == _expected()
+    assert len(calls) == 1
+    assert pauses == []
+
+
 def test_healthy_snapshot_reads_once_without_sleep(tmp_path):
     stores = _stores(tmp_path)
     result, calls, pauses = _probe(stores, [_snapshot(stores)])
