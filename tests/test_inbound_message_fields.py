@@ -192,6 +192,124 @@ def test_large_telegram_ids_keep_exact_decimal_digits():
                for key in FIELDS if key.endswith("_id") or key == "reply_to")
 
 
+def _telegram_batch(data):
+    offsets = []
+
+    def response(request):
+        body = json.loads(request.content)
+        assert body["allowed_updates"] == ["message"]
+        offsets.append(body.get("offset"))
+        updates = [{"update_id": 100 + index, "message": message}
+                   for index, message in enumerate(data)] if len(offsets) == 1 else []
+        return httpx.Response(200, json={"ok": True, "result": updates})
+
+    adapter = TelegramAdapter("fixture-token")
+    adapter._client.close()
+    adapter._client = httpx.Client(transport=httpx.MockTransport(response))
+    messages, error = [], None
+    try:
+        try:
+            messages = adapter.get_updates()
+        except Exception as exc:
+            error = type(exc).__name__
+        assert adapter.get_updates() == []
+    finally:
+        adapter.close()
+    return SimpleNamespace(messages=messages, error=error, offsets=offsets)
+
+
+def _batch_with_middle(**changes):
+    return [_telegram_data(message_id=10, text="first-private-text"),
+            _telegram_data(message_id=11, text="middle-private-text", **changes),
+            _telegram_data(message_id=12, text="last-private-text")]
+
+
+def _assert_skipped_middle(outcome, stderr, error_class):
+    assert outcome.error is None, f"batch mapping raised {outcome.error}"
+    assert [message.message_id for message in outcome.messages] == ["10", "12"]
+    assert [message.content for message in outcome.messages] == ["first-private-text", "last-private-text"]
+    assert outcome.offsets == [None, 103]
+    assert stderr.splitlines() == [f"Telegram update 101 skipped: {error_class}"]
+    assert all(text not in stderr for text in ["first-private-text", "middle-private-text", "last-private-text"])
+
+
+@pytest.mark.parametrize("field", ["via_bot", "sender_business_bot"])
+def test_malformed_optional_bot_does_not_discard_other_updates(capsys, field):
+    outcome = _telegram_batch(_batch_with_middle(**{field: "bad"}))
+    _assert_skipped_middle(outcome, capsys.readouterr().err, "ValueError")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("via_bot", {}), ("via_bot", {"id": ""}), ("via_bot", {"id": "123"}),
+    ("via_bot", {"id": True}), ("sender_business_bot", {"id": None}),
+])
+def test_present_optional_bot_requires_a_usable_id(capsys, field, value):
+    outcome = _telegram_batch(_batch_with_middle(**{field: value}))
+    _assert_skipped_middle(outcome, capsys.readouterr().err, "ValueError")
+
+
+@pytest.mark.parametrize("shape,error_class", [
+    ("date", "KeyError"), ("from", "AttributeError"), ("reply_to_message", "AttributeError"),
+])
+def test_malformed_existing_message_fields_do_not_discard_other_updates(capsys, shape, error_class):
+    data = _batch_with_middle()
+    if shape == "date":
+        del data[1][shape]
+    else:
+        data[1][shape] = "x"
+    outcome = _telegram_batch(data)
+    _assert_skipped_middle(outcome, capsys.readouterr().err, error_class)
+
+
+@pytest.mark.parametrize("sender_id", ["", "abc", True, 202.5])
+@pytest.mark.parametrize("is_bot", [False, True])
+def test_non_integer_sender_ids_are_unavailable(sender_id, is_bot):
+    message = _telegram(_telegram_data(**{"from": {"id": sender_id, "is_bot": is_bot}}))
+    assert _contract(message.metadata) == _facts(user_id=None, was_bot=is_bot, bot_id=None)
+    assert message.metadata["bot_id"] != ""
+    assert message.metadata["sender_id"] == str(sender_id)
+
+
+def test_non_integer_reply_sender_id_is_unavailable():
+    message = _telegram(_telegram_data(reply_to_message={"message_id": "39", "from": {"id": "abc"}}))
+    assert _contract(message.metadata) == _facts(reply_to="39", reply_to_sender_id=None)
+    assert message.reply_to == "39"
+
+
+def test_well_formed_update_batch_preserves_every_mapped_field(capsys):
+    data = [_telegram_data(message_id=10),
+            _telegram_data(message_id=11, text="", caption="second", forward_origin={},
+                           via_bot={"id": 303}, sender_business_bot={"id": 404},
+                           photo=[{"file_id": "small", "file_size": 1},
+                                  {"file_id": "large", "file_size": 2}],
+                           **{"from": {"id": 202, "first_name": "Sender", "is_bot": True,
+                                       "username": "sample"}}),
+            _telegram_data(message_id=12, text="third", via_bot=None, sender_business_bot=None,
+                           reply_to_message={"message_id": 9, "from": {"id": 505}})]
+    outcome = _telegram_batch(data)
+    assert outcome.error is None
+    assert outcome.offsets == [None, 103]
+    expected = []
+    for message_id, content, reply_to, metadata in [
+        ("10", "first", "", {"sender_id": "202", "username": "", "chat_type": "private",
+                             "chat_title": "", "entities": [], **_facts()}),
+        ("11", "second", "", {"sender_id": "202", "username": "sample", "chat_type": "private",
+                              "chat_title": "", "entities": [],
+                              **_facts(was_bot=True, bot_id="202", forwarded=True,
+                                       via_bot_id="303", sender_business_bot_id="404"),
+                              "attachments": [{"type": "photo", "file_id": "large", "file_size": 2}]}),
+        ("12", "third", "9", {"sender_id": "202", "username": "", "chat_type": "private",
+                              "chat_title": "", "entities": [],
+                              **_facts(reply_to="9", reply_to_sender_id="505")}),
+    ]:
+        expected.append({"platform": "telegram", "chat_id": "101", "sender": "Sender",
+                         "content": content, "timestamp": "2023-11-14T22:13:20+00:00",
+                         "message_id": message_id, "reply_to": reply_to, "is_outbound": False,
+                         "metadata": metadata})
+    assert [message.to_dict() for message in outcome.messages] == expected
+    assert capsys.readouterr().err == ""
+
+
 async def _slack(monkeypatch, event):
     current = SimpleNamespace(handle_inbound=AsyncMock())
     adapter = MagicMock()
