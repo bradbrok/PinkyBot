@@ -203,6 +203,31 @@ async def test_broker_and_scheduler_share_ordered_sender_resolution(tmp_path, mo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_bound_requester_precedes_an_earlier_enabled_sender(tmp_path, monkeypatch, enabled):
+    app = create_api(default_working_dir=str(tmp_path), db_path=str(tmp_path / "pinky.db"))
+    rig = _rig(tmp_path, monkeypatch, app.state.agents)
+    rig.registry.register("aaa_bound", working_dir=str(tmp_path / "aaa_bound"))
+    _bind(rig, "aaa_bound")
+    _bind(rig, "requester")
+    rig.registry.update("requester", enabled=enabled)
+    app.state.broker._send_callback = rig.send
+    request = _hold(rig)
+
+    await rig.broker._notify_approval_request(request)
+
+    assert rig.sent == [(
+        "requester", "telegram", "100",
+        "🆕 New user wants to talk to requester:\nGuest (ID: U_GUEST)\n\n"
+        "Held messages: 1; oldest: 10s\nReview the request:\n"
+        "/approve_U_GUEST\n/deny_U_GUEST", "owner-route",
+    )]
+    assert not any("OWNER_NOTIFY_ROUTE_FALLBACK" in line for line in rig.logs)
+    assert await app.state.scheduler._owner_notify_callback("requester", "scheduler alert") is True
+    assert rig.sent[1:] == [("requester", "telegram", "100", "scheduler alert", "owner-route")]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("prefix", ["approve", "APPROVE"])
 async def test_request_command_approves_requester_without_phantom_rows(tmp_path, monkeypatch, prefix):
     rig = _rig(tmp_path, monkeypatch)
@@ -280,6 +305,7 @@ async def test_unknown_request_only_replies(tmp_path, monkeypatch, action):
     "/approve_reqabc", "/approve_req1 trailing", "/deny_req1suffix",
     "/approve_req1\n/deny_req1", "/approve_req1.0", "/approve_req-1",
     "/approve_req", "/deny_req１", "prefix/approve_req1",
+    "/APPROVE_REQabc", "/Deny_Req1 extra", "/approve_REQ",
 ])
 async def test_malformed_request_commands_cannot_become_legacy_targets(
     tmp_path, monkeypatch, command,
@@ -412,3 +438,60 @@ async def test_sender_survives_retry_health_and_backlog_projections(tmp_path, mo
         "SELECT notification_destination FROM approval_requests WHERE id=?", (request["id"],)
     ).fetchone()[0]
     assert json.loads(stored)["sender"] == "sender"
+
+
+@pytest.mark.asyncio
+async def test_failed_aging_notice_keeps_the_last_delivered_destination(tmp_path, monkeypatch):
+    app = create_api(default_working_dir=str(tmp_path), db_path=str(tmp_path / "pinky.db"))
+    rig = _rig(tmp_path, monkeypatch, app.state.agents)
+    _bind(rig)
+    request = _hold(rig)
+    await rig.broker._notify_approval_request(request)
+    assert len(rig.sent) == 1 and rig.sent[0][0] == "sender"
+    destination = {**OWNER_DESTINATION, "sender": "sender"}
+    delivered = rig.registry.get_approval_request("requester", "U_GUEST")
+    assert delivered["notification_state"] == "delivered"
+    assert delivered["notification_destination"] == destination
+    rig.clock[0] += 24 * 60 * 60
+    failed_calls = []
+
+    async def unavailable(*args, **kwargs):
+        failed_calls.append((args, kwargs))
+        raise RuntimeError("route unavailable")
+
+    rig.broker._send_callback = unavailable
+    await rig.broker._notify_approval_request(request)
+
+    assert len(failed_calls) == 1
+    current = rig.registry.get_approval_request("requester", "U_GUEST")
+    assert current["notification_state"] == "retrying"
+    assert current["aging_reprompt_count"] == 1
+    client = TestClient(app)
+    health = client.get("/agents/requester/health")
+    backlog = client.get("/system/approval-backlog")
+    assert health.status_code == backlog.status_code == 200
+    health_row = health.json()["checks"]["approval_notifications"]["requests"][0]
+    assert health_row.get("notification_destination") == destination
+    backlog_row = backlog.json()["backlogs"][0]
+    assert backlog_row["notification_destination"] == destination
+
+
+@pytest.mark.asyncio
+async def test_default_owner_channel_uses_another_senders_account(tmp_path, monkeypatch):
+    app = create_api(default_working_dir=str(tmp_path), db_path=str(tmp_path / "pinky.db"))
+    rig = _rig(tmp_path, monkeypatch, app.state.agents)
+    _bind(rig, "sender", platform="slack", account="default-route")
+    rig.registry.set_setting("operator_chat_id", "D_OWNER")
+    rig.registry.set_setting("operator_platform", "slack")
+    app.state.broker._send_callback = rig.send
+    logs = []
+    monkeypatch.setattr("pinky_daemon.api._log", logs.append)
+
+    assert await app.state.scheduler._owner_notify_callback("requester", "scheduler alert") is True
+
+    assert rig.sent == [("sender", "slack", "D_OWNER", "scheduler alert", "default-route")]
+    fallback_lines = [line for line in logs if "OWNER_NOTIFY_ROUTE_FALLBACK" in line]
+    assert fallback_lines == [
+        "api: OWNER_NOTIFY_ROUTE_FALLBACK for scheduler alert agent 'requester': "
+        "using daemon default owner channel slack/default-route/D_OWNER via local sender 'sender'"
+    ]
