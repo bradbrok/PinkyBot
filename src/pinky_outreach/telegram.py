@@ -23,6 +23,33 @@ class TelegramError(Exception):
         super().__init__(f"Telegram API error {error_code}: {description}")
 
 
+def _inbound_sender_fields(message: dict) -> dict:
+    sender = message.get("from") or {}
+    reply = message.get("reply_to_message") or {}
+
+    def identifier(value: dict, key: str = "id") -> str | None:
+        raw = value.get(key)
+        return str(raw) if raw is not None else None
+
+    user_id = identifier(sender)
+    was_bot = bool(sender.get("is_bot"))
+    return {
+        "user_id": user_id,
+        "was_bot": was_bot,
+        "bot_id": user_id if was_bot else None,
+        "forwarded": bool(
+            "forward_origin" in message
+            or any(key.startswith("forward_") for key in message)
+            or message.get("is_automatic_forward")
+        ),
+        "via_bot_id": identifier(message.get("via_bot") or {}),
+        "sender_business_bot_id": identifier(message.get("sender_business_bot") or {}),
+        "reply_to": identifier(reply, "message_id"),
+        "reply_to_sender_id": identifier(reply.get("from") or {}),
+        "platform_ts": int(message["date"]),
+    }
+
+
 class TelegramAdapter:
     """Telegram Bot API adapter using httpx."""
 
@@ -455,8 +482,8 @@ class TelegramAdapter:
                 "username": sender_data.get("username", ""),
                 "chat_type": msg_data["chat"].get("type", ""),
                 "chat_title": msg_data["chat"].get("title", ""),
-                "reply_to_sender_id": str(msg_data.get("reply_to_message", {}).get("from", {}).get("id", "")),
                 "entities": msg_data.get("entities", []),
+                **_inbound_sender_fields(msg_data),
             }
 
             # Detect file attachments

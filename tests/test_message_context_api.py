@@ -410,9 +410,10 @@ def test_text_path_refuses_row_changes_between_context_and_text_reads(tmp_path, 
 
         def race(*args, **kwargs):
             if change == "replace":
-                store.put({"agent_name": "sample", "message_id": "record", "platform": "test",
-                           "chat_id": "chat", "metadata": {"direction": "inbound"}},
-                          content="replacement", sender_id="replacement", stored_at=time.time() + 1)
+                store._db.execute("UPDATE message_contexts SET stored_at=? WHERE agent_name=? "
+                                  "AND platform=? AND chat_id=? AND message_id=?",
+                                  (time.time() + 1, "sample", "test", "chat", "record"))
+                store._db.commit()
             else:
                 store.sweep_retention(now=time.time() + 31 * 86400)
             return getter(*args, **kwargs)
@@ -420,6 +421,27 @@ def test_text_path_refuses_row_changes_between_context_and_text_reads(tmp_path, 
         monkeypatch.setattr(store, "get_text", race)
         response = _signed(client, _TEXT_BASE + "/text")
         assert response.status_code == 404 and response.json() == expected
+
+
+def test_repeated_inbound_put_between_text_reads_preserves_the_first_response(tmp_path, monkeypatch):
+    with _gateway(tmp_path, monkeypatch) as client:
+        _remember_text(client, content="first", sender="first")
+        store = client.app.state.message_context_store
+        getter = store.get_text
+        writes = []
+
+        def repeat(*args, **kwargs):
+            writes.append(store.put({"agent_name": "sample", "message_id": "record",
+                                     "platform": "test", "chat_id": "chat",
+                                     "metadata": {"direction": "inbound"}},
+                                    content="second", sender_id="second", stored_at=time.time() + 1))
+            return getter(*args, **kwargs)
+
+        monkeypatch.setattr(store, "get_text", repeat)
+        response = _signed(client, _TEXT_BASE + "/text")
+        assert response.status_code == 200
+        assert response.json()["text"] == "first" and response.json()["sender_id"] == "first"
+        assert writes == [False]
 
 
 @pytest.mark.parametrize("segment", ["platform", "chat_id", "message_id"])

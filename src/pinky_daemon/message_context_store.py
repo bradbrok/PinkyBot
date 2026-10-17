@@ -217,14 +217,14 @@ class MessageContextStore:
         return value if isinstance(value, dict) else {}
 
     def put(self, context: dict[str, Any], *, stored_at: float | None = None,
-            content: str | None = None, sender_id: str = "") -> None:
-        """Insert or replace one agent-scoped message context."""
+            content: str | None = None, sender_id: str = "") -> bool:
+        """Write a context unless a visible inbound row already owns its identity."""
         agent_name = str(context.get("agent_name") or "")
         message_id = str(context.get("message_id") or "")
         platform = str(context.get("platform") or "")
         chat_id = str(context.get("chat_id") or "")
         if not agent_name or not message_id or not platform or not chat_id:
-            return
+            return False
         attachments = context.get("attachments")
         metadata = context.get("metadata")
         content_status = "absent"
@@ -238,6 +238,17 @@ class MessageContextStore:
         now = time.time() if stored_at is None else float(stored_at)
         with self._lock:
             try:
+                existing = self._db.execute(
+                    "SELECT stored_at, metadata_json FROM message_contexts "
+                    "WHERE agent_name=? AND platform=? AND chat_id=? AND message_id=?",
+                    (agent_name, platform, chat_id, message_id),
+                ).fetchone()
+                if (
+                    existing is not None
+                    and existing["stored_at"] >= time.time() - self.retention_seconds
+                    and self._json_dict(existing["metadata_json"]).get("direction") == "inbound"
+                ):
+                    return False
                 self._db.execute(
                     """
                     INSERT INTO message_contexts (
@@ -280,6 +291,7 @@ class MessageContextStore:
                 self._sweep_retention_locked(now)
                 self._trim_agent_locked(agent_name, now)
                 self._db.commit()
+                return True
             except Exception:
                 self._db.rollback()
                 raise

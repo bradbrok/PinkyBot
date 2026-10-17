@@ -51,6 +51,11 @@ _APPROVAL_NOTIFY_RETRY_MAX_SEC = 30 * 60
 _APPROVAL_NOTIFY_MAX_ATTEMPTS = 5
 _APPROVAL_NOTIFY_POLL_SEC = 5
 
+INBOUND_MESSAGE_FIELDS = (
+    "user_id", "was_bot", "bot_id", "forwarded", "via_bot_id", "sender_business_bot_id",
+    "reply_to", "reply_to_sender_id", "platform_ts",
+)
+
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
@@ -622,17 +627,22 @@ class MessageBroker:
 
     def _remember_context(self, context: MessageContext, *, content: str | None = None,
                           sender_id: str = "") -> None:
-        """Cache immediately and persist best-effort for restart survival."""
+        """Preserve inbound context and tolerate persistence failures."""
         stored_at = time.time()
         with self._message_context_lock:
-            self._cache_message_context(context, stored_at=stored_at)
-            if self._message_context_store is None:
+            self._prune_expired_message_contexts(time.time())
+            cached = self._message_contexts.get(self._message_context_key(context))
+            if cached is not None and (cached.metadata or {}).get("direction") == "inbound":
                 return
-            try:
-                self._message_context_store.put(context.to_dict(), stored_at=stored_at,
-                                                content=content, sender_id=sender_id)
-            except Exception as exc:  # noqa: BLE001 — routing must survive store faults
-                _log(f"message-context persistence failed: {type(exc).__name__}")
+            if self._message_context_store is not None:
+                try:
+                    written = self._message_context_store.put(context.to_dict(), stored_at=stored_at,
+                                                              content=content, sender_id=sender_id)
+                    if written is False:
+                        return
+                except Exception as exc:  # noqa: BLE001 — routing must survive store faults
+                    _log(f"message-context persistence failed: {type(exc).__name__}")
+            self._cache_message_context(context, stored_at=stored_at)
 
     def remember_message_context(
         self,
@@ -1439,7 +1449,7 @@ class MessageBroker:
                 slack_envelope = None
                 if message.platform == "slack" and message.message_id:
                     slack_envelope = {
-                        "metadata": {key: message.metadata[key] for key in ("user_id", "bot_id")
+                        "metadata": {key: message.metadata[key] for key in INBOUND_MESSAGE_FIELDS
                                      if key in message.metadata},
                         "message_id": message.message_id,
                         "reply_to": message.reply_to,
