@@ -55,6 +55,7 @@ INBOUND_MESSAGE_FIELDS = (
     "user_id", "was_bot", "bot_id", "forwarded", "via_bot_id", "sender_business_bot_id",
     "reply_to", "reply_to_sender_id", "platform_ts",
 )
+BUTTON_TAP_FIELDS = ("button_data", "button_message_id")
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)

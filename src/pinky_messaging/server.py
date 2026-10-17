@@ -141,6 +141,7 @@ def create_server(
         link_preview_above: bool = False,
         blocks: str = "",
         reply_to: str = "",
+        buttons: str = "",
     ) -> str:
         """Send a message to a chat/channel. Use chat IDs, not display names.
 
@@ -161,6 +162,9 @@ def create_server(
         value returned by a tool verbatim as a JSON string. `text` is still sent
         as the notification fallback. Ignored on non-Slack platforms; if the JSON
         is malformed it is dropped and the message is sent text-only.
+
+        buttons (Telegram only): a JSON array of one to three text/data objects
+        for one inline row, with optional success, danger or primary style.
         """
         result = _api("POST", "/broker/send", {
             "agent_name": agent_name,
@@ -173,6 +177,7 @@ def create_server(
                 disable_link_preview, prefer_large_media, link_preview_above
             ),
             "blocks": blocks or None,
+            "buttons": buttons or None,
         })
         return json.dumps(result)
 
