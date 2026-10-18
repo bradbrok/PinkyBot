@@ -1131,6 +1131,7 @@ class TestDreamReflectionLoudness:
         monkeypatch.setattr(dream_runner_module, "_REFLECTION_ATTEMPT_LEASE_S", 120.0)
         db_path = str(tmp_path / "dream.db")
         owner = DreamRunner(db_path=db_path)
+        owner._save_state("pinky", "seed", last_message_ts=100.0)
         attempt = owner._begin_reflection_attempt(
             "pinky",
             "2026-08-12",
@@ -1691,6 +1692,7 @@ class TestDreamReflectionLoudness:
             "recent",
             "pending",
         ):
+            runner._save_state(agent, "seed", last_message_ts=100.0)
             receipt = runner._begin_reflection_attempt(
                 agent,
                 "2026-08-12",
@@ -1793,6 +1795,7 @@ class TestDreamReflectionLoudness:
         assert "reflection_rowid_floor" not in columns
         assert {"lease_owner", "lease_expires_at", "terminal"} <= columns
         assert runner._db.execute("PRAGMA user_version").fetchone()[0] == 1
+        runner._save_state("pinky", "seed", last_message_ts=100.0)
         assert runner._begin_reflection_attempt(
             "pinky",
             "2026-08-12",

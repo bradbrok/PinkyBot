@@ -160,6 +160,13 @@ class _ReflectionAttempt:
     lease_expires_at: float
 
 
+@dataclass(frozen=True)
+class _StaleDreamProgress:
+    """The durable progress no longer permits the history that was read."""
+
+    watermark: float
+
+
 class DreamRunner:
     """Runs nightly dream consolidation sessions for agents.
 
@@ -546,10 +553,16 @@ class DreamRunner:
         ).fetchone()
         return int(row[0] or 0) if row else 0
 
-    def _close_empty_retry_interval(self, attempt: _ReflectionAttempt) -> None:
-        """Finish an empty retry window without recording a reflection outcome."""
+    def _close_empty_retry_interval(
+        self, attempt: _ReflectionAttempt, *, expected_watermark: float
+    ) -> _StaleDreamProgress | None:
+        """Close an empty retry only while its observed progress is current."""
         summary = "No conversation history remains in the retry interval."
         with self._db:
+            self._db.execute("BEGIN IMMEDIATE")
+            watermark = self._get_last_message_ts(attempt.agent_name)
+            if watermark != expected_watermark:
+                return _StaleDreamProgress(watermark)
             self._db.execute(
                 """UPDATE dream_reflection_attempts SET terminal=1
                    WHERE agent_name=? AND night_key=?
@@ -559,7 +572,7 @@ class DreamRunner:
             self._write_state(
                 attempt.agent_name,
                 summary,
-                max(self._get_last_message_ts(attempt.agent_name), attempt.history_end_ts),
+                max(watermark, attempt.history_end_ts),
                 saved_at=time.time(),
             )
             attempt_count = self._night_attempt_count(attempt.agent_name, attempt.night_key)
@@ -605,11 +618,37 @@ class DreamRunner:
         dream_start: datetime,
         history_start_ts: float,
         history_end_ts: float,
-    ) -> _ReflectionAttempt | None:
-        """Persist a run intent before the SDK can call ``reflect``."""
+        retry_interval: _ReflectionAttempt | None = None,
+    ) -> _ReflectionAttempt | _StaleDreamProgress | None:
+        """Validate the read interval and persist its intent in one write transaction."""
         lease_expires_at = time.time() + _REFLECTION_ATTEMPT_LEASE_S
         try:
             with self._db:
+                # A connection context alone starts BEGIN only at the INSERT.
+                # Acquire the write lock before reading any freshness predicates.
+                self._db.execute("BEGIN IMMEDIATE")
+                watermark = self._get_last_message_ts(agent_name)
+                if retry_interval is None:
+                    if watermark != history_start_ts:
+                        return _StaleDreamProgress(watermark)
+                else:
+                    retryable = self._db.execute(
+                        """SELECT 1 FROM dream_reflection_attempts
+                           WHERE agent_name=? AND night_key=? AND attempt_n=?
+                             AND correlation_id=? AND status='failed' AND terminal=0
+                             AND history_start_ts=? AND history_end_ts=?""",
+                        (
+                            agent_name,
+                            night_key,
+                            retry_interval.attempt_n,
+                            retry_interval.correlation_id,
+                            history_start_ts,
+                            history_end_ts,
+                        ),
+                    ).fetchone()
+                    # Frozen retries may overlap the watermark; do not rebase them.
+                    if retryable is None or history_end_ts <= watermark:
+                        return _StaleDreamProgress(watermark)
                 existing = self._get_pending_reflection_attempt(agent_name)
                 if existing is not None:
                     return None
@@ -995,7 +1034,7 @@ class DreamRunner:
             self._write_state(
                 attempt.agent_name,
                 summary,
-                attempt.history_start_ts,
+                max(self._get_last_message_ts(attempt.agent_name), attempt.history_start_ts),
                 saved_at=failed_at,
             )
 
@@ -1107,6 +1146,20 @@ class DreamRunner:
                 )
             return await self._run_dream_locked(agent_name, agent_config)
 
+    @staticmethod
+    def _stale_history_summary(
+        agent_name: str,
+        night_key: str,
+        history_path: str,
+        history_start_ts: float,
+        stale: _StaleDreamProgress,
+    ) -> str:
+        _log(
+            f"dream-runner: WARNING stale history for '{agent_name}' night={night_key} "
+            f"path={history_path} start={history_start_ts} watermark={stale.watermark}"
+        )
+        return "Dream skipped: dream progress moved while this run read its history."
+
     async def _run_dream_locked(self, agent_name: str, agent_config) -> str:
         """Spawn a dream SDK run for the agent and store the summary.
 
@@ -1130,6 +1183,7 @@ class DreamRunner:
             return recovered_summary
 
         retry_interval: _ReflectionAttempt | None = None
+        history_path = "normal"
         if attempt is not None:
             last_message_ts = attempt.history_start_ts
             new_watermark = attempt.history_end_ts
@@ -1142,8 +1196,10 @@ class DreamRunner:
                 history_path="recovery",
             )
         else:
+            watermark_snapshot = self._get_last_message_ts(agent_name)
             retry_interval = self._get_retryable_failed_attempt(agent_name)
             if retry_interval is not None:
+                history_path = "retry"
                 last_message_ts = retry_interval.history_start_ts
                 new_watermark = retry_interval.history_end_ts
                 night_key = retry_interval.night_key
@@ -1156,16 +1212,22 @@ class DreamRunner:
                 if not history_lines:
                     # Read the continuation before any state write: a read error
                     # must leave the retry window available for a later run.
-                    last_message_ts = max(
-                        self._get_last_message_ts(agent_name), retry_interval.history_end_ts
-                    )
+                    history_path = "continuation"
+                    last_message_ts = max(watermark_snapshot, retry_interval.history_end_ts)
                     history_lines, new_watermark = self._fetch_unprocessed_history(
                         agent_name, after_ts=last_message_ts
                     )
-                    self._close_empty_retry_interval(retry_interval)
+                    stale = self._close_empty_retry_interval(
+                        retry_interval, expected_watermark=watermark_snapshot
+                    )
+                    if stale is not None:
+                        return self._stale_history_summary(
+                            agent_name, night_key, history_path, last_message_ts, stale
+                        )
+                    watermark_snapshot = last_message_ts
                     retry_interval = None
             else:
-                last_message_ts = self._get_last_message_ts(agent_name)
+                last_message_ts = watermark_snapshot
                 history_lines, new_watermark = self._fetch_unprocessed_history(
                     agent_name, after_ts=last_message_ts
                 )
@@ -1179,24 +1241,32 @@ class DreamRunner:
             current_night_key = self._night_key(
                 agent_config, datetime.now(timezone.utc)
             )
-            completed_night = self._db.execute(
-                """SELECT 1 FROM dream_reflection_outcomes
-                   WHERE agent_name=? AND night_key=?""",
-                (agent_name, current_night_key),
-            ).fetchone()
-            if completed_night:
-                _log(
-                    f"dream-runner: true same-night duplicate rejected before "
-                    f"runner.run for '{agent_name}' night={current_night_key}"
+            with self._db:
+                self._db.execute("BEGIN IMMEDIATE")
+                watermark = self._get_last_message_ts(agent_name)
+                if watermark != watermark_snapshot:
+                    return self._stale_history_summary(
+                        agent_name, current_night_key, history_path, last_message_ts,
+                        _StaleDreamProgress(watermark),
+                    )
+                completed_night = self._db.execute(
+                    """SELECT 1 FROM dream_reflection_outcomes
+                       WHERE agent_name=? AND night_key=?""",
+                    (agent_name, current_night_key),
+                ).fetchone()
+                if completed_night:
+                    _log(
+                        f"dream-runner: true same-night duplicate rejected before "
+                        f"runner.run for '{agent_name}' night={current_night_key}"
+                    )
+                    return summary
+                # Preserve the watermark and the summary of any concurrent run.
+                self._write_state(
+                    agent_name,
+                    summary,
+                    max(watermark, last_message_ts),
+                    saved_at=time.time(),
                 )
-                return summary
-            # Preserve the existing watermark; saving the default 0.0 would
-            # make the next dream re-fetch and re-consolidate all history.
-            self._save_state(
-                agent_name,
-                summary,
-                last_message_ts=max(self._get_last_message_ts(agent_name), last_message_ts),
-            )
             return summary
 
         if attempt is None:
@@ -1217,7 +1287,12 @@ class DreamRunner:
                 dream_start=dream_start,
                 history_start_ts=last_message_ts,
                 history_end_ts=new_watermark,
+                retry_interval=retry_interval,
             )
+            if isinstance(attempt, _StaleDreamProgress):
+                return self._stale_history_summary(
+                    agent_name, night_key, history_path, last_message_ts, attempt
+                )
             if attempt is None:
                 if self._night_attempt_count(agent_name, night_key) >= (
                     _REFLECTION_ATTEMPT_CAP
