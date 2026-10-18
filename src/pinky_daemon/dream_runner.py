@@ -172,7 +172,7 @@ class DreamRunner:
         self,
         db_path: str = "data/dream_state.db",
         *,
-        history_provider: Callable[[str, float, int, str], list[dict]] | None = None,
+        history_provider: Callable[..., list[dict]] | None = None,
         owner_provider: Callable[[], dict] | None = None,
         setting_provider: Callable[[str], str] | None = None,
         signing_key_provider: Callable[[str], str | None] | None = None,
@@ -545,6 +545,29 @@ class DreamRunner:
             (agent_name, night_key),
         ).fetchone()
         return int(row[0] or 0) if row else 0
+
+    def _close_empty_retry_interval(self, attempt: _ReflectionAttempt) -> None:
+        """Finish an empty retry window without recording a reflection outcome."""
+        summary = "No conversation history remains in the retry interval."
+        with self._db:
+            self._db.execute(
+                """UPDATE dream_reflection_attempts SET terminal=1
+                   WHERE agent_name=? AND night_key=?
+                     AND status='failed' AND terminal=0""",
+                (attempt.agent_name, attempt.night_key),
+            )
+            self._write_state(
+                attempt.agent_name,
+                summary,
+                max(self._get_last_message_ts(attempt.agent_name), attempt.history_end_ts),
+                saved_at=time.time(),
+            )
+            attempt_count = self._night_attempt_count(attempt.agent_name, attempt.night_key)
+        _log(
+            f"dream-runner: WARNING closed empty retry for '{attempt.agent_name}' "
+            f"night={attempt.night_key} after {attempt_count} attempts "
+            f"interval=({attempt.history_start_ts}, {attempt.history_end_ts}]"
+        )
 
     def _night_is_terminal(self, agent_name: str, night_key: str) -> bool:
         return self._db.execute(
@@ -1116,6 +1139,7 @@ class DreamRunner:
                 agent_name,
                 after_ts=last_message_ts,
                 through_ts=new_watermark,
+                history_path="recovery",
             )
         else:
             retry_interval = self._get_retryable_failed_attempt(agent_name)
@@ -1127,7 +1151,19 @@ class DreamRunner:
                     agent_name,
                     after_ts=last_message_ts,
                     through_ts=new_watermark,
+                    history_path="retry",
                 )
+                if not history_lines:
+                    # Read the continuation before any state write: a read error
+                    # must leave the retry window available for a later run.
+                    last_message_ts = max(
+                        self._get_last_message_ts(agent_name), retry_interval.history_end_ts
+                    )
+                    history_lines, new_watermark = self._fetch_unprocessed_history(
+                        agent_name, after_ts=last_message_ts
+                    )
+                    self._close_empty_retry_interval(retry_interval)
+                    retry_interval = None
             else:
                 last_message_ts = self._get_last_message_ts(agent_name)
                 history_lines, new_watermark = self._fetch_unprocessed_history(
@@ -1156,7 +1192,11 @@ class DreamRunner:
                 return summary
             # Preserve the existing watermark; saving the default 0.0 would
             # make the next dream re-fetch and re-consolidate all history.
-            self._save_state(agent_name, summary, last_message_ts=last_message_ts)
+            self._save_state(
+                agent_name,
+                summary,
+                last_message_ts=max(self._get_last_message_ts(agent_name), last_message_ts),
+            )
             return summary
 
         if attempt is None:
@@ -2942,54 +2982,67 @@ class DreamRunner:
         after_ts: float = 0.0,
         *,
         through_ts: float | None = None,
+        history_path: str = "normal",
     ) -> tuple[list[str], float]:
-        """Fetch all conversation messages since the last watermark.
-
-        Returns (formatted_lines, new_watermark_ts).
-        """
+        """Read an interval in newest-first pages, then format chronological lines."""
         if not self._history_provider:
             return [], after_ts
 
-        try:
-            messages = self._history_provider(agent_name, after_ts, 1000, "")
-        except Exception as e:
-            _log(f"dream-runner: failed to fetch history for '{agent_name}': {e}")
-            return [], after_ts
-
-        if not messages:
-            return [], after_ts
-
-        # Filter to messages after the watermark
-        new_msgs = [
-            m
-            for m in messages
-            if (m.get("timestamp") or 0) > after_ts
-            and (
-                through_ts is None
-                or (m.get("timestamp") or 0) <= through_ts
-            )
-        ]
-        if not new_msgs:
-            return [], after_ts
-
-        # Sort chronologically (API returns newest first)
-        new_msgs.sort(key=lambda m: m.get("timestamp", 0))
-
-        # Format as readable conversation lines
-        lines = []
+        upper_bound = through_ts or 0.0
+        page_limit = 1000
+        seen_ids = set()
+        collected: list[tuple[float, str]] = []
+        history_chars = 0
         new_watermark = after_ts
-        for m in new_msgs:
-            ts = m.get("timestamp", 0)
-            role = m.get("role", "?")
-            content = (m.get("content") or "").strip()
-            if not content:
-                continue
-            time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "?"
-            lines.append(f"[{time_str}] [{role}] {content}")
-            if ts > new_watermark:
-                new_watermark = ts
+        while True:
+            try:
+                messages = self._history_provider(
+                    agent_name, after_ts, page_limit, "", before_ts=upper_bound
+                )
+            except Exception as exc:
+                _log(
+                    f"dream-runner: WARNING failed to fetch {history_path} history "
+                    f"for '{agent_name}': {exc}"
+                )
+                raise
+            if not messages:
+                break
 
-        return lines, new_watermark
+            for message in messages:
+                ts = message.get("timestamp") or 0.0
+                if ts <= after_ts or (through_ts is not None and ts > through_ts):
+                    continue
+                message_id = message.get("id")
+                if message_id is not None:
+                    if message_id in seen_ids:
+                        continue
+                    seen_ids.add(message_id)
+                content = (message.get("content") or "").strip()
+                if not content:
+                    continue
+                role = message.get("role", "?")
+                time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "?"
+                line = f"[{time_str}] [{role}] {content}"
+                history_chars += len(line) + bool(collected)
+                collected.append((ts, line))
+                new_watermark = max(new_watermark, ts)
+
+            # Cross the cap so the existing prompt truncation emits its marker.
+            if history_chars > _MAX_HISTORY_CHARS:
+                break
+            oldest_ts = min(message.get("timestamp") or 0.0 for message in messages)
+            if len(messages) < page_limit or oldest_ts <= after_ts:
+                break
+            if upper_bound and oldest_ts >= upper_bound:
+                # An inclusive cursor stuck on a timestamp needs the rest of its
+                # tie group. IDs prevent the repeated edge from duplicating lines.
+                page_limit += 1000
+            else:
+                upper_bound = oldest_ts
+                page_limit = 1000
+
+        collected.sort(key=lambda item: item[0])
+        return [line for _, line in collected], new_watermark
 
     def _write_state(
         self,

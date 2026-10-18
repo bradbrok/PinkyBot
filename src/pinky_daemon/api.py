@@ -3174,9 +3174,10 @@ def create_api(
 
     dream_runner = DreamRunner(
         db_path=store_manifest["dream_state"].path,
-        history_provider=lambda agent_name, after_ts, limit, role: _resolve_agent_history(
+        history_provider=lambda agent_name, after_ts, limit, role, before_ts=0.0: _resolve_agent_history(
             agent_name,
             after_ts=after_ts,
+            before_ts=before_ts,
             limit=limit,
             role=role,
         ),

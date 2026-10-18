@@ -93,7 +93,7 @@ async def test_public_standalone_dream_observes_gate(tmp_path, monkeypatch, tran
         return registry.get_setting(key)
 
     runner = DreamRunner(db_path=str(tmp_path / "dream.sqlite"), setting_provider=settings,
-        history_provider=lambda *a: [{"timestamp": 200., "role": "user", "content": "synthetic history"}])
+        history_provider=lambda *a, before_ts=0.0: [{"timestamp": 200., "role": "user", "content": "synthetic history"}])
     reaper = AsyncMock(side_effect=AssertionError("standalone entry attempted migration"))
     monkeypatch.setattr(tmux_session, "reap_legacy_tmux_sessions", reaper)
     if transport_source == "environment":
