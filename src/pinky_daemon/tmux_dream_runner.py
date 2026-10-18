@@ -45,7 +45,7 @@ from pinky_daemon.tmux_session import (
     production_tmux_control,
     require_legacy_tmux_reaped,
 )
-from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target, text_argument
+from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target
 
 _DEFAULT_CLAUDE_BIN = "/opt/homebrew/bin/claude"  # cc_autoupdate.sh manages this path
 
@@ -56,6 +56,15 @@ def _log(msg: str) -> None:
 
 class _ReplExitedError(Exception):
     """The dream REPL process exited before writing a result file."""
+
+
+def _composer_text(pane: str) -> str | None:
+    """Return the region between the last two horizontal rules, if drawn."""
+    lines = pane.splitlines()
+    rules = [index for index, line in enumerate(lines) if set(line.strip()) == {"─"}]
+    if len(rules) < 2:
+        return None
+    return "\n".join(lines[rules[-2] + 1:rules[-1]])
 
 
 @dataclass
@@ -275,22 +284,14 @@ class TmuxDreamRunner:
                 f"to {result_path} using the Write tool. Do not create that file until "
                 f"you are done — it is the completion signal."
             )
-            rc, out = await self._tmux(
-                "send-keys",
-                "-t",
-                exact_pane_target(self.session_name),
-                "-l",
-                "--",
-                text_argument(instruction),
-            )
-            if rc != 0:
+            pasted = await self._control.paste_text(instruction, enter=True)
+            if not pasted.ok:
                 return RunResult(
                     output="",
                     exit_code=1,
-                    error=f"tmux send-keys failed: {out.strip()}",
+                    error=f"tmux paste failed: rc={pasted.returncode}",
                     duration_ms=int((time.time() - start) * 1000),
                 )
-            await self._tmux("send-keys", "-t", exact_pane_target(self.session_name), "Enter")
             await self._ensure_submitted(instruction)
 
             output = await self._wait_for_result(result_path, deadline=start + self._config.timeout_s)
@@ -308,10 +309,7 @@ class TmuxDreamRunner:
                 duration_ms=int((time.time() - start) * 1000),
             )
         except TimeoutError:
-            _, pane = await self._tmux(
-                "capture-pane", "-p", "-t", exact_pane_target(self.session_name)
-            )
-            tail = pane.strip()[-500:]
+            tail = await self._capture_failure_tail()
             return RunResult(
                 output="",
                 exit_code=1,
@@ -349,21 +347,22 @@ class TmuxDreamRunner:
     # ── waiting ───────────────────────────────────────────────
 
     async def _ensure_submitted(self, instruction: str) -> None:
-        """Re-send Enter once if the instruction is still parked in the input box.
-
-        Paste-without-submit is a known tmux-rails failure mode; the dream
-        turn is long, so a single cheap recheck beats losing the whole night.
-        """
-        await asyncio.sleep(self._config.submit_check_delay_s)
-        rc, pane = await self._tmux(
-            "capture-pane", "-p", "-t", exact_pane_target(self.session_name)
-        )
-        if rc != 0:
-            return
+        """Retry only parked input, allowing three total submit attempts."""
         marker = instruction[:40]
-        if marker in pane and "esc to interrupt" not in pane:
-            _log(f"tmux-dream: {self.session_name} instruction not submitted — re-sending Enter")
-            await self._tmux("send-keys", "-t", exact_pane_target(self.session_name), "Enter")
+        for attempt in range(1, 4):
+            await asyncio.sleep(self._config.submit_check_delay_s)
+            rc, pane = await self._tmux(
+                "capture-pane", "-p", "-t", exact_pane_target(self.session_name)
+            )
+            composer = _composer_text(pane) if rc == 0 else None
+            state = "unknown" if composer is None else (
+                "parked" if marker in composer else "submitted"
+            )
+            _log(f"tmux-dream: {self._agent_name} submit attempt={attempt} state={state}")
+            if state != "parked":
+                return
+            if attempt < 3:
+                await self._tmux("send-keys", "-t", exact_pane_target(self.session_name), "Enter")
 
     async def _wait_ready(self) -> bool:
         """Poll the pane until the Claude REPL has drawn its input UI."""
@@ -372,10 +371,24 @@ class TmuxDreamRunner:
             rc, pane = await self._tmux(
                 "capture-pane", "-p", "-t", exact_pane_target(self.session_name)
             )
-            if rc == 0 and ("shortcuts" in pane or "❯" in pane or "Claude" in pane):
-                return True
+            if rc == 0:
+                composer = _composer_text(pane)
+                if "shortcuts" in pane or (
+                    composer is not None
+                    and any(line.lstrip().startswith("❯") for line in composer.splitlines())
+                ):
+                    return True
             await asyncio.sleep(1.0)
         return False
+
+    async def _capture_failure_tail(self) -> str:
+        """Keep scrollback diagnostics on a single log and error line."""
+        _, pane = await self._tmux(
+            "capture-pane", "-p", "-S", "-200", "-t", exact_pane_target(self.session_name)
+        )
+        tail = " | ".join(pane.strip()[-500:].splitlines())
+        _log(f"tmux-dream: {self._agent_name} pane tail: {tail}")
+        return tail
 
     async def _repl_alive(self) -> bool | None:
         """Tri-state liveness probe for the claude process in the dream pane.
@@ -426,10 +439,7 @@ class TmuxDreamRunner:
                 else:
                     dead_probes += 1
                     if alive is False or dead_probes >= 2:
-                        _, pane = await self._tmux(
-                            "capture-pane", "-p", "-t", exact_pane_target(self.session_name)
-                        )
-                        tail = pane.strip()[-500:]
+                        tail = await self._capture_failure_tail()
                         raise _ReplExitedError(
                             f"dream REPL exited before writing a result file; "
                             f"pane tail: {tail}"

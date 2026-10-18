@@ -233,6 +233,10 @@ async def test_teardown_error_still_revokes_receipt(clean_daemon, monkeypatch):
     monkeypatch.setattr(runner, "_ensure_submitted", AsyncMock())
     monkeypatch.setattr(runner, "_wait_for_result", AsyncMock(return_value="completed"))
     monkeypatch.setattr(
+        runner._control, "paste_text",
+        AsyncMock(return_value=TmuxCommandResult(returncode=0, stdout="", stderr="")),
+    )
+    monkeypatch.setattr(
         runner._control,
         "new_session",
         AsyncMock(
