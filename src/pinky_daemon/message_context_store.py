@@ -17,7 +17,9 @@ from pinky_daemon.store_catalog import (
 )
 
 DEFAULT_RETENTION_DAYS = 30
-DEFAULT_MAX_PER_AGENT = 1000
+DEFAULT_MAX_PER_AGENT = 5000
+DEFAULT_MIN_AGE_DAYS = 7
+DEFAULT_HARD_CAP_PER_AGENT = 20000
 
 
 class MessageContextStore:
@@ -29,11 +31,15 @@ class MessageContextStore:
         *,
         retention_days: int = DEFAULT_RETENTION_DAYS,
         max_per_agent: int = DEFAULT_MAX_PER_AGENT,
+        min_age_days: int = DEFAULT_MIN_AGE_DAYS,
+        hard_cap_per_agent: int = DEFAULT_HARD_CAP_PER_AGENT,
         catalog: StoreCatalog | None = None,
     ) -> None:
         self.db_path = db_path
         self.retention_days = max(1, retention_days)
         self.max_per_agent = max(1, max_per_agent)
+        self.min_age_days = max(1, min_age_days)
+        self.hard_cap_per_agent = max(self.max_per_agent, hard_cap_per_agent)
         self._lock = threading.RLock()
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = open_store_connection(
@@ -67,6 +73,10 @@ class MessageContextStore:
     @property
     def retention_seconds(self) -> float:
         return float(self.retention_days * 86400)
+
+    @property
+    def min_age_seconds(self) -> float:
+        return float(self.min_age_days * 86400)
 
     def _create_schema(self) -> None:
         self._db.executescript(
@@ -268,6 +278,7 @@ class MessageContextStore:
                     ),
                 )
                 self._sweep_retention_locked(now)
+                self._trim_agent_locked(agent_name, now)
                 self._db.commit()
             except Exception:
                 self._db.rollback()
@@ -359,37 +370,56 @@ class MessageContextStore:
             return tuple(row) if row is not None else None
 
     def _sweep_retention_locked(self, now: float) -> int:
-        """Prune rows while the caller owns ``_lock`` and the transaction."""
+        """Prune expired rows while the caller owns ``_lock`` and the transaction."""
         cutoff = now - self.retention_seconds
         before = self._db.total_changes
         self._db.execute(
             "DELETE FROM message_contexts WHERE stored_at < ?",
             (cutoff,),
         )
-        agent_rows = self._db.execute(
-            "SELECT DISTINCT agent_name FROM message_contexts"
-        ).fetchall()
-        for row in agent_rows:
-            self._db.execute(
-                """
-                DELETE FROM message_contexts
-                WHERE rowid IN (
-                    SELECT rowid FROM message_contexts
-                    WHERE agent_name=?
-                    ORDER BY stored_at DESC, rowid DESC
-                    LIMIT -1 OFFSET ?
-                )
-                """,
-                (row["agent_name"], self.max_per_agent),
+        return self._db.total_changes - before
+
+    def _trim_agent_locked(self, agent_name: str, now: float) -> int:
+        """Apply one agent's count limits within the caller's lock and transaction."""
+        min_age_cutoff = now - self.min_age_seconds
+        before = self._db.total_changes
+        self._db.execute(
+            """
+            DELETE FROM message_contexts
+            WHERE stored_at < ? AND rowid IN (
+                SELECT rowid FROM message_contexts
+                WHERE agent_name=?
+                ORDER BY stored_at DESC, rowid DESC
+                LIMIT -1 OFFSET ?
             )
+            """,
+            (min_age_cutoff, agent_name, self.max_per_agent),
+        )
+        self._db.execute(
+            """
+            DELETE FROM message_contexts
+            WHERE rowid IN (
+                SELECT rowid FROM message_contexts
+                WHERE agent_name=?
+                ORDER BY stored_at DESC, rowid DESC
+                LIMIT -1 OFFSET ?
+            )
+            """,
+            (agent_name, self.hard_cap_per_agent),
+        )
         return self._db.total_changes - before
 
     def sweep_retention(self, *, now: float | None = None) -> int:
-        """Prune contexts older than 30 days and cap each agent to 1,000 rows."""
+        """Prune expired contexts and apply the age-limited cap and hard ceiling."""
         current = time.time() if now is None else float(now)
         with self._lock:
             try:
                 deleted = self._sweep_retention_locked(current)
+                agent_rows = self._db.execute(
+                    "SELECT DISTINCT agent_name FROM message_contexts"
+                ).fetchall()
+                for row in agent_rows:
+                    deleted += self._trim_agent_locked(row["agent_name"], current)
                 self._db.commit()
                 return deleted
             except Exception:

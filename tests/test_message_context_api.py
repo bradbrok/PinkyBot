@@ -16,6 +16,8 @@ from pinky_daemon.auth import (
     create_session_cookie,
 )
 from pinky_daemon.broker import BrokerMessage
+from tests.test_message_context_store import CONTEXT_NOW, DAY, _age_context
+from tests.test_message_context_store import context_clock as context_clock
 
 pytestmark = pytest.mark.real_auth
 SECRET = "message-context-api-test-secret-not-for-runtime"
@@ -92,7 +94,7 @@ def test_unknown_identity_is_404_with_retention_text(tmp_path, monkeypatch, path
         assert response.status_code == 404
         detail = response.json()["detail"]
         assert detail["code"] == "message_context_not_found"
-        assert "30 days" in detail["detail"] and "1000" in detail["detail"]
+        assert "30 days" in detail["detail"] and "5000" in detail["detail"]
 
 
 def test_only_records_stamped_inbound_by_routing_are_served(tmp_path, monkeypatch):
@@ -129,6 +131,7 @@ def test_only_records_stamped_inbound_by_routing_are_served(tmp_path, monkeypatc
 def test_rows_past_retention_or_cap_are_404(tmp_path, monkeypatch):
     with _gateway(tmp_path, monkeypatch) as client:
         store = client.app.state.message_context_store
+        store.hard_cap_per_agent = store.max_per_agent
         base = {
             "agent_name": "sample", "platform": "slack", "chat_id": "D1", "timestamp": 1.0,
             "metadata": {"direction": "inbound"},
@@ -171,6 +174,7 @@ def test_cache_only_rows_are_not_served_when_the_store_has_dropped_them(tmp_path
     with _gateway(tmp_path, monkeypatch) as client:
         broker = client.app.state.broker
         store = client.app.state.message_context_store
+        store.hard_cap_per_agent = store.max_per_agent
         _inbound(client)
         assert _signed(client, PATH).status_code == 200  # cached at the head of the order
         base = {"agent_name": "sample", "platform": "slack", "chat_id": "D1", "timestamp": 1.0}
@@ -347,6 +351,7 @@ def test_text_path_all_invisible_rows_share_routing_miss_body(tmp_path, monkeypa
     with _gateway(tmp_path, monkeypatch) as client:
         if kind == "capped":
             client.app.state.message_context_store.max_per_agent = 1
+            client.app.state.message_context_store.hard_cap_per_agent = 1
         expected = _signed(client, _TEXT_BASE).json()
         broker, store = client.app.state.broker, client.app.state.message_context_store
         if kind == "outbound":
@@ -493,3 +498,60 @@ def test_non_ok_raw_text_is_never_returned_or_hashed(tmp_path, monkeypatch, stat
         assert response.json()["text_status"] == status
         assert response.json()["text"] is None
         assert response.json()["text_sha256"] is None
+
+
+
+def _fill_context_age_boundary(client, stored_at):
+    store = client.app.state.message_context_store
+    store.max_per_agent = 1000
+    store.put(_age_context("record"), stored_at=stored_at, content="retained text", sender_id="sender")
+    for index in range(1500):
+        store.put(_age_context(f"newer-{index}"), stored_at=CONTEXT_NOW - 1500 + index)
+    store.sweep_retention(now=CONTEXT_NOW)
+    return store
+
+
+def _minimum_age_miss_text(max_per_agent):
+    return ("no inbound message context for that identity within the "
+            f"retention window (30 days; the newest {max_per_agent} per agent "
+            "once a row is older than 7 days)")
+
+
+def test_text_row_within_minimum_age_survives_count_limit(tmp_path, monkeypatch, context_clock):
+    with _gateway(tmp_path, monkeypatch) as client:
+        store = _fill_context_age_boundary(client, context_clock - (72 * 3600 + 5 * 60))
+        response = _signed(client, _TEXT_BASE + "/text")
+        assert response.status_code == 200, response.json()
+        assert response.json()["text"] == "retained text"
+        assert response.json()["stored_at"] == context_clock - (72 * 3600 + 5 * 60)
+        assert store.get("sample", "record", platform="test", chat_id="chat") is not None
+        assert store._db.execute("SELECT count(*) FROM message_contexts").fetchone()[0] == 1501
+
+
+def test_text_row_past_minimum_age_is_removed_by_count_limit(tmp_path, monkeypatch, context_clock):
+    with _gateway(tmp_path, monkeypatch) as client:
+        store = _fill_context_age_boundary(client, context_clock - (7 * DAY + 60))
+        response = _signed(client, _TEXT_BASE + "/text")
+        assert response.status_code == 404
+        assert response.json() == {"detail": {"code": "message_context_not_found",
+                                               "detail": _minimum_age_miss_text(1000)}}
+        assert store.get("sample", "record", platform="test", chat_id="chat") is None
+        assert store._db.execute("SELECT count(*) FROM message_contexts").fetchone()[0] == 1500
+
+
+@pytest.mark.parametrize("suffix", ["", "/text"])
+def test_both_context_miss_routes_describe_minimum_age(tmp_path, monkeypatch, context_clock, suffix):
+    with _gateway(tmp_path, monkeypatch) as client:
+        response = _signed(client, _TEXT_BASE + suffix)
+        assert response.status_code == 404
+        assert response.json() == {"detail": {"code": "message_context_not_found",
+                                               "detail": _minimum_age_miss_text(5000)}}
+
+
+def test_daemon_context_store_uses_retention_defaults(tmp_path, monkeypatch, context_clock):
+    with _gateway(tmp_path, monkeypatch) as client:
+        store = client.app.state.message_context_store
+        assert store.max_per_agent == 5000
+        assert store.min_age_days == 7
+        assert store.hard_cap_per_agent == 20000
+        assert store.retention_days == 30

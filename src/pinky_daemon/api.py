@@ -9125,8 +9125,9 @@ npm run build</pre>
             "code": "message_context_not_found",
             "detail": (
                 "no inbound message context for that identity within the "
-                f"retention window ({message_context_store.retention_days} days, "
-                f"{message_context_store.max_per_agent} most recent per agent)"
+                f"retention window ({message_context_store.retention_days} days; "
+                f"the newest {message_context_store.max_per_agent} per agent once a row is "
+                f"older than {message_context_store.min_age_days} days)"
             ),
         }
         # Identity segments are plain platform ids; a decoded '?' or '#' in one
@@ -9157,8 +9158,9 @@ npm run build</pre>
         not_found = {
             "code": "message_context_not_found",
             "detail": ("no inbound message context for that identity within the "
-                       f"retention window ({message_context_store.retention_days} days, "
-                       f"{message_context_store.max_per_agent} most recent per agent)"),
+                       f"retention window ({message_context_store.retention_days} days; "
+                       f"the newest {message_context_store.max_per_agent} per agent once a row is "
+                       f"older than {message_context_store.min_age_days} days)"),
         }
         if any(ch in segment for segment in (platform, chat_id, message_id) for ch in "?#"):
             raise HTTPException(404, not_found)
