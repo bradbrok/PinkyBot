@@ -10,9 +10,13 @@ import logging
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 logger = logging.getLogger("pinky.storage")
+
+_LINUX_READS = 5
+_LINUX_READ_GAP = 0.02
 
 
 # struct flock has a different field order on Darwin and Linux. ctypes supplies
@@ -127,23 +131,30 @@ async def recheck_sqlite_locks(get_stores, publish, status: dict, *, sleep=None)
     return status
 
 
-def _probe_linux(stores: list[list[str]], pid: int) -> dict:
-    """Inspect every holder; a peer cannot mask this process in /proc/locks."""
-    locks = []
-    for line in Path("/proc/locks").read_text().splitlines():
+def _read_proc_locks() -> str:
+    return Path("/proc/locks").read_text()
+
+
+def _parse_proc_locks(text: str, pid: int) -> set:
+    locks = set()
+    for line in text.splitlines():
         fields = line.split()
         if len(fields) < 8 or fields[1:4] != ["POSIX", "ADVISORY", "READ"]:
             continue
         if int(fields[4]) != pid:
             continue
         major, minor, inode = fields[5].split(":")
-        locks.append(
+        locks.add(
             (
                 (int(major, 16), int(minor, 16), int(inode)),
                 int(fields[6]),
                 float("inf") if fields[7] == "EOF" else int(fields[7]),
             )
         )
+    return locks
+
+
+def _evaluate_linux(stores: list[list[str]], locks: set) -> dict:
     missing = []
     inconclusive = []
     for name, path in stores:
@@ -172,6 +183,25 @@ def _probe_linux(stores: list[list[str]], pid: int) -> dict:
             if not present:
                 missing.append(f"{name}:{label}")
     return {"missing": missing, "inconclusive": inconclusive, "reason": "device_mismatch"}
+
+
+def _probe_linux(stores: list[list[str]], pid: int, *, read=None, sleep=None) -> dict:
+    """Inspect every holder; a peer cannot mask this process in /proc/locks.
+
+    /proc/locks is read in pages and is not an atomic snapshot, so a held lock can
+    be skipped while other entries change; a lock counts as held if any read shows it.
+    """
+    read = _read_proc_locks if read is None else read
+    sleep = time.sleep if sleep is None else sleep
+    locks = set()
+    for attempt in range(_LINUX_READS):
+        if attempt:
+            sleep(_LINUX_READ_GAP)
+        locks.update(_parse_proc_locks(read(), pid))
+        result = _evaluate_linux(stores, locks)
+        if not result["missing"]:
+            break
+    return result
 
 
 if __name__ == "__main__":
