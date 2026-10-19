@@ -120,7 +120,7 @@ class TestDreamRunner:
         try:
             runner = DreamRunner(
                 db_path=path,
-                history_provider=lambda agent_name, after_ts, limit, role: messages,
+                history_provider=lambda agent_name, after_ts, limit, role, before_ts=0.0: messages,
             )
 
             lines, watermark = runner._fetch_unprocessed_history("pinky", after_ts=150.0)
@@ -520,7 +520,7 @@ class TestRunDreamWatermark:
     def _runner(self, tmp_path, messages):
         return DreamRunner(
             db_path=str(tmp_path / "dream.db"),
-            history_provider=lambda agent, after_ts, limit, role: messages,
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: messages,
         )
 
     @pytest.mark.asyncio
@@ -609,7 +609,7 @@ class TestDreamReflectionLoudness:
 
         db_path = str(tmp_path / "dream.db")
 
-        def messages(agent, after_ts, limit, role):
+        def messages(agent, after_ts, limit, role, before_ts=0.0):
             return [
                 {
                     "timestamp": after_ts + 1.0,
@@ -778,7 +778,7 @@ class TestDreamReflectionLoudness:
         db_path = str(tmp_path / "dream.db")
         runner = DreamRunner(
             db_path=db_path,
-            history_provider=lambda agent, after_ts, limit, role: messages,
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: messages,
         )
         runner._save_state("pinky", "seed", last_message_ts=100.0)
 
@@ -807,7 +807,7 @@ class TestDreamReflectionLoudness:
 
         reopened = DreamRunner(
             db_path=db_path,
-            history_provider=lambda agent, after_ts, limit, role: messages,
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: messages,
         )
         summary = await reopened.run_dream(
             "pinky", _DreamAgentConfig(str(tmp_path))
@@ -858,7 +858,7 @@ class TestDreamReflectionLoudness:
 
         runner = DreamRunner(
             db_path=str(tmp_path / "dream.db"),
-            history_provider=lambda agent, after_ts, limit, role: list(messages),
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: list(messages),
             owner_notify_callback=owner_notify,
         )
         await self._record_night(runner, "2026-08-10", 0, 1)
@@ -925,7 +925,7 @@ class TestDreamReflectionLoudness:
         ]
         runner = DreamRunner(
             db_path=str(tmp_path / "dream.db"),
-            history_provider=lambda agent, after_ts, limit, role: messages,
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: messages,
         )
 
         def counted_links(*args, **kwargs):
@@ -979,7 +979,7 @@ class TestDreamReflectionLoudness:
         ]
         runner = DreamRunner(
             db_path=str(tmp_path / "dream.db"),
-            history_provider=lambda agent, after_ts, limit, role: messages,
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: messages,
         )
 
         trigger_a = asyncio.create_task(
@@ -1009,7 +1009,7 @@ class TestDreamReflectionLoudness:
         db_path = str(tmp_path / "dream.db")
         owner = DreamRunner(
             db_path=db_path,
-            history_provider=lambda agent, after_ts, limit, role: messages,
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: messages,
         )
         owner._save_state("pinky", "seed", last_message_ts=100.0)
         receipt = owner._begin_reflection_attempt(
@@ -1036,7 +1036,7 @@ class TestDreamReflectionLoudness:
         )
         contender = DreamRunner(
             db_path=db_path,
-            history_provider=lambda agent, after_ts, limit, role: messages,
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: messages,
         )
         blocked = await contender.run_dream(
             "pinky", _DreamAgentConfig(str(tmp_path))
@@ -1089,11 +1089,11 @@ class TestDreamReflectionLoudness:
         db_path = str(tmp_path / "dream.db")
         owner = DreamRunner(
             db_path=db_path,
-            history_provider=lambda agent, after_ts, limit, role: messages,
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: messages,
         )
         contender = DreamRunner(
             db_path=db_path,
-            history_provider=lambda agent, after_ts, limit, role: messages,
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: messages,
         )
 
         owner_task = asyncio.create_task(
@@ -1131,6 +1131,7 @@ class TestDreamReflectionLoudness:
         monkeypatch.setattr(dream_runner_module, "_REFLECTION_ATTEMPT_LEASE_S", 120.0)
         db_path = str(tmp_path / "dream.db")
         owner = DreamRunner(db_path=db_path)
+        owner._save_state("pinky", "seed", last_message_ts=100.0)
         attempt = owner._begin_reflection_attempt(
             "pinky",
             "2026-08-12",
@@ -1200,7 +1201,7 @@ class TestDreamReflectionLoudness:
         )
         runner = DreamRunner(
             db_path=str(tmp_path / "dream.db"),
-            history_provider=lambda agent, after_ts, limit, role: [
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: [
                 {"timestamp": 200.0, "role": "user", "content": "hung interval"}
             ],
         )
@@ -1253,7 +1254,7 @@ class TestDreamReflectionLoudness:
         monkeypatch.setattr(dream_runner_module, "SDKRunner", CancellationSuppressingRunner)
         runner = DreamRunner(
             db_path=str(tmp_path / "dream.db"),
-            history_provider=lambda *args: [{"timestamp": 200.0, "role": "user", "content": "x"}],
+            history_provider=lambda *args, before_ts=0.0: [{"timestamp": 200.0, "role": "user", "content": "x"}],
         )
         summary = await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
         assert "TimeoutError" in summary
@@ -1324,7 +1325,7 @@ class TestDreamReflectionLoudness:
         db_path = str(tmp_path / "dream.db")
         runner = DreamRunner(
             db_path=db_path,
-            history_provider=lambda agent, after_ts, limit, role: list(messages),
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: list(messages),
         )
         runner._save_state("pinky", "seed", last_message_ts=100.0)
         with pytest.raises(SimulatedProcessDeath):
@@ -1362,7 +1363,7 @@ class TestDreamReflectionLoudness:
         )
         reopened = DreamRunner(
             db_path=db_path,
-            history_provider=lambda agent, after_ts, limit, role: list(messages),
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: list(messages),
         )
         for _ in range(3):
             await reopened.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
@@ -1449,7 +1450,7 @@ class TestDreamReflectionLoudness:
         )
         runner = DreamRunner(
             db_path=str(tmp_path / "dream.db"),
-            history_provider=lambda agent, after_ts, limit, role: list(messages),
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: list(messages),
         )
 
         assert await runner.run_dream(
@@ -1509,7 +1510,7 @@ class TestDreamReflectionLoudness:
         )
         runner = DreamRunner(
             db_path=str(tmp_path / "dream.db"),
-            history_provider=lambda agent, after_ts, limit, role: [
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: [
                 {"timestamp": 200.0, "role": "user", "content": "context"}
             ],
         )
@@ -1554,7 +1555,7 @@ class TestDreamReflectionLoudness:
         )
         runner = DreamRunner(
             db_path=str(tmp_path / "dream.db"),
-            history_provider=lambda agent, after_ts, limit, role: [
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: [
                 {"timestamp": 200.0, "role": "user", "content": "frozen interval"}
             ],
         )
@@ -1671,7 +1672,7 @@ class TestDreamReflectionLoudness:
         os.utime(unrelated, (now - 25 * 3600, now - 25 * 3600))
         runner = DreamRunner(
             db_path=str(tmp_path / "dream.db"),
-            history_provider=lambda agent, after_ts, limit, role: [],
+            history_provider=lambda agent, after_ts, limit, role, before_ts=0.0: [],
         )
 
         await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
@@ -1691,6 +1692,7 @@ class TestDreamReflectionLoudness:
             "recent",
             "pending",
         ):
+            runner._save_state(agent, "seed", last_message_ts=100.0)
             receipt = runner._begin_reflection_attempt(
                 agent,
                 "2026-08-12",
@@ -1793,6 +1795,7 @@ class TestDreamReflectionLoudness:
         assert "reflection_rowid_floor" not in columns
         assert {"lease_owner", "lease_expires_at", "terminal"} <= columns
         assert runner._db.execute("PRAGMA user_version").fetchone()[0] == 1
+        runner._save_state("pinky", "seed", last_message_ts=100.0)
         assert runner._begin_reflection_attempt(
             "pinky",
             "2026-08-12",

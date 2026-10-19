@@ -3174,9 +3174,10 @@ def create_api(
 
     dream_runner = DreamRunner(
         db_path=store_manifest["dream_state"].path,
-        history_provider=lambda agent_name, after_ts, limit, role: _resolve_agent_history(
+        history_provider=lambda agent_name, after_ts, limit, role, before_ts=0.0: _resolve_agent_history(
             agent_name,
             after_ts=after_ts,
+            before_ts=before_ts,
             limit=limit,
             role=role,
         ),
@@ -13539,11 +13540,6 @@ npm run build</pre>
         if not send_callback:
             return False
 
-        sender_names = [agent_name] + [
-            agent.name
-            for agent in agents.list(enabled_only=True)
-            if agent.name != agent_name
-        ]
         attempted_routes: set[tuple[str, str, str, str]] = set()
         failures: list[str] = []
 
@@ -13588,11 +13584,9 @@ npm run build</pre>
             preferred_bound = bool(agents.get_raw_token_for_account(
                 agent_name, platform, account_id,
             ))
-            sender_name = next((
-                candidate
-                for candidate in sender_names
-                if agents.get_raw_token_for_account(candidate, platform, account_id)
-            ), "")
+            sender_name, _ = agents.resolve_owner_notification_sender(
+                agent_name, platform, account_id,
+            )
 
             if not preferred_bound and sender_name:
                 # Another local sender holds a token for this account, so
@@ -13644,14 +13638,9 @@ npm run build</pre>
         default_sender = ""
         default_account = ""
         if default_conversation_id and default_platform:
-            for candidate in sender_names:
-                account_id = agents.get_token_account_id(candidate, default_platform)
-                if account_id and agents.get_raw_token_for_account(
-                    candidate, default_platform, account_id,
-                ):
-                    default_sender = candidate
-                    default_account = account_id
-                    break
+            default_sender, default_account = agents.resolve_owner_notification_sender(
+                agent_name, default_platform,
+            )
 
         if default_sender:
             _log(

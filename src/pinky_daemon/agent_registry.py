@@ -5185,6 +5185,19 @@ except Exception as exc:
             return ""
         return self.get_raw_token(agent_name, platform)
 
+    def resolve_owner_notification_sender(
+        self, preferred: str, platform: str, account_id: str = "",
+    ) -> tuple[str, str]:
+        """Prefer the requesting agent, then enabled local senders in registry order."""
+        names = [preferred] + [
+            agent.name for agent in self.list(enabled_only=True) if agent.name != preferred
+        ]
+        for name in names:
+            account = account_id or self.get_token_account_id(name, platform)
+            if account and self.get_raw_token_for_account(name, platform, account):
+                return name, account
+        return "", ""
+
     def list_tokens(self, agent_name: str) -> list[AgentToken]:
         """List all tokens for an agent."""
         rows = self._db.execute(
@@ -7558,7 +7571,8 @@ except Exception as exc:
                        COUNT(DISTINCT CASE WHEN principal.status='approved'
                                            THEN pm.sender_id END),
                        GROUP_CONCAT(DISTINCT CASE WHEN principal.status='approved'
-                                                  THEN pm.sender_id END)
+                                                  THEN pm.sender_id END),
+                       ar.notification_destination, ar.fallback_path
                 FROM pending_messages AS pm
                 LEFT JOIN approved_users AS gate
                   ON gate.agent_name=pm.agent_name AND gate.chat_id=pm.chat_id
@@ -7570,7 +7584,7 @@ except Exception as exc:
                 WHERE {' AND '.join(where)}
                 GROUP BY pm.agent_name, pm.chat_id, gate.status,
                          gate.display_name, ar.id, ar.notification_state,
-                         ar.last_notified_at
+                         ar.last_notified_at, ar.notification_destination, ar.fallback_path
                 ORDER BY MIN(pm.created_at), pm.agent_name, pm.chat_id""",
             params,
         ).fetchall()
@@ -7591,6 +7605,8 @@ except Exception as exc:
                 "approved_principal_count": row[10],
                 "approved_principal_ids": row[11].split(",") if row[11] else [],
                 "high_signal": row[2] != "approved" and row[10] > 0,
+                "notification_destination": json.loads(row[12] or "{}"),
+                "fallback_path": json.loads(row[13] or "[]"),
             }
             for row in rows
         ]
@@ -7668,6 +7684,13 @@ except Exception as exc:
             (agent_name, chat_id),
         ).fetchone()
         return self._enrich_approval_request(self._approval_request_dict(row)) if row else None
+
+    def get_approval_request_by_id(self, request_id: int | str) -> dict | None:
+        """Resolve a request command to its stored agent and gate."""
+        row = self._db.execute(
+            "SELECT agent_name, chat_id FROM approval_requests WHERE id=?", (request_id,),
+        ).fetchone()
+        return self.get_approval_request(row[0], row[1]) if row else None
 
     def record_approval_hold(
         self, agent_name: str, chat_id: str, *, target_name: str = "",
@@ -7850,7 +7873,8 @@ except Exception as exc:
     def get_approval_notification_health(self, agent_name: str) -> dict:
         rows = self._db.execute(
             """SELECT id, chat_id, held_count, oldest_held_at, notification_state,
-                      notification_attempts, next_retry_at, last_error
+                      notification_attempts, next_retry_at, last_error,
+                      notification_destination, fallback_path
                FROM approval_requests
                WHERE agent_name=? AND gate_state='pending'
                  AND notification_state IN ('retrying', 'failed')
@@ -7863,6 +7887,8 @@ except Exception as exc:
                 "oldest_age_seconds": max(0, int(time.time() - r[3])) if r[3] else 0,
                 "notification_state": r[4], "attempts": r[5],
                 "next_retry_at": r[6], "last_error": r[7],
+                "notification_destination": json.loads(r[8] or "{}"),
+                "fallback_path": json.loads(r[9] or "[]"),
             }
             for r in rows
         ]
