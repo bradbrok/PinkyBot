@@ -6,6 +6,7 @@ import asyncio
 import os
 import shlex
 import tempfile
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -38,6 +39,11 @@ class _FakeTmux:
         rc, out = await self("new-session", "-d", "-c", cwd, *cli)
         return TmuxCommandResult(returncode=rc, stdout="", stderr=out)
 
+    async def paste_text(self, text, *, enter=True):
+        assert enter is True
+        rc, out = await self("paste_text", text)
+        return TmuxCommandResult(returncode=rc, stdout="", stderr=out)
+
     def named(self, cmd: str) -> list[tuple[str, ...]]:
         return [c for c in self.calls if c[0] == cmd]
 
@@ -56,6 +62,7 @@ def _runner(tmp: str, fake: _FakeTmux, **overrides) -> TmuxDreamRunner:
     runner = TmuxDreamRunner(cfg, agent_name="ivan")
     runner._tmux = fake  # type: ignore[method-assign]
     runner._control.new_session = fake.new_session
+    runner._control.paste_text = fake.paste_text
 
     seeded: list[str] = []
     runner._seeded_dirs = seeded  # type: ignore[attr-defined]
@@ -79,9 +86,9 @@ class TestTmuxDreamRunner:
 
             async def write_result():
                 # Wait until the instruction was sent, then play the dream agent
-                while not fake.named("send-keys"):
+                while not fake.named("paste_text"):
                     await asyncio.sleep(0.01)
-                instruction = fake.named("send-keys")[0][-1]
+                instruction = fake.named("paste_text")[0][-1]
                 # Snapshot the prompt file mid-run - both files are cleaned
                 # up after a successful run.
                 prompt_file = next(
@@ -104,7 +111,7 @@ class TestTmuxDreamRunner:
             # Prompt file holds system prompt + prompt; REPL never saw them
             assert "DREAM INSTRUCTIONS" in prompt_content[0]
             assert "consolidate the night" in prompt_content[0]
-            instruction = fake.named("send-keys")[0][-1]
+            instruction = fake.named("paste_text")[0][-1]
             assert "consolidate the night" not in instruction
             assert "prompt-" in instruction and "result-" in instruction
 
@@ -258,13 +265,13 @@ class TestTmuxDreamRunner:
             runner = _runner(tmp, fake, timeout_s=30.0)
 
             async def write_result():
-                while not fake.named("send-keys"):
+                while not fake.named("paste_text"):
                     await asyncio.sleep(0.01)
                 # Let the poller swallow the rc=124 probe before the
                 # result appears.
                 while fake.probes < 1:
                     await asyncio.sleep(0.01)
-                instruction = fake.named("send-keys")[0][-1]
+                instruction = fake.named("paste_text")[0][-1]
                 result_path = next(
                     tok for tok in instruction.split() if "result-" in tok
                 )
@@ -332,9 +339,9 @@ class TestTmuxDreamRunner:
             runner = _runner(tmp, fake, timeout_s=30.0)
 
             async def touch_empty_result():
-                while not fake.named("send-keys"):
+                while not fake.named("paste_text"):
                     await asyncio.sleep(0.01)
-                instruction = fake.named("send-keys")[0][-1]
+                instruction = fake.named("paste_text")[0][-1]
                 result_path = next(
                     tok for tok in instruction.split() if "result-" in tok
                 )
@@ -490,3 +497,179 @@ class TestDreamTransportResolution:
             raise RuntimeError("db locked")
 
         assert self._dr(setting_provider=boom)._resolve_dream_transport() == "sdk"
+
+
+_COMPOSER_RULE = "─" * 80
+
+
+def _composer_pane(text: str = "", *, history: str = "") -> str:
+    return (
+        "Claude CLI\nModel · Service\n~/workspace\n\n"
+        f"{history}\n{_COMPOSER_RULE}\n❯\u00a0{text}\n{_COMPOSER_RULE}\n"
+        "  Permission mode enabled\n"
+    )
+
+
+class _InstructionTmux(_FakeTmux):
+    """Model composer placement while recording both delivery mechanisms."""
+
+    def __init__(self, state: str = "submitted"):
+        super().__init__()
+        self.state = state
+        self.instruction = ""
+        self.pastes: list[tuple[str, bool, int | None]] = []
+        self.parked_observations = 0
+
+    async def paste_text(self, text: str, *, enter=True, enter_delay_ms=None):
+        self.instruction = text
+        self.pastes.append((text, enter, enter_delay_ms))
+        self.calls.append(("paste_text", text))
+        return TmuxCommandResult(returncode=0, stdout="", stderr="")
+
+    @property
+    def enter_attempts(self) -> int:
+        return sum(enter for _, enter, _ in self.pastes) + sum(
+            call[-1] == "Enter" for call in self.named("send-keys")
+        )
+
+    async def __call__(self, *args: str) -> tuple[int, str]:
+        if args[0] == "send-keys" and "-l" in args:
+            self.instruction = args[-1]
+        if args[0] != "capture-pane":
+            return await super().__call__(*args)
+        self.calls.append(args)
+        if not self.instruction:
+            return 0, _composer_pane()
+        marker = self.instruction[:40]
+        if self.state == "parked":
+            self.parked_observations += 1
+            assert self.parked_observations <= 3, "submission check exceeded three attempts"
+            history = f"{_COMPOSER_RULE}\nEarlier output\n{_COMPOSER_RULE}\n"
+            return 0, _composer_pane(marker, history=history)
+        if self.state == "submitted":
+            return 0, _composer_pane(history=f"❯ {marker}\nWorking…\n")
+        return 0, f"Claude CLI\n{marker}\n"
+
+
+def _instruction_runner(tmp_path, fake):
+    runner = _runner(str(tmp_path), fake)
+    runner._control.paste_text = fake.paste_text
+    runner._wait_for_result = AsyncMock(return_value="Completed report")
+    return runner
+
+
+class TestInstructionSubmission:
+    async def test_instruction_uses_bracketed_paste_once(self, tmp_path):
+        fake = _InstructionTmux()
+        runner = _instruction_runner(tmp_path, fake)
+
+        result = await runner.run("Synthetic task")
+
+        assert result.ok
+        assert fake.pastes == [(fake.instruction, True, None)]
+        assert not any("-l" in call for call in fake.named("send-keys"))
+        assert fake.enter_attempts == 1
+
+    async def test_parked_instruction_retries_only_enter_up_to_three_attempts(
+        self, tmp_path, monkeypatch,
+    ):
+        from pinky_daemon import tmux_dream_runner
+
+        fake = _InstructionTmux("parked")
+        runner = _instruction_runner(tmp_path, fake)
+        logs = []
+        monkeypatch.setattr(tmux_dream_runner, "_log", logs.append)
+
+        result = await runner.run("Synthetic task")
+
+        assert result.ok
+        assert fake.enter_attempts == 3
+        assert len(fake.pastes) == 1
+        decisions = [line for line in logs if "state=parked" in line]
+        assert len(decisions) == 3
+        for attempt, line in enumerate(decisions, start=1):
+            assert runner._agent_name in line
+            assert f"attempt={attempt}" in line
+            assert "\n" not in line
+
+    async def test_submitted_instruction_gets_no_extra_enter(self, tmp_path, monkeypatch):
+        from pinky_daemon import tmux_dream_runner
+
+        fake = _InstructionTmux("submitted")
+        runner = _instruction_runner(tmp_path, fake)
+        logs = []
+        monkeypatch.setattr(tmux_dream_runner, "_log", logs.append)
+
+        result = await runner.run("Synthetic task")
+
+        assert result.ok
+        assert fake.enter_attempts == 1
+        assert len(fake.pastes) == 1
+        decisions = [line for line in logs if "state=submitted" in line]
+        assert len(decisions) == 1
+        assert runner._agent_name in decisions[0] and "attempt=1" in decisions[0]
+
+    async def test_unknown_layout_gets_no_extra_enter_and_one_decision(
+        self, tmp_path, monkeypatch,
+    ):
+        from pinky_daemon import tmux_dream_runner
+
+        fake = _InstructionTmux("unknown")
+        runner = _instruction_runner(tmp_path, fake)
+        logs = []
+        monkeypatch.setattr(tmux_dream_runner, "_log", logs.append)
+
+        result = await runner.run("Synthetic task")
+
+        assert result.ok
+        assert fake.enter_attempts == 1
+        assert len(fake.pastes) == 1
+        decisions = [line for line in logs if "state=unknown" in line]
+        assert len(decisions) == 1
+        assert runner._agent_name in decisions[0] and "attempt=1" in decisions[0]
+
+    @pytest.mark.parametrize("pane,ready", [
+        pytest.param("Claude CLI\nModel · Service\n", False, id="banner"),
+        pytest.param("❯ unframed text\n", False, id="unframed-glyph"),
+        pytest.param(_composer_pane(), True, id="composer"),
+        pytest.param("? for shortcuts", True, id="shortcuts"),
+    ])
+    async def test_ready_requires_composer(self, tmp_path, pane, ready):
+        fake = _FakeTmux()
+        runner = _runner(str(tmp_path), fake)
+        runner._config.ready_timeout_s = 0.01
+        runner._tmux = AsyncMock(return_value=(0, pane))
+
+        assert await runner._wait_ready() is ready
+
+    @pytest.mark.parametrize("reason", ["timeout", "exited"])
+    async def test_failure_tail_uses_scrollback_on_one_line(self, tmp_path, monkeypatch, reason):
+        from pinky_daemon import tmux_dream_runner
+
+        class _TailTmux(_InstructionTmux):
+            async def __call__(self, *args):
+                if args[0] == "capture-pane":
+                    self.calls.append(args)
+                    return 0, "Earlier output\nFailure detail\n" if "-S" in args else ""
+                return await super().__call__(*args)
+
+        fake = _TailTmux()
+        runner = _runner(str(tmp_path), fake, timeout_s=0.05)
+        runner._control.paste_text = fake.paste_text
+        runner._wait_ready = AsyncMock(return_value=True)
+        runner._ensure_submitted = AsyncMock()
+        runner._repl_alive = AsyncMock(return_value=reason != "exited")
+        logs = []
+        monkeypatch.setattr(tmux_dream_runner, "_log", logs.append)
+
+        result = await runner.run("Synthetic task")
+
+        assert result.exit_code == 1
+        assert any("-S" in call and call[call.index("-S") + 1] == "-200"
+                   for call in fake.named("capture-pane"))
+        assert "Earlier output | Failure detail" in result.error
+        assert "\n" not in result.error
+        diagnostics = [line for line in logs if "pane tail:" in line]
+        assert len(diagnostics) == 1
+        assert "Earlier output | Failure detail" in diagnostics[0]
+        assert "\n" not in diagnostics[0]

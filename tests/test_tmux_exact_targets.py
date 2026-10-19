@@ -412,7 +412,7 @@ async def test_dream_run_leaves_prefix_neighbour_untouched(dream_tmux, tmp_path)
     fake_claude = tmp_path / "fake-claude"
     fake_claude.write_text(
         "#!/bin/sh\n"
-        "printf 'Claude fake REPL\\n'\n"
+        "printf 'Provider\\n────────────────────────────────────────────────────────────\\n❯ \\n────────────────────────────────────────────────────────────\\n'\n"
         "IFS= read -r line || exit 1\n"
         "path=$(printf '%s\\n' \"$line\""
         " | sed -n 's/.* plain text to \\(.*\\) using the Write tool.*/\\1/p')\n"
@@ -465,20 +465,22 @@ async def test_dream_liveness_probe_ignores_prefix_neighbour(dream_tmux, tmp_pat
 
 
 async def test_dream_readiness_wait_ignores_prefix_neighbour(dream_tmux, tmp_path):
-    dream_tmux.new("pinky-dream-x-old", "printf 'Claude neighbour\\n'; exec cat")
-    dream_tmux.wait_for_text("pinky-dream-x-old", "Claude neighbour")
+    ready_command = "printf 'Provider\\n────────────────────────────────────────────────────────────\\n❯ \\n────────────────────────────────────────────────────────────\\n'; exec cat"
+    dream_tmux.new("pinky-dream-x-old", ready_command)
+    dream_tmux.wait_for_text("pinky-dream-x-old", "❯")
     runner = _dream_runner(tmp_path, ready_timeout_s=1.5)
 
     assert await runner._wait_ready() is False
 
-    dream_tmux.new("pinky-dream-x", "printf 'Claude exact\\n'; exec cat")
-    dream_tmux.wait_for_text("pinky-dream-x", "Claude exact")
+    dream_tmux.new("pinky-dream-x", ready_command)
+    dream_tmux.wait_for_text("pinky-dream-x", "❯")
     assert await runner._wait_ready() is True
 
 
 async def test_dream_submit_check_never_sends_enter_to_prefix_neighbour(dream_tmux, tmp_path):
     instruction = "Read the file /nowhere/prompt.md and follow it"
-    dream_tmux.new("pinky-dream-x-old", "exec cat")
+    parked_command = "printf 'Provider\\n────────────────────────────────────────────────────────────\\n❯ \\n────────────────────────────────────────────────────────────\\n\\033[2A\\033[2C'; exec cat"
+    dream_tmux.new("pinky-dream-x-old", parked_command)
     dream_tmux.type_literal("pinky-dream-x-old", instruction)
     dream_tmux.wait_for_text("pinky-dream-x-old", instruction)
     runner = _dream_runner(tmp_path)
@@ -488,7 +490,7 @@ async def test_dream_submit_check_never_sends_enter_to_prefix_neighbour(dream_tm
     # No Enter reached the neighbour: cat never echoed the line back.
     assert dream_tmux.capture("pinky-dream-x-old").count(instruction) == 1
 
-    dream_tmux.new("pinky-dream-x", "exec cat")
+    dream_tmux.new("pinky-dream-x", parked_command)
     dream_tmux.type_literal("pinky-dream-x", instruction)
     dream_tmux.wait_for_text("pinky-dream-x", instruction)
     await runner._ensure_submitted(instruction)
