@@ -1994,8 +1994,15 @@ class BrokerSlackPoller:
         ]
 
         meta = {
-            "user_id": user_id,
-            "bot_id": bot_id,
+            "user_id": user_id or None,
+            "bot_id": bot_id or None,
+            "was_bot": bool(bot_id) or subtype == "bot_message",
+            "forwarded": None,
+            "via_bot_id": None,
+            "sender_business_bot_id": None,
+            "reply_to": thread_ts if thread_ts and thread_ts != ts else None,
+            "reply_to_sender_id": event.get("parent_user_id") or None,
+            "platform_ts": None,
             "channel_type": channel_type,
             "thread_ts": thread_ts,
         }

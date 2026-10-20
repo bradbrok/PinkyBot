@@ -7,6 +7,7 @@ Handles sending messages, polling for updates, and message history.
 from __future__ import annotations
 
 import os
+import sys
 from datetime import datetime, timezone
 
 import httpx
@@ -21,6 +22,45 @@ class TelegramError(Exception):
         self.description = description
         self.error_code = error_code
         super().__init__(f"Telegram API error {error_code}: {description}")
+
+
+def _telegram_id(value: object) -> str | None:
+    return str(value) if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _inbound_sender_fields(message: dict) -> dict:
+    sender = message.get("from") or {}
+    reply = message.get("reply_to_message") or {}
+
+    def optional_bot_id(field: str) -> str | None:
+        value = message.get(field)
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise ValueError("invalid optional bot")
+        result = _telegram_id(value.get("id"))
+        if result is None:
+            raise ValueError("invalid optional bot id")
+        return result
+
+    user_id = _telegram_id(sender.get("id"))
+    was_bot = bool(sender.get("is_bot"))
+    reply_id = reply.get("message_id")
+    return {
+        "user_id": user_id,
+        "was_bot": was_bot,
+        "bot_id": user_id if was_bot else None,
+        "forwarded": bool(
+            "forward_origin" in message
+            or any(key.startswith("forward_") for key in message)
+            or message.get("is_automatic_forward")
+        ),
+        "via_bot_id": optional_bot_id("via_bot"),
+        "sender_business_bot_id": optional_bot_id("sender_business_bot"),
+        "reply_to": str(reply_id) if reply_id is not None else None,
+        "reply_to_sender_id": _telegram_id((reply.get("from") or {}).get("id")),
+        "platform_ts": int(message["date"]),
+    }
 
 
 class TelegramAdapter:
@@ -435,83 +475,94 @@ class TelegramAdapter:
         for update in result:
             self._last_update_id = max(self._last_update_id, update["update_id"])
 
-            msg_data = update.get("message")
-            if not msg_data:
+            try:
+                message = self._message_from_update(update)
+            except Exception as exc:
+                print(f"Telegram update {update['update_id']} skipped: {type(exc).__name__}",
+                      file=sys.stderr, flush=True)
                 continue
-
-            text = msg_data.get("text", "")
-            caption = msg_data.get("caption", "")
-            content = text or caption or ""
-
-            sender_data = msg_data.get("from", {})
-            sender_parts = [
-                sender_data.get("first_name", ""),
-                sender_data.get("last_name", ""),
-            ]
-            sender_name = " ".join(p for p in sender_parts if p) or "unknown"
-
-            metadata = {
-                "sender_id": str(sender_data.get("id", "")),
-                "username": sender_data.get("username", ""),
-                "chat_type": msg_data["chat"].get("type", ""),
-                "chat_title": msg_data["chat"].get("title", ""),
-                "reply_to_sender_id": str(msg_data.get("reply_to_message", {}).get("from", {}).get("id", "")),
-                "entities": msg_data.get("entities", []),
-            }
-
-            # Detect file attachments
-            attachments = []
-            attachment_types = [
-                ("photo", None),
-                ("document", None),
-                ("voice", None),
-                ("video", None),
-                ("audio", None),
-                ("sticker", None),
-            ]
-            for att_type, _ in attachment_types:
-                att_data = msg_data.get(att_type)
-                if not att_data:
-                    continue
-
-                if att_type == "photo":
-                    # photo is an array of PhotoSize, pick largest by file_size
-                    largest = max(att_data, key=lambda p: p.get("file_size", 0))
-                    attachments.append({
-                        "type": "photo",
-                        "file_id": largest["file_id"],
-                        "file_size": largest.get("file_size", 0),
-                    })
-                else:
-                    att_info: dict = {
-                        "type": att_type,
-                        "file_id": att_data["file_id"],
-                    }
-                    if "file_name" in att_data:
-                        att_info["file_name"] = att_data["file_name"]
-                    if "mime_type" in att_data:
-                        att_info["mime_type"] = att_data["mime_type"]
-                    if "file_size" in att_data:
-                        att_info["file_size"] = att_data["file_size"]
-                    attachments.append(att_info)
-
-            if attachments:
-                metadata["attachments"] = attachments
-
-            messages.append(Message(
-                platform=Platform.telegram,
-                chat_id=str(msg_data["chat"]["id"]),
-                sender=sender_name,
-                content=content,
-                timestamp=datetime.fromtimestamp(msg_data["date"], tz=timezone.utc),
-                message_id=str(msg_data["message_id"]),
-                reply_to=str(msg_data["reply_to_message"]["message_id"])
-                if msg_data.get("reply_to_message")
-                else "",
-                metadata=metadata,
-            ))
+            if message is not None:
+                messages.append(message)
 
         return messages
+
+    @staticmethod
+    def _message_from_update(update: dict) -> Message | None:
+        msg_data = update.get("message")
+        if not msg_data:
+            return None
+
+        text = msg_data.get("text", "")
+        caption = msg_data.get("caption", "")
+        content = text or caption or ""
+
+        sender_data = msg_data.get("from", {})
+        sender_parts = [
+            sender_data.get("first_name", ""),
+            sender_data.get("last_name", ""),
+        ]
+        sender_name = " ".join(p for p in sender_parts if p) or "unknown"
+
+        metadata = {
+            "sender_id": str(sender_data.get("id", "")),
+            "username": sender_data.get("username", ""),
+            "chat_type": msg_data["chat"].get("type", ""),
+            "chat_title": msg_data["chat"].get("title", ""),
+            "entities": msg_data.get("entities", []),
+            **_inbound_sender_fields(msg_data),
+        }
+
+        # Detect file attachments
+        attachments = []
+        attachment_types = [
+            ("photo", None),
+            ("document", None),
+            ("voice", None),
+            ("video", None),
+            ("audio", None),
+            ("sticker", None),
+        ]
+        for att_type, _ in attachment_types:
+            att_data = msg_data.get(att_type)
+            if not att_data:
+                continue
+
+            if att_type == "photo":
+                # photo is an array of PhotoSize, pick largest by file_size
+                largest = max(att_data, key=lambda p: p.get("file_size", 0))
+                attachments.append({
+                    "type": "photo",
+                    "file_id": largest["file_id"],
+                    "file_size": largest.get("file_size", 0),
+                })
+            else:
+                att_info: dict = {
+                    "type": att_type,
+                    "file_id": att_data["file_id"],
+                }
+                if "file_name" in att_data:
+                    att_info["file_name"] = att_data["file_name"]
+                if "mime_type" in att_data:
+                    att_info["mime_type"] = att_data["mime_type"]
+                if "file_size" in att_data:
+                    att_info["file_size"] = att_data["file_size"]
+                attachments.append(att_info)
+
+        if attachments:
+            metadata["attachments"] = attachments
+
+        return Message(
+            platform=Platform.telegram,
+            chat_id=str(msg_data["chat"]["id"]),
+            sender=sender_name,
+            content=content,
+            timestamp=datetime.fromtimestamp(msg_data["date"], tz=timezone.utc),
+            message_id=str(msg_data["message_id"]),
+            reply_to=str(msg_data["reply_to_message"]["message_id"])
+            if msg_data.get("reply_to_message")
+            else "",
+            metadata=metadata,
+        )
 
     # ── Actions ──────────────────────────────────────────────
 

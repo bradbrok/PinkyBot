@@ -2829,7 +2829,7 @@ def _private_text_read(store):
     return getter("sample", "record", platform="test", chat_id="chat")
 
 
-def test_inbound_text_is_persisted_outside_routing_context_and_cleared_by_outbound(tmp_path):
+def test_inbound_text_stays_outside_routing_context_and_survives_outbound(tmp_path):
     from dataclasses import fields
 
     from pinky_daemon.broker import MessageContext
@@ -2838,18 +2838,19 @@ def test_inbound_text_is_persisted_outside_routing_context_and_cleared_by_outbou
     expected = {"agent_name", "message_id", "platform", "chat_id", "timestamp", "reply_to",
                 "is_group", "source_was_voice", "attachments", "metadata"}
     try:
-        message = _private_text_message(metadata={"direction": "outbound", "text": "forged",
+        message = _private_text_message(content="first", sender_id="second",
+                                       metadata={"direction": "outbound", "text": "forged",
                                                  "content": "forged", "sender_id": "forged"})
         broker.remember_message_context(message)
-        assert _private_text_read(store) == ("source text", "ok", "sender-1")
+        assert _private_text_read(store) == ("first", "ok", "second")
         context = broker.get_message_context("sample", "record")
         assert {f.name for f in fields(MessageContext)} == expected
         assert set(context.to_dict()) == expected
-        assert "source text" not in repr(context.to_dict())
-        assert "sender-1" not in repr(context.to_dict())
+        assert "first" not in repr(context.to_dict())
+        assert "second" not in repr(context.to_dict())
         assert context.metadata["direction"] == "inbound"
         broker.remember_outbound_message_context("sample", "record", platform="test", chat_id="chat")
-        assert _private_text_read(store) == (None, "absent", "")
+        assert _private_text_read(store) == ("first", "ok", "second")
     finally:
         store.close()
 

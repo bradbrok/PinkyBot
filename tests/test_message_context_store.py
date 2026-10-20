@@ -270,25 +270,30 @@ def test_explicit_inbound_text_survives_reopen_without_normalization(tmp_path, t
 
 
 @pytest.mark.parametrize("text", ["é" * 8192 + "x", "x" * 16385], ids=["multibyte-over", "ascii-over"])
-def test_over_byte_cap_replaces_previous_text_with_null_not_prefix(tmp_path, text):
+def test_over_byte_cap_first_write_is_not_replaced_with_short_text(tmp_path, text):
     store = MessageContextStore(str(tmp_path / "context.db"))
     try:
-        _put_text(store, _text_context(), content="old", sender_id="sender-0")
-        _put_text(store, _text_context(), content=text, sender_id="sender-1")
-        assert _read_text(store) == (None, "too_long", "sender-1")
+        _put_text(store, _text_context(), content=text, sender_id="first")
+        assert _read_text(store) == (None, "too_long", "first")
+        _put_text(store, _text_context(), content="second", sender_id="second")
+        assert _read_text(store) == (None, "too_long", "first")
         assert store._db.execute("SELECT content FROM message_contexts").fetchone()[0] is None
     finally:
         store.close()
 
 
 @pytest.mark.parametrize("direction", ["outbound", "", "Inbound"])
-def test_non_inbound_upsert_clears_every_text_column(tmp_path, direction):
+def test_non_inbound_put_preserves_existing_inbound_text(tmp_path, direction):
     store = MessageContextStore(str(tmp_path / "context.db"))
     try:
-        _put_text(store, _text_context(), content="previous", sender_id="sender-1")
-        _put_text(store, _text_context(direction=direction), content="forged", sender_id="forged")
-        assert _read_text(store) == (None, "absent", "")
-        row = store._db.execute("SELECT content, content_status, sender_id FROM message_contexts").fetchone()
+        _put_text(store, _text_context(), content="first", sender_id="first")
+        _put_text(store, _text_context(direction=direction), content="second", sender_id="second")
+        assert _read_text(store) == ("first", "ok", "first")
+        _put_text(store, _text_context("non-inbound", direction=direction),
+                  content="second", sender_id="second")
+        assert _read_text(store, "non-inbound") == (None, "absent", "")
+        row = store._db.execute("SELECT content, content_status, sender_id FROM message_contexts "
+                                "WHERE message_id='non-inbound'").fetchone()
         assert tuple(row) == (None, "absent", "")
     finally:
         store.close()
@@ -298,12 +303,14 @@ def test_metadata_and_context_keys_cannot_supply_text_or_sender(tmp_path):
     store = MessageContextStore(str(tmp_path / "context.db"))
     try:
         context = _text_context()
-        context.update(content="forged", text="forged", sender_id="forged")
-        context["metadata"].update(content="forged", text="forged", sender_id="forged")
+        context.update(content="first", text="first", sender_id="first")
+        context["metadata"].update(content="first", text="first", sender_id="first")
         store.put(context)
         assert _read_text(store) == (None, "absent", "")
-        _put_text(store, context, content="exact", sender_id="sender-1")
-        assert _read_text(store) == ("exact", "ok", "sender-1")
+        _put_text(store, _text_context("record-2"), content="second", sender_id="second")
+        assert _read_text(store, "record-2") == ("second", "ok", "second")
+        _put_text(store, context, content="second", sender_id="second")
+        assert _read_text(store) == (None, "absent", "")
     finally:
         store.close()
 
@@ -349,7 +356,8 @@ def test_text_visibility_matches_retention_cap_and_snapshot(tmp_path, monkeypatc
         _put_text(store, _text_context(), content="first", sender_id="sender", stored_at=now)
         assert _read_text(store, stored_at=now) == ("first", "ok", "sender")
         _put_text(store, _text_context(), content="second", sender_id="sender", stored_at=now + 1)
-        assert _read_text(store, stored_at=now) is None
+        assert _read_text(store, stored_at=now) == ("first", "ok", "sender")
+        assert _read_text(store, stored_at=now + 1) is None
         for index in range(2):
             _put_text(store, _text_context(str(index)), content="recent", stored_at=now + 2 + index)
         assert _read_text(store) is None

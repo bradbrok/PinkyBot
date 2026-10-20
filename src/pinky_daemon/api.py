@@ -164,7 +164,7 @@ from pinky_daemon.auth import (
     verify_session_cookie,
 )
 from pinky_daemon.autonomy import AgentEvent, AutonomyEngine, EventType
-from pinky_daemon.broker import BrokerMessage, MessageBroker
+from pinky_daemon.broker import INBOUND_MESSAGE_FIELDS, BrokerMessage, MessageBroker
 from pinky_daemon.codex_home import codex_home_for, per_agent_codex_home_enabled
 from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.conversation_store import ConversationStore
@@ -9177,11 +9177,14 @@ npm run build</pre>
             raise HTTPException(404, not_found)
         content, status, sender_id = private
         text = content if status == "ok" else None
-        return {"message_ts": float(context.timestamp), "stored_at": float(stored_at),
+        body = {"message_ts": float(context.timestamp), "stored_at": float(stored_at),
                 "is_group": bool(context.is_group), "sender_id": sender_id,
                 "source_was_voice": bool(context.source_was_voice), "text_status": status,
                 "text": text, "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()
                 if text is not None else None}
+        body.update({key: context.metadata[key] for key in INBOUND_MESSAGE_FIELDS
+                     if key in context.metadata})
+        return body
 
     # Action policy routes compose with the existing signed caller and owner gates.
     def _policy_agent(request: Request, name: str):
