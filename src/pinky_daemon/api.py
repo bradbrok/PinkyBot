@@ -30,6 +30,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 import uuid
@@ -164,7 +165,12 @@ from pinky_daemon.auth import (
     verify_session_cookie,
 )
 from pinky_daemon.autonomy import AgentEvent, AutonomyEngine, EventType
-from pinky_daemon.broker import INBOUND_MESSAGE_FIELDS, BrokerMessage, MessageBroker
+from pinky_daemon.broker import (
+    BUTTON_TAP_FIELDS,
+    INBOUND_MESSAGE_FIELDS,
+    BrokerMessage,
+    MessageBroker,
+)
 from pinky_daemon.codex_home import codex_home_for, per_agent_codex_home_enabled
 from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.conversation_store import ConversationStore
@@ -2424,6 +2430,40 @@ def create_api(
         clean = {k: v for k, v in raw.items() if k in allowed and v is True}
         return clean or None
 
+    def _parse_telegram_buttons(raw: str) -> list[dict]:
+        """Parse one inline row and refuse unsupported button fields."""
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            raise ValueError("expected JSON array") from None
+        if not isinstance(value, list) or not 1 <= len(value) <= 3:
+            raise ValueError("expected one to three buttons")
+        row = []
+        seen = set()
+        for button in value:
+            if not isinstance(button, dict) or set(button) - {"text", "data", "style"}:
+                raise ValueError("unsupported button keys")
+            text = button.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("text must be non-empty")
+            if len(text) > 64:
+                raise ValueError("text exceeds 64 characters")
+            if any(unicodedata.category(char) in ("Cc", "Zl", "Zp") for char in text):
+                raise ValueError("text contains a control character")
+            data = button.get("data")
+            if not isinstance(data, str) or re.fullmatch(r"[A-Za-z0-9_:-]{1,64}", data) is None:
+                raise ValueError("invalid callback data")
+            if "style" in button and button["style"] not in ("success", "danger", "primary"):
+                raise ValueError("invalid button style")
+            if data in seen:
+                raise ValueError("callback data must be unique")
+            seen.add(data)
+            item = {"text": text, "callback_data": data}
+            if "style" in button:
+                item["style"] = button["style"]
+            row.append(item)
+        return row
+
     def _send_text_message(
         agent_name: str,
         platform: str,
@@ -2438,6 +2478,7 @@ def create_api(
         quote: str = "",
         blocks: str = "",
         reply_metadata: dict | None = None,
+        buttons: list[dict] | None = None,
     ) -> SimpleNamespace:
         """Send a text message and return SimpleNamespace(message_id=...).
 
@@ -2515,7 +2556,9 @@ def create_api(
             if reply_to_id is not None and quote:
                 reply_parameters = {"message_id": reply_to_id, "quote": quote}
 
-            def _tg_send(rp):
+            reply_markup = {"inline_keyboard": [buttons]} if buttons else None
+
+            def _tg_send(rp, markup):
                 # Send with the existing MarkdownV2->plain degradation; ``rp`` is
                 # the reply_parameters (or None for a normal/unquoted reply).
                 if parse_mode:
@@ -2523,12 +2566,14 @@ def create_api(
                         chat_id, content, reply_to_message_id=reply_to_id,
                         parse_mode=parse_mode, disable_notification=silent,
                         link_preview_options=link_preview_options, reply_parameters=rp,
+                        reply_markup=markup,
                     )
                 try:
                     return adapter.send_message(
                         chat_id, _md_to_tg_mdv2(content), reply_to_message_id=reply_to_id,
                         parse_mode="MarkdownV2", disable_notification=silent,
                         link_preview_options=link_preview_options, reply_parameters=rp,
+                        reply_markup=markup,
                     )
                 except Exception as e:
                     _log(f"broker-send: MarkdownV2 failed ({e}), trying plain")
@@ -2536,10 +2581,11 @@ def create_api(
                         chat_id, content, reply_to_message_id=reply_to_id,
                         disable_notification=silent,
                         link_preview_options=link_preview_options, reply_parameters=rp,
+                        reply_markup=markup,
                     )
 
             try:
-                result = _tg_send(reply_parameters)
+                result = _tg_send(reply_parameters, reply_markup)
             except Exception as e:
                 # An invalid quote (not an exact substring / too long) makes
                 # Telegram reject the send. Don't sink the whole reply — degrade
@@ -2554,7 +2600,7 @@ def create_api(
                 )
                 if quote_rejected:
                     _log(f"broker-send: reply quote rejected ({e.description}); resending without quote")
-                    result = _tg_send(None)
+                    result = _tg_send(None, reply_markup)
                 else:
                     raise
             return SimpleNamespace(message_id=_extract_message_id(result))
@@ -2691,8 +2737,17 @@ def create_api(
         quote: str = "",
         blocks: str = "",
         reply_metadata: dict | None = None,
+        buttons: str = "",
     ) -> dict:
         """Send a message back to the platform on behalf of an agent."""
+        button_row = None
+        if buttons:
+            if platform != "telegram":
+                raise HTTPException(400, "buttons are Telegram only")
+            try:
+                button_row = _parse_telegram_buttons(buttons)
+            except ValueError as error:
+                raise HTTPException(400, "invalid buttons: " + str(error)) from None
         if account_id and not agents.get_raw_token_for_account(
             agent_name, platform, account_id,
         ):
@@ -2718,6 +2773,7 @@ def create_api(
                     quote=quote,
                     blocks=blocks,
                     reply_metadata=reply_metadata,
+                    buttons=button_row,
                 ),
             )
             # Once an outbound message lands, the typing indicator becomes noise —
@@ -2746,7 +2802,7 @@ def create_api(
         # Plain sends keep key_extra="" — their historical dedupe behaviour is
         # unchanged. The dict is serialized (never used raw) so the key stays
         # hashable.
-        if account_id or parse_mode or link_preview_options or quote or blocks or reply_metadata:
+        if account_id or parse_mode or link_preview_options or quote or blocks or reply_metadata or buttons:
             key_extra = json.dumps(
                 {
                     "acct": account_id or "",
@@ -2755,6 +2811,7 @@ def create_api(
                     "q": quote or "",
                     "blk": blocks or "",
                     "reply_meta": reply_metadata or None,
+                    "btn": json.dumps(button_row, sort_keys=True, separators=(",", ":")) if button_row else "",
                 },
                 sort_keys=True, separators=(",", ":"),
             )
@@ -9182,7 +9239,7 @@ npm run build</pre>
                 "source_was_voice": bool(context.source_was_voice), "text_status": status,
                 "text": text, "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()
                 if text is not None else None}
-        body.update({key: context.metadata[key] for key in INBOUND_MESSAGE_FIELDS
+        body.update({key: context.metadata[key] for key in INBOUND_MESSAGE_FIELDS + BUTTON_TAP_FIELDS
                      if key in context.metadata})
         return body
 
@@ -11181,6 +11238,11 @@ npm run build</pre>
         parse_mode = req.get("parse_mode", "")
         link_preview_options = _sanitize_link_preview_options(req.get("link_preview_options"))
         blocks = req.get("blocks") or ""
+        buttons = req.get("buttons")
+        if buttons is None:
+            buttons = ""
+        elif not isinstance(buttons, str):
+            buttons = json.dumps(buttons)
         if not isinstance(blocks, str):
             # Tolerate a pre-serialized list (defensive) by JSON-encoding it; the
             # send path parses a JSON string. Anything else -> drop to text-only.
@@ -11201,22 +11263,22 @@ npm run build</pre>
                 parse_mode=parse_mode,
                 link_preview_options=link_preview_options,
                 blocks=blocks,
+                buttons=buttons,
             )
         except HTTPException:
             raise
         except Exception as e:
             _log(f"broker-send: failed for {agent_name} -> {platform}:{chat_id}: {e}")
             raise HTTPException(502, f"Failed to send message: {e}")
+        metadata = {"tool": "send", "reply_to": reply_to, "delivery": result}
+        if buttons:
+            metadata["buttons"] = _parse_telegram_buttons(buttons)
         _record_outbound_message(
             agent_name,
             platform=platform,
             chat_id=chat_id,
             content=content,
-            metadata={
-                "tool": "send",
-                "reply_to": reply_to,
-                "delivery": result,
-            },
+            metadata=metadata,
         )
         return result
 

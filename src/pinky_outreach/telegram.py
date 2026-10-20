@@ -7,12 +7,16 @@ Handles sending messages, polling for updates, and message history.
 from __future__ import annotations
 
 import os
+import re
 import sys
+import time
 from datetime import datetime, timezone
 
 import httpx
 
 from pinky_outreach.types import Chat, Message, Platform
+
+CALLBACK_ANSWER_BUDGET = 10.0
 
 
 class TelegramError(Exception):
@@ -131,6 +135,7 @@ class TelegramAdapter:
         disable_notification: bool = False,
         link_preview_options: dict | None = None,
         reply_parameters: dict | None = None,
+        reply_markup: dict | None = None,
     ) -> Message:
         """Send a text message.
 
@@ -155,6 +160,7 @@ class TelegramAdapter:
             parse_mode=parse_mode,
             disable_notification=disable_notification,
             link_preview_options=link_preview_options,
+            reply_markup=reply_markup,
         )
 
         return Message(
@@ -451,6 +457,10 @@ class TelegramAdapter:
 
     # ── Receiving ────────────────────────────────────────────
 
+    def answer_callback_query(self, callback_query_id: str) -> None:
+        """Acknowledge a button tap without displaying text or an alert."""
+        self._request("answerCallbackQuery", callback_query_id=callback_query_id, http_timeout=5)
+
     def get_updates(
         self,
         *,
@@ -468,12 +478,28 @@ class TelegramAdapter:
             offset=self._last_update_id + 1 if self._last_update_id else None,
             timeout=timeout,
             limit=limit,
-            allowed_updates=["message"],
+            allowed_updates=["message", "callback_query"],
         )
 
         messages = []
+        answer_time = 0.0
+        skipped_answers = 0
         for update in result:
             self._last_update_id = max(self._last_update_id, update["update_id"])
+
+            callback = update.get("callback_query")
+            callback_id = callback.get("id") if isinstance(callback, dict) else None
+            if isinstance(callback_id, str) and callback_id:
+                if answer_time >= CALLBACK_ANSWER_BUDGET:
+                    skipped_answers += 1
+                else:
+                    started = time.monotonic()
+                    try:
+                        self.answer_callback_query(callback_id)
+                    except Exception as exc:
+                        print(type(exc).__name__, file=sys.stderr, flush=True)
+                    finally:
+                        answer_time += time.monotonic() - started
 
             try:
                 message = self._message_from_update(update)
@@ -484,10 +510,14 @@ class TelegramAdapter:
             if message is not None:
                 messages.append(message)
 
+        if skipped_answers:
+            print(f"callback answers skipped: {skipped_answers}", file=sys.stderr, flush=True)
         return messages
 
     @staticmethod
     def _message_from_update(update: dict) -> Message | None:
+        if "message" not in update and "callback_query" in update:
+            return TelegramAdapter._message_from_callback(update["callback_query"])
         msg_data = update.get("message")
         if not msg_data:
             return None
@@ -562,6 +592,60 @@ class TelegramAdapter:
             if msg_data.get("reply_to_message")
             else "",
             metadata=metadata,
+        )
+
+    @staticmethod
+    def _message_from_callback(cq: dict) -> Message | None:
+        if not isinstance(cq, dict):
+            return None
+        card = cq.get("message")
+        if not isinstance(card, dict):
+            return None
+        if "data" not in cq:
+            return None
+        data = cq["data"]
+        if not isinstance(data, str) or re.fullmatch(r"[A-Za-z0-9_:-]{1,64}", data) is None:
+            return None
+        callback_id = cq.get("id")
+        if not isinstance(callback_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", callback_id) is None:
+            return None
+        sender = cq.get("from")
+        if not isinstance(sender, dict):
+            return None
+        user_id = _telegram_id(sender.get("id"))
+        if user_id is None:
+            return None
+        card_id = str(card["message_id"])
+        chat = card["chat"]
+        sender_name = " ".join(part for part in (sender.get("first_name", ""),
+                                                sender.get("last_name", "")) if part) or "unknown"
+        was_bot = bool(sender.get("is_bot"))
+        return Message(
+            platform=Platform.telegram,
+            chat_id=str(chat["id"]),
+            sender=sender_name,
+            content="Button tapped: " + data,
+            timestamp=datetime.now(timezone.utc),
+            message_id="cb-" + callback_id,
+            reply_to=card_id,
+            metadata={
+                "sender_id": user_id,
+                "username": sender.get("username") or "",
+                "chat_type": chat.get("type", ""),
+                "chat_title": chat.get("title", ""),
+                "entities": [],
+                "user_id": user_id,
+                "was_bot": was_bot,
+                "bot_id": user_id if was_bot else None,
+                "forwarded": False,
+                "via_bot_id": None,
+                "sender_business_bot_id": None,
+                "reply_to": card_id,
+                "reply_to_sender_id": _telegram_id((card.get("from") or {}).get("id")),
+                "platform_ts": None,
+                "button_data": data,
+                "button_message_id": card_id,
+            },
         )
 
     # ── Actions ──────────────────────────────────────────────

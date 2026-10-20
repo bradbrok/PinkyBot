@@ -55,6 +55,7 @@ INBOUND_MESSAGE_FIELDS = (
     "user_id", "was_bot", "bot_id", "forwarded", "via_bot_id", "sender_business_bot_id",
     "reply_to", "reply_to_sender_id", "platform_ts",
 )
+BUTTON_TAP_FIELDS = ("button_data", "button_message_id")
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -1066,6 +1067,9 @@ class MessageBroker:
             owner happens to send mid-login can't be injected into the sign-in.
         The code itself is never logged.
         """
+        if "button_data" in message.metadata:
+            return False
+
         agent_name = message.agent_name
         if not _auth_relay.has_pending(agent_name):
             return False
@@ -1077,12 +1081,16 @@ class MessageBroker:
             return False
 
         # Strict quote-reply correlation. The code is accepted ONLY when the
-        # owner quote-replies to our exact relay message — a deliberate act that
-        # binds the code to this login. A message with no reply, a reply to some
+        # owner quote-replies to our exact relay message in the recorded chat.
+        # This binds the code to this login. A message with no reply, a reply to some
         # other message, or a relay we never tracked (empty relay_mid) is not a
         # reply to us → route normally, never consume it as the code.
         relay_mid = _auth_relay.pending_relay_mid(agent_name)
-        if not relay_mid or message.reply_to != relay_mid:
+        relay_chat_id = _auth_relay.pending_relay_chat_id(agent_name)
+        if (
+            not relay_chat_id or message.chat_id != relay_chat_id
+            or not relay_mid or message.reply_to != relay_mid
+        ):
             return False
 
         code = extract_auth_code(message.content)

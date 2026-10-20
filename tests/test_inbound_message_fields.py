@@ -109,7 +109,7 @@ def _telegram_data(**changes):
 
 def _telegram(data):
     def response(request):
-        assert json.loads(request.content)["allowed_updates"] == ["message"]
+        assert json.loads(request.content)["allowed_updates"] == ["message", "callback_query"]
         return httpx.Response(200, json={"ok": True, "result": [{"update_id": 1, "message": data}]})
 
     adapter = TelegramAdapter("fixture-token")
@@ -197,7 +197,7 @@ def _telegram_batch(data, *, first_update_id=100, read_stderr=None):
 
     def response(request):
         body = json.loads(request.content)
-        assert body["allowed_updates"] == ["message"]
+        assert body["allowed_updates"] == ["message", "callback_query"]
         offsets.append(body.get("offset"))
         updates = [{"update_id": first_update_id + index, "message": message}
                    for index, message in enumerate(data)] if len(offsets) == 1 else []
