@@ -677,17 +677,11 @@ class TmuxTranscriptTailer:
         if Path(discovered) == self._path:
             return
         # #291: never repoint to a transcript whose mtime PREDATES the current
-        # bind. On a fresh launch (context_restart / new session) the
-        # SessionStart hook binds the new JSONL the instant Claude Code
-        # announces the session — before CC has flushed the file to disk. The
-        # next poll sees ``_path`` missing and lands here; ``path_discovery``
-        # (newest-existing-by-mtime) then returns the PREVIOUS session's file,
-        # and the pre-#291 code clobbered the correct bind with it. That wedges
-        # the tailer on a frozen file forever: the stale path EXISTS so this
-        # self-heal never re-fires, and the first-bind flag was already consumed
-        # so #565 won't either — leaving the watchdog blind (frozen
-        # ``transcript_mtime`` reads "quiet" + undetected stop hooks pile the
-        # inflight deque) until it force_restarts a perfectly healthy agent.
+        # bind. The SessionStart hook can bind a new JSONL before it reaches
+        # disk. Fresh-launch discovery excludes the pre-launch snapshot, but
+        # continue launches and adopted panes have an empty snapshot. Keep
+        # this independent guard so an older transcript cannot steal their
+        # missing bind and leave the tailer watching a frozen file.
         # The freshly-bound session's own JSONL, once it materialises, has
         # mtime >= the bind; a strictly-older file is always a previous session
         # and never a valid heal target. Strict ``<`` (no slack): the stale

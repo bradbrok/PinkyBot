@@ -7236,13 +7236,12 @@ class TmuxSession(TransportReplacementMixin):
                 transcript_path=path,
                 on_turn_complete=self._handle_turn_complete,
                 agent_name=self.agent_name,
-                # #515 self-heal: hand the tailer our discovery
-                # callback so it can mtime-scan and rebind on its own
-                # if the SessionStart hook never fires. Closes the
-                # placeholder-flavor gap; the stale-real-path flavor
-                # is covered by ``_attempt_first_bind_recovery``
-                # (issue #565).
-                path_discovery=self._discover_transcript_path,
+                # #515 self-heal excludes pre-launch history, even if the
+                # previous session's shutdown write lands after a new bind.
+                # This bound method reads the current launch's snapshot on
+                # each poll, including when this tailer survives a respawn.
+                # The tailer's #291 mtime floor remains a second guard.
+                path_discovery=self._discover_post_launch_transcript_path,
                 # Mid-turn context gauge: surface each assistant
                 # entry's usage block as it lands so context% tracks
                 # the live window instead of freezing at the previous
