@@ -56,7 +56,11 @@ def _retained_session(tmp_path, monkeypatch, runtime="claude", cold=False):
     ss._tailer = tailer_class(
         transcript_path=tmux_session._PLACEHOLDER_TRANSCRIPT_PATH if cold else old,
         on_turn_complete=AsyncMock(),
-        path_discovery=ss._discover_transcript_path,
+        path_discovery=(
+            ss._discover_transcript_path
+            if runtime == "codex"
+            else ss._discover_post_launch_transcript_path
+        ),
     )
     if not cold:
         ss._tailer.set_offset(old.stat().st_size)
@@ -227,6 +231,124 @@ async def test_recovery_never_reads_prelaunch_rollout_history(tmp_path, monkeypa
     assert reads == [new]
     assert clock.sleeps == [5.0, 5.0]
     assert ss._tailer.transcript_path == new
+
+
+async def _spawn_self_healing_session(tmp_path, monkeypatch, *, cold=False, continued=False):
+    ss, old, root = _retained_session(tmp_path, monkeypatch, cold=cold)
+    ss._tailer = None
+    ss._config.force_fresh_context_once = not continued
+    monkeypatch.setattr(TmuxTranscriptTailer, "start", AsyncMock())
+    monkeypatch.setattr(TmuxTranscriptTailer, "stop", AsyncMock())
+    seen = []
+    monkeypatch.setattr(ss, "_on_transcript_entry", seen.append)
+    await TmuxSession._spawn_tmux_repl(ss)
+    return ss, old, root, seen
+
+
+async def test_self_heal_keeps_missing_hook_bind_after_previous_shutdown_write(tmp_path, monkeypatch):
+    ss, old, root, seen = await _spawn_self_healing_session(tmp_path, monkeypatch)
+    try:
+        new = root / "new.jsonl"
+        assert old in ss._prelaunch_transcripts
+        assert not ss._last_launch_used_continue
+        assert ss.set_transcript_path(new, session_id="new-session")
+        assert not new.exists()
+
+        # The previous session's shutdown write lands after the new bind.
+        with old.open("a") as handle:
+            handle.write(json.dumps({"type": "user", "message": "old shutdown"}) + "\n")
+        os.utime(old, (ss._tailer._path_bound_at + 10,) * 2)
+        assert old.stat().st_mtime > ss._tailer._path_bound_at
+        ss._tailer._try_self_heal_repoint()
+
+        assert ss._tailer.transcript_path == new
+        assert ss._tailer.stats["self_heal_repoints"] == 0
+        assert seen == []
+        entry = {"type": "queue-operation", "operation": "dequeue", "content": "new turn"}
+        new.write_text(json.dumps(entry) + "\n")
+        await ss._tailer.read_once()
+        assert seen == [entry]
+        assert ss._tailer.transcript_path == new
+        assert ss._tailer.offset == new.stat().st_size
+        assert ss._tailer.stats["self_heal_repoints"] == 0
+    finally:
+        await ss._stop_tailer()
+
+
+async def test_self_heal_chooses_postlaunch_file_over_newest_history(tmp_path, monkeypatch):
+    ss, old, root, seen = await _spawn_self_healing_session(tmp_path, monkeypatch)
+    try:
+        new = root / "bound.jsonl"
+        assert old in ss._prelaunch_transcripts
+        assert ss.set_transcript_path(new, session_id="new-session")
+        assert not new.exists()
+        postlaunch = root / "postlaunch.jsonl"
+        entry = {"type": "queue-operation", "operation": "dequeue", "content": "recovered turn"}
+        postlaunch.write_text(json.dumps(entry) + "\n")
+        os.utime(postlaunch, (ss._tailer._path_bound_at + 10,) * 2)
+        with old.open("a") as handle:
+            handle.write(json.dumps({"type": "user", "message": "old shutdown"}) + "\n")
+        os.utime(old, (ss._tailer._path_bound_at + 20,) * 2)
+        assert postlaunch not in ss._prelaunch_transcripts
+        assert old.stat().st_mtime > postlaunch.stat().st_mtime > ss._tailer._path_bound_at
+        ss._tailer.set_offset(7)
+
+        ss._tailer._try_self_heal_repoint()
+
+        assert ss._tailer.transcript_path == postlaunch
+        assert ss._tailer.offset == 0
+        assert ss._tailer.stats["self_heal_repoints"] == 1
+        await ss._tailer.read_once()
+        assert seen == [entry]
+        assert ss._tailer.transcript_path == postlaunch
+    finally:
+        await ss._stop_tailer()
+
+
+@pytest.mark.parametrize("mtime_delta", [-10, 10], ids=["older-than-bind", "newer-than-bind"])
+async def test_self_heal_continue_launch_preserves_mtime_floor(tmp_path, monkeypatch, mtime_delta):
+    ss, old, root, _ = await _spawn_self_healing_session(tmp_path, monkeypatch, continued=True)
+    try:
+        assert ss._last_launch_used_continue
+        assert ss._prelaunch_transcripts == frozenset()
+        missing = root / "missing.jsonl"
+        assert ss.set_transcript_path(missing, session_id="continued-session")
+        os.utime(old, (ss._tailer._path_bound_at + mtime_delta,) * 2)
+
+        ss._tailer._try_self_heal_repoint()
+
+        if mtime_delta < 0:
+            assert ss._tailer.transcript_path == missing
+            assert ss._tailer.stats["self_heal_repoints"] == 0
+            assert ss._tailer.stats["self_heal_stale_skips"] == 1
+        else:
+            assert ss._tailer.transcript_path == old
+            assert ss._tailer.offset == 0
+            assert ss._tailer.stats["self_heal_repoints"] == 1
+            assert ss._tailer.stats["self_heal_stale_skips"] == 0
+    finally:
+        await ss._stop_tailer()
+
+
+async def test_self_heal_cold_start_finds_first_transcript(tmp_path, monkeypatch):
+    ss, _, root, seen = await _spawn_self_healing_session(tmp_path, monkeypatch, cold=True)
+    try:
+        assert ss._prelaunch_transcripts == frozenset()
+        assert ss._tailer.transcript_path == tmux_session._PLACEHOLDER_TRANSCRIPT_PATH
+        assert not list(root.iterdir())
+        new = root / "first.jsonl"
+        entry = {"type": "queue-operation", "operation": "dequeue", "content": "first turn"}
+        new.write_text(json.dumps(entry) + "\n")
+
+        ss._tailer._try_self_heal_repoint()
+
+        assert ss._tailer.transcript_path == new
+        assert ss._tailer.offset == 0
+        assert ss._tailer.stats["self_heal_repoints"] == 1
+        await ss._tailer.read_once()
+        assert seen == [entry]
+    finally:
+        await ss._stop_tailer()
 
 
 def test_recovery_caps_postlaunch_content_reads_and_stops_at_first_match(tmp_path, monkeypatch):
