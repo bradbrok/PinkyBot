@@ -4561,6 +4561,13 @@ class TmuxSession(TransportReplacementMixin):
                 f"for {FRESH_CONTEXT_RESPAWN_GRACE_SEC:.0f}s"
             )
 
+        # A new conversation has no current usage snapshot. Keep cumulative
+        # usage intact; resume launches retain their snapshot and latches.
+        if self._last_launch_forced_fresh:
+            self.usage.last_usage = {}
+            self._restart_nudge_fired = False
+            self._soft_nudge_fired = False
+
         # Auth-relay (#205): if enabled + configured, start a flag-gated
         # background watcher that detects the claude OAuth login wall and relays
         # it to the owner. The normal path is byte-identical when off. Cancel a
@@ -7759,7 +7766,9 @@ class TmuxSession(TransportReplacementMixin):
                     continue
                 try:
                     self._processing = True
-                    await self._deliver_turn(turn)
+                    if await self._deliver_turn(turn) is False:
+                        self._inflight_turn = None
+                        continue
                     self._stats["turns"] += 1
                     if reload_guard is not None:
                         detail = (
@@ -11974,8 +11983,30 @@ class TmuxSession(TransportReplacementMixin):
             turn.completion_event.set()
         self._turn_done.set()
 
-    async def _deliver_turn(self, turn: _QueuedTurn) -> None:
-        """Push one turn through to the tmux pane.
+    def _drop_stale_context_nudge(self, turn: _QueuedTurn) -> bool:
+        """Discard an internal measurement whose delivery condition no longer holds."""
+        if not turn.internal or turn.reason not in {
+            "context_autorestart_nudge", "context_nudge_soft",
+        }:
+            return False
+        now_pct = self.get_context_info()["percentage"]
+        threshold_pct = (
+            self._effective_restart_threshold_pct()
+            if turn.reason == "context_autorestart_nudge"
+            else self._soft_nudge_threshold_pct()
+        )
+        if now_pct >= threshold_pct:
+            return False
+        if turn.completion_event is not None:
+            turn.completion_event.set()
+        _log(
+            f"tmux[{self.agent_name}]: dropped stale context nudge "
+            f"(reason={turn.reason}, now_pct={now_pct}, threshold_pct={threshold_pct})"
+        )
+        return True
+
+    async def _deliver_turn(self, turn: _QueuedTurn) -> bool | None:
+        """Push one turn through to the tmux pane; return False for a stale nudge.
 
         PR8b: the response side is handled asynchronously by the
         transcript tailer (set up in ``_spawn_tmux_repl``). This method
@@ -12039,6 +12070,8 @@ class TmuxSession(TransportReplacementMixin):
         the wake prompt (broker calls ``send`` the moment ``state ==
         CONNECTED``, which fires before this wait would have ended).
         """
+        if self._drop_stale_context_nudge(turn):
+            return False
         if not await wait_for_api(self._config, "tmux-turn"):
             self._refuse_api_turn(turn)
             return
@@ -12196,13 +12229,6 @@ class TmuxSession(TransportReplacementMixin):
                     f"({e}); continuing with prompt + directive fallback"
                 )
 
-        # Clear the back-compat ``_turn_done`` event before pasting.
-        # Under #560 the worker no longer awaits this between dispatches
-        # — the clear is purely for legacy observers and for tests that
-        # pin the "cleared on dispatch, set on completion" pattern.
-        # ``_handle_turn_complete`` re-sets it on every successful pop.
-        self._turn_done.clear()
-
         # Use paste_text (bracketed paste + delayed Enter) instead of raw
         # send-keys (issue #514, Misha/Pulse v2 pattern). The delayed
         # Enter gives claude's cold-start splash UI time to dismiss
@@ -12215,6 +12241,8 @@ class TmuxSession(TransportReplacementMixin):
         # interleave with this paste — two send paths into one pane.
         while True:
             async with self._repl_control_lock:
+                if self._drop_stale_context_nudge(turn):
+                    return False
                 # A scheduler-side cancel can land while this task awaits the
                 # REPL lock; pasting after that point would execute a turn
                 # whose wake was already re-persisted as undelivered — the
@@ -12260,6 +12288,9 @@ class TmuxSession(TransportReplacementMixin):
                     if not api_allows_submission(self._config, "tmux-turn"):
                         self._refuse_api_turn(turn)
                         return
+                    # A dropped nudge never started a turn. Clear the legacy
+                    # dispatch event only once the locked paste can proceed.
+                    self._turn_done.clear()
                     deferred = isinstance(turn.prompt, DeferredPrompt)
                     turn.prompt = render_prompt(turn.prompt)
                     transcript_ticket = (
