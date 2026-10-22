@@ -501,6 +501,7 @@ async def test_start_tailer_uses_codex_tailer(monkeypatch):
         lambda wd, *, agent=None: None,
     )  # cold start
     ss = _session()
+    monkeypatch.setattr(ss, "_codex_dismiss_nux_and_ready", AsyncMock())
     await ss._start_tailer()
     try:
         assert isinstance(ss._tailer, CodexTmuxTranscriptTailer)

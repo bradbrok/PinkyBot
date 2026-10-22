@@ -1,6 +1,7 @@
 """A discovered rollout stays bound to the file validated for that session."""
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -31,6 +32,7 @@ async def discovered(d, monkeypatch, per_agent, caller="tenant"):
 
     # Exercise real Codex construction without starting a polling/recovery task.
     monkeypatch.setattr(TmuxSession, "_start_tailer", defer_background_start)
+    monkeypatch.setattr(session, "_codex_dismiss_nux_and_ready", AsyncMock())
     await session._start_tailer()
     tailer = session._tailer
     entries = []
