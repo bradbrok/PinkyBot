@@ -5,6 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -57,6 +58,7 @@ async def test_codex_discovery_to_bind_swap_never_dispatches_peer(daemon,monkeyp
     async def defer(self):
         pass
     monkeypatch.setattr(TmuxSession,'_start_tailer',defer)
+    monkeypatch.setattr(session,'_codex_dismiss_nux_and_ready',AsyncMock())
     await session._start_tailer()
     tailer=session._tailer
     entries=[]

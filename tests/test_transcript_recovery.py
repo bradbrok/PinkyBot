@@ -40,6 +40,7 @@ def _retained_session(tmp_path, monkeypatch, runtime="claude", cold=False):
             StreamingSessionConfig(agent_name="test-agent", working_dir=str(working_dir)),
             tmux_control=session_tests._make_mock_tmux(),
         )
+        monkeypatch.setattr(ss, "_codex_dismiss_nux_and_ready", AsyncMock())
         root = home / "sessions"
         old = root / "2026" / "09" / "24" / "rollout-session.jsonl"
         tailer_class = CodexTmuxTranscriptTailer

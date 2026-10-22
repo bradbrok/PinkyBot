@@ -22,9 +22,10 @@ Overridden seams:
                                    payload, with the configured tmux pane PATH
   * ``_project_dir`` / ``_has_prior_transcript`` / ``_discover_transcript_path``
                                  → codex rollout store (``~/.codex/sessions``)
-  * ``_start_tailer``            → ``CodexTmuxTranscriptTailer``
-  * ``_spawn_tmux_repl``         → wrap super() with codex trust pre-seed +
-                                   first-run NUX dismissal + readiness gate
+  * ``_start_tailer``            → Codex tailer, then NUX dismissal/readiness
+                                   after parent tailer start, within spawn rollback
+  * ``_spawn_tmux_repl``         → delegate to parent spawn; trust pre-seed
+                                   runs in ``_prepare_tmux_spawn``
   * ``_watch_for_oauth_url``     → no-op (claude OAuth wall N/A for codex)
   * ``handle_stop_failure``      → no-op (codex turn-end = rollout tailer, not a
                                    ``.claude`` StopFailure hook; Murzik #795 P2)
@@ -250,7 +251,13 @@ class CodexTmuxSession(TmuxSession):
         wasn't forced. ``-C`` (cwd) is only valid on a fresh launch — codex
         rejects it on ``resume``. Effort is set via ``-c`` at launch (no native
         keystroke block — hence ``_native_ultracode_pending = False``)."""
-        force_fresh = bool(getattr(self._config, "force_fresh_context_once", False))
+        force_fresh_once = bool(
+            getattr(self._config, "force_fresh_context_once", False)
+        )
+        in_fresh_grace = (
+            time.monotonic() < self._fresh_context_respawn_grace_until
+        )
+        force_fresh = force_fresh_once or in_fresh_grace
         has_prior = self._has_prior_transcript()
         use_resume = has_prior and not force_fresh
 
@@ -259,6 +266,8 @@ class CodexTmuxSession(TmuxSession):
         self._last_launch_used_continue = use_resume
         self._last_launch_forced_fresh = force_fresh
         self._last_launch_had_prior_transcript = has_prior
+        self._last_launch_force_fresh_once = force_fresh_once
+        self._last_launch_in_fresh_grace = in_fresh_grace
         self._native_ultracode_pending = False
 
         parts = ["codex"]
@@ -460,10 +469,12 @@ class CodexTmuxSession(TmuxSession):
 
     # ── seam: tailer class ──────────────────────────────────────────────────
     async def _start_tailer(self) -> None:
-        """Construct the codex tailer (the only part that differs from claude),
-        then delegate to ``super()._start_tailer()`` for the per-spawn arming /
-        first-bind / readiness-gate-reset / #565 recovery scheduling (it takes
-        the retained-instance branch because ``self._tailer`` is now set)."""
+        """Construct the Codex tailer and delegate to ``super()._start_tailer()``
+        for the per-spawn arming / first-bind / readiness-gate-reset / #565
+        recovery scheduling (it takes the retained-instance branch because
+        ``self._tailer`` is now set). Finish with NUX dismissal and readiness
+        here so a readiness failure rolls back with parent tailer startup.
+        """
         if self._tailer is None:
             guessed = self._discover_transcript_path()
             path = guessed or _PLACEHOLDER_TRANSCRIPT_PATH
@@ -496,6 +507,7 @@ class CodexTmuxSession(TmuxSession):
                 except OSError:
                     pass
         await super()._start_tailer()
+        await self._codex_dismiss_nux_and_ready()
 
     # ── seam: scheduler queued-route delivery (#1006) ──────────────────────
     def _codex_scheduler_evidence(self, candidate=None) -> tuple[bool, ...]:
@@ -810,7 +822,6 @@ class CodexTmuxSession(TmuxSession):
 
     async def _spawn_tmux_repl(self) -> None:
         await super()._spawn_tmux_repl()
-        await self._codex_dismiss_nux_and_ready()
 
     async def _watch_for_oauth_url(self) -> None:
         """No-op: the claude OAuth login-wall relay (#205) doesn't apply to
