@@ -250,7 +250,13 @@ class CodexTmuxSession(TmuxSession):
         wasn't forced. ``-C`` (cwd) is only valid on a fresh launch — codex
         rejects it on ``resume``. Effort is set via ``-c`` at launch (no native
         keystroke block — hence ``_native_ultracode_pending = False``)."""
-        force_fresh = bool(getattr(self._config, "force_fresh_context_once", False))
+        force_fresh_once = bool(
+            getattr(self._config, "force_fresh_context_once", False)
+        )
+        in_fresh_grace = (
+            time.monotonic() < self._fresh_context_respawn_grace_until
+        )
+        force_fresh = force_fresh_once or in_fresh_grace
         has_prior = self._has_prior_transcript()
         use_resume = has_prior and not force_fresh
 
@@ -259,6 +265,8 @@ class CodexTmuxSession(TmuxSession):
         self._last_launch_used_continue = use_resume
         self._last_launch_forced_fresh = force_fresh
         self._last_launch_had_prior_transcript = has_prior
+        self._last_launch_force_fresh_once = force_fresh_once
+        self._last_launch_in_fresh_grace = in_fresh_grace
         self._native_ultracode_pending = False
 
         parts = ["codex"]
