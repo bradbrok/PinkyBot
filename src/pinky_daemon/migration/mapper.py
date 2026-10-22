@@ -19,6 +19,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any
 
+from pinky_daemon.anthropic_text import message_text
+
 # ── Model string translation table ────────────────────────────────────────────
 
 MODEL_MAP: dict[str, tuple[str, str | None]] = {
@@ -133,7 +135,7 @@ def _call_claude(system: str, user: str, *, max_tokens: int = 2048) -> str:
         system=system,
         messages=[{"role": "user", "content": user}],
     )
-    return response.content[0].text if response.content else ""
+    return message_text(response)  # raises if no text block; callers fall back
 
 
 def _extract_json(text: str) -> Any:
