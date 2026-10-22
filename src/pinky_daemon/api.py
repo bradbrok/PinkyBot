@@ -2432,6 +2432,8 @@ def create_api(
 
     def _parse_telegram_buttons(raw: str) -> list[dict]:
         """Parse one inline row and refuse unsupported button fields."""
+        from pinky_outreach.telegram import CALLBACK_CHOSEN_MARKER
+
         try:
             value = json.loads(raw)
         except (TypeError, ValueError):
@@ -2453,6 +2455,8 @@ def create_api(
             data = button.get("data")
             if not isinstance(data, str) or re.fullmatch(r"[A-Za-z0-9_:-]{1,64}", data) is None:
                 raise ValueError("invalid callback data")
+            if data == CALLBACK_CHOSEN_MARKER:
+                raise ValueError("reserved callback data")
             if "style" in button and button["style"] not in ("success", "danger", "primary"):
                 raise ValueError("invalid button style")
             if data in seen:

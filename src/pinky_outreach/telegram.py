@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -17,6 +18,8 @@ import httpx
 from pinky_outreach.types import Chat, Message, Platform
 
 CALLBACK_ANSWER_BUDGET = 10.0
+CALLBACK_CHOSEN_CAP = 4096
+CALLBACK_CHOSEN_MARKER = "__chosen__"
 
 
 class TelegramError(Exception):
@@ -78,6 +81,8 @@ class TelegramAdapter:
         self._timeout = timeout
         self._client = httpx.Client(timeout=timeout)
         self._last_update_id: int = 0
+        self._chosen_cards: dict[tuple[str, str], None] = {}
+        self._choice_lock = threading.Lock()
 
     def close(self) -> None:
         self._client.close()
@@ -457,9 +462,19 @@ class TelegramAdapter:
 
     # ── Receiving ────────────────────────────────────────────
 
-    def answer_callback_query(self, callback_query_id: str) -> None:
-        """Acknowledge a button tap without displaying text or an alert."""
-        self._request("answerCallbackQuery", callback_query_id=callback_query_id, http_timeout=5)
+    def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
+        """Acknowledge a button tap with an optional toast."""
+        self._request("answerCallbackQuery", callback_query_id=callback_query_id,
+                      text=text, http_timeout=5)
+
+    @staticmethod
+    def _callback_buttons(card: dict) -> list[dict]:
+        markup = card.get("reply_markup")
+        rows = markup.get("inline_keyboard") if isinstance(markup, dict) else None
+        if not isinstance(rows, list):
+            return []
+        return [button for row in rows if isinstance(row, list)
+                for button in row if isinstance(button, dict)]
 
     def get_updates(
         self,
@@ -489,17 +504,50 @@ class TelegramAdapter:
 
             callback = update.get("callback_query")
             callback_id = callback.get("id") if isinstance(callback, dict) else None
+            fields = None
+            if "message" not in update:
+                try:
+                    fields = self._callback_message_fields(callback)
+                except Exception:
+                    # The mapper reports malformed updates after acknowledgement.
+                    pass
+            chosen = False
+            label = None
+            toast = None
+            if fields is not None:
+                card = callback["message"]
+                card_key = (fields["chat_id"], fields["reply_to"])
+                buttons = self._callback_buttons(card)
+                with self._choice_lock:
+                    marked = any(
+                        button.get("callback_data") == CALLBACK_CHOSEN_MARKER for button in buttons
+                    )
+                    chosen = card_key in self._chosen_cards or marked
+                    if card.get("date") != 0:
+                        label = next((button["text"] for button in buttons
+                                      if button.get("callback_data") == callback["data"]
+                                      and isinstance(button.get("text"), str)
+                                      and button["text"].strip()), None)
+                    toast = "Already chosen" if chosen else (
+                        "Selected: " + label if label is not None else "Selected"
+                    )
+                    self._chosen_cards[card_key] = None
+                    if len(self._chosen_cards) > CALLBACK_CHOSEN_CAP:
+                        del self._chosen_cards[next(iter(self._chosen_cards))]
             if isinstance(callback_id, str) and callback_id:
                 if answer_time >= CALLBACK_ANSWER_BUDGET:
                     skipped_answers += 1
                 else:
                     started = time.monotonic()
                     try:
-                        self.answer_callback_query(callback_id)
+                        self.answer_callback_query(callback_id, text=toast)
                     except Exception as exc:
                         print(type(exc).__name__, file=sys.stderr, flush=True)
                     finally:
                         answer_time += time.monotonic() - started
+
+            if chosen:
+                continue
 
             try:
                 message = self._message_from_update(update)
@@ -508,6 +556,23 @@ class TelegramAdapter:
                       file=sys.stderr, flush=True)
                 continue
             if message is not None:
+                if fields is not None:
+                    if label is not None and answer_time < CALLBACK_ANSWER_BUDGET:
+                        started = time.monotonic()
+                        try:
+                            self._request(
+                                "editMessageReplyMarkup",
+                                chat_id=card["chat"]["id"], message_id=card["message_id"],
+                                reply_markup={"inline_keyboard": [[{
+                                    "text": "Selected: " + label,
+                                    "callback_data": CALLBACK_CHOSEN_MARKER,
+                                }]]},
+                                http_timeout=min(5, CALLBACK_ANSWER_BUDGET - answer_time),
+                            )
+                        except Exception as exc:
+                            print(type(exc).__name__, file=sys.stderr, flush=True)
+                        finally:
+                            answer_time += time.monotonic() - started
                 messages.append(message)
 
         if skipped_answers:
@@ -596,6 +661,13 @@ class TelegramAdapter:
 
     @staticmethod
     def _message_from_callback(cq: dict) -> Message | None:
+        fields = TelegramAdapter._callback_message_fields(cq)
+        if fields is None:
+            return None
+        return Message(timestamp=datetime.now(timezone.utc), **fields)
+
+    @staticmethod
+    def _callback_message_fields(cq: dict) -> dict | None:
         if not isinstance(cq, dict):
             return None
         card = cq.get("message")
@@ -620,12 +692,11 @@ class TelegramAdapter:
         sender_name = " ".join(part for part in (sender.get("first_name", ""),
                                                 sender.get("last_name", "")) if part) or "unknown"
         was_bot = bool(sender.get("is_bot"))
-        return Message(
+        return dict(
             platform=Platform.telegram,
             chat_id=str(chat["id"]),
             sender=sender_name,
             content="Button tapped: " + data,
-            timestamp=datetime.now(timezone.utc),
             message_id="cb-" + callback_id,
             reply_to=card_id,
             metadata={

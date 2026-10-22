@@ -165,6 +165,7 @@ def create_server(
 
         buttons (Telegram only): a JSON array of one to three text/data objects
         for one inline row, with optional success, danger or primary style.
+        A card takes one choice; the first tap is delivered and the keyboard shows it.
         """
         result = _api("POST", "/broker/send", {
             "agent_name": agent_name,

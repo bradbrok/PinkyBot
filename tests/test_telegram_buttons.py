@@ -79,6 +79,8 @@ def _adapter(updates=(), *, answer_error=None, repeats=1):
             if answer_error is not None:
                 raise answer_error
             result = True
+        elif method == "editMessageReplyMarkup":
+            result = True
         elif method == "sendMessage":
             result = {"message_id": 51, "date": 1700000000, "chat": {"id": 101}}
         else:
@@ -193,7 +195,7 @@ def test_callback_is_answered_before_mapping_and_keeps_tapper_facts(monkeypatch,
         messages = _poll(state.adapter)
         after = datetime.now(timezone.utc)
         assert state.events == ["answer", "map"]
-        assert _answers(state) == [{"callback_query_id": "tap_1"}]
+        assert _answers(state) == [{"callback_query_id": "tap_1", "text": "Selected"}]
         answer = next(call for call in state.calls if call[0] == "answerCallbackQuery")
         assert answer[2] == {"connect": 5, "read": 5, "write": 5, "pool": 5}
         assert len(messages) == 1
@@ -220,7 +222,7 @@ def test_inaccessible_card_keeps_a_null_reply_sender():
         assert len(messages) == 1
         assert messages[0].metadata["reply_to_sender_id"] is None
         assert messages[0].reply_to == "41"
-        assert _answers(state) == [{"callback_query_id": "tap_1"}]
+        assert _answers(state) == [{"callback_query_id": "tap_1", "text": "Selected"}]
 
 
 @pytest.mark.parametrize("kind", [
@@ -258,7 +260,7 @@ def test_answer_failure_keeps_callback_batch_and_cursor(capsys, failure):
     updates = [_update(), {"update_id": 101, "message": _telegram_data(message_id=42)}]
     with _adapter(updates, answer_error=failure) as state:
         assert [message.message_id for message in _poll(state.adapter)] == ["cb-tap_1", "42"]
-        assert _answers(state) == [{"callback_query_id": "tap_1"}]
+        assert _answers(state) == [{"callback_query_id": "tap_1", "text": "Selected"}]
         assert _poll(state.adapter) == []
         assert state.offsets == [None, 102]
         assert capsys.readouterr().err.splitlines() == [type(failure).__name__]
@@ -472,7 +474,9 @@ async def test_redelivered_callback_preserves_every_text_field_and_store_time(ga
         first_body = first.json()
         assert type(first_body["stored_at"]) is float
         clock[0] += 30
-        await _deliver(state)
+        with _adapter([_update()]) as restarted:
+            state.poller._adapter = restarted.adapter
+            await _deliver(state)
         second = _read(gateway)
         assert second.status_code == 200
         assert second.json() == first_body
@@ -506,7 +510,7 @@ def _slow_answers(monkeypatch, adapter):
     monkeypatch.setattr(telegram_module, "time",
                         SimpleNamespace(monotonic=lambda: clock.now), raising=False)
 
-    def answer(callback_id):
+    def answer(callback_id, text=None):
         clock.attempted.append(callback_id)
         if clock.slow:
             clock.now += 5.0
@@ -517,7 +521,11 @@ def _slow_answers(monkeypatch, adapter):
 
 
 def _twenty_taps():
-    return [_update(_callback(id=f"tap_{index}"), update_id=index) for index in range(1, 21)]
+    callbacks = [_callback(id=f"tap_{index}") for index in range(1, 21)]
+    for index, callback in enumerate(callbacks, start=1):
+        callback["message"]["message_id"] = index
+    return [_update(callback, update_id=index)
+            for index, callback in enumerate(callbacks, start=1)]
 
 
 def test_callback_answer_budget_keeps_every_tap_and_counts_skips(monkeypatch, capsys):
@@ -535,11 +543,14 @@ def test_callback_answer_budget_keeps_every_tap_and_counts_skips(monkeypatch, ca
 
 
 def test_callback_answer_budget_resets_for_instant_answers(monkeypatch, capsys):
-    with _adapter(_twenty_taps(), repeats=2) as state:
+    updates = _twenty_taps()
+    with _adapter(updates, repeats=2) as state:
         clock = _slow_answers(monkeypatch, state.adapter)
         assert len(_poll(state.adapter)) == 20
         assert clock.attempted == ["tap_1", "tap_2"]
         assert capsys.readouterr().err.splitlines()[-1] == "callback answers skipped: 18"
+        for update in updates:
+            update["callback_query"]["message"]["message_id"] += 20
         clock.slow = False
         clock.attempted.clear()
         messages = _poll(state.adapter)
