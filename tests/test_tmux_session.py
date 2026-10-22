@@ -13805,3 +13805,299 @@ async def test_soft_deleted_model_turn_keeps_tokens_with_pricing_error(
         assert f"{full_id} is inactive" in stderr
     finally:
         registry.close()
+
+
+@pytest.fixture
+async def context_nudge_session(tmp_path, monkeypatch):
+    """Exercise real lifecycle code with a mocked pane and transcript tailer."""
+    from pinky_daemon.codex_tmux_session import CodexTmuxSession
+
+    sessions = []
+    logs = []
+    monkeypatch.setattr(tmux_session, "_log", logs.append)
+    monkeypatch.setattr(tmux_session, "_TRANSPORT_LOCK_DIR", tmp_path / "locks")
+    monkeypatch.setattr(tmux_session, "wait_for_api", AsyncMock(return_value=True))
+    monkeypatch.setattr(tmux_session, "api_allows_submission", lambda *_args: True)
+    monkeypatch.setattr(tmux_session, "_POST_SPAWN_LIVENESS_DELAY_SEC", 0)
+
+    def make(*, codex=False, model="claude-opus-4-8"):
+        tmux = _make_mock_tmux()
+        alive = False
+
+        async def spawn(**_kwargs):
+            nonlocal alive
+            alive = True
+            return _ok()
+
+        async def kill():
+            nonlocal alive
+            alive = False
+            return _ok()
+
+        tmux.has_session = AsyncMock(side_effect=lambda: alive)
+        tmux.new_session = AsyncMock(side_effect=spawn)
+        tmux.kill_session = AsyncMock(side_effect=kill)
+        if codex:
+            tmux.capture_pane = AsyncMock(return_value=TmuxCommandResult(0, "/model to change", ""))
+        config = StreamingSessionConfig(
+            agent_name="context-test", working_dir=str(tmp_path),
+            model="gpt-5.5" if codex else model,
+        )
+        cls = CodexTmuxSession if codex else TmuxSession
+        ss = cls(config, tmux_control=tmux)
+        ss._skip_wake_prompt_for_tests = True
+        ss._emit_stream_event = AsyncMock()
+        ss._has_prior_transcript = lambda: True
+        ss._inflight_watchdog = AsyncMock()
+        ss._stop_tailer = AsyncMock()
+        ss._prepare_tmux_spawn = MagicMock()
+        ss._native_ultracode_pending = False
+        snapshots = []
+
+        async def tailer_started():
+            ss._session_ready_event.set()
+
+        async def wake(reason, *, front=False):
+            snapshots.append({
+                "usage": dict(vars(ss.usage)),
+                "hard": ss._restart_nudge_fired,
+                "soft": ss._soft_nudge_fired,
+                "forced": ss._last_launch_forced_fresh,
+                "reason": reason.value,
+            })
+            await ss._enqueue_internal_prompt("Continue saved work.", reason="wake_context", front=front)
+
+        ss._start_tailer = AsyncMock(side_effect=tailer_started)
+        ss._enqueue_wake_prompt = wake
+        sessions.append(ss)
+        return ss, tmux, snapshots, logs
+
+    yield make
+    for ss in sessions:
+        if ss._ctx_usage_emit_task is not None:
+            await ss._ctx_usage_emit_task
+        await ss.disconnect()
+
+
+def _seed_context_snapshot(ss, total=400_023):
+    ss.usage.total_cost_usd = 1.25
+    ss.usage.total_turns = 7
+    ss.usage.total_queries = 8
+    ss.usage.total_duration_ms = 1234
+    ss.usage.total_api_duration_ms = 456
+    ss.usage.input_tokens = 123
+    ss.usage.output_tokens = 45
+    ss.usage.cache_read_tokens = 67
+    ss.usage.cache_write_tokens = 89
+    ss.usage.last_stop_reason = "end_turn"
+    ss.usage.last_model_usage = {"test-model": {"input_tokens": 123}}
+    ss.usage.last_usage = {"input_tokens": total}
+    ss._restart_nudge_fired = ss._soft_nudge_fired = True
+    return {key: value for key, value in vars(ss.usage).items() if key != "last_usage"}
+
+
+async def _drain_context_nudge_worker(ss):
+    for _ in range(200):
+        await asyncio.sleep(0)
+        if ss._message_queue.empty() and ss._inflight_turn is None:
+            return
+    pytest.fail("message worker did not drain its queue")
+
+
+@pytest.mark.usefixtures("reference_static_context")
+class TestContextNudgeDelivery:
+    @pytest.mark.parametrize("in_flight", [True, False], ids=["inflight", "queued"])
+    async def test_fresh_restart_discards_old_nudge_before_wake(self, context_nudge_session, in_flight):
+        ss, tmux, snapshots, logs = context_nudge_session()
+        ss._state_machine._state = SessionState.CONNECTED
+        unchanged = _seed_context_snapshot(ss)
+        info = ss.get_context_info()
+        assert info["totalTokens"] == 400_023
+        assert info["maxTokens"] == 967_000
+        assert ss._effective_restart_threshold_pct() == pytest.approx(400_000 / 967_000 * 100)
+        await ss._enqueue_autorestart_nudge(total=400_023, max_tokens=967_000, pct=info["percentage"])
+        nudge = ss._message_queue.get_nowait()
+        nudge.completion_event = asyncio.Event()
+        if in_flight:
+            await ss._deliver_turn(nudge)
+            assert ss._inflight_metas[0].turn is nudge
+            assert not nudge.transport_accepted
+        else:
+            ss._message_queue.put_nowait(nudge)
+        await ss.disconnect()
+        assert not nudge.completion_event.is_set()
+        assert nudge.replay_count == int(in_flight)
+        assert list(ss._message_queue._queue) == [nudge]
+        tmux.paste_text.reset_mock()
+        ss._config.force_fresh_context_once = True
+        ss._config.restart_reason = "context_restart"
+        await ss.connect()
+        await _drain_context_nudge_worker(ss)
+        assert [call.args[0] for call in tmux.paste_text.await_args_list] == ["Continue saved work."]
+        assert nudge.completion_event.is_set()
+        assert ss.usage.last_usage == {}
+        assert not ss._restart_nudge_fired and not ss._soft_nudge_fired
+        assert snapshots[0]["usage"] == {**unchanged, "last_usage": {}}
+        assert snapshots[0]["hard"] is False and snapshots[0]["soft"] is False
+        assert snapshots[0]["reason"] == "context_restart"
+        assert ss._stats["turns"] == 1
+        assert [entry.turn.reason for entry in ss._inflight_metas] == ["wake_context"]
+        drops = [line for line in logs if "dropped stale context nudge" in line]
+        assert drops == [
+            "tmux[context-test]: dropped stale context nudge "
+            f"(reason=context_autorestart_nudge, now_pct=0.0, threshold_pct={ss._effective_restart_threshold_pct()})"
+        ]
+
+    async def test_fresh_snapshot_rearms_nudges_without_resetting_cumulative_usage(self, context_nudge_session, monkeypatch):
+        ss, _tmux, _snapshots, _logs = context_nudge_session()
+        unchanged = _seed_context_snapshot(ss)
+        ss._config.force_fresh_context_once = True
+        await ss.connect()
+        await _drain_context_nudge_worker(ss)
+        assert ss.get_context_info()["totalTokens"] == 0
+        assert ss.get_context_info()["percentage"] == 0
+        assert ss.usage.last_usage == {}
+        assert not ss._restart_nudge_fired and not ss._soft_nudge_fired
+        assert {key: value for key, value in vars(ss.usage).items() if key != "last_usage"} == unchanged
+        queued = AsyncMock()
+        monkeypatch.setattr(ss, "_enqueue_internal_prompt", queued)
+        ss._on_transcript_usage({"input_tokens": 116_040})
+        await ss._ctx_usage_emit_task
+        assert ss.get_context_info()["percentage"] == 12.0
+        assert ss.get_context_info()["totalTokens"] == 116_040
+        queued.assert_not_awaited()
+        ss._on_transcript_usage({"input_tokens": 400_023})
+        await ss._ctx_usage_emit_task
+        queued.assert_awaited_once()
+        assert queued.await_args.kwargs["reason"] == "context_autorestart_nudge"
+        assert "400,023 / 967,000" in queued.await_args.args[0]
+        assert ss._restart_nudge_fired
+
+    @pytest.mark.parametrize("codex", [False, True], ids=["claude", "codex"])
+    @pytest.mark.parametrize("fresh", [False, True], ids=["resume", "fresh"])
+    async def test_launch_resets_snapshot_only_for_new_conversation(self, context_nudge_session, codex, fresh):
+        ss, _tmux, _snapshots, _logs = context_nudge_session(codex=codex)
+        unchanged = _seed_context_snapshot(ss)
+        previous = dict(ss.usage.last_usage)
+        ss._config.force_fresh_context_once = fresh
+        await ss.connect()
+        await _drain_context_nudge_worker(ss)
+        assert ss._last_launch_forced_fresh is fresh
+        assert ss.usage.last_usage == ({} if fresh else previous)
+        assert ss._restart_nudge_fired is (not fresh)
+        assert ss._soft_nudge_fired is (not fresh)
+        assert {key: value for key, value in vars(ss.usage).items() if key != "last_usage"} == unchanged
+
+    async def test_fresh_grace_respawn_resets_snapshot_without_consuming_another_flag(self, context_nudge_session):
+        ss, _tmux, _snapshots, _logs = context_nudge_session()
+        unchanged = _seed_context_snapshot(ss)
+        ss._fresh_context_respawn_grace_until = _time.monotonic() + 180
+        grace = ss._fresh_context_respawn_grace_until
+        epoch = ss._fresh_context_respawn_epoch
+        await ss.connect()
+        await _drain_context_nudge_worker(ss)
+        assert ss._last_launch_forced_fresh
+        assert not ss._last_launch_force_fresh_once
+        assert ss.usage.last_usage == {}
+        assert not ss._restart_nudge_fired and not ss._soft_nudge_fired
+        assert ss._fresh_context_respawn_grace_until == grace
+        assert ss._fresh_context_respawn_epoch == epoch
+        assert {key: value for key, value in vars(ss.usage).items() if key != "last_usage"} == unchanged
+
+    @pytest.mark.parametrize("reason,total", [
+        ("context_autorestart_nudge", 133_600),
+        ("context_autorestart_nudge", 150_300),
+        ("context_nudge_soft", 58_450),
+        ("context_nudge_soft", 66_800),
+    ])
+    async def test_current_context_nudge_keeps_its_original_text_at_and_above_threshold(self, context_nudge_session, reason, total):
+        ss, tmux, _snapshots, _logs = context_nudge_session(model="claude-haiku-4-5")
+        ss._state_machine._state = SessionState.CONNECTED
+        ss.usage.last_usage = {"input_tokens": total}
+        await ss._emit_context_usage_event()
+        turn = ss._message_queue.get_nowait()
+        assert turn.reason == reason
+        prompt = turn.prompt
+        threshold = ss._effective_restart_threshold_pct() if reason == "context_autorestart_nudge" else ss._soft_nudge_threshold_pct()
+        assert ss.get_context_info()["percentage"] >= threshold
+        if total in (133_600, 58_450):
+            assert ss.get_context_info()["percentage"] == threshold
+        await ss._deliver_turn(turn)
+        tmux.paste_text.assert_awaited_once_with(prompt, enter=True)
+        assert ss._inflight_metas[0].turn is turn
+
+    async def test_soft_nudge_becoming_stale_does_not_change_worker_stats(self, context_nudge_session):
+        ss, tmux, _snapshots, logs = context_nudge_session(model="claude-haiku-4-5")
+        ss._state_machine._state = SessionState.CONNECTED
+        ss.usage.last_usage = {"input_tokens": 116_900}
+        await ss._emit_context_usage_event()
+        turn = ss._message_queue.get_nowait()
+        assert turn.reason == "context_nudge_soft"
+        turn.completion_event = asyncio.Event()
+        ss._message_queue.put_nowait(turn)
+        ss.usage.last_usage = {"input_tokens": 10_000}
+        before = dict(ss._stats)
+        ss._worker_task = asyncio.create_task(ss._message_worker())
+        await _drain_context_nudge_worker(ss)
+        tmux.paste_text.assert_not_awaited()
+        assert not ss._inflight_metas
+        assert turn.completion_event.is_set()
+        assert ss._stats == before
+        assert ss.usage.last_usage == {"input_tokens": 10_000}
+        assert [line for line in logs if "dropped stale context nudge" in line] == [
+            "tmux[context-test]: dropped stale context nudge "
+            "(reason=context_nudge_soft, now_pct=6.0, threshold_pct=35.0)"
+        ]
+
+    async def test_stale_nudge_does_not_drop_neighboring_external_wake_or_other_internal_turns(self, context_nudge_session):
+        ss, tmux, _snapshots, _logs = context_nudge_session()
+        ss._state_machine._state = SessionState.CONNECTED
+        ss._session_ready_event.set()
+        completion = asyncio.Event()
+        turns = [
+            _QueuedTurn(prompt="old measurement", internal=True, reason="context_autorestart_nudge", completion_event=completion),
+            _QueuedTurn(prompt="user request", reason="context_nudge_soft", platform="test", chat_id="chat", message_id="1"),
+            _QueuedTurn(prompt="orientation", internal=True, reason="wake_context"),
+            _QueuedTurn(prompt="checkpoint", internal=True, reason="idle_sleep_presave"),
+        ]
+        for turn in turns:
+            ss._message_queue.put_nowait(turn)
+        ss._worker_task = asyncio.create_task(ss._message_worker())
+        await _drain_context_nudge_worker(ss)
+        assert [call.args[0] for call in tmux.paste_text.await_args_list] == ["user request", "orientation", "checkpoint"]
+        assert [entry.turn for entry in ss._inflight_metas] == turns[1:]
+        assert ss._stats["turns"] == 3
+        assert ss._stats["errors"] == 0
+        assert completion.is_set()
+
+    async def test_nudge_is_rechecked_after_waiting_for_pane_control(self, context_nudge_session):
+        ss, tmux, _snapshots, _logs = context_nudge_session()
+        ss._state_machine._state = SessionState.CONNECTED
+        ss.usage.last_usage = {"input_tokens": 400_023}
+        completion = asyncio.Event()
+        turn = _QueuedTurn(prompt="old measurement", internal=True, reason="context_autorestart_nudge", completion_event=completion)
+        lock = asyncio.Lock()
+        waiting = asyncio.Event()
+
+        class ObservedLock:
+            async def __aenter__(self):
+                waiting.set()
+                return await lock.__aenter__()
+
+            async def __aexit__(self, *args):
+                return await lock.__aexit__(*args)
+
+        ss._repl_control_lock = ObservedLock()
+        ss._turn_done.set()
+        await lock.acquire()
+        task = asyncio.create_task(ss._deliver_turn(turn))
+        try:
+            await asyncio.wait_for(waiting.wait(), 5)
+            ss.usage.last_usage = {"input_tokens": 10_000}
+        finally:
+            lock.release()
+        await task
+        tmux.paste_text.assert_not_awaited()
+        assert not ss._inflight_metas
+        assert completion.is_set()
+        assert ss._turn_done.is_set()
