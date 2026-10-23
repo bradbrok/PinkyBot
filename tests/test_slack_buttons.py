@@ -218,17 +218,34 @@ def test_explicit_custom_blocks_still_send_without_managed_buttons(gateway, outb
     assert outbound.call_args.kwargs["blocks"] == blocks
 
 
-@pytest.mark.parametrize("depth", [400, 1200])
-def test_explicit_blocks_depth_preserves_existing_lenient_fallback(gateway, outbound, depth):
-    raw = "[" * depth + '"plain"' + "]" * depth
+def _json_recursion_error_depth():
+    for depth in (1200, 12000, 120000, 1200000):
+        try:
+            json.loads("[" * depth + '"plain"' + "]" * depth)
+        except RecursionError:
+            return depth
+    pytest.skip(f"Python {sys.version.split()[0]} parsed all probed JSON nesting depths")
+
+
+def test_explicit_blocks_depth_preserves_parsed_blocks(gateway, outbound):
+    raw = "[" * 400 + '"plain"' + "]" * 400
     response = _post(gateway, blocks=raw)
     assert response.status_code == 200, response.text
     outbound.assert_called_once()
     assert outbound.call_args.args == ("CCHANNEL", CONTENT)
-    if depth == 1200:
-        assert outbound.call_args.kwargs["blocks"] is None
-    else:
-        assert outbound.call_args.kwargs["blocks"] == json.loads(raw)
+    assert outbound.call_args.kwargs["blocks"] == json.loads(raw)
+
+
+def test_explicit_blocks_depth_preserves_existing_lenient_fallback(gateway, outbound):
+    depth = _json_recursion_error_depth()
+    raw = "[" * depth + '"plain"' + "]" * depth
+    with pytest.raises(RecursionError):
+        json.loads(raw)
+    response = _post(gateway, blocks=raw)
+    assert response.status_code == 200, response.text
+    outbound.assert_called_once()
+    assert outbound.call_args.args == ("CCHANNEL", CONTENT)
+    assert outbound.call_args.kwargs["blocks"] is None
 
 
 def test_explicit_blocks_depth_still_refuses_a_reserved_id(gateway, outbound):
