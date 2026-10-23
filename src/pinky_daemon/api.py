@@ -2624,6 +2624,10 @@ def create_api(
                         _log("broker-send: slack blocks not a JSON array, ignoring (text-only)")
                 except Exception as e:
                     _log(f"broker-send: slack blocks JSON parse failed ({e}), sending text-only")
+            if buttons:
+                from pinky_outreach.slack import button_card_blocks
+
+                parsed_blocks = button_card_blocks(content, buttons)
             # Honor the cross-platform "no preview" intent on Slack too:
             # link_preview_options.is_disabled → suppress both link and media
             # unfurls. None leaves Slack's defaults untouched.
@@ -2745,13 +2749,36 @@ def create_api(
     ) -> dict:
         """Send a message back to the platform on behalf of an agent."""
         button_row = None
+        delivery_blocks = blocks
         if buttons:
-            if platform != "telegram":
-                raise HTTPException(400, "buttons are Telegram only")
+            if platform not in ("telegram", "slack"):
+                raise HTTPException(400, "buttons are Telegram and Slack only")
             try:
                 button_row = _parse_telegram_buttons(buttons)
             except ValueError as error:
                 raise HTTPException(400, "invalid buttons: " + str(error)) from None
+        if platform == "slack":
+            if button_row and blocks:
+                raise HTTPException(400, "invalid buttons: buttons cannot be combined with blocks")
+            if button_row and len(content) > 3000:
+                raise HTTPException(400, "invalid buttons: text exceeds 3000 characters with Slack buttons")
+            if blocks:
+                from pinky_outreach.slack import has_reserved_button_ids
+
+                try:
+                    explicit_blocks = json.loads(blocks)
+                except Exception as error:
+                    _log(f"broker-send: slack blocks JSON parse failed ({error}), sending text-only")
+                    delivery_blocks = ""
+                else:
+                    try:
+                        reserved_ids = has_reserved_button_ids(explicit_blocks)
+                    except Exception:
+                        raise HTTPException(
+                            400, "invalid buttons: Slack block identifiers could not be checked",
+                        ) from None
+                    if reserved_ids:
+                        raise HTTPException(400, "invalid buttons: reserved Slack button identifiers")
         if account_id and not agents.get_raw_token_for_account(
             agent_name, platform, account_id,
         ):
@@ -2775,7 +2802,7 @@ def create_api(
                     silent=silent,
                     link_preview_options=link_preview_options,
                     quote=quote,
-                    blocks=blocks,
+                    blocks=delivery_blocks,
                     reply_metadata=reply_metadata,
                     buttons=button_row,
                 ),

@@ -21,6 +21,12 @@ from typing import TYPE_CHECKING
 from pinky_daemon import purchase_approval
 from pinky_daemon.message_handler import InboundMessage, MessageHandler
 from pinky_outreach.discord import DiscordAdapter, DiscordError, DiscordRateLimited
+from pinky_outreach.slack import (
+    BUTTON_ACTION_PREFIX,
+    BUTTON_BLOCK_ID,
+    BUTTON_CHOSEN_BLOCK_ID,
+    chosen_card_blocks,
+)
 from pinky_outreach.telegram import TelegramAdapter, TelegramError
 
 # Cross-repo contract with pos-spec-purchasing's blocks.py — the action_ids on
@@ -1659,6 +1665,8 @@ class BrokerSlackPoller:
         elif action_id == _PURCHASE_REJECT_ACTION_ID:
             decision = "reject"
         else:
+            if isinstance(action_id, str) and action_id.startswith(BUTTON_ACTION_PREFIX):
+                await self._handle_button_tap(payload, _admitted=_admitted)
             # Not a purchase button — nothing else is wired up. Already acked.
             return
 
@@ -1814,6 +1822,163 @@ class BrokerSlackPoller:
                     ),
                 },
             )
+
+    def _button_tap_fields(self, payload: dict) -> dict:
+        """Validate a managed card click; errors contain fixed reason codes only."""
+        def record(value, code):
+            if not isinstance(value, dict):
+                raise ValueError(code)
+            return value
+
+        def token(value, pattern, code):
+            if not isinstance(value, str) or re.fullmatch(pattern, value) is None:
+                raise ValueError(code)
+            return value
+
+        record(payload, "payload")
+        actions = payload.get("actions")
+        if not isinstance(actions, list) or len(actions) != 1:
+            raise ValueError("actions")
+        action = record(actions[0], "action")
+        if payload.get("type") != "block_actions" or action.get("type") != "button":
+            raise ValueError("action_type")
+        action_id = action.get("action_id")
+        if not isinstance(action_id, str) or not action_id.startswith(BUTTON_ACTION_PREFIX):
+            raise ValueError("action_id")
+        data = token(action_id[len(BUTTON_ACTION_PREFIX):], r"[A-Za-z0-9_:-]{1,64}", "data")
+        if action.get("value") != data:
+            raise ValueError("value")
+        if action.get("block_id") != BUTTON_BLOCK_ID:
+            raise ValueError("block")
+        clicker = token(record(payload.get("user"), "user").get("id"), r"[A-Z0-9]{2,32}",
+                        "clicker")
+        channel = token(record(payload.get("channel"), "channel").get("id"),
+                        r"[A-Z0-9]{2,32}", "channel")
+        container = record(payload.get("container"), "container")
+        if (container.get("type") != "message" or container.get("is_ephemeral")
+                or container.get("channel_id") != channel):
+            raise ValueError("container")
+        card = record(payload.get("message"), "message")
+        ts_pattern = r"[0-9]{1,16}\.[0-9]{1,16}"
+        card_ts = token(card.get("ts"), ts_pattern, "card_ts")
+        if card_ts != container.get("message_ts"):
+            raise ValueError("container_ts")
+        if "thread_ts" in card:
+            token(card["thread_ts"], ts_pattern, "thread_ts")
+        action_ts = token(action.get("action_ts"), ts_pattern, "action_ts")
+        if not ((self._bot_user_id and card.get("user") == self._bot_user_id)
+                or (self._bot_id and card.get("bot_id") == self._bot_id)):
+            raise ValueError("ownership")
+        blocks = card.get("blocks")
+        if not isinstance(blocks, list):
+            raise ValueError("blocks")
+        chosen = any(isinstance(block, dict) and block.get("block_id") == BUTTON_CHOSEN_BLOCK_ID
+                     for block in blocks)
+        element = None
+        for block in blocks:
+            if not isinstance(block, dict) or block.get("block_id") != BUTTON_BLOCK_ID:
+                continue
+            elements = block.get("elements")
+            if isinstance(elements, list):
+                element = next((item for item in elements if isinstance(item, dict)
+                                and item.get("action_id") == action_id
+                                and item.get("value") == data), element)
+        if element is None and not chosen:
+            raise ValueError("card")
+        text = (element or {}).get("text")
+        label = text.get("text") if isinstance(text, dict) else None
+        if (not isinstance(label, str) or not label.strip() or len(label) > 64
+                or any(unicodedata.category(char) in ("Cc", "Zl", "Zp") for char in label)):
+            label = None
+        return {"card": card, "card_ts": card_ts, "action_ts": action_ts, "data": data,
+                "clicker": clicker, "channel": channel, "label": label, "chosen": chosen}
+
+    async def _tap_respond(self, response_url: str, payload: dict) -> None:
+        """Post cosmetic tap feedback without logging capability URLs or values."""
+        if not isinstance(response_url, str) or not response_url.startswith("https://hooks.slack.com/"):
+            return
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._adapter.respond_via_url(response_url, payload),
+            )
+        except Exception as error:
+            _log("button tap response failed: " + type(error).__name__)
+
+    async def _deliver_button_message(self, message) -> None:
+        """Keep background delivery failures from logging private tap values."""
+        try:
+            await self._broker.handle_inbound(message)
+        except Exception as error:
+            _log("button tap delivery failed: " + type(error).__name__)
+
+    async def _handle_button_tap(self, payload: dict, *, _admitted: bool = False) -> None:
+        """Route the first allowed managed-card choice through ordinary inbound delivery."""
+        if not _admitted and not self._accepting_deliveries:
+            return
+        try:
+            fields = self._button_tap_fields(payload)
+        except ValueError as error:
+            _log(f"slack-poller[{self._agent_name}]: button tap malformed ({error})")
+            return
+        card, channel = fields["card"], fields["channel"]
+        clicker, card_ts = fields["clicker"], fields["card_ts"]
+        prefix = f"slack-poller[{self._agent_name}]: button tap"
+        root = card.get("thread_ts") or card_ts
+        is_dm = channel.startswith("D")
+        message = self._BrokerMessage(
+            platform="slack", chat_id=channel, sender_name=clicker, sender_id=clicker,
+            content="Button tapped: " + fields["data"], agent_name=self._agent_name,
+            message_id="act-" + fields["action_ts"], reply_to=root, is_group=not is_dm,
+            metadata={
+                "user_id": clicker, "bot_id": None, "was_bot": False, "forwarded": None,
+                "via_bot_id": None, "sender_business_bot_id": None,
+                "reply_to": card_ts, "reply_to_sender_id": card.get("user") or None,
+                "platform_ts": None, "channel_type": "im" if is_dm else "", "thread_ts": root,
+                "button_data": fields["data"], "button_message_id": card_ts,
+            },
+        )
+        already_chosen = fields["chosen"]
+        if not already_chosen:
+            if not self._broker.button_tap_allowed(message):
+                _log(f"{prefix} refused ({clicker}, {channel}, {card_ts})")
+                return
+            # No await separates the marker check and the synchronous durable claim.
+            already_chosen = not self._broker.claim_button_card(
+                self._agent_name, "slack", channel, card_ts,
+            )
+        if already_chosen:
+            _log(f"{prefix} already_chosen ({clicker}, {channel}, {card_ts})")
+            await self._tap_respond(payload.get("response_url"), {
+                "response_type": "ephemeral", "replace_original": False, "text": "Already chosen",
+            })
+            return
+
+        message.sender_name = await self._resolve_user_name(clicker) or clicker
+        message.chat_title = await self._resolve_channel_title(channel)
+        if not _admitted and not self._accepting_deliveries:
+            return
+        _log(f"{prefix} selected ({clicker}, {channel}, {card_ts})")
+        _deliver_in_background(self._deliver_button_message(message), prefix)
+        if self._event_callback:
+            try:
+                await self._event_callback(platform="slack", chat_id=channel,
+                                           sender=message.sender_name, content=message.content)
+            except Exception as error:
+                _log("button tap event callback failed: " + type(error).__name__)
+        blocks = chosen_card_blocks(card["blocks"], fields["label"])
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self._adapter.update_message(
+                    channel, card_ts, text=card.get("text") or "Selected", blocks=blocks, timeout=5.0,
+                ),
+            )
+        except Exception as error:
+            _log("button tap update failed: " + type(error).__name__)
+            await self._tap_respond(payload.get("response_url"), {
+                "replace_original": True,
+                "text": "Selected: " + fields["label"] if fields["label"] is not None else "Selected",
+                "blocks": blocks,
+            })
 
     @staticmethod
     def _decided_blocks(verb: str, approver_name: str, pending_id: str) -> list[dict]:
