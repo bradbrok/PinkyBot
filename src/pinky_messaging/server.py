@@ -163,9 +163,11 @@ def create_server(
         as the notification fallback. Ignored on non-Slack platforms; if the JSON
         is malformed it is dropped and the message is sent text-only.
 
-        buttons (Telegram only): a JSON array of one to three text/data objects
-        for one inline row, with optional success, danger or primary style.
-        A card takes one choice; the first tap is delivered and the keyboard shows it.
+        buttons (Telegram and Slack): a JSON array of one to three text/data objects
+        for one inline row, with optional success, danger or primary style. On Slack
+        the text is shown above the buttons, is limited to 3000 characters, and cannot
+        be combined with blocks; success and primary both render as Slack's primary
+        style. A card takes one choice; the first tap is delivered and the card shows it.
         """
         result = _api("POST", "/broker/send", {
             "agent_name": agent_name,

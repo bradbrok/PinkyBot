@@ -24,6 +24,56 @@ import httpx
 
 from pinky_outreach.types import Chat, Message, Platform
 
+BUTTON_ACTION_PREFIX = "pinky_btn:"
+BUTTON_BLOCK_ID = "pinky_btn"
+BUTTON_TEXT_BLOCK_ID = "pinky_btn_text"
+BUTTON_CHOSEN_BLOCK_ID = "pinky_btn_chosen"
+SLACK_BUTTON_STYLES = {"success": "primary", "danger": "danger", "primary": "primary"}
+
+
+def button_card_blocks(content: str, row: list[dict]) -> list[dict]:
+    """Render a managed one-choice card from the shared validated button row."""
+    elements = []
+    for button in row:
+        element = {"type": "button", "action_id": BUTTON_ACTION_PREFIX + button["callback_data"],
+                   "value": button["callback_data"],
+                   "text": {"type": "plain_text", "text": button["text"]}}
+        if "style" in button:
+            element["style"] = SLACK_BUTTON_STYLES[button["style"]]
+        elements.append(element)
+    return [
+        {"type": "section", "block_id": BUTTON_TEXT_BLOCK_ID,
+         "text": {"type": "mrkdwn", "text": content}},
+        {"type": "actions", "block_id": BUTTON_BLOCK_ID, "elements": elements},
+    ]
+
+
+def chosen_card_blocks(blocks: list[dict], label: str | None) -> list[dict]:
+    """Keep the card layout and replace its managed actions with the choice."""
+    chosen = {"type": "context", "block_id": BUTTON_CHOSEN_BLOCK_ID,
+              "elements": [{"type": "plain_text",
+                            "text": "Selected: " + label if label is not None else "Selected"}]}
+    return [chosen if isinstance(block, dict) and block.get("block_id") == BUTTON_BLOCK_ID
+            else block for block in blocks]
+
+
+def has_reserved_button_ids(value) -> bool:
+    """Reject managed identifiers anywhere in an explicit Block Kit layout."""
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            action_id = item.get("action_id")
+            if isinstance(action_id, str) and action_id.startswith(BUTTON_ACTION_PREFIX):
+                return True
+            if item.get("block_id") in (BUTTON_BLOCK_ID, BUTTON_TEXT_BLOCK_ID,
+                                        BUTTON_CHOSEN_BLOCK_ID):
+                return True
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return False
+
 
 class SlackError(Exception):
     """Slack API error."""
@@ -160,6 +210,18 @@ class SlackAdapter:
             is_outbound=True,
             metadata={"thread_ts": thread_ts} if thread_ts else {},
         )
+
+    def update_message(
+        self, channel: str, ts: str, text: str, blocks: list[dict], *, timeout: float = 5.0,
+    ) -> None:
+        """Replace a posted card with a bounded chat.update request."""
+        response = self._client.post(
+            "/chat.update", json={"channel": channel, "ts": ts, "text": text, "blocks": blocks},
+            timeout=timeout,
+        )
+        data = response.json()
+        if not data.get("ok"):
+            raise SlackError(data.get("error", "unknown_error"))
 
     def respond_via_url(self, response_url: str, payload: dict) -> None:
         """POST to a Slack interactive ``response_url`` to update/replace a message.

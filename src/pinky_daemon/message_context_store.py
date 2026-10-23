@@ -98,6 +98,12 @@ class MessageContextStore:
                 sender_id        TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (agent_name, platform, chat_id, message_id)
             );
+            CREATE TABLE IF NOT EXISTS button_choices (
+                agent_name TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,
+                message_id TEXT NOT NULL, chosen_at REAL NOT NULL,
+                PRIMARY KEY (agent_name, platform, chat_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_button_choices_chosen ON button_choices(chosen_at);
             """
         )
         self._db.commit()
@@ -421,12 +427,42 @@ class MessageContextStore:
         )
         return self._db.total_changes - before
 
+    def _sweep_button_choices_locked(self, now: float) -> int:
+        cursor = self._db.execute(
+            "DELETE FROM button_choices WHERE chosen_at < ?", (now - self.retention_seconds,),
+        )
+        return cursor.rowcount
+
+    def claim_button_choice(
+        self, agent_name: str, platform: str, chat_id: str, message_id: str, *, now=None,
+    ) -> bool:
+        """Persist the first choice for one card without storing its text or data."""
+        if not all((agent_name, platform, chat_id, message_id)):
+            return False
+        current = time.time() if now is None else float(now)
+        with self._lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                self._sweep_button_choices_locked(current)
+                cursor = self._db.execute(
+                    "INSERT OR IGNORE INTO button_choices "
+                    "(agent_name, platform, chat_id, message_id, chosen_at) VALUES (?, ?, ?, ?, ?)",
+                    (agent_name, platform, chat_id, message_id, current),
+                )
+                won = cursor.rowcount == 1
+                self._db.commit()
+                return won
+            except Exception:
+                self._db.rollback()
+                raise
+
     def sweep_retention(self, *, now: float | None = None) -> int:
         """Prune expired contexts and apply the age-limited cap and hard ceiling."""
         current = time.time() if now is None else float(now)
         with self._lock:
             try:
                 deleted = self._sweep_retention_locked(current)
+                deleted += self._sweep_button_choices_locked(current)
                 agent_rows = self._db.execute(
                     "SELECT DISTINCT agent_name FROM message_contexts"
                 ).fetchall()

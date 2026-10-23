@@ -389,11 +389,11 @@ def test_invalid_button_rows_are_refused_without_sending(gateway, outbound, butt
     outbound.mock.assert_not_called()
 
 
-@pytest.mark.parametrize("platform", ["slack", "discord"])
+@pytest.mark.parametrize("platform", ["discord"])
 def test_buttons_are_refused_on_other_platforms(gateway, outbound, platform):
     response = _post(gateway, json.dumps(BUTTONS), platform=platform)
     assert response.status_code == 400, response.text
-    assert response.json()["detail"] == "buttons are Telegram only"
+    assert response.json()["detail"] == "buttons are Telegram and Slack only"
     outbound.mock.assert_not_called()
 
 

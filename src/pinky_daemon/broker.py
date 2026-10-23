@@ -235,6 +235,8 @@ class MessageBroker:
         self._typing_callback = typing_callback
         self._activity = activity_store
         self._message_context_store = message_context_store
+        self._button_claim_lock = threading.Lock()
+        self._button_claims: dict[tuple[str, str, str, str], None] = {}
         self._stop_callback = stop_callback
         self._stop_all_callback = stop_all_callback
         self._stats = {
@@ -1353,6 +1355,48 @@ class MessageBroker:
         except asyncio.CancelledError:
             pass
 
+    def _approval_key(self, message: BrokerMessage) -> tuple[str, bool]:
+        if message.is_group and message.chat_id:
+            approval_key = message.chat_id
+            is_channel = True
+        else:
+            approval_key = message.sender_id or message.chat_id
+            is_channel = False
+        return approval_key, is_channel
+
+    def button_tap_allowed(self, message: BrokerMessage) -> bool:
+        """Preflight a tap without onboarding, ownership changes or pending writes."""
+        try:
+            key, is_channel = self._approval_key(message)
+            status = self._registry.get_user_status(message.agent_name, key)
+            if status == "approved":
+                return True
+            if status in (None, "pending") and not is_channel:
+                primary = self._registry.get_primary_user()
+                return bool(primary.get("chat_id") and key == primary["chat_id"])
+        except Exception:
+            return False
+        return False
+
+    def claim_button_card(
+        self, agent_name: str, platform: str, chat_id: str, card_id: str,
+    ) -> bool:
+        """Claim a card synchronously; retain an in-process fallback if storage fails."""
+        key = (agent_name, platform, chat_id, card_id)
+        with self._button_claim_lock:
+            if key in self._button_claims:
+                return False
+            self._button_claims[key] = None
+            if len(self._button_claims) > 4096:
+                del self._button_claims[next(iter(self._button_claims))]
+        if self._message_context_store is None:
+            return True
+        try:
+            return self._message_context_store.claim_button_choice(*key)
+        except Exception as error:
+            _log("button-claim persistence failed: " + type(error).__name__)
+            return True
+
     async def handle_inbound(self, message: BrokerMessage) -> None:
         """Handle an incoming platform message. Non-blocking."""
         agent_name = message.agent_name
@@ -1388,12 +1432,7 @@ class MessageBroker:
         #    so one approval lets everyone in the channel talk to it (no
         #    per-member gate). For a 1:1 DM the unit is the individual sender
         #    (defense against strangers DMing the bot directly).
-        if message.is_group and message.chat_id:
-            approval_key = message.chat_id
-            is_channel = True
-        else:
-            approval_key = message.sender_id or message.chat_id
-            is_channel = False
+        approval_key, is_channel = self._approval_key(message)
         status = self._registry.get_user_status(agent_name, approval_key)
 
         if status == "denied":
