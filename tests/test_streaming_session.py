@@ -1483,3 +1483,56 @@ def test_restart_tokens_cap_sdk_invalid_warns_once(cap, capsys):
     warnings = [line for line in capsys.readouterr().err.splitlines()
                 if "WARNING" in line and "restart_tokens_cap" in line]
     assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_reader_transport_error_does_not_deadlock_reconnect() -> None:
+    """A reader-loop transport error (e.g. SDK frame over max_buffer_size) must
+    hand the reconnect to its own task. The reconnect cycle's disconnect()
+    cancels and awaits the reader task; if the reader awaited the reconnect,
+    the two deadlocked and the session sat in RECONNECTING until the watchdog.
+    """
+    ss = _make_session()
+
+    async def _receive_messages():
+        raise RuntimeError(
+            "Failed to decode JSON: JSON message exceeded maximum buffer size"
+        )
+        yield  # pragma: no cover - makes this an async generator
+
+    ss._client.receive_messages = _receive_messages
+    reconnected = asyncio.Event()
+
+    async def _fake_reconnect() -> None:
+        # Mirror disconnect(): cancel and await the reader task.
+        reader = ss._reader_task
+        if reader is not None and not reader.done():
+            reader.cancel()
+            try:
+                await reader
+            except asyncio.CancelledError:
+                pass
+        ss._state_machine._state = SessionState.CONNECTED
+        reconnected.set()
+
+    ss.attempt_reconnect = _fake_reconnect  # type: ignore[assignment]
+    ss._reader_task = asyncio.create_task(ss._reader_loop())
+
+    await asyncio.wait_for(reconnected.wait(), timeout=2)
+    assert ss._reader_task.done()
+    assert ss.state == SessionState.CONNECTED
+    assert ss._reader_reconnect_task is not None
+    await asyncio.wait_for(ss._reader_reconnect_task, timeout=2)
+
+
+def test_sdk_max_buffer_size_default_and_env_override(monkeypatch) -> None:
+    from pinky_daemon import streaming_session as mod
+
+    monkeypatch.delenv("PINKY_SDK_MAX_BUFFER_BYTES", raising=False)
+    assert mod._sdk_max_buffer_size() == mod._DEFAULT_SDK_MAX_BUFFER_BYTES
+    assert mod._sdk_max_buffer_size() > 1024 * 1024
+    monkeypatch.setenv("PINKY_SDK_MAX_BUFFER_BYTES", "5000000")
+    assert mod._sdk_max_buffer_size() == 5_000_000
+    for bad in ("nope", "0", "-5"):
+        monkeypatch.setenv("PINKY_SDK_MAX_BUFFER_BYTES", bad)
+        assert mod._sdk_max_buffer_size() == mod._DEFAULT_SDK_MAX_BUFFER_BYTES
