@@ -880,6 +880,8 @@ class _FilesystemLayoutInspector:
         self.warnings: list[str] = []
         self.unclaimed_databases: list[_FilesystemDatabase] = []
         self.skipped_unmanaged_subtrees = 0
+        self._owned_child_identities: dict[str, set[tuple[int, int]]] = {}
+        self._registered_ancestor_identities: set[tuple[int, int]] | None = None
 
     def inspect(self) -> LayoutInspection:
         pending_directories: list[tuple[str, bool]] = [(self.root, False)]
@@ -924,6 +926,10 @@ class _FilesystemLayoutInspector:
                 and segments[2] in _DAEMON_AGENT_SUBDIRECTORIES
                 for segments in (discovered_segments, relative_segments)
             )
+            owned_visit = owned_visit or any(
+                self._is_owned_agent_child(segments, directory_identity)
+                for segments in (discovered_segments, relative_segments)
+            )
             if directory_identity in visited_directories:
                 if owned_visit and not visited_directories[directory_identity]:
                     visited_directories[directory_identity] = True
@@ -946,9 +952,7 @@ class _FilesystemLayoutInspector:
                     pattern.split("/") for pattern in _UNMANAGED_SUBTREES
                 )
             ):
-                prefix = resolved_directory + os.sep
-                if not any(path == resolved_directory or path.startswith(prefix)
-                           for path in self.registered_realpaths):
+                if not self._contains_registered_store(resolved_directory, directory_identity):
                     if directory_identity not in skipped_directories:
                         skipped_directories.add(directory_identity)
                         self.skipped_unmanaged_subtrees += 1
@@ -1036,6 +1040,54 @@ class _FilesystemLayoutInspector:
         return LayoutInspection(
             self.findings, self.warnings, self.skipped_unmanaged_subtrees
         )
+
+    def _is_owned_agent_child(self, segments, directory_identity) -> bool:
+        if len(segments) != 3 or segments[0] != "agents":
+            return False
+        agent_directory = os.path.join(self.root, *segments[:2])
+        if agent_directory not in self._owned_child_identities:
+            identities = set()
+            for name in sorted(_DAEMON_AGENT_SUBDIRECTORIES):
+                try:
+                    metadata = os.stat(os.path.join(agent_directory, name))
+                except OSError:
+                    # The walk reports inaccessible paths when it visits them.
+                    continue
+                if stat.S_ISDIR(metadata.st_mode):
+                    identities.add((metadata.st_dev, metadata.st_ino))
+            self._owned_child_identities[agent_directory] = identities
+        return directory_identity in self._owned_child_identities[agent_directory]
+
+    def _contains_registered_store(self, directory, directory_identity) -> bool:
+        prefix = directory + os.sep
+        if any(path == directory or path.startswith(prefix) for path in self.registered_realpaths):
+            return True
+        if self._registered_ancestor_identities is None:
+            # Also retain exact registered directory identities. File identities
+            # cannot match a directory, so they need no additional metadata probe.
+            identities = {
+                identity for identity, paths in self.registered_paths_by_inode.items()
+                if any(self._under_root(path) for path in paths)
+            }
+            ancestors = set()
+            for path in sorted(self.registered_realpaths):
+                ancestor = os.path.dirname(path)
+                while self._under_root(ancestor) and ancestor not in ancestors:
+                    ancestors.add(ancestor)
+                    try:
+                        metadata = os.stat(ancestor)
+                    except OSError:
+                        # Classification probes leave normal walk diagnostics intact.
+                        pass
+                    else:
+                        if stat.S_ISDIR(metadata.st_mode):
+                            identities.add((metadata.st_dev, metadata.st_ino))
+                    parent = os.path.dirname(ancestor)
+                    if parent == ancestor:
+                        break
+                    ancestor = parent
+            self._registered_ancestor_identities = identities
+        return directory_identity in self._registered_ancestor_identities
 
     def _record_database(self, discovered_path, resolved_path, path_stat) -> None:
         name = os.path.basename(discovered_path)

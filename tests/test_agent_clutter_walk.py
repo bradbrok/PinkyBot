@@ -380,3 +380,94 @@ def test_owned_revisit_retries_directory_after_transient_metadata_error(tmp_path
     assert sum("could not inspect" in warning for warning in report.warnings) == 1
     assert sum("orphan.db" in warning for warning in report.warnings) == 1
     assert report.skipped_unmanaged_subtrees == 0
+
+
+def _directory_spelling_alias(monkeypatch, directory, mode, *, backing=None):
+    """Expose alternate metadata spelling while realpath retains the caller's case."""
+    alternate = directory.with_name(directory.name.lower())
+    if mode == "native":
+        if not alternate.exists():
+            pytest.skip("temporary volume is case-sensitive; stubbed coverage runs on every platform")
+        assert alternate.samefile(directory)
+        return alternate
+
+    real_stat, realpath = os.stat, os.path.realpath
+    backing = directory if backing is None else backing
+
+    def metadata(path, *args, **kwargs):
+        if not isinstance(path, int):
+            value = os.fspath(path)
+            if value == str(alternate) or value.startswith(str(alternate) + os.sep):
+                path = str(backing) + value[len(str(alternate)):]
+        return real_stat(path, *args, **kwargs)
+
+    def resolve(path, *args, **kwargs):
+        value = os.fspath(path)
+        if any(value == str(parent) or value.startswith(str(parent) + os.sep)
+               for parent in (directory, alternate)):
+            return os.path.abspath(value)
+        return realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", metadata)
+    monkeypatch.setattr(os.path, "realpath", resolve)
+    return alternate
+
+
+@pytest.mark.parametrize("mode", ["native", "stubbed"])
+@pytest.mark.parametrize("registered", [False, True])
+def test_owned_child_case_alias_is_walked(tmp_path, monkeypatch, mode, registered):
+    root = tmp_path / "root"
+    directory = root / "agents/a/DATA"
+    live = _write(directory, "live.db")
+    orphan = _write(directory, "orphan.db")
+    alternate = _directory_spelling_alias(monkeypatch, directory, mode)
+    declared = alternate / "live.db"
+    assert os.path.realpath(declared) == str(declared)
+    assert alternate.stat().st_ino == directory.stat().st_ino
+    identities = store_catalog.read_store_identities([declared]) if registered else {}
+    report = _inspect(root, identities)
+    assert report.skipped_unmanaged_subtrees == 0
+    assert sum(str(orphan) in warning for warning in report.warnings) == 1
+    assert len(report.warnings) == (1 if registered else 2)
+    assert [(item["kind"], item["path"]) for item in report.findings] == (
+        [("alias_of_registered_store", str(live))] if registered else []
+    )
+
+
+@pytest.mark.parametrize("mode", ["native", "stubbed"])
+@pytest.mark.parametrize("present", [False, True])
+def test_registered_ancestor_case_alias_is_walked(tmp_path, monkeypatch, mode, present):
+    root = tmp_path / "root"
+    directory = root / "agents/a/BATCH"
+    orphan = _write(directory, "orphan.db")
+    nested = directory / "nested"
+    nested.mkdir()
+    live = nested / "live.db"
+    if present:
+        live.touch()
+    alternate = _directory_spelling_alias(monkeypatch, directory, mode)
+    declared = alternate / "nested/live.db"
+    assert os.path.realpath(declared) == str(declared)
+    identities = store_catalog.read_store_identities([declared])
+    assert (identities[str(declared)] is not None) == present
+    report = _inspect(root, identities)
+    assert report.skipped_unmanaged_subtrees == 0
+    assert len(report.warnings) == 1 and str(orphan) in report.warnings[0]
+    assert [(item["kind"], item["path"]) for item in report.findings] == (
+        [("alias_of_registered_store", str(live))] if present else []
+    )
+
+
+def test_distinct_case_sensitive_identities_keep_child_unmanaged(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    directory = _write(root, "agents/a/DATA/orphan.db").parent
+    backing = _write(tmp_path, "lowercase-backing/live.db").parent
+    alternate = _directory_spelling_alias(
+        monkeypatch, directory, "stubbed", backing=backing,
+    )
+    upper_stat, lower_stat = directory.stat(), alternate.stat()
+    assert (upper_stat.st_dev, upper_stat.st_ino) != (lower_stat.st_dev, lower_stat.st_ino)
+    identities = store_catalog.read_store_identities([alternate / "live.db"])
+    report = _inspect(root, identities)
+    assert report.findings == [] and report.warnings == []
+    assert report.skipped_unmanaged_subtrees == 1
