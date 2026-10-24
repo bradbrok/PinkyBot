@@ -888,17 +888,26 @@ class _FilesystemLayoutInspector:
         visited_directories: dict[tuple[int, int], bool] = {}
         directory_children: dict[tuple[int, int], list[str]] = {}
         skipped_directories: set[tuple[int, int]] = set()
+        reported_directory_errors: set[str] = set()
         while pending_directories:
             directory, owned_visit = pending_directories.pop()
             try:
                 resolved_directory = os.path.realpath(directory)
             except OSError as exc:
-                self._inspection_error("directory", directory, None, exc)
+                if (not StoreCatalog._is_missing_path_error(exc)
+                        and directory not in reported_directory_errors):
+                    reported_directory_errors.add(directory)
+                    self._inspection_error("directory", directory, None, exc)
                 continue
             try:
                 directory_stat = os.stat(resolved_directory)
             except OSError as exc:
-                self._inspection_error("directory", directory, resolved_directory, exc)
+                # Retry metadata so a stronger visit can recover, but emit one
+                # diagnostic per failed path during this inspection.
+                if (not StoreCatalog._is_missing_path_error(exc)
+                        and resolved_directory not in reported_directory_errors):
+                    reported_directory_errors.add(resolved_directory)
+                    self._inspection_error("directory", directory, resolved_directory, exc)
                 continue
             if not stat.S_ISDIR(directory_stat.st_mode):
                 self._record_database(directory, resolved_directory, directory_stat)

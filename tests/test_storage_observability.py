@@ -174,8 +174,8 @@ def test_clean_existing_store_records_preflight_ok_and_warning_free_boot_pass(
     store.close()
 
     class QuietStoreCatalog(api_module.DaemonStoreCatalog):
-        def __init__(self, expected_root: str | os.PathLike[str]) -> None:
-            super().__init__(expected_root, silence_allowlist={})
+        def __init__(self, expected_root: str | os.PathLike[str], **kwargs) -> None:
+            super().__init__(expected_root, silence_allowlist={}, **kwargs)
 
     monkeypatch.setattr(api_module, "DaemonStoreCatalog", QuietStoreCatalog)
     app = api_module.create_api(

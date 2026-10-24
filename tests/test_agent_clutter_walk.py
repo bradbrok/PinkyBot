@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 
 import pytest
@@ -314,3 +315,68 @@ def test_registered_clutter_context_keeps_aliased_agent_children_visible(tmp_pat
     (clutter / "escape").symlink_to(outside, target_is_directory=True)
     (registered.parent / "link").symlink_to(clutter.parent, target_is_directory=True)
     _assert_alias_findings_match_reference(root, registered)
+
+
+def test_owned_revisit_reports_persistent_directory_stat_error_once(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    inner = root / "agents/b/100-inner"
+    denied = inner / "denied"
+    denied.mkdir(parents=True)
+    owned = root / "agents/a/.claude"
+    owned.mkdir(parents=True)
+    (owned / "link").symlink_to(inner, target_is_directory=True)
+    (root / "000-early").symlink_to(inner, target_is_directory=True)
+    original = os.stat
+
+    def metadata(path, *args, **kwargs):
+        if not isinstance(path, int) and os.fspath(path) == str(denied):
+            raise PermissionError(errno.EACCES, "fixture denied", str(denied))
+        return original(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "stat", metadata)
+        after = _inspect(root)
+    error = PermissionError(errno.EACCES, "fixture denied", str(denied))
+    # Pin the optimized base's directory diagnostic; the older reference walk
+    # stats children before queuing them and labels this "file or directory".
+    assert after.findings == []
+    assert after.warnings == [
+        "could not inspect database directory outside registered store footprint; "
+        f"skipping: path={str(denied)!r} error=PermissionError: {error}",
+    ]
+
+
+def test_owned_revisit_retries_directory_after_transient_metadata_error(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    inner = root / "agents/b/100-inner"
+    denied = _write(inner, "denied/orphan.db").parent
+    registered = _write(root, "registered.db")
+    os.link(registered, denied / "alias.db")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (denied / "escape").symlink_to(outside, target_is_directory=True)
+    owned = root / "agents/a/.claude"
+    owned.mkdir(parents=True)
+    (owned / "link").symlink_to(inner, target_is_directory=True)
+    (root / "000-early").symlink_to(inner, target_is_directory=True)
+    identities = store_catalog.read_store_identities([registered])
+    original = os.stat
+    attempts = 0
+
+    def metadata(path, *args, **kwargs):
+        nonlocal attempts
+        if not isinstance(path, int) and os.fspath(path) == str(denied):
+            attempts += 1
+            if attempts == 1:
+                raise PermissionError(errno.EACCES, "fixture denied", str(denied))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", metadata)
+    report = _inspect(root, identities)
+    assert attempts == 2
+    assert {item["kind"] for item in report.findings} == {
+        "directory_outside_root", "alias_of_registered_store",
+    }
+    assert sum("could not inspect" in warning for warning in report.warnings) == 1
+    assert sum("orphan.db" in warning for warning in report.warnings) == 1
+    assert report.skipped_unmanaged_subtrees == 0
