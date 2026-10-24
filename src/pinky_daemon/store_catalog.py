@@ -882,12 +882,14 @@ class _FilesystemLayoutInspector:
         self.skipped_unmanaged_subtrees = 0
 
     def inspect(self) -> LayoutInspection:
-        pending_directories: list[str] = [self.root]
-        # Cycles are guarded by inode; warning policy follows each file realpath.
-        visited_directories: set[tuple[int, int]] = set()
+        pending_directories: list[tuple[str, bool]] = [(self.root, False)]
+        # Scan each inode once, but propagate a later owned visit through cached
+        # child edges. This preserves alias context without duplicate findings.
+        visited_directories: dict[tuple[int, int], bool] = {}
+        directory_children: dict[tuple[int, int], list[str]] = {}
         skipped_directories: set[tuple[int, int]] = set()
         while pending_directories:
-            directory = pending_directories.pop()
+            directory, owned_visit = pending_directories.pop()
             try:
                 resolved_directory = os.path.realpath(directory)
             except OSError as exc:
@@ -905,21 +907,28 @@ class _FilesystemLayoutInspector:
                 self._outside_root("directory", directory, resolved_directory)
                 continue
             directory_identity = (directory_stat.st_dev, directory_stat.st_ino)
-            if directory_identity in visited_directories:
-                continue
             relative_directory = os.path.relpath(resolved_directory, self.root).replace(os.sep, "/")
             relative_segments = relative_directory.split("/")
-            unmanaged_agent_child = (
-                len(relative_segments) == 3
-                and relative_segments[0] == "agents"
-                and relative_segments[2] not in _DAEMON_AGENT_SUBDIRECTORIES
+            discovered_segments = os.path.relpath(directory, self.root).split(os.sep)
+            owned_visit = owned_visit or any(
+                len(segments) >= 3 and segments[0] == "agents"
+                and segments[2] in _DAEMON_AGENT_SUBDIRECTORIES
+                for segments in (discovered_segments, relative_segments)
             )
-            if unmanaged_agent_child and directory != resolved_directory:
-                discovered_segments = os.path.relpath(directory, self.root).split(os.sep)
-                # A daemon-owned alias must still expose its target's contents.
-                if (len(discovered_segments) == 3 and discovered_segments[0] == "agents"
-                        and discovered_segments[2] in _DAEMON_AGENT_SUBDIRECTORIES):
-                    unmanaged_agent_child = False
+            if directory_identity in visited_directories:
+                if owned_visit and not visited_directories[directory_identity]:
+                    visited_directories[directory_identity] = True
+                    pending_directories.extend(
+                        (child, True)
+                        for child in reversed(directory_children[directory_identity])
+                    )
+                continue
+            unmanaged_agent_child = (
+                not owned_visit
+                and len(discovered_segments) == 3
+                and discovered_segments[0] == "agents"
+                and discovered_segments[2] not in _DAEMON_AGENT_SUBDIRECTORIES
+            )
             if unmanaged_agent_child or any(
                 len(relative_segments) == len(pattern_segments)
                 and all(fnmatch.fnmatchcase(part, pattern_part)
@@ -935,13 +944,17 @@ class _FilesystemLayoutInspector:
                         skipped_directories.add(directory_identity)
                         self.skipped_unmanaged_subtrees += 1
                     continue
+                if unmanaged_agent_child:
+                    # A registered store claims the containing agent subtree.
+                    owned_visit = True
             # A later owned alias may require a previously pruned target. Only
             # scanned directories participate in the cycle guard; counts follow
             # the final set of directories whose contents were left uninspected.
             if directory_identity in skipped_directories:
                 skipped_directories.remove(directory_identity)
                 self.skipped_unmanaged_subtrees -= 1
-            visited_directories.add(directory_identity)
+            visited_directories[directory_identity] = owned_visit
+            directory_children[directory_identity] = []
             try:
                 with os.scandir(resolved_directory) as iterator:
                     entries = sorted(iterator, key=lambda entry: entry.name)
@@ -986,7 +999,10 @@ class _FilesystemLayoutInspector:
                     child_directories.append(discovered_path)
                     continue
                 self._record_database(discovered_path, resolved_path, entry_stat)
-            pending_directories.extend(reversed(child_directories))
+            directory_children[directory_identity] = child_directories
+            pending_directories.extend(
+                (child, owned_visit) for child in reversed(child_directories)
+            )
 
         matched_allowlist_patterns: set[str] = set()
         for database in self.unclaimed_databases:
