@@ -10,9 +10,14 @@ stubbed here.
 from __future__ import annotations
 
 import fcntl
+import http.client
 import importlib.util
+import json
 import os
 import stat
+import time
+import urllib.error
+import urllib.request
 from datetime import timedelta
 from pathlib import Path
 
@@ -356,6 +361,213 @@ def test_restart_daemon_requires_identity(store):
     ok, detail = ca.restart_daemon(store["env"], "")
     assert ok is False
     assert "identity" in detail.lower()
+
+
+@pytest.fixture
+def restart_http(store, monkeypatch):
+    """Exercise the real restart helper without contacting a daemon."""
+    _seed_account(store)
+    write_env(store["env"], "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n")
+
+    def configure(body=b'{"restarting": true}', *, open_error=None, read_error=None):
+        requests = []
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def read(self):
+                if read_error is not None:
+                    raise read_error
+                return body
+
+        def urlopen(request, *, timeout):
+            assert request.get_method() == "POST"
+            assert request.full_url.endswith("/admin/restart")
+            requests.append(timeout)
+            if open_error is not None:
+                raise open_error
+            return Response()
+
+        monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+        return requests
+
+    return configure
+
+
+@pytest.fixture
+def restart_clock(store, monkeypatch):
+    clock = {"now": 0, "sleeps": []}
+    monkeypatch.setattr(ca, "RESTART_HEALTH_TIMEOUT_S", 6)
+    monkeypatch.setattr(ca, "RESTART_UNKNOWN_TIMEOUT_S", 12, raising=False)
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+
+    def sleep(seconds):
+        assert "sk-ant-oat01-NEW" in store["env"].read_text()
+        clock["sleeps"].append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(time, "sleep", sleep)
+    return clock
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["timeout", "wrapped-timeout", "disconnect", "wrapped-reset", "broken-pipe",
+     "untyped-error", "non-json", "bad-utf8", "incomplete-body", "body-refused"],
+)
+def test_switch_restart_unknown_keeps_token_until_generation_advances(
+    store, monkeypatch, restart_http, restart_clock, capsys, outcome,
+):
+    outcomes = {
+        "timeout": {"open_error": TimeoutError("timed out")},
+        "wrapped-timeout": {"open_error": urllib.error.URLError(TimeoutError("timed out"))},
+        "disconnect": {"open_error": http.client.RemoteDisconnected("response dropped")},
+        "wrapped-reset": {"open_error": urllib.error.URLError(ConnectionResetError("reset"))},
+        "broken-pipe": {"open_error": BrokenPipeError("send interrupted")},
+        "untyped-error": {"open_error": urllib.error.URLError("connection refused")},
+        "non-json": {"body": b"not JSON"},
+        "bad-utf8": {"body": b"\xff"},
+        "incomplete-body": {"read_error": http.client.IncompleteRead(b"{", 10)},
+        "body-refused": {"read_error": ConnectionRefusedError("response read failed")},
+    }
+    requests = restart_http(**outcomes[outcome])
+    polls = []
+
+    def generation():
+        if polls:
+            assert "sk-ant-oat01-NEW" in store["env"].read_text()
+        polls.append(restart_clock["now"])
+        return "new-gen" if restart_clock["now"] >= 9 else "old-gen"
+
+    monkeypatch.setattr(ca, "daemon_generation", generation)
+    assert run("switch", "acct", "--restart", "--as-agent", "operator") == 0
+    assert "sk-ant-oat01-NEW" in store["env"].read_text()
+    assert polls == [0, 0, 3, 6, 9]
+    assert restart_clock["sleeps"] == [3, 3, 3]
+    assert len(requests) == 1
+    output = capsys.readouterr()
+    assert "Daemon restarted — a new process is serving." in output.out
+    assert "Reverted" not in output.err
+
+
+def test_switch_restart_timeout_reverts_only_after_unknown_deadline(
+    store, monkeypatch, restart_http, restart_clock, capsys,
+):
+    requests = restart_http(open_error=TimeoutError("timed out"))
+    polls = []
+
+    def generation():
+        if polls:
+            assert "sk-ant-oat01-NEW" in store["env"].read_text()
+        polls.append(restart_clock["now"])
+        return "old-gen"
+
+    monkeypatch.setattr(ca, "daemon_generation", generation)
+    assert run("switch", "acct", "--restart", "--as-agent", "operator") == 1
+    assert polls == [0, 0, 3, 6, 9]
+    assert restart_clock["now"] == 12
+    assert restart_clock["sleeps"] == [3, 3, 3, 3]
+    assert len(requests) == 1
+    assert store["env"].read_text() == "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n"
+    error = capsys.readouterr().err
+    assert "restart could still be in flight" in error
+    assert "generation" in error and "started_at" in error
+    assert ".env" in error and "CLAUDE_CODE_OAUTH_TOKEN" in error
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"error": "layout blocked", "preflight": {"ok": False}}, {}, {"restarting": False},
+     {"restarting": 1}, {"restarting": "true"},
+     {"restarting": True, "error": "layout blocked"}, [], None],
+)
+def test_switch_restart_refused_body_reverts_without_polling(
+    store, monkeypatch, restart_http, restart_clock, capsys, body,
+):
+    requests = restart_http(json.dumps(body).encode())
+    generations = []
+
+    def baseline_only():
+        generations.append(1)
+        assert len(generations) == 1, "a refused restart must not be polled"
+        return "old-gen"
+
+    monkeypatch.setattr(ca, "daemon_generation", baseline_only)
+    assert run("switch", "acct", "--restart", "--as-agent", "operator") == 1
+    assert store["env"].read_text() == "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n"
+    assert generations == [1]
+    assert restart_clock["sleeps"] == []
+    assert len(requests) == 1
+    error = capsys.readouterr().err
+    if isinstance(body, dict) and "error" in body:
+        assert "layout blocked" in error
+    if isinstance(body, dict) and "preflight" in body:
+        assert 'preflight: {"ok": false}' in error
+
+
+def test_switch_restart_accepted_body_confirms_generation(
+    store, monkeypatch, restart_http, restart_clock, capsys,
+):
+    requests = restart_http()
+    generations = iter(["old-gen", "new-gen"])
+    monkeypatch.setattr(ca, "daemon_generation", lambda: next(generations))
+    assert run("switch", "acct", "--restart", "--as-agent", "operator") == 0
+    assert "sk-ant-oat01-NEW" in store["env"].read_text()
+    assert requests == [600]
+    assert restart_clock["sleeps"] == []
+    assert "Daemon restarted — a new process is serving." in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("failure", ["refused", "wrapped-refused", "http-error"])
+def test_switch_restart_definite_failure_reverts_without_polling(
+    store, monkeypatch, restart_http, restart_clock, failure,
+):
+    errors = {
+        "refused": ConnectionRefusedError("connection refused"),
+        "wrapped-refused": urllib.error.URLError(ConnectionRefusedError("connection refused")),
+        "http-error": urllib.error.HTTPError(
+            "http://127.0.0.1/admin/restart", 503, "down", {}, None,
+        ),
+    }
+    requests = restart_http(open_error=errors[failure])
+    generations = []
+
+    def baseline_only():
+        generations.append(1)
+        assert len(generations) == 1, "a definite failure must not be polled"
+        return "old-gen"
+
+    monkeypatch.setattr(ca, "daemon_generation", baseline_only)
+    assert run("switch", "acct", "--restart", "--as-agent", "operator") == 1
+    assert generations == [1]
+    assert restart_clock["sleeps"] == []
+    assert len(requests) == 1
+    assert store["env"].read_text() == "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n"
+
+
+@pytest.mark.parametrize("phase", ["connect", "response"])
+def test_restart_daemon_classifies_urllib_transport_errors(store, monkeypatch, phase):
+    """Let urllib wrap a connect refusal or propagate a dropped response."""
+    if phase == "connect":
+        def connect(self):
+            raise ConnectionRefusedError("connection refused")
+
+        monkeypatch.setattr(http.client.HTTPConnection, "connect", connect)
+    else:
+        monkeypatch.setattr(http.client.HTTPConnection, "request", lambda *a, **k: None)
+
+        def getresponse(self):
+            raise http.client.RemoteDisconnected("response dropped")
+
+        monkeypatch.setattr(http.client.HTTPConnection, "getresponse", getresponse)
+    accepted, _ = ca.restart_daemon(store["env"], "operator")
+    assert accepted is (False if phase == "connect" else None)
 
 
 # ── advisory lock / directory-mode fail-closed ───────────────────────────────
