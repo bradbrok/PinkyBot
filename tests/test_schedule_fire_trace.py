@@ -362,12 +362,14 @@ async def _trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, fault, e
     def faulty(event):
         if event["edge"] == edge:
             entered.set()
+            try:
+                assert release.wait(3)
+            finally:
+                entered.clear()
             if fault == "raise":
                 raise RuntimeError("injected trace error")
             if fault == "slow":
                 time.sleep(2)
-            if fault in {"busy", "busy_transient"}:
-                assert release.wait(3)
         try:
             return original(event)
         except sqlite3.OperationalError as exc:
@@ -379,24 +381,21 @@ async def _trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, fault, e
             raise
 
     monkeypatch.setattr(writer, "_write", faulty)
-    if edge == "paste":
-        start = time.perf_counter()
-        _, receipt = await paste(pane, durable)
-        elapsed = time.perf_counter() - start
-    else:
-        _, receipt = await paste(pane, durable)
-        flush(pane.registry)
-        start = time.perf_counter()
-        await observe(pane)
-        elapsed = time.perf_counter() - start
-        assert receipt.result() is True
-    assert elapsed < 0.5, "trace IO added wake-path latency"
-    assert await asyncio.to_thread(entered.wait, 1)
-    if fault in {"busy", "busy_transient"}:
-        lock = sqlite3.connect(writer.path, timeout=0, check_same_thread=False)
-        lock.execute("BEGIN IMMEDIATE")
-        release.set()
     try:
+        if edge == "paste":
+            _, receipt = await paste(pane, durable)
+        else:
+            _, receipt = await paste(pane, durable)
+            flush(pane.registry)
+            await observe(pane)
+            assert receipt.result() is True
+        assert await asyncio.to_thread(entered.wait, 1)
+        # Delivery completed while the writer was still held before trace IO.
+        assert entered.is_set() and not release.is_set(), "receipt waited for trace IO"
+        if fault in {"busy", "busy_transient"}:
+            lock = sqlite3.connect(writer.path, timeout=0, check_same_thread=False)
+            lock.execute("BEGIN IMMEDIATE")
+        release.set()
         if fault == "busy_transient":
             # Release only after a real BUSY; acknowledge before the retry can run.
             assert await asyncio.to_thread(busy_seen.wait, 3)
@@ -409,10 +408,12 @@ async def _trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, fault, e
         else:
             flush(pane.registry)
     finally:
+        release.set()
         lock_released.set()
         if lock:
             lock.rollback()
             lock.close()
+        flush(pane.registry)
     failures = writer.failure_counts(since=time.time() - 86400)
     assert failures[edge] == (0 if fault == "busy_transient" else 1)
     trace_errors = [r for r in caplog.records if "schedule fire trace" in r.message.lower()]
@@ -473,6 +474,63 @@ async def test_t5_slow_enqueue_warning_is_separate_from_target_fault(
     assert failures[edge] == expected
     record, = rows(pane.registry)
     assert record["enqueued_at"] > 0, "slow enqueue write succeeded before paste fault injection"
+
+
+@pytest.fixture
+def trace_waits(pane, monkeypatch):
+    waiting = SimpleNamespace(started=threading.Event(), events=[])
+    original_wait = threading.Event.wait
+
+    def wait(event, timeout=None):
+        if timeout == 3:
+            waiting.events.append(event)
+            waiting.started.set()
+        return original_wait(event, timeout)
+
+    monkeypatch.setattr(threading.Event, "wait", wait)
+    try:
+        yield waiting
+    finally:
+        for event in waiting.events:
+            event.set()
+        flush(pane.registry)
+
+
+@pytest.mark.parametrize("edge", ["paste", "accept"])
+async def test_t5_scheduling_delay_does_not_imply_trace_blocking(
+    pane, monkeypatch, caplog, trace_waits, edge,
+):
+    operation = "paste" if edge == "paste" else "observe"
+    original = globals()[operation]
+
+    async def descheduled(*args):
+        await asyncio.sleep(0.6)
+        return await original(*args)
+
+    monkeypatch.setitem(globals(), operation, descheduled)
+    await _trace_writer_cannot_block_receipt(
+        pane, monkeypatch, caplog, "busy_transient", edge,
+    )
+
+
+@pytest.mark.parametrize("edge", ["paste", "accept"])
+async def test_t5_receipt_failure_releases_trace_worker(
+    pane, monkeypatch, caplog, trace_waits, edge,
+):
+    operation = "paste" if edge == "paste" else "observe"
+    original = globals()[operation]
+
+    async def fail_after_receipt(*args):
+        await original(*args)
+        assert await asyncio.to_thread(trace_waits.started.wait, 1)
+        raise RuntimeError("injected receipt-check failure")
+
+    monkeypatch.setitem(globals(), operation, fail_after_receipt)
+    with pytest.raises(RuntimeError, match="injected receipt-check failure"):
+        await _trace_writer_cannot_block_receipt(
+            pane, monkeypatch, caplog, "busy_transient", edge,
+        )
+    assert pane.registry._fire_trace.flush(timeout=0.1), "receipt failure left trace work blocked"
 
 
 def test_t6_api_filters_counts_and_auth(tmp_path):
