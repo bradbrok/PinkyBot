@@ -72,6 +72,20 @@ DEFAULT_FILESYSTEM_SILENCE_ALLOWLIST: dict[str, str] = {
 
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _IGNORED_DIRECTORY_KINDS = frozenset({"snapshot", "snapshots", "temp", "temporary", "tmp"})
+# Fixed first-level paths created by daemon transports, provisioning and MCPs.
+# The explicit unmanaged workspace rule below still takes precedence.
+_DAEMON_AGENT_SUBDIRECTORIES = frozenset({
+    "data",  # Agent memory, plugin state and transport cleanup receipts.
+    "output",  # Default output directory created during registration.
+    "attachments",  # Broker downloads and generated media previews.
+    "dreams",  # Dream prompts, results and temporary MCP configurations.
+    ".claude",  # Managed Claude hooks, settings and hook diagnostics.
+    ".claude-local",  # Dedicated local Claude configuration and transcripts.
+    ".claude-container",  # Bind-mounted container Claude configuration.
+    ".codex",  # Per-agent Codex configuration, soul and rollout state.
+    ".codex-app-server",  # App-server transport socket directory.
+    "workspace",  # Registration creates it; its contents remain unmanaged.
+})
 _UNMANAGED_SUBTREES = ("agents/*/workspace",)
 _SQLITE_HEADER_PREFIX = b"SQLite format 3\x00"
 _SQLITE_HEADER_JOURNAL_BYTES = slice(18, 20)
@@ -871,6 +885,7 @@ class _FilesystemLayoutInspector:
         pending_directories: list[str] = [self.root]
         # Cycles are guarded by inode; warning policy follows each file realpath.
         visited_directories: set[tuple[int, int]] = set()
+        skipped_directories: set[tuple[int, int]] = set()
         while pending_directories:
             directory = pending_directories.pop()
             try:
@@ -892,10 +907,20 @@ class _FilesystemLayoutInspector:
             directory_identity = (directory_stat.st_dev, directory_stat.st_ino)
             if directory_identity in visited_directories:
                 continue
-            visited_directories.add(directory_identity)
             relative_directory = os.path.relpath(resolved_directory, self.root).replace(os.sep, "/")
             relative_segments = relative_directory.split("/")
-            if any(
+            unmanaged_agent_child = (
+                len(relative_segments) == 3
+                and relative_segments[0] == "agents"
+                and relative_segments[2] not in _DAEMON_AGENT_SUBDIRECTORIES
+            )
+            if unmanaged_agent_child and directory != resolved_directory:
+                discovered_segments = os.path.relpath(directory, self.root).split(os.sep)
+                # A daemon-owned alias must still expose its target's contents.
+                if (len(discovered_segments) == 3 and discovered_segments[0] == "agents"
+                        and discovered_segments[2] in _DAEMON_AGENT_SUBDIRECTORIES):
+                    unmanaged_agent_child = False
+            if unmanaged_agent_child or any(
                 len(relative_segments) == len(pattern_segments)
                 and all(fnmatch.fnmatchcase(part, pattern_part)
                         for part, pattern_part in zip(relative_segments, pattern_segments))
@@ -906,8 +931,17 @@ class _FilesystemLayoutInspector:
                 prefix = resolved_directory + os.sep
                 if not any(path == resolved_directory or path.startswith(prefix)
                            for path in self.registered_realpaths):
-                    self.skipped_unmanaged_subtrees += 1
+                    if directory_identity not in skipped_directories:
+                        skipped_directories.add(directory_identity)
+                        self.skipped_unmanaged_subtrees += 1
                     continue
+            # A later owned alias may require a previously pruned target. Only
+            # scanned directories participate in the cycle guard; counts follow
+            # the final set of directories whose contents were left uninspected.
+            if directory_identity in skipped_directories:
+                skipped_directories.remove(directory_identity)
+                self.skipped_unmanaged_subtrees -= 1
+            visited_directories.add(directory_identity)
             try:
                 with os.scandir(resolved_directory) as iterator:
                     entries = sorted(iterator, key=lambda entry: entry.name)
@@ -1006,7 +1040,16 @@ class _FilesystemLayoutInspector:
                 ),
             })
             return
-        if resolved_path in self.registered_realpaths or self._ignored_path(resolved_path):
+        # Reflection stores belong to the memory MCP, not the daemon's boot
+        # catalog. Claim only their exact conventional path, after alias and
+        # escape checks; neighboring and nested databases still need warnings.
+        segments = database.relative_path.split("/")
+        component_memory = (
+            len(segments) == 4 and segments[0] == "agents"
+            and segments[2:] == ["data", "memory.db"]
+        )
+        if (resolved_path in self.registered_realpaths
+                or self._ignored_path(resolved_path) or component_memory):
             return
         self.unclaimed_databases.append(database)
 
@@ -1113,6 +1156,7 @@ class StoreCatalog:
         silence_allowlist: Mapping[str, str] | None = None,
         manifest: Mapping[str, StoreIntegrityTarget] | None = None,
         observability: StorageObservability | None = None,
+        log: Callable[[str], None] | None = None,
     ) -> None:
         root = os.getcwd() if expected_root is None else os.fspath(expected_root)
         self._expected_root = os.path.realpath(root)
@@ -1122,6 +1166,8 @@ class StoreCatalog:
         self._silence_allowlist = dict(configured_allowlist)
         self._manifest = dict(manifest or {})
         self._observability = observability
+        self._layout_log = logger.info if log is None else log
+        self._skipped_unmanaged_subtrees = 0
         self._entries: list[_CatalogEntry] = []
         self._observations: list[StoreObservation] = []
         self._preflight_outcome_callback: Callable[[str, str], None] | None = None
@@ -1132,6 +1178,11 @@ class StoreCatalog:
     def expected_root(self) -> str:
         """Return the canonical filesystem root this catalog governs."""
         return self._expected_root
+
+    @property
+    def skipped_unmanaged_subtrees(self) -> int:
+        """Return the number pruned by the latest filesystem reconciliation."""
+        return self._skipped_unmanaged_subtrees
 
     def manifest_target(self, logical_name: str) -> StoreIntegrityTarget | None:
         """Return the declared target for one logical store, if configured."""
@@ -1957,8 +2008,9 @@ class StoreCatalog:
         report = inspect_filesystem_layout(
             self._expected_root, identities, silence_allowlist=allowlist
         )
-        logger.info(
-            "STORE CATALOG: skipped %d unmanaged subtree(s)", report.skipped_unmanaged_subtrees
+        self._skipped_unmanaged_subtrees = report.skipped_unmanaged_subtrees
+        self._layout_log(
+            f"STORE CATALOG: skipped {report.skipped_unmanaged_subtrees} unmanaged subtree(s)"
         )
         # Traversal failures preceded deferred inode-alias checks historically.
         for finding in report.findings:
