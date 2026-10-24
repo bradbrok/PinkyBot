@@ -358,14 +358,23 @@ async def _trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, fault, e
     lock_released = threading.Event()
     busy_attempts = []
     lock = None
+    get_nowait = writer._queue.get_nowait
 
-    def faulty(event):
+    def held_dequeue():
+        event = get_nowait()
         if event["edge"] == edge:
             entered.set()
             try:
                 assert release.wait(3)
+            except BaseException:
+                writer._queue.task_done()
+                raise
             finally:
                 entered.clear()
+        return event
+
+    def faulty(event):
+        if event["edge"] == edge:
             if fault == "raise":
                 raise RuntimeError("injected trace error")
             if fault == "slow":
@@ -380,6 +389,8 @@ async def _trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, fault, e
                 assert lock_released.wait(3)
             raise
 
+    # Keep test coordination outside the trace write and retry budgets.
+    monkeypatch.setattr(writer._queue, "get_nowait", held_dequeue)
     monkeypatch.setattr(writer, "_write", faulty)
     try:
         if edge == "paste":
@@ -504,8 +515,10 @@ async def test_t5_scheduling_delay_does_not_imply_trace_blocking(
     original = globals()[operation]
 
     async def descheduled(*args):
+        result = await original(*args)
+        assert await asyncio.to_thread(trace_waits.started.wait, 1)
         await asyncio.sleep(0.6)
-        return await original(*args)
+        return result
 
     monkeypatch.setitem(globals(), operation, descheduled)
     await _trace_writer_cannot_block_receipt(
