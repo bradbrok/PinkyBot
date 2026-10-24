@@ -55,9 +55,9 @@ PROBE_TIMEOUT_S = 60
 # /admin/restart runs the startup layout pre-flight before responding; a large
 # data root can take minutes to inspect.
 RESTART_REQUEST_TIMEOUT_S = 600
-RESTART_HEALTH_TIMEOUT_S = 90
-# A lost response can leave pre-flight, shutdown, and boot still in progress.
-RESTART_UNKNOWN_TIMEOUT_S = 900
+# A new generation can take minutes to boot, even after acceptance; a lost
+# response can also leave pre-flight/shutdown in progress.
+RESTART_HEALTH_TIMEOUT_S = 900
 INDEX_VERSION = 1
 
 # billing modes the store recognises. Owner-declared per account: the auth
@@ -887,7 +887,7 @@ def cmd_switch(args: argparse.Namespace) -> int:
         _revert(env_path, backup, f"restart call failed ({detail})")
         return 1
 
-    wait_s = RESTART_UNKNOWN_TIMEOUT_S if ok is None else RESTART_HEALTH_TIMEOUT_S
+    wait_s = RESTART_HEALTH_TIMEOUT_S
     if ok is None:
         print(
             f"claude-account: restart call outcome unknown ({detail}); waiting up to "

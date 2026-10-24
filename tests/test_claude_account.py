@@ -311,7 +311,7 @@ def test_switch_restart_success_when_generation_advances(store, monkeypatch):
     assert "sk-ant-oat01-NEW" in store["env"].read_text()  # kept, not reverted
 
 
-def test_switch_restart_reverts_on_unchanged_generation(store, monkeypatch):
+def test_switch_restart_reverts_on_unchanged_generation(store, monkeypatch, capsys):
     """The false-green case: the OLD process still answers /api (same started_at)
     but never restarts → must NOT be accepted; revert instead."""
     _seed_account(store)
@@ -323,6 +323,9 @@ def test_switch_restart_reverts_on_unchanged_generation(store, monkeypatch):
     assert rc == 1
     # atomic revert restored the exact original .env
     assert store["env"].read_text() == "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n"
+    error = capsys.readouterr().err
+    assert "the new process never came up" in error
+    assert "a restart could still be in flight" not in error
 
 
 def test_switch_restart_unreadable_baseline_aborts_untouched(store, monkeypatch):
@@ -403,8 +406,7 @@ def restart_http(store, monkeypatch):
 @pytest.fixture
 def restart_clock(store, monkeypatch):
     clock = {"now": 0, "sleeps": []}
-    monkeypatch.setattr(ca, "RESTART_HEALTH_TIMEOUT_S", 6)
-    monkeypatch.setattr(ca, "RESTART_UNKNOWN_TIMEOUT_S", 12, raising=False)
+    monkeypatch.setattr(ca, "RESTART_HEALTH_TIMEOUT_S", 12)
     monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
 
     def sleep(seconds):
@@ -477,6 +479,7 @@ def test_switch_restart_timeout_reverts_only_after_unknown_deadline(
     assert store["env"].read_text() == "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n"
     error = capsys.readouterr().err
     assert "restart could still be in flight" in error
+    assert "the new process never came up" not in error
     assert "generation" in error and "started_at" in error
     assert ".env" in error and "CLAUDE_CODE_OAUTH_TOKEN" in error
 
@@ -522,6 +525,38 @@ def test_switch_restart_accepted_body_confirms_generation(
     assert requests == [600]
     assert restart_clock["sleeps"] == []
     assert "Daemon restarted — a new process is serving." in capsys.readouterr().out
+
+
+def test_switch_restart_accepted_keeps_token_through_slow_boot(
+    store, monkeypatch, restart_http, capsys,
+):
+    requests = restart_http()
+    clock = {"now": 0}
+    polls = []
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+
+    def sleep(seconds):
+        assert "sk-ant-oat01-NEW" in store["env"].read_text()
+        clock["now"] += seconds
+
+    def generation():
+        if polls:
+            assert "sk-ant-oat01-NEW" in store["env"].read_text()
+        polls.append(clock["now"])
+        if clock["now"] < 30:
+            return "old-gen"
+        return "new-gen" if clock["now"] >= 360 else None
+
+    monkeypatch.setattr(time, "sleep", sleep)
+    monkeypatch.setattr(ca, "daemon_generation", generation)
+    assert run("switch", "acct", "--restart", "--as-agent", "operator") == 0
+    assert clock["now"] == 360
+    assert any(moment > 90 for moment in polls)
+    assert "sk-ant-oat01-NEW" in store["env"].read_text()
+    assert requests == [600]
+    output = capsys.readouterr()
+    assert "Daemon restarted — a new process is serving." in output.out
+    assert "Reverted" not in output.err
 
 
 @pytest.mark.parametrize("failure", ["refused", "wrapped-refused", "http-error"])
