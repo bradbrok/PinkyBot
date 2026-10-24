@@ -380,3 +380,271 @@ def test_owned_revisit_retries_directory_after_transient_metadata_error(tmp_path
     assert sum("could not inspect" in warning for warning in report.warnings) == 1
     assert sum("orphan.db" in warning for warning in report.warnings) == 1
     assert report.skipped_unmanaged_subtrees == 0
+
+
+def _directory_spelling_alias(monkeypatch, directory, mode, *, backing=None):
+    """Expose alternate metadata spelling while realpath retains the caller's case."""
+    alternate = directory.with_name(directory.name.lower())
+    if mode == "native":
+        if not alternate.exists():
+            pytest.skip("temporary volume is case-sensitive; stubbed coverage runs on every platform")
+        assert alternate.samefile(directory)
+        return alternate
+
+    real_stat, realpath = os.stat, os.path.realpath
+    backing = directory if backing is None else backing
+
+    def metadata(path, *args, **kwargs):
+        if not isinstance(path, int):
+            value = os.fspath(path)
+            if value == str(alternate) or value.startswith(str(alternate) + os.sep):
+                path = str(backing) + value[len(str(alternate)):]
+        return real_stat(path, *args, **kwargs)
+
+    def resolve(path, *args, **kwargs):
+        value = os.fspath(path)
+        if any(value == str(parent) or value.startswith(str(parent) + os.sep)
+               for parent in (directory, alternate)):
+            return os.path.abspath(value)
+        return realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", metadata)
+    monkeypatch.setattr(os.path, "realpath", resolve)
+    return alternate
+
+
+@pytest.mark.parametrize("mode", ["native", "stubbed"])
+@pytest.mark.parametrize("registered", [False, True])
+def test_owned_child_case_alias_is_walked(tmp_path, monkeypatch, mode, registered):
+    root = tmp_path / "root"
+    directory = root / "agents/a/DATA"
+    live = _write(directory, "live.db")
+    orphan = _write(directory, "orphan.db")
+    alternate = _directory_spelling_alias(monkeypatch, directory, mode)
+    declared = alternate / "live.db"
+    assert os.path.realpath(declared) == str(declared)
+    assert alternate.stat().st_ino == directory.stat().st_ino
+    identities = store_catalog.read_store_identities([declared]) if registered else {}
+    report = _inspect(root, identities)
+    assert report.skipped_unmanaged_subtrees == 0
+    assert sum(str(orphan) in warning for warning in report.warnings) == 1
+    assert len(report.warnings) == (1 if registered else 2)
+    assert [(item["kind"], item["path"]) for item in report.findings] == (
+        [("alias_of_registered_store", str(live))] if registered else []
+    )
+
+
+@pytest.mark.parametrize("mode", ["native", "stubbed"])
+@pytest.mark.parametrize("present", [False, True])
+def test_registered_ancestor_case_alias_is_walked(tmp_path, monkeypatch, mode, present):
+    root = tmp_path / "root"
+    directory = root / "agents/a/BATCH"
+    orphan = _write(directory, "orphan.db")
+    nested = directory / "nested"
+    nested.mkdir()
+    live = nested / "live.db"
+    if present:
+        live.touch()
+    alternate = _directory_spelling_alias(monkeypatch, directory, mode)
+    declared = alternate / "nested/live.db"
+    assert os.path.realpath(declared) == str(declared)
+    identities = store_catalog.read_store_identities([declared])
+    assert (identities[str(declared)] is not None) == present
+    report = _inspect(root, identities)
+    assert report.skipped_unmanaged_subtrees == 0
+    assert len(report.warnings) == 1 and str(orphan) in report.warnings[0]
+    assert [(item["kind"], item["path"]) for item in report.findings] == (
+        [("alias_of_registered_store", str(live))] if present else []
+    )
+
+
+def test_distinct_case_sensitive_identities_keep_child_unmanaged(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    directory = _write(root, "agents/a/DATA/orphan.db").parent
+    backing = _write(tmp_path, "lowercase-backing/live.db").parent
+    alternate = _directory_spelling_alias(
+        monkeypatch, directory, "stubbed", backing=backing,
+    )
+    upper_stat, lower_stat = directory.stat(), alternate.stat()
+    assert (upper_stat.st_dev, upper_stat.st_ino) != (lower_stat.st_dev, lower_stat.st_ino)
+    identities = store_catalog.read_store_identities([alternate / "live.db"])
+    report = _inspect(root, identities)
+    assert report.findings == [] and report.warnings == []
+    assert report.skipped_unmanaged_subtrees == 1
+
+
+def _workspace_case_fixture(tmp_path, monkeypatch, mode, spelling):
+    root = tmp_path / "root"
+    name = "WORKSPACE" if spelling == "upper" else "workspace"
+    orphan = _write(root, f"agents/a/{name}/orphan.db")
+    directory = orphan.parent
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escape = directory / "escape"
+    escape.symlink_to(outside, target_is_directory=True)
+    realpath = os.path.realpath
+    alternate = _directory_spelling_alias(monkeypatch, directory, mode)
+    preserving_realpath = os.path.realpath
+    if mode == "stubbed":
+        def resolve(path, *args, **kwargs):
+            if os.path.islink(path):
+                return realpath(path, *args, **kwargs)
+            return preserving_realpath(path, *args, **kwargs)
+
+        monkeypatch.setattr(os.path, "realpath", resolve)
+    actual_stat, alternate_stat = directory.stat(), alternate.stat()
+    assert (actual_stat.st_dev, actual_stat.st_ino) == (alternate_stat.st_dev, alternate_stat.st_ino)
+    assert os.path.realpath(alternate) == str(alternate)
+    assert os.path.realpath(escape) == str(outside)
+    return root, directory, alternate, orphan, escape
+
+
+@pytest.mark.parametrize("spelling", ["upper", "lower"])
+@pytest.mark.parametrize("mode", ["native", "stubbed"])
+@pytest.mark.parametrize("registered_sibling", [False, True])
+def test_workspace_case_alias_keeps_skip_precedence(
+    tmp_path, monkeypatch, spelling, mode, registered_sibling,
+):
+    root, directory, _, _, _ = _workspace_case_fixture(tmp_path, monkeypatch, mode, spelling)
+    sibling = _write(root, "registered.db") if registered_sibling else None
+    identities = store_catalog.read_store_identities([sibling]) if sibling else {}
+    original, scanned = os.scandir, []
+
+    def scandir(path):
+        scanned.append(os.fspath(path))
+        return original(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    report = _inspect(root, identities)
+    assert report.skipped_unmanaged_subtrees == 1
+    assert report.findings == [] and report.warnings == []
+    assert not any(path == str(directory) or path.startswith(str(directory) + os.sep)
+                   for path in scanned)
+
+
+@pytest.mark.parametrize("spelling", ["upper", "lower"])
+@pytest.mark.parametrize("mode", ["native", "stubbed"])
+@pytest.mark.parametrize("registered", ["present", "absent", "directory"])
+def test_workspace_case_alias_with_registered_store_is_walked(
+    tmp_path, monkeypatch, spelling, mode, registered,
+):
+    root, directory, alternate, orphan, escape = _workspace_case_fixture(
+        tmp_path, monkeypatch, mode, spelling,
+    )
+    live = directory / "nested/live.db"
+    if registered == "present":
+        _write(directory, "nested/live.db")
+    elif registered == "absent":
+        live.parent.mkdir()
+    declared = alternate if registered == "directory" else alternate / "nested/live.db"
+    identities = store_catalog.read_store_identities([declared])
+    report = _inspect(root, identities)
+    assert report.skipped_unmanaged_subtrees == 0
+    assert len(report.warnings) == 1 and str(orphan) in report.warnings[0]
+    expected = [("directory_outside_root", str(escape))]
+    if registered == "present" and spelling == "upper":
+        expected.append(("alias_of_registered_store", str(live)))
+    assert [(item["kind"], item["path"]) for item in report.findings] == expected
+
+
+@pytest.mark.parametrize("mode", ["native", "stubbed"])
+def test_registered_workspace_case_alias_promotes_cached_agent_children(tmp_path, monkeypatch, mode):
+    root, directory, alternate, orphan, escape = _workspace_case_fixture(
+        tmp_path, monkeypatch, mode, "upper",
+    )
+    _write(directory, "live.data")
+    other = _write(root, "agents/b/batch/other.db")
+    (directory / "link").symlink_to(other.parent.parent, target_is_directory=True)
+    (root / "000-early").symlink_to(other.parent.parent, target_is_directory=True)
+    identities = store_catalog.read_store_identities([alternate / "live.data"])
+    report = _inspect(root, identities)
+    assert report.skipped_unmanaged_subtrees == 0
+    assert [(item["kind"], item["path"]) for item in report.findings] == [
+        ("directory_outside_root", str(escape)),
+    ]
+    assert len(report.warnings) == 2
+    assert all(any(str(path) in warning for warning in report.warnings) for path in (orphan, other))
+
+
+@pytest.mark.parametrize("spelling", ["lower", "upper"])
+@pytest.mark.parametrize("mode", ["native", "stubbed"])
+@pytest.mark.parametrize("target", ["agent-data", "root-managed"])
+def test_workspace_link_preserves_managed_target(tmp_path, monkeypatch, spelling, mode, target):
+    root = tmp_path / "root"
+    relative = "agents/a/data" if target == "agent-data" else "managed"
+    orphan = _write(root, f"{relative}/orphan.db")
+    directory = orphan.parent
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escape = directory / "escape"
+    escape.symlink_to(outside, target_is_directory=True)
+    name = "WORKSPACE" if spelling == "upper" else "workspace"
+    link = root / "agents/a" / name
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(directory, target_is_directory=True)
+    alternate = link.with_name("workspace")
+    metadata, realpath = os.stat, os.path.realpath
+    if mode == "native":
+        if not alternate.exists():
+            pytest.skip("temporary volume is case-sensitive; stubbed coverage runs on every platform")
+        assert alternate.samefile(link)
+    else:
+        def physical(path):
+            if isinstance(path, int):
+                return path
+            value = os.fspath(path)
+            if value == str(alternate) or value.startswith(str(alternate) + os.sep):
+                return str(link) + value[len(str(alternate)):]
+            return path
+
+        def inspect(path, *args, **kwargs):
+            return metadata(physical(path), *args, **kwargs)
+
+        def resolve(path, *args, **kwargs):
+            return realpath(physical(path), *args, **kwargs)
+
+        monkeypatch.setattr(os, "stat", inspect)
+        monkeypatch.setattr(os.path, "realpath", resolve)
+    entry_stat = os.stat(alternate, follow_symlinks=False)
+    target_stat = directory.stat()
+    assert (entry_stat.st_dev, entry_stat.st_ino) != (target_stat.st_dev, target_stat.st_ino)
+    assert os.path.realpath(alternate) == str(directory)
+    original, scanned = os.scandir, []
+
+    def scandir(path):
+        scanned.append(os.fspath(path))
+        return original(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    report = _inspect(root)
+    assert report.skipped_unmanaged_subtrees == 0
+    assert [(item["kind"], item["path"]) for item in report.findings] == [
+        ("directory_outside_root", str(escape)),
+    ]
+    assert len(report.warnings) == 1 and str(orphan) in report.warnings[0]
+    assert scanned.count(str(directory)) == 1
+    assert str(outside) not in scanned
+
+
+@pytest.mark.parametrize("mode", ["native", "stubbed"])
+@pytest.mark.parametrize("kind", ["direct", "cached-ancestor"])
+def test_owned_alias_cannot_promote_workspace(tmp_path, monkeypatch, mode, kind):
+    root, directory, _, _, _ = _workspace_case_fixture(tmp_path, monkeypatch, mode, "upper")
+    if kind == "direct":
+        (directory.parent / ".claude").symlink_to(directory, target_is_directory=True)
+    else:
+        owned = root / "agents/b/.claude"
+        owned.mkdir(parents=True)
+        (owned / "link").symlink_to(directory.parent, target_is_directory=True)
+        (root / "000-early").symlink_to(directory.parent, target_is_directory=True)
+    original, scanned = os.scandir, []
+
+    def scandir(path):
+        scanned.append(os.fspath(path))
+        return original(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    report = _inspect(root)
+    assert report.skipped_unmanaged_subtrees == 1
+    assert report.findings == [] and report.warnings == []
+    assert str(directory) not in scanned

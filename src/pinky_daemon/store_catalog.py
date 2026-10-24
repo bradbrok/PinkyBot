@@ -880,6 +880,8 @@ class _FilesystemLayoutInspector:
         self.warnings: list[str] = []
         self.unclaimed_databases: list[_FilesystemDatabase] = []
         self.skipped_unmanaged_subtrees = 0
+        self._agent_child_identities: dict[str, dict[str, tuple[int, int] | None]] = {}
+        self._registered_ancestor_identities: set[tuple[int, int]] | None = None
 
     def inspect(self) -> LayoutInspection:
         pending_directories: list[tuple[str, bool]] = [(self.root, False)]
@@ -919,10 +921,23 @@ class _FilesystemLayoutInspector:
             relative_directory = os.path.relpath(resolved_directory, self.root).replace(os.sep, "/")
             relative_segments = relative_directory.split("/")
             discovered_segments = os.path.relpath(directory, self.root).split(os.sep)
-            owned_visit = owned_visit or any(
-                len(segments) >= 3 and segments[0] == "agents"
-                and segments[2] in _DAEMON_AGENT_SUBDIRECTORIES
-                for segments in (discovered_segments, relative_segments)
+            unmanaged_workspace = any(
+                len(relative_segments) == len(pattern_segments)
+                and all(fnmatch.fnmatchcase(part, pattern_part)
+                        for part, pattern_part in zip(relative_segments, pattern_segments))
+                for pattern_segments in (
+                    pattern.split("/") for pattern in _UNMANAGED_SUBTREES
+                )
+            ) or self._is_unmanaged_workspace(relative_segments, directory_identity)
+            owned_visit = not unmanaged_workspace and (
+                owned_visit or any(
+                    len(segments) >= 3 and segments[0] == "agents"
+                    and segments[2] in _DAEMON_AGENT_SUBDIRECTORIES
+                    for segments in (discovered_segments, relative_segments)
+                ) or any(
+                    self._is_owned_agent_child(segments, directory_identity)
+                    for segments in (discovered_segments, relative_segments)
+                )
             )
             if directory_identity in visited_directories:
                 if owned_visit and not visited_directories[directory_identity]:
@@ -938,24 +953,14 @@ class _FilesystemLayoutInspector:
                 and discovered_segments[0] == "agents"
                 and discovered_segments[2] not in _DAEMON_AGENT_SUBDIRECTORIES
             )
-            if unmanaged_agent_child or any(
-                len(relative_segments) == len(pattern_segments)
-                and all(fnmatch.fnmatchcase(part, pattern_part)
-                        for part, pattern_part in zip(relative_segments, pattern_segments))
-                for pattern_segments in (
-                    pattern.split("/") for pattern in _UNMANAGED_SUBTREES
-                )
-            ):
-                prefix = resolved_directory + os.sep
-                if not any(path == resolved_directory or path.startswith(prefix)
-                           for path in self.registered_realpaths):
+            if unmanaged_agent_child or unmanaged_workspace:
+                if not self._contains_registered_store(resolved_directory, directory_identity):
                     if directory_identity not in skipped_directories:
                         skipped_directories.add(directory_identity)
                         self.skipped_unmanaged_subtrees += 1
                     continue
-                if unmanaged_agent_child:
-                    # A registered store claims the containing agent subtree.
-                    owned_visit = True
+                # A registered store claims the containing agent subtree.
+                owned_visit = True
             # A later owned alias may require a previously pruned target. Only
             # scanned directories participate in the cycle guard; counts follow
             # the final set of directories whose contents were left uninspected.
@@ -1036,6 +1041,68 @@ class _FilesystemLayoutInspector:
         return LayoutInspection(
             self.findings, self.warnings, self.skipped_unmanaged_subtrees
         )
+
+    def _is_owned_agent_child(self, segments, directory_identity) -> bool:
+        if len(segments) != 3 or segments[0] != "agents":
+            return False
+        agent_directory = os.path.join(self.root, *segments[:2])
+        return any(
+            self._agent_child_identity(agent_directory, name) == directory_identity
+            for name in sorted(_DAEMON_AGENT_SUBDIRECTORIES - {"workspace"})
+        )
+
+    def _is_unmanaged_workspace(self, segments, directory_identity) -> bool:
+        if len(segments) != 3 or segments[0] != "agents":
+            return False
+        agent_directory = os.path.join(self.root, *segments[:2])
+        return self._agent_child_identity(agent_directory, "workspace") == directory_identity
+
+    def _agent_child_identity(self, agent_directory, name):
+        identities = self._agent_child_identities.setdefault(agent_directory, {})
+        if name not in identities:
+            try:
+                # Workspace policy belongs to the entry, not its managed link target.
+                metadata = os.stat(
+                    os.path.join(agent_directory, name), follow_symlinks=name != "workspace",
+                )
+            except OSError:
+                # The walk reports inaccessible paths when it visits them.
+                identities[name] = None
+            else:
+                identities[name] = ((metadata.st_dev, metadata.st_ino)
+                                    if stat.S_ISDIR(metadata.st_mode) else None)
+        return identities[name]
+
+    def _contains_registered_store(self, directory, directory_identity) -> bool:
+        prefix = directory + os.sep
+        if any(path == directory or path.startswith(prefix) for path in self.registered_realpaths):
+            return True
+        if self._registered_ancestor_identities is None:
+            # Also retain exact registered directory identities. File identities
+            # cannot match a directory, so they need no additional metadata probe.
+            identities = {
+                identity for identity, paths in self.registered_paths_by_inode.items()
+                if any(self._under_root(path) for path in paths)
+            }
+            ancestors = set()
+            for path in sorted(self.registered_realpaths):
+                ancestor = os.path.dirname(path)
+                while self._under_root(ancestor) and ancestor not in ancestors:
+                    ancestors.add(ancestor)
+                    try:
+                        metadata = os.stat(ancestor)
+                    except OSError:
+                        # Classification probes leave normal walk diagnostics intact.
+                        pass
+                    else:
+                        if stat.S_ISDIR(metadata.st_mode):
+                            identities.add((metadata.st_dev, metadata.st_ino))
+                    parent = os.path.dirname(ancestor)
+                    if parent == ancestor:
+                        break
+                    ancestor = parent
+            self._registered_ancestor_identities = identities
+        return directory_identity in self._registered_ancestor_identities
 
     def _record_database(self, discovered_path, resolved_path, path_stat) -> None:
         name = os.path.basename(discovered_path)
