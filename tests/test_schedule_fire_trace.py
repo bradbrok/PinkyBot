@@ -338,6 +338,61 @@ async def test_t5_trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, f
     await _trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, fault, edge)
 
 
+async def _without_trace_worker_waits(writer, monkeypatch, operation, *args):
+    caller = threading.get_ident()
+    calls = []
+    timers = []
+
+    def watch(owner, name, label, block_index=None):
+        original = getattr(owner, name)
+
+        def record(*args, **kwargs):
+            if label == "writer.close" and writer._retry_timer is not None:
+                timers.append(writer._retry_timer)
+            blocking = (block_index is None or kwargs.get(
+                "block", args[block_index] if len(args) > block_index else True,
+            ))
+            if blocking and threading.get_ident() == caller:
+                calls.append(label)
+            return original(*args, **kwargs)
+
+        patch.setattr(owner, name, record)
+
+    try:
+        with monkeypatch.context() as patch:
+            # Record attempts, then assert outside trace_event's error suppression.
+            # Background worker IO and later maintenance barriers remain allowed.
+            for name in (
+                "flush", "close", "_setup", "_connect", "_run", "_write_with_retry",
+                "_write", "_persist_failures", "_apply", "_ensure_columns",
+                "_snapshot_ledger", "failures", "failure_counts", "failure_bounds",
+                "report", "_log_transition",
+            ):
+                watch(writer, name, f"writer.{name}")
+            watch(writer._queue, "join", "writer._queue.join")
+            watch(writer._queue, "get", "writer._queue.get", block_index=0)
+            watch(writer._queue, "put", "writer._queue.put", block_index=1)
+            for name in ("all_tasks_done", "not_empty", "not_full"):
+                condition = getattr(writer._queue, name)
+                for method in ("wait", "wait_for"):
+                    watch(condition, method, f"writer._queue.{name}.{method}")
+            watch(writer._closed, "wait", "writer._closed.wait")
+            if writer._retry_timer is not None:
+                timers.append(writer._retry_timer)
+            thread_join = threading.Thread.join
+
+            def join(thread, *args, **kwargs):
+                if (threading.get_ident() == caller
+                        and (thread is writer._retry_timer or thread in timers)):
+                    calls.append("writer._retry_timer.join")
+                return thread_join(thread, *args, **kwargs)
+
+            patch.setattr(threading.Thread, "join", join)
+            return await operation(*args)
+    finally:
+        assert calls == [], f"wake caller used trace worker blocking surfaces: {calls}"
+
+
 async def _trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, fault, edge):
     pending, durable = fire(pane.registry)
     flush(pane.registry)
@@ -394,11 +449,11 @@ async def _trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, fault, e
     monkeypatch.setattr(writer, "_write", faulty)
     try:
         if edge == "paste":
-            _, receipt = await paste(pane, durable)
+            _, receipt = await _without_trace_worker_waits(writer, monkeypatch, paste, pane, durable)
         else:
-            _, receipt = await paste(pane, durable)
+            _, receipt = await _without_trace_worker_waits(writer, monkeypatch, paste, pane, durable)
             flush(pane.registry)
-            await observe(pane)
+            await _without_trace_worker_waits(writer, monkeypatch, observe, pane)
             assert receipt.result() is True
         assert await asyncio.to_thread(entered.wait, 1)
         # Delivery completed while the writer was still held before trace IO.
