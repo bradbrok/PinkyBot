@@ -492,6 +492,7 @@ def test_queued_directory_changes_match_frozen_walk(tmp_path, monkeypatch, repla
 @pytest.mark.parametrize("relative", [
     "agents/a/workspace", "agents/a/b/workspace",
     "agents/a/build/cache/workspace", "agents/workspace",
+    "agents/a/data/workspace", "agents/a/.claude/cache/workspace",
 ])
 def test_unmanaged_pattern_matches_exact_path_segments(tmp_path, relative):
     root = tmp_path / "data"
@@ -503,7 +504,11 @@ def test_unmanaged_pattern_matches_exact_path_segments(tmp_path, relative):
     (workspace / "escape").symlink_to(outside, target_is_directory=True)
     identities = _identities(registered)
     report = _inspect(root, identities)
-    if relative == "agents/a/workspace":
+    # Unknown first-level agent directories are pruned before their nested
+    # workspace names matter. Owned ancestors retain the exact workspace rule.
+    if relative in {
+        "agents/a/workspace", "agents/a/b/workspace", "agents/a/build/cache/workspace",
+    }:
         assert report.findings == [] and report.warnings == []
         assert report.skipped_unmanaged_subtrees == 1
     else:

@@ -2030,7 +2030,7 @@ def create_api(
     db_path = os.path.realpath(db_path)
     _data_dir = Path(db_path).parent
     store_manifest = _derive_api_store_manifest(db_path)
-    store_catalog = DaemonStoreCatalog(expected_root=_data_dir)
+    store_catalog = DaemonStoreCatalog(expected_root=_data_dir, log=_log)
     store_catalog.configure_manifest(store_manifest)
     storage_observability = StorageObservability(store_manifest)
     store_catalog.configure_observability(storage_observability)
@@ -16533,7 +16533,10 @@ npm run build</pre>
         _log(f"ERROR startup: store catalog validation failed: {exc}")
         raise
     finally:
-        _log(f"startup: phase store_catalog_validate {int((time.monotonic() - phase_started) * 1000)} ms")
+        _log(
+            f"startup: phase store_catalog_validate {int((time.monotonic() - phase_started) * 1000)} ms"
+            f"; skipped={store_catalog.skipped_unmanaged_subtrees}"
+        )
     storage_observability.record_boot_success(store_catalog.snapshot(), warnings)
     storage_observability.arm_runtime()
 

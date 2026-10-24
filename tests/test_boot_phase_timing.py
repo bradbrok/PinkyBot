@@ -46,7 +46,7 @@ def test_api_logs_integrity_and_catalog_durations(tmp_path, monkeypatch):
     app = api.create_api(db_path=str(tmp_path / "data/conversations.db"))
     try:
         assert messages.count("startup: phase preflight_integrity 250 ms") == 1
-        assert messages.count("startup: phase store_catalog_validate 125 ms") == 1
+        assert messages.count("startup: phase store_catalog_validate 125 ms; skipped=0") == 1
     finally:
         app.state.store_catalog.shutdown(deadline_seconds=5)
 
