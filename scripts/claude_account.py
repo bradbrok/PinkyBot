@@ -52,7 +52,12 @@ SETUP_TOKEN_PREFIX = "sk-ant-oat01-"
 DEFAULT_TTL_DAYS = 365
 EXPIRY_WARN_DAYS = 30
 PROBE_TIMEOUT_S = 60
-RESTART_HEALTH_TIMEOUT_S = 90
+# /admin/restart runs the startup layout pre-flight before responding; a large
+# data root can take minutes to inspect.
+RESTART_REQUEST_TIMEOUT_S = 600
+# A new generation can take minutes to boot, even after acceptance; a lost
+# response can also leave pre-flight/shutdown in progress.
+RESTART_HEALTH_TIMEOUT_S = 900
 INDEX_VERSION = 1
 
 # billing modes the store recognises. Owner-declared per account: the auth
@@ -177,8 +182,8 @@ def store_lock():
     """Advisory exclusive lock held for a whole mutating operation.
 
     A switch reads → backs up → writes → restarts → verifies → maybe reverts over
-    a window up to RESTART_HEALTH_TIMEOUT_S. Without a lock, a second concurrent
-    switch (process B) can write in the middle, and a delayed revert from process
+    a window covering the restart request and generation wait. Without a lock, a
+    second concurrent switch (process B) can write in the middle, and a delayed revert from process
     A then restores A's older backup and silently clobbers B. flock is per open
     file description, so a second claude-account process fails closed here rather
     than interleaving. Read-only commands do not take the lock.
@@ -448,7 +453,7 @@ def _daemon_base_url() -> str:
     return f"http://127.0.0.1:{port}"
 
 
-def restart_daemon(env_path: Path, as_agent: str) -> tuple[bool, str]:
+def restart_daemon(env_path: Path, as_agent: str) -> tuple[bool | None, str]:
     """POST /admin/restart with internal auth (the path the daemon's own restart
     tool uses). The daemon abstracts launchctl-vs-systemd, so we never
     reimplement box-specific restart logic here.
@@ -458,6 +463,9 @@ def restart_daemon(env_path: Path, as_agent: str) -> tuple[bool, str]:
     a real agent on this box (supplied via --as-agent / PINKY_AGENT_NAME) — there
     is no baked-in default. ``env_path`` is the same .env the switch operated on,
     so the secret is sourced from the file being managed.
+
+    Return True for acceptance, False for definite refusal, or None when the
+    request may have reached the daemon but its outcome is unknown.
     """
     if not as_agent:
         return False, (
@@ -490,12 +498,41 @@ def restart_daemon(env_path: Path, as_agent: str) -> tuple[bool, str]:
         _daemon_base_url() + path, method="POST", headers=headers, data=b""
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return (200 <= resp.status < 300), f"HTTP {resp.status}"
+        response = urllib.request.urlopen(req, timeout=RESTART_REQUEST_TIMEOUT_S)
     except urllib.error.HTTPError as exc:
         return False, f"HTTP {exc.code}"
-    except Exception as exc:  # noqa: BLE001
+    except urllib.error.URLError as exc:
+        # urllib wraps request-time OSErrors. A typed connect refusal proves no
+        # request was sent; timeouts/resets cannot prove that and stay unknown.
+        return (False if isinstance(exc.reason, ConnectionRefusedError) else None), str(exc)
+    except ConnectionRefusedError as exc:
         return False, str(exc)
+    except Exception as exc:  # noqa: BLE001
+        return None, str(exc)
+
+    try:
+        with response as resp:
+            detail = f"HTTP {resp.status}"
+            if not 200 <= resp.status < 300:
+                return False, detail
+            try:
+                result = json.loads(resp.read().decode("utf-8"))
+            except ValueError:
+                return None, f"{detail}: restart response is not valid JSON"
+            if isinstance(result, dict):
+                if "error" not in result and result.get("restarting") is True:
+                    return True, detail
+                error = result.get("error") or "restart not accepted (missing restarting: true)"
+                detail += f": {error}"
+                if "preflight" in result:
+                    summary = json.dumps(result["preflight"], sort_keys=True)
+                    if len(summary) <= 500:
+                        detail += f"; preflight: {summary}"
+            else:
+                detail += ": restart not accepted (missing restarting: true)"
+            return False, detail
+    except Exception as exc:  # noqa: BLE001 — response loss cannot disprove acceptance
+        return None, str(exc)
 
 
 def daemon_generation() -> str | None:
@@ -846,16 +883,24 @@ def cmd_switch(args: argparse.Namespace) -> int:
 
     print("Restarting the daemon…")
     ok, detail = restart_daemon(env_path, as_agent)
-    if not ok:
+    if ok is False:
         _revert(env_path, backup, f"restart call failed ({detail})")
         return 1
+
+    wait_s = RESTART_HEALTH_TIMEOUT_S
+    if ok is None:
+        print(
+            f"claude-account: restart call outcome unknown ({detail}); waiting up to "
+            f"{wait_s}s for a new daemon generation.",
+            file=sys.stderr,
+        )
 
     # Require the process generation to ADVANCE — /admin/restart returns 200 and
     # only SIGTERMs ~1s later, and the OLD process keeps answering /api until then,
     # so a bare 200 is not proof of restart.
     import time
 
-    deadline = time.monotonic() + RESTART_HEALTH_TIMEOUT_S
+    deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
         cur = daemon_generation()
         if cur is not None and cur != before_gen:
@@ -864,9 +909,19 @@ def cmd_switch(args: argparse.Namespace) -> int:
                   "guarantee no Fable-credit consent prompt at real startup.")
             return 0
         time.sleep(3)
-    _revert(env_path, backup,
-            f"daemon generation did not advance within {RESTART_HEALTH_TIMEOUT_S}s "
-            f"(restart not confirmed — the new process never came up)")
+    if ok is None:
+        _revert(env_path, backup,
+                f"daemon generation did not advance within {wait_s}s "
+                "(restart not confirmed — a restart could still be in flight)")
+        print(
+            "Check the daemon generation (/api started_at), then which token .env holds "
+            f"({TOKEN_ENV_KEY}), before retrying.",
+            file=sys.stderr,
+        )
+    else:
+        _revert(env_path, backup,
+                f"daemon generation did not advance within {wait_s}s "
+                f"(restart not confirmed — the new process never came up)")
     return 1
 
 
