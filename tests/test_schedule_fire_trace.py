@@ -1,6 +1,7 @@
 """Durable observations must diagnose fires without influencing delivery."""
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import os
@@ -339,7 +340,7 @@ async def test_t5_trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, f
 
 
 async def _without_trace_worker_waits(writer, monkeypatch, operation, *args):
-    caller = threading.get_ident()
+    active = contextvars.ContextVar("trace_receipt_operation", default=False)
     calls = []
     timers = []
 
@@ -352,16 +353,18 @@ async def _without_trace_worker_waits(writer, monkeypatch, operation, *args):
             blocking = (block_index is None or kwargs.get(
                 "block", args[block_index] if len(args) > block_index else True,
             ))
-            if blocking and threading.get_ident() == caller:
+            if blocking and active.get():
                 calls.append(label)
             return original(*args, **kwargs)
 
         patch.setattr(owner, name, record)
 
+    token = active.set(True)
     try:
         with monkeypatch.context() as patch:
             # Record attempts, then assert outside trace_event's error suppression.
             # Background worker IO and later maintenance barriers remain allowed.
+            # The marker follows awaited offloads into their execution context.
             for name in (
                 "flush", "close", "_setup", "_connect", "_run", "_write_with_retry",
                 "_write", "_persist_failures", "_apply", "_ensure_columns",
@@ -382,7 +385,7 @@ async def _without_trace_worker_waits(writer, monkeypatch, operation, *args):
             thread_join = threading.Thread.join
 
             def join(thread, *args, **kwargs):
-                if (threading.get_ident() == caller
+                if (active.get()
                         and (thread is writer._retry_timer or thread in timers)):
                     calls.append("writer._retry_timer.join")
                 return thread_join(thread, *args, **kwargs)
@@ -390,6 +393,7 @@ async def _without_trace_worker_waits(writer, monkeypatch, operation, *args):
             patch.setattr(threading.Thread, "join", join)
             return await operation(*args)
     finally:
+        active.reset(token)
         assert calls == [], f"wake caller used trace worker blocking surfaces: {calls}"
 
 
