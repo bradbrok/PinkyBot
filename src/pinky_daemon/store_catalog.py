@@ -1061,7 +1061,10 @@ class _FilesystemLayoutInspector:
         identities = self._agent_child_identities.setdefault(agent_directory, {})
         if name not in identities:
             try:
-                metadata = os.stat(os.path.join(agent_directory, name))
+                # Workspace policy belongs to the entry, not its managed link target.
+                metadata = os.stat(
+                    os.path.join(agent_directory, name), follow_symlinks=name != "workspace",
+                )
             except OSError:
                 # The walk reports inaccessible paths when it visits them.
                 identities[name] = None

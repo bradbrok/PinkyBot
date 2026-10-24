@@ -564,3 +564,87 @@ def test_registered_workspace_case_alias_promotes_cached_agent_children(tmp_path
     ]
     assert len(report.warnings) == 2
     assert all(any(str(path) in warning for warning in report.warnings) for path in (orphan, other))
+
+
+@pytest.mark.parametrize("spelling", ["lower", "upper"])
+@pytest.mark.parametrize("mode", ["native", "stubbed"])
+@pytest.mark.parametrize("target", ["agent-data", "root-managed"])
+def test_workspace_link_preserves_managed_target(tmp_path, monkeypatch, spelling, mode, target):
+    root = tmp_path / "root"
+    relative = "agents/a/data" if target == "agent-data" else "managed"
+    orphan = _write(root, f"{relative}/orphan.db")
+    directory = orphan.parent
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escape = directory / "escape"
+    escape.symlink_to(outside, target_is_directory=True)
+    name = "WORKSPACE" if spelling == "upper" else "workspace"
+    link = root / "agents/a" / name
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(directory, target_is_directory=True)
+    alternate = link.with_name("workspace")
+    metadata, realpath = os.stat, os.path.realpath
+    if mode == "native":
+        if not alternate.exists():
+            pytest.skip("temporary volume is case-sensitive; stubbed coverage runs on every platform")
+        assert alternate.samefile(link)
+    else:
+        def physical(path):
+            if isinstance(path, int):
+                return path
+            value = os.fspath(path)
+            if value == str(alternate) or value.startswith(str(alternate) + os.sep):
+                return str(link) + value[len(str(alternate)):]
+            return path
+
+        def inspect(path, *args, **kwargs):
+            return metadata(physical(path), *args, **kwargs)
+
+        def resolve(path, *args, **kwargs):
+            return realpath(physical(path), *args, **kwargs)
+
+        monkeypatch.setattr(os, "stat", inspect)
+        monkeypatch.setattr(os.path, "realpath", resolve)
+    entry_stat = os.stat(alternate, follow_symlinks=False)
+    target_stat = directory.stat()
+    assert (entry_stat.st_dev, entry_stat.st_ino) != (target_stat.st_dev, target_stat.st_ino)
+    assert os.path.realpath(alternate) == str(directory)
+    original, scanned = os.scandir, []
+
+    def scandir(path):
+        scanned.append(os.fspath(path))
+        return original(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    report = _inspect(root)
+    assert report.skipped_unmanaged_subtrees == 0
+    assert [(item["kind"], item["path"]) for item in report.findings] == [
+        ("directory_outside_root", str(escape)),
+    ]
+    assert len(report.warnings) == 1 and str(orphan) in report.warnings[0]
+    assert scanned.count(str(directory)) == 1
+    assert str(outside) not in scanned
+
+
+@pytest.mark.parametrize("mode", ["native", "stubbed"])
+@pytest.mark.parametrize("kind", ["direct", "cached-ancestor"])
+def test_owned_alias_cannot_promote_workspace(tmp_path, monkeypatch, mode, kind):
+    root, directory, _, _, _ = _workspace_case_fixture(tmp_path, monkeypatch, mode, "upper")
+    if kind == "direct":
+        (directory.parent / ".claude").symlink_to(directory, target_is_directory=True)
+    else:
+        owned = root / "agents/b/.claude"
+        owned.mkdir(parents=True)
+        (owned / "link").symlink_to(directory.parent, target_is_directory=True)
+        (root / "000-early").symlink_to(directory.parent, target_is_directory=True)
+    original, scanned = os.scandir, []
+
+    def scandir(path):
+        scanned.append(os.fspath(path))
+        return original(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    report = _inspect(root)
+    assert report.skipped_unmanaged_subtrees == 1
+    assert report.findings == [] and report.warnings == []
+    assert str(directory) not in scanned
