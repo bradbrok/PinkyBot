@@ -121,6 +121,8 @@ from pinky_daemon.tmux_targets import (
     text_argument,
 )
 from pinky_daemon.tmux_transcript import (
+    _PLACEHOLDER_TRANSCRIPT_PATH,
+    _RETIRE_DISCOVERY_ALLOWANCE_SEC,
     TmuxTranscriptTailer,
     TurnResponse,
     claude_project_slug,
@@ -584,17 +586,6 @@ def _adaptive_paste_enter_delay_ms(text: str) -> int:
         len(text) // _PASTE_ENTER_DELAY_CHARS_PER_MS
     )
     return min(_PASTE_ENTER_MAX_DELAY_MS, scaled)
-
-# Sentinel path used by ``_start_tailer`` when the transcript JSONL
-# doesn't exist yet (cold-start). The tailer's ``read_once`` treats
-# the non-existent file as "no data" and waits; once the SessionStart
-# hook reports the real path, ``set_transcript_path`` swaps to it.
-#
-# Defined as a module-level constant (issue #563) so the placeholder→real
-# transition can be detected reliably in ``TmuxSession.set_transcript_path``:
-# the seek-to-byte-0 behavior only applies on that first transition, not
-# on subsequent real→real swaps (compact-resume protected by #496).
-_PLACEHOLDER_TRANSCRIPT_PATH = Path("/dev/null/no-transcript-yet")
 
 # Poll for a fresh transcript when the startup hook is lost. Transcripts
 # can appear lazily after the first prompt, well after the first attempt.
@@ -2704,6 +2695,7 @@ class TmuxSession(TransportReplacementMixin):
         # seek-to-EOF default (#496 round-1 Case 3 reply-spam defense).
         self._tailer_first_bind_pending: bool = False
         self._prelaunch_transcripts: frozenset[Path] = frozenset()
+        self._transcript_discovery_floor: float = 0.0
         self._first_bind_wait_logged: bool = False
 
         # #1148 — lineage reported by the pane's SessionStart hook. A new
@@ -4413,6 +4405,19 @@ class TmuxSession(TransportReplacementMixin):
                 if not self._last_launch_used_continue
                 else frozenset()
             )
+            self._transcript_discovery_floor = (
+                time.time()
+                if self._last_launch_forced_fresh and self._trace_transport_kind == "tmux_claude"
+                else 0.0
+            )
+            if isinstance(self._tailer, TmuxTranscriptTailer):
+                if self._last_launch_forced_fresh:
+                    self._tailer.retire_binding(
+                        _PLACEHOLDER_TRANSCRIPT_PATH,
+                        discovery_floor=self._transcript_discovery_floor,
+                    )
+                else:
+                    self._tailer.set_discovery_floor(0.0)
             # Stamp before process creation so even an immediate current-
             # session hook POST is correctly considered fresh.
             session_started_at = time.time()
@@ -5983,6 +5988,8 @@ class TmuxSession(TransportReplacementMixin):
         )
         if accepted is False:
             return False
+        if isinstance(self._tailer, TmuxTranscriptTailer):
+            self._transcript_discovery_floor = 0.0
         # Consume the first-bind flag only after an accepted attempt, including
         # a path equality no-op. A refusal must leave the window available.
         self._tailer_first_bind_pending = False
@@ -7232,7 +7239,11 @@ class TmuxSession(TransportReplacementMixin):
         """
         if self._tailer is None:
             # ── Construction (first call only) ──────────────────────
-            guessed = self._discover_transcript_path()
+            # Reused names need SessionStart; a lost hook leaves them pending.
+            guessed = (
+                self._discover_post_launch_transcript_path()
+                if self._last_launch_forced_fresh else self._discover_transcript_path()
+            )
             # Even if guessed is None (cold start, no transcript yet)
             # we still construct the tailer so ``notify_tail()`` works
             # as soon as the SessionStart hook reports a path. Use a
@@ -7263,6 +7274,9 @@ class TmuxSession(TransportReplacementMixin):
                 # source that cannot exist yet.
                 on_bound_path_wedge=self._on_bound_path_wedge,
                 owned_projects=self._transcript_ownership,
+                discovery_floor=(
+                    self._transcript_discovery_floor if self._last_launch_forced_fresh else 0.0
+                ),
             )
             await self._tailer.start()
             if guessed is None:
@@ -7271,12 +7285,12 @@ class TmuxSession(TransportReplacementMixin):
                     f"path — awaiting SessionStart hook to report actual transcript"
                 )
             else:
-                # Seek to EOF on the existing file so we don't replay
-                # historical turns on a warm-wake / resume. The
-                # SessionStart hook (or the #565 delayed recovery)
-                # can ``set_offset(0)`` if a fresh backfill is wanted.
+                # Fresh discovery reads from byte zero; resume keeps the
+                # EOF defense against replaying historical turns.
                 try:
-                    self._tailer.set_offset(guessed.stat().st_size)
+                    self._tailer.set_offset(
+                        0 if self._last_launch_forced_fresh else guessed.stat().st_size
+                    )
                 except OSError:
                     # File disappeared between exists() check and
                     # stat() — race with Claude Code rotating /
@@ -7476,6 +7490,9 @@ class TmuxSession(TransportReplacementMixin):
         # Discovery can be satisfied by the tailer's independent self-heal.
         # Acknowledge it without rewinding bytes already consumed.
         if Path(discovered) == Path(self._tailer.transcript_path):
+            if isinstance(self._tailer, TmuxTranscriptTailer):
+                self._tailer.set_transcript_path(discovered)
+                self._transcript_discovery_floor = 0.0
             self._tailer_first_bind_pending = False
             _log(
                 f"tmux[{self.agent_name}]: #565 recovery: first bind already satisfied by self-heal"
@@ -7668,11 +7685,20 @@ class TmuxSession(TransportReplacementMixin):
 
     def _discover_post_launch_transcript_path(self) -> Path | None:
         """Find a new transcript path, excluding history modified at shutdown."""
+        discovery_floor = (
+            self._tailer.discovery_floor
+            if isinstance(self._tailer, TmuxTranscriptTailer)
+            else self._transcript_discovery_floor
+        )
         candidates = sorted(
             (
                 (path, mtime)
                 for path, mtime in self._transcript_candidates()
                 if path not in self._prelaunch_transcripts
+                and (self._trace_transport_kind != "tmux_claude"
+                     or not self._last_launch_forced_fresh
+                     or discovery_floor <= 0.0
+                     or mtime >= discovery_floor - _RETIRE_DISCOVERY_ALLOWANCE_SEC)
             ),
             key=lambda candidate: candidate[1],
             reverse=True,

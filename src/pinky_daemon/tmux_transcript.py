@@ -75,6 +75,20 @@ _FALLBACK_POLL_SEC = 2.0
 # to do on a hot file.
 _ACTIVE_POLL_SEC = 0.2
 
+# Retired-file discovery tolerates mtime granularity and small writer-clock skew.
+_RETIRE_DISCOVERY_ALLOWANCE_SEC = 2.0
+
+# Sentinel path used by ``_start_tailer`` when the transcript JSONL
+# doesn't exist yet (cold-start). The tailer's ``read_once`` treats
+# the non-existent file as "no data" and waits; once the SessionStart
+# hook reports the real path, ``set_transcript_path`` swaps to it.
+#
+# Defined as a module-level constant (issue #563) so the placeholder→real
+# transition can be detected reliably in ``TmuxSession.set_transcript_path``:
+# the seek-to-byte-0 behavior only applies on that first transition, not
+# on subsequent real→real swaps (compact-resume protected by #496).
+_PLACEHOLDER_TRANSCRIPT_PATH = Path("/dev/null/no-transcript-yet")
+
 
 def claude_project_slug(working_dir: str | Path) -> str:
     """Encode a working directory with the transcript discovery slug algorithm."""
@@ -343,6 +357,7 @@ class TmuxTranscriptTailer:
         on_entry: EntryCallback | None = None,
         on_bound_path_wedge: Callable[[Path, float], None] | None = None,
         owned_projects: frozenset[Path] | None = None,
+        discovery_floor: float = 0.0,
     ) -> None:
         self._path = Path(transcript_path)
         self._owned_projects = owned_projects
@@ -360,6 +375,8 @@ class TmuxTranscriptTailer:
         # because the freshly-bound JSONL hasn't hit disk yet. Re-stamped on
         # every real path change in ``set_transcript_path``.
         self._path_bound_at = 0.0
+        # Discovery age is independent of the real-bind wedge clock.
+        self._discovery_floor = discovery_floor
         self._on_turn_complete = on_turn_complete
         self._agent_name = agent_name or self._path.stem[:12]
         self._fallback_poll_sec = fallback_poll_sec
@@ -459,6 +476,29 @@ class TmuxTranscriptTailer:
         self._owned_projects = projects
         self._ownership_rejection_logged = False
 
+    @property
+    def discovery_floor(self) -> float:
+        """Retirement wall time for discovery; zero after an accepted bind."""
+        return self._discovery_floor
+
+    def set_discovery_floor(self, floor: float) -> None:
+        """Scope discovery age to the current launch without changing its binding."""
+        self._discovery_floor = floor
+
+    def retire_binding(self, placeholder: Path, *, discovery_floor: float | None = None) -> None:
+        """Discard the retired conversation before a fresh process is created."""
+        self._path = Path(placeholder)
+        self._path_bound_at = 0.0
+        self._discovery_floor = time.time() if discovery_floor is None else discovery_floor
+        self._bound_path_ever_materialized = False
+        self._bound_path_wedge_reported = False
+        self._ownership_rejection_logged = False
+        self._swap_generation += 1
+        self._offset = 0
+        self._buffer.drain()
+        self._active = False
+        self._wake_event.set()
+
     def set_transcript_path(
         self, path: Path, *, seek_to_start: bool = False,
     ) -> None:
@@ -507,6 +547,8 @@ class TmuxTranscriptTailer:
         discarding partial state, symmetric with the truncation/rotation
         path in ``_read_and_dispatch``).
         """
+        if Path(path) == _PLACEHOLDER_TRANSCRIPT_PATH:
+            return
         if Path(path) != self._path:
             self._path = Path(path)
             self._ownership_rejection_logged = False
@@ -529,6 +571,12 @@ class TmuxTranscriptTailer:
             self._buffer.drain()
             self._stats["rotations"] += 1
             self._wake_event.set()
+        elif self._path_bound_at == 0.0:
+            self._path_bound_at = time.time()
+            self._bound_path_ever_materialized = self._path.exists()
+            self._bound_path_wedge_reported = False
+        if self._path_bound_at != 0.0:
+            self._discovery_floor = 0.0
 
     def wake(self) -> None:
         """Signal the tail loop that new data is available now.
@@ -693,7 +741,10 @@ class TmuxTranscriptTailer:
             discovered_mtime = Path(discovered).stat().st_mtime
         except OSError:
             return
-        if discovered_mtime < self._path_bound_at:
+        discovery_floor = max(
+            self._path_bound_at, self._discovery_floor - _RETIRE_DISCOVERY_ALLOWANCE_SEC,
+        )
+        if discovered_mtime < discovery_floor:
             monotonic_now = time.monotonic()
             if (
                 self._last_stale_discovery_log_at == 0.0
@@ -703,7 +754,7 @@ class TmuxTranscriptTailer:
                 _log(
                     f"tmux_tailer[{self._agent_name}]: self-heal SKIP stale "
                     f"discovery {discovered} (mtime {discovered_mtime:.0f} "
-                    f"predates bind {self._path_bound_at:.0f}) — awaiting "
+                    f"predates floor {discovery_floor:.0f}) — awaiting "
                     f"bound path to materialise (#291)"
                 )
                 self._last_stale_discovery_log_at = monotonic_now
