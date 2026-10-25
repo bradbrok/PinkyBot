@@ -121,6 +121,7 @@ from pinky_daemon.tmux_targets import (
     text_argument,
 )
 from pinky_daemon.tmux_transcript import (
+    _PLACEHOLDER_TRANSCRIPT_PATH,
     _RETIRE_DISCOVERY_ALLOWANCE_SEC,
     TmuxTranscriptTailer,
     TurnResponse,
@@ -585,17 +586,6 @@ def _adaptive_paste_enter_delay_ms(text: str) -> int:
         len(text) // _PASTE_ENTER_DELAY_CHARS_PER_MS
     )
     return min(_PASTE_ENTER_MAX_DELAY_MS, scaled)
-
-# Sentinel path used by ``_start_tailer`` when the transcript JSONL
-# doesn't exist yet (cold-start). The tailer's ``read_once`` treats
-# the non-existent file as "no data" and waits; once the SessionStart
-# hook reports the real path, ``set_transcript_path`` swaps to it.
-#
-# Defined as a module-level constant (issue #563) so the placeholder→real
-# transition can be detected reliably in ``TmuxSession.set_transcript_path``:
-# the seek-to-byte-0 behavior only applies on that first transition, not
-# on subsequent real→real swaps (compact-resume protected by #496).
-_PLACEHOLDER_TRANSCRIPT_PATH = Path("/dev/null/no-transcript-yet")
 
 # Poll for a fresh transcript when the startup hook is lost. Transcripts
 # can appear lazily after the first prompt, well after the first attempt.
@@ -7501,7 +7491,7 @@ class TmuxSession(TransportReplacementMixin):
         # Acknowledge it without rewinding bytes already consumed.
         if Path(discovered) == Path(self._tailer.transcript_path):
             if isinstance(self._tailer, TmuxTranscriptTailer):
-                self._tailer.set_discovery_floor(0.0)
+                self._tailer.set_transcript_path(discovered)
                 self._transcript_discovery_floor = 0.0
             self._tailer_first_bind_pending = False
             _log(

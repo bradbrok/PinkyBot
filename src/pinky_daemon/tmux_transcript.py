@@ -78,6 +78,17 @@ _ACTIVE_POLL_SEC = 0.2
 # Retired-file discovery tolerates mtime granularity and small writer-clock skew.
 _RETIRE_DISCOVERY_ALLOWANCE_SEC = 2.0
 
+# Sentinel path used by ``_start_tailer`` when the transcript JSONL
+# doesn't exist yet (cold-start). The tailer's ``read_once`` treats
+# the non-existent file as "no data" and waits; once the SessionStart
+# hook reports the real path, ``set_transcript_path`` swaps to it.
+#
+# Defined as a module-level constant (issue #563) so the placeholder→real
+# transition can be detected reliably in ``TmuxSession.set_transcript_path``:
+# the seek-to-byte-0 behavior only applies on that first transition, not
+# on subsequent real→real swaps (compact-resume protected by #496).
+_PLACEHOLDER_TRANSCRIPT_PATH = Path("/dev/null/no-transcript-yet")
+
 
 def claude_project_slug(working_dir: str | Path) -> str:
     """Encode a working directory with the transcript discovery slug algorithm."""
@@ -536,7 +547,8 @@ class TmuxTranscriptTailer:
         discarding partial state, symmetric with the truncation/rotation
         path in ``_read_and_dispatch``).
         """
-        self._discovery_floor = 0.0
+        if Path(path) == _PLACEHOLDER_TRANSCRIPT_PATH:
+            return
         if Path(path) != self._path:
             self._path = Path(path)
             self._ownership_rejection_logged = False
@@ -559,6 +571,12 @@ class TmuxTranscriptTailer:
             self._buffer.drain()
             self._stats["rotations"] += 1
             self._wake_event.set()
+        elif self._path_bound_at == 0.0:
+            self._path_bound_at = time.time()
+            self._bound_path_ever_materialized = self._path.exists()
+            self._bound_path_wedge_reported = False
+        if self._path_bound_at != 0.0:
+            self._discovery_floor = 0.0
 
     def wake(self) -> None:
         """Signal the tail loop that new data is available now.
