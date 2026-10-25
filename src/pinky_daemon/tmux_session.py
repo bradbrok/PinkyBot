@@ -7254,6 +7254,7 @@ class TmuxSession(TransportReplacementMixin):
                 # the live window instead of freezing at the previous
                 # turn's value for the whole in-flight turn.
                 on_usage=self._on_transcript_usage,
+                accept_transcript=self._is_current_launch_transcript,
                 # Scheduler receipts require an exact user/dequeue transcript
                 # observation; successful external-pane keystrokes are weaker.
                 on_entry=self._on_transcript_entry,
@@ -7665,6 +7666,10 @@ class TmuxSession(TransportReplacementMixin):
     def _is_own_transcript(self, path: Path) -> bool:
         """The default runtime has a dedicated transcript directory per workspace."""
         return True
+
+    def _is_current_launch_transcript(self, path: Path) -> bool:
+        """Exclude pre-launch history when replacing the conversation."""
+        return not self._last_launch_forced_fresh or path not in self._prelaunch_transcripts
 
     def _discover_post_launch_transcript_path(self) -> Path | None:
         """Find a new transcript path, excluding history modified at shutdown."""
