@@ -121,6 +121,7 @@ from pinky_daemon.tmux_targets import (
     text_argument,
 )
 from pinky_daemon.tmux_transcript import (
+    _RETIRE_DISCOVERY_ALLOWANCE_SEC,
     TmuxTranscriptTailer,
     TurnResponse,
     claude_project_slug,
@@ -4415,12 +4416,18 @@ class TmuxSession(TransportReplacementMixin):
                 else frozenset()
             )
             self._transcript_discovery_floor = (
-                time.time() if self._last_launch_forced_fresh else 0.0
+                time.time()
+                if self._last_launch_forced_fresh and self._trace_transport_kind == "tmux_claude"
+                else 0.0
             )
-            if self._last_launch_forced_fresh and isinstance(self._tailer, TmuxTranscriptTailer):
-                self._tailer.retire_binding(
-                    _PLACEHOLDER_TRANSCRIPT_PATH, discovery_floor=self._transcript_discovery_floor,
-                )
+            if isinstance(self._tailer, TmuxTranscriptTailer):
+                if self._last_launch_forced_fresh:
+                    self._tailer.retire_binding(
+                        _PLACEHOLDER_TRANSCRIPT_PATH,
+                        discovery_floor=self._transcript_discovery_floor,
+                    )
+                else:
+                    self._tailer.set_discovery_floor(0.0)
             # Stamp before process creation so even an immediate current-
             # session hook POST is correctly considered fresh.
             session_started_at = time.time()
@@ -5991,6 +5998,8 @@ class TmuxSession(TransportReplacementMixin):
         )
         if accepted is False:
             return False
+        if isinstance(self._tailer, TmuxTranscriptTailer):
+            self._transcript_discovery_floor = 0.0
         # Consume the first-bind flag only after an accepted attempt, including
         # a path equality no-op. A refusal must leave the window available.
         self._tailer_first_bind_pending = False
@@ -7491,6 +7500,9 @@ class TmuxSession(TransportReplacementMixin):
         # Discovery can be satisfied by the tailer's independent self-heal.
         # Acknowledge it without rewinding bytes already consumed.
         if Path(discovered) == Path(self._tailer.transcript_path):
+            if isinstance(self._tailer, TmuxTranscriptTailer):
+                self._tailer.set_discovery_floor(0.0)
+                self._transcript_discovery_floor = 0.0
             self._tailer_first_bind_pending = False
             _log(
                 f"tmux[{self.agent_name}]: #565 recovery: first bind already satisfied by self-heal"
@@ -7683,13 +7695,20 @@ class TmuxSession(TransportReplacementMixin):
 
     def _discover_post_launch_transcript_path(self) -> Path | None:
         """Find a new transcript path, excluding history modified at shutdown."""
+        discovery_floor = (
+            self._tailer.discovery_floor
+            if isinstance(self._tailer, TmuxTranscriptTailer)
+            else self._transcript_discovery_floor
+        )
         candidates = sorted(
             (
                 (path, mtime)
                 for path, mtime in self._transcript_candidates()
                 if path not in self._prelaunch_transcripts
-                and (not self._last_launch_forced_fresh
-                     or mtime >= self._transcript_discovery_floor)
+                and (self._trace_transport_kind != "tmux_claude"
+                     or not self._last_launch_forced_fresh
+                     or discovery_floor <= 0.0
+                     or mtime >= discovery_floor - _RETIRE_DISCOVERY_ALLOWANCE_SEC)
             ),
             key=lambda candidate: candidate[1],
             reverse=True,

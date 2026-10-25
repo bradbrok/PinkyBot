@@ -75,6 +75,9 @@ _FALLBACK_POLL_SEC = 2.0
 # to do on a hot file.
 _ACTIVE_POLL_SEC = 0.2
 
+# Retired-file discovery tolerates mtime granularity and small writer-clock skew.
+_RETIRE_DISCOVERY_ALLOWANCE_SEC = 2.0
+
 
 def claude_project_slug(working_dir: str | Path) -> str:
     """Encode a working directory with the transcript discovery slug algorithm."""
@@ -462,6 +465,15 @@ class TmuxTranscriptTailer:
         self._owned_projects = projects
         self._ownership_rejection_logged = False
 
+    @property
+    def discovery_floor(self) -> float:
+        """Retirement wall time for discovery; zero after an accepted bind."""
+        return self._discovery_floor
+
+    def set_discovery_floor(self, floor: float) -> None:
+        """Scope discovery age to the current launch without changing its binding."""
+        self._discovery_floor = floor
+
     def retire_binding(self, placeholder: Path, *, discovery_floor: float | None = None) -> None:
         """Discard the retired conversation before a fresh process is created."""
         self._path = Path(placeholder)
@@ -524,6 +536,7 @@ class TmuxTranscriptTailer:
         discarding partial state, symmetric with the truncation/rotation
         path in ``_read_and_dispatch``).
         """
+        self._discovery_floor = 0.0
         if Path(path) != self._path:
             self._path = Path(path)
             self._ownership_rejection_logged = False
@@ -710,7 +723,9 @@ class TmuxTranscriptTailer:
             discovered_mtime = Path(discovered).stat().st_mtime
         except OSError:
             return
-        discovery_floor = max(self._path_bound_at, self._discovery_floor)
+        discovery_floor = max(
+            self._path_bound_at, self._discovery_floor - _RETIRE_DISCOVERY_ALLOWANCE_SEC,
+        )
         if discovered_mtime < discovery_floor:
             monotonic_now = time.monotonic()
             if (
