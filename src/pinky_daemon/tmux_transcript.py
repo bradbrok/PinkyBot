@@ -343,6 +343,7 @@ class TmuxTranscriptTailer:
         on_entry: EntryCallback | None = None,
         on_bound_path_wedge: Callable[[Path, float], None] | None = None,
         owned_projects: frozenset[Path] | None = None,
+        discovery_floor: float = 0.0,
     ) -> None:
         self._path = Path(transcript_path)
         self._owned_projects = owned_projects
@@ -360,6 +361,8 @@ class TmuxTranscriptTailer:
         # because the freshly-bound JSONL hasn't hit disk yet. Re-stamped on
         # every real path change in ``set_transcript_path``.
         self._path_bound_at = 0.0
+        # Discovery age is independent of the real-bind wedge clock.
+        self._discovery_floor = discovery_floor
         self._on_turn_complete = on_turn_complete
         self._agent_name = agent_name or self._path.stem[:12]
         self._fallback_poll_sec = fallback_poll_sec
@@ -459,10 +462,11 @@ class TmuxTranscriptTailer:
         self._owned_projects = projects
         self._ownership_rejection_logged = False
 
-    def retire_binding(self, placeholder: Path) -> None:
+    def retire_binding(self, placeholder: Path, *, discovery_floor: float | None = None) -> None:
         """Discard the retired conversation before a fresh process is created."""
         self._path = Path(placeholder)
         self._path_bound_at = 0.0
+        self._discovery_floor = time.time() if discovery_floor is None else discovery_floor
         self._bound_path_ever_materialized = False
         self._bound_path_wedge_reported = False
         self._ownership_rejection_logged = False
@@ -706,7 +710,8 @@ class TmuxTranscriptTailer:
             discovered_mtime = Path(discovered).stat().st_mtime
         except OSError:
             return
-        if discovered_mtime < self._path_bound_at:
+        discovery_floor = max(self._path_bound_at, self._discovery_floor)
+        if discovered_mtime < discovery_floor:
             monotonic_now = time.monotonic()
             if (
                 self._last_stale_discovery_log_at == 0.0
@@ -716,7 +721,7 @@ class TmuxTranscriptTailer:
                 _log(
                     f"tmux_tailer[{self._agent_name}]: self-heal SKIP stale "
                     f"discovery {discovered} (mtime {discovered_mtime:.0f} "
-                    f"predates bind {self._path_bound_at:.0f}) — awaiting "
+                    f"predates floor {discovery_floor:.0f}) — awaiting "
                     f"bound path to materialise (#291)"
                 )
                 self._last_stale_discovery_log_at = monotonic_now

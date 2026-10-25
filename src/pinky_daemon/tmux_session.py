@@ -2704,6 +2704,7 @@ class TmuxSession(TransportReplacementMixin):
         # seek-to-EOF default (#496 round-1 Case 3 reply-spam defense).
         self._tailer_first_bind_pending: bool = False
         self._prelaunch_transcripts: frozenset[Path] = frozenset()
+        self._transcript_discovery_floor: float = 0.0
         self._first_bind_wait_logged: bool = False
 
         # #1148 — lineage reported by the pane's SessionStart hook. A new
@@ -4413,8 +4414,13 @@ class TmuxSession(TransportReplacementMixin):
                 if not self._last_launch_used_continue
                 else frozenset()
             )
+            self._transcript_discovery_floor = (
+                time.time() if self._last_launch_forced_fresh else 0.0
+            )
             if self._last_launch_forced_fresh and isinstance(self._tailer, TmuxTranscriptTailer):
-                self._tailer.retire_binding(_PLACEHOLDER_TRANSCRIPT_PATH)
+                self._tailer.retire_binding(
+                    _PLACEHOLDER_TRANSCRIPT_PATH, discovery_floor=self._transcript_discovery_floor,
+                )
             # Stamp before process creation so even an immediate current-
             # session hook POST is correctly considered fresh.
             session_started_at = time.time()
@@ -7269,6 +7275,9 @@ class TmuxSession(TransportReplacementMixin):
                 # source that cannot exist yet.
                 on_bound_path_wedge=self._on_bound_path_wedge,
                 owned_projects=self._transcript_ownership,
+                discovery_floor=(
+                    self._transcript_discovery_floor if self._last_launch_forced_fresh else 0.0
+                ),
             )
             await self._tailer.start()
             if guessed is None:
@@ -7679,6 +7688,8 @@ class TmuxSession(TransportReplacementMixin):
                 (path, mtime)
                 for path, mtime in self._transcript_candidates()
                 if path not in self._prelaunch_transcripts
+                and (not self._last_launch_forced_fresh
+                     or mtime >= self._transcript_discovery_floor)
             ),
             key=lambda candidate: candidate[1],
             reverse=True,
