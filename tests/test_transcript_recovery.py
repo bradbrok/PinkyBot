@@ -119,7 +119,12 @@ async def test_recovery_acknowledges_self_heal_without_rewind(tmp_path, monkeypa
     def tick(number):
         if number == 1:
             _write_transcript(new, ss._config.working_dir)
-            os.utime(new, (getattr(ss._tailer, "_path_bound_at", new.stat().st_mtime) + 10,) * 2)
+            mtime = max(
+                new.stat().st_mtime,
+                getattr(ss._tailer, "_path_bound_at", 0.0),
+                getattr(ss, "_transcript_discovery_floor", 0.0),
+            ) + 10
+            os.utime(new, (mtime,) * 2)
             ss._tailer._try_self_heal_repoint()
             assert ss._tailer.transcript_path == new
             ss._tailer.set_offset(7)

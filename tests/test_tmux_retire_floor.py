@@ -116,7 +116,7 @@ async def test_old_file_surfacing_in_spawn_waits_for_current_content(relaunch, r
 
 
 @pytest.mark.parametrize("origin", ["retired", "constructed"])
-@pytest.mark.parametrize("delta", [-1, 0, 1], ids=["old", "equal", "new"])
+@pytest.mark.parametrize("delta", [-3, 0, 1], ids=["old", "equal", "new"])
 async def test_unbound_reader_keeps_a_strict_discovery_floor(tmp_path, monkeypatch, origin, delta):
     monkeypatch.setattr(tmux_transcript.time, "time", lambda: 1_000.0)
     candidate = tmp_path / "candidate.jsonl"
