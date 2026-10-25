@@ -4413,6 +4413,8 @@ class TmuxSession(TransportReplacementMixin):
                 if not self._last_launch_used_continue
                 else frozenset()
             )
+            if self._last_launch_forced_fresh and isinstance(self._tailer, TmuxTranscriptTailer):
+                self._tailer.retire_binding(_PLACEHOLDER_TRANSCRIPT_PATH)
             # Stamp before process creation so even an immediate current-
             # session hook POST is correctly considered fresh.
             session_started_at = time.time()
@@ -7232,7 +7234,11 @@ class TmuxSession(TransportReplacementMixin):
         """
         if self._tailer is None:
             # ── Construction (first call only) ──────────────────────
-            guessed = self._discover_transcript_path()
+            # Reused names need SessionStart; a lost hook leaves them pending.
+            guessed = (
+                self._discover_post_launch_transcript_path()
+                if self._last_launch_forced_fresh else self._discover_transcript_path()
+            )
             # Even if guessed is None (cold start, no transcript yet)
             # we still construct the tailer so ``notify_tail()`` works
             # as soon as the SessionStart hook reports a path. Use a
@@ -7254,7 +7260,6 @@ class TmuxSession(TransportReplacementMixin):
                 # the live window instead of freezing at the previous
                 # turn's value for the whole in-flight turn.
                 on_usage=self._on_transcript_usage,
-                accept_transcript=self._is_current_launch_transcript,
                 # Scheduler receipts require an exact user/dequeue transcript
                 # observation; successful external-pane keystrokes are weaker.
                 on_entry=self._on_transcript_entry,
@@ -7272,12 +7277,12 @@ class TmuxSession(TransportReplacementMixin):
                     f"path — awaiting SessionStart hook to report actual transcript"
                 )
             else:
-                # Seek to EOF on the existing file so we don't replay
-                # historical turns on a warm-wake / resume. The
-                # SessionStart hook (or the #565 delayed recovery)
-                # can ``set_offset(0)`` if a fresh backfill is wanted.
+                # Fresh discovery reads from byte zero; resume keeps the
+                # EOF defense against replaying historical turns.
                 try:
-                    self._tailer.set_offset(guessed.stat().st_size)
+                    self._tailer.set_offset(
+                        0 if self._last_launch_forced_fresh else guessed.stat().st_size
+                    )
                 except OSError:
                     # File disappeared between exists() check and
                     # stat() — race with Claude Code rotating /
@@ -7666,10 +7671,6 @@ class TmuxSession(TransportReplacementMixin):
     def _is_own_transcript(self, path: Path) -> bool:
         """The default runtime has a dedicated transcript directory per workspace."""
         return True
-
-    def _is_current_launch_transcript(self, path: Path) -> bool:
-        """Exclude pre-launch history when replacing the conversation."""
-        return not self._last_launch_forced_fresh or path not in self._prelaunch_transcripts
 
     def _discover_post_launch_transcript_path(self) -> Path | None:
         """Find a new transcript path, excluding history modified at shutdown."""

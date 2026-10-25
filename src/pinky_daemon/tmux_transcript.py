@@ -340,7 +340,6 @@ class TmuxTranscriptTailer:
         active_poll_sec: float = _ACTIVE_POLL_SEC,
         path_discovery: Callable[[], Path | None] | None = None,
         on_usage: Callable[[dict], None] | None = None,
-        accept_transcript: Callable[[Path], bool] | None = None,
         on_entry: EntryCallback | None = None,
         on_bound_path_wedge: Callable[[Path, float], None] | None = None,
         owned_projects: frozenset[Path] | None = None,
@@ -386,7 +385,6 @@ class TmuxTranscriptTailer:
         # transcript-swap race that ``_swap_generation`` guards around
         # turn callbacks.
         self._on_usage = on_usage
-        self._accept_transcript = accept_transcript
         # Raw-entry hook used by TmuxSession to observe prompt acceptance.
         # Sync so reading a chunk has no new suspension point.
         self._on_entry = _bind_entry_callback(on_entry)
@@ -460,6 +458,19 @@ class TmuxTranscriptTailer:
     def set_owned_projects(self, projects: frozenset[Path]) -> None:
         self._owned_projects = projects
         self._ownership_rejection_logged = False
+
+    def retire_binding(self, placeholder: Path) -> None:
+        """Discard the retired conversation before a fresh process is created."""
+        self._path = Path(placeholder)
+        self._path_bound_at = 0.0
+        self._bound_path_ever_materialized = False
+        self._bound_path_wedge_reported = False
+        self._ownership_rejection_logged = False
+        self._swap_generation += 1
+        self._offset = 0
+        self._buffer.drain()
+        self._active = False
+        self._wake_event.set()
 
     def set_transcript_path(
         self, path: Path, *, seek_to_start: bool = False,
@@ -760,9 +771,6 @@ class TmuxTranscriptTailer:
                 f"raised ({type(e).__name__}: {e})"
             )
 
-    def _accepts_current_path(self) -> bool:
-        return self._accept_transcript is None or self._accept_transcript(self._path)
-
     async def _read_and_dispatch(self) -> int:
         """Read from ``_offset`` to EOF, feed each JSONL entry, fire
         ``on_turn_complete`` per stop_hook_summary.
@@ -770,7 +778,7 @@ class TmuxTranscriptTailer:
         Returns number of bytes consumed. Zero if file doesn't exist yet
         (cold start before claude has written anything).
         """
-        if not self._accepts_current_path() or not self._path.exists():
+        if not self._path.exists():
             return 0
         # Snapshot for the mid-chunk swap check below. The only awaits in
         # this method are the turn callbacks; everything else is sync, so
@@ -913,9 +921,6 @@ class TmuxTranscriptTailer:
                     self._active = False
                     self._stats["turns_fired"] += 1
                     await self._safe_callback(response)
-                    # A fresh launch can retire the same path while awaited.
-                    if not self._accepts_current_path():
-                        return bytes_read
                     if self._swap_generation != generation:
                         # ``set_transcript_path`` swapped the watched file
                         # while the callback was awaited. The rest of this

@@ -101,7 +101,9 @@ async def relaunch(tmp_path, monkeypatch):
         assert session._last_launch_forced_fresh is fresh
         assert (session._tailer is original_tailer) is retained
         assert session._tailer.transcript_path == (
-            current if create_during_spawn and not retained else previous
+            current if create_during_spawn and not retained else (
+                tmux_session._PLACEHOLDER_TRANSCRIPT_PATH if fresh else previous
+            )
         )
         assert session.usage.total_turns == 3
         assert session.usage.input_tokens == 123
