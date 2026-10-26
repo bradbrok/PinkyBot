@@ -66,7 +66,7 @@ def report_of(result: subprocess.CompletedProcess[str], root: Path, *, ok: bool)
     assert set(report) == {"ok", "root", "checked", "findings", "warnings_count", "warnings"}
     assert report["ok"] is ok
     assert report["root"] == os.path.realpath(root)
-    assert report["checked"] == ["import", "layout"]
+    assert report["checked"] == ["import", "layout", "guard_selftest"]
     assert isinstance(report["findings"], list)
     assert type(report["warnings_count"]) is int
     assert all(isinstance(warning, str) for warning in report["warnings"])
