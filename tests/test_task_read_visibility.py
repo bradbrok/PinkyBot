@@ -6,7 +6,11 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from pinky_daemon.auth import SESSION_COOKIE_NAME, create_session_cookie
+from pinky_daemon.auth import (
+    SESSION_COOKIE_NAME,
+    build_internal_auth_headers,
+    create_session_cookie,
+)
 from pinky_daemon.routes import projects_tasks
 from tests.conftest import TEST_SESSION_SECRET
 from tests.isolated_policy_support import daemon as daemon
@@ -243,3 +247,106 @@ def test_self_health_already_counts_only_own_tasks(data):
 def test_missing_comments_unrestricted_behavior_is_preserved(data):
     response = read(data, "/tasks/987654321/comments", "normal")
     assert (response.status_code, response.json()) == (200, {"comments": [], "count": 0})
+
+
+@pytest.fixture
+def workload(data):
+    for role, (assigned, creator) in ROLES.items():
+        for status in ("in_progress", "blocked"):
+            data.rows[role, status] = data.store.create(
+                f"{role} {status}", assigned_agent=assigned, created_by=creator,
+                status=status, priority="urgent" if role == "hidden" else "normal",
+            )
+    return data
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+def test_health_unknown_verified_caller_has_scoped_workload(workload, monkeypatch, mode):
+    monkeypatch.setenv("PINKY_ISOLATED_POLICY_MODE", mode)
+    key = workload.d.agents.get_or_create_signing_key("unknown")
+    assert workload.d.agents.get("unknown") is None
+
+    def get(path):
+        headers = build_internal_auth_headers(key, agent_name="unknown", method="GET", path=path)
+        return workload.client.get(path, headers=headers)
+
+    assert get("/tasks/stats").json() == {
+        "by_status": {"pending": 2, "completed": 1, "cancelled": 1, "in_progress": 1, "blocked": 1},
+        "by_agent": {},
+    }
+    response = get("/agents/peer/health")
+    assert response.status_code == 200
+    assert response.json()["tasks"] == {"total_active": 0, "pending": 0, "in_progress": 0, "blocked": 0}
+
+    # A caller-created peer assignment is visible; unrelated visible rows are
+    # still excluded by the health route's target-assignment filter.
+    workload.store.create("Created assignment", assigned_agent="peer", created_by="unknown", status="blocked")
+    workload.store.create("Own assignment", assigned_agent="unknown", created_by="peer")
+    workload.store.create("Unassigned work", created_by="unknown")
+    response = get("/agents/peer/health")
+    assert response.status_code == 200
+    assert response.json()["tasks"] == {"total_active": 1, "pending": 0, "in_progress": 0, "blocked": 1}
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("state", ["missing", "null_flag", "zero_flag"])
+def test_health_uncertain_caller_has_scoped_workload(workload, monkeypatch, state, mode):
+    monkeypatch.setenv("PINKY_ISOLATED_POLICY_MODE", mode)
+    path = "/agents/peer/health"
+    headers = signed(workload.d, "GET", path)
+    original = workload.d.agents.get
+
+    def get(name):
+        if name == "tenant":
+            if state == "missing":
+                return None
+            return SimpleNamespace(isolated=None if state == "null_flag" else 0)
+        return original(name)
+
+    monkeypatch.setattr(workload.d.agents, "get", get)
+    response = workload.client.get(path, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["tasks"] == {"total_active": 4, "pending": 2, "in_progress": 1, "blocked": 1}
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("actor", ["tenant", "normal", "browser", "unsigned"])
+def test_health_workload_auth_controls(workload, monkeypatch, actor, mode):
+    monkeypatch.setenv("PINKY_ISOLATED_POLICY_MODE", mode)
+    if actor == "browser":
+        workload.client.cookies.set(SESSION_COOKIE_NAME, create_session_cookie(TEST_SESSION_SECRET))
+    target = "tenant" if actor == "tenant" else "peer"
+    response = read(workload, f"/agents/{target}/health", actor if actor in ("tenant", "normal") else "")
+    if actor == "unsigned":
+        assert response.status_code == 401
+        return
+    assert response.status_code == 200
+    count = 1 if actor == "tenant" else 2
+    assert response.json()["tasks"] == {
+        "total_active": 4*count, "pending": 2*count, "in_progress": count, "blocked": count,
+    }
+    if actor == "tenant":
+        assert read(workload, "/agents/peer/health").status_code == 403
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+def test_next_in_progress_excludes_private_peer_task(workload, monkeypatch, mode):
+    monkeypatch.setenv("PINKY_ISOLATED_POLICY_MODE", mode)
+    for task in workload.rows.values():
+        if task.status == "pending":
+            workload.store.update(task.id, status="completed")
+    assert workload.store.list(status="pending") == []
+    assert workload.store.list(assigned_agent="peer", status="in_progress")[0].id == workload.rows["hidden", "in_progress"].id
+    path = "/tasks/next?agent_name=peer"
+    response = read(workload, path)
+    assert response.status_code == 200
+    assert response.json() == {"task": workload.rows["created", "in_progress"].to_dict(), "source": "in_progress"}
+    control = read(workload, path, "normal")
+    assert control.status_code == 200
+    assert control.json() == {"task": workload.rows["hidden", "in_progress"].to_dict(), "source": "in_progress"}
+    for (role, _), task in workload.rows.items():
+        if role != "hidden":
+            workload.store.update(task.id, status="completed")
+    response = read(workload, path)
+    assert response.status_code == 200
+    assert response.json() == {"task": None, "source": "none"}
