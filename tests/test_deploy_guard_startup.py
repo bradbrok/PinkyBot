@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import threading
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -435,19 +436,26 @@ def test_dependency_install_has_one_implementation():
     )
 
 
-def test_alert_sender_does_not_follow_redirects(tmp_path, caplog):
+def test_alert_sender_does_not_follow_redirects(tmp_path, caplog, monkeypatch):
     g = guard_module()
-    calls = []
+    calls, errors = [], []
+    original_error = g.report_error
 
-    class Handler(BaseHTTPRequestHandler):
-        def do_POST(self):
-            calls.append("POST")
-            self.send_response(302)
-            self.send_header("Location", "/followed")
-            self.end_headers()
+    def require_redirect_error(directory, message, exc=None, **kwargs):
+        assert isinstance(exc, urllib.error.HTTPError), type(exc).__name__
+        assert exc.code == 302
+        errors.append(exc.code)
+        original_error(directory, message, exc, **kwargs)
 
+    class Target(BaseHTTPRequestHandler):
         def do_GET(self):
-            calls.append("GET")
+            calls.append(("target", "GET"))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+
+        def do_POST(self):
+            calls.append(("target", "POST"))
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b'{"ok":true}')
@@ -455,8 +463,23 @@ def test_alert_sender_does_not_follow_redirects(tmp_path, caplog):
         def log_message(self, *args):
             pass
 
+    target = ThreadingHTTPServer(("127.0.0.1", 0), Target)
+    reached = threading.Event()
+
+    class Origin(BaseHTTPRequestHandler):
+        def do_POST(self):
+            calls.append(("origin", "POST"))
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{target.server_port}/followed")
+            self.end_headers()
+            reached.set()
+
+        def log_message(self, *args):
+            pass
+
     state = tmp_path / "deploy"
-    g.refresh_alert_route(
+    assert g.refresh_alert_route(
         state,
         [
             dict(
@@ -467,16 +490,22 @@ def test_alert_sender_does_not_follow_redirects(tmp_path, caplog):
             )
         ],
     )
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    worker = threading.Thread(target=server.serve_forever, daemon=True)
-    worker.start()
+    monkeypatch.setattr(g, "report_error", require_redirect_error)
+    origin = ThreadingHTTPServer(("127.0.0.1", 0), Origin)
+    servers = [origin, target]
+    workers = [threading.Thread(target=server.serve_forever, daemon=True) for server in servers]
+    for worker in workers:
+        worker.start()
     try:
         assert not g.send_alert(
-            state, "fixture alert", base_url=f"http://127.0.0.1:{server.server_port}"
+            state, "fixture alert", base_url=f"http://127.0.0.1:{origin.server_port}"
         )
-        assert calls == ["POST"]
+        assert reached.wait(1)
+        assert errors == [302] and calls == [("origin", "POST")]
         assert TOKEN not in caplog.text
     finally:
-        server.shutdown()
-        server.server_close()
-        worker.join(timeout=2)
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+        for worker in workers:
+            worker.join(timeout=2)
