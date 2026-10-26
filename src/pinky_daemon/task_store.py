@@ -187,6 +187,13 @@ class Task:
         }
 
 
+def _task_visibility(visible_to: str) -> tuple[str, tuple[str, ...]]:
+    """SQL predicate for an optional caller-scoped read; values stay bound."""
+    if not visible_to:
+        return "1", ()
+    return "(assigned_agent='' OR assigned_agent=? OR created_by=?)", (visible_to, visible_to)
+
+
 class TaskStore:
     """SQLite-backed task management."""
 
@@ -416,9 +423,12 @@ class TaskStore:
         _log(f"tasks: created #{cursor.lastrowid} '{title}'")
         return self.get(cursor.lastrowid)  # type: ignore
 
-    def get(self, task_id: int) -> Task | None:
+    def get(self, task_id: int, *, visible_to: str = "") -> Task | None:
         """Get a task by ID."""
-        row = self._read_one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        visibility, params = _task_visibility(visible_to)
+        row = self._read_one(
+            f"SELECT * FROM tasks WHERE id=? AND {visibility}", (task_id, *params),
+        )
         if not row:
             return None
         return self._row_to_task(row)
@@ -482,10 +492,16 @@ class TaskStore:
         parent_id: int | None = None,
         include_completed: bool = False,
         limit: int = 100,
+        visible_to: str = "",
     ) -> list[Task]:
         """List tasks with optional filters."""
         conditions = []
         params: list = []
+
+        if visible_to:
+            visibility, visibility_params = _task_visibility(visible_to)
+            conditions.append(visibility)
+            params.extend(visibility_params)
 
         if status:
             conditions.append("status=?")
@@ -530,21 +546,25 @@ class TaskStore:
 
         return [self._row_to_task(r) for r in rows]
 
-    def get_subtasks(self, parent_id: int) -> list[Task]:
+    def get_subtasks(self, parent_id: int, *, visible_to: str = "") -> list[Task]:
         """Get all subtasks of a task."""
-        return self.list(parent_id=parent_id, include_completed=True)
+        return self.list(parent_id=parent_id, include_completed=True, visible_to=visible_to)
 
-    def count_by_status(self) -> dict[str, int]:
+    def count_by_status(self, *, visible_to: str = "") -> dict[str, int]:
         """Get task counts grouped by status."""
-        rows = self._read("SELECT status, COUNT(*) FROM tasks GROUP BY status")
+        visibility, params = _task_visibility(visible_to)
+        rows = self._read(
+            f"SELECT status, COUNT(*) FROM tasks WHERE {visibility} GROUP BY status", params,
+        )
         return {r[0]: r[1] for r in rows}
 
-    def count_by_agent(self) -> dict[str, int]:
+    def count_by_agent(self, *, visible_to: str = "") -> dict[str, int]:
         """Get active task counts grouped by assigned agent."""
+        visibility, params = _task_visibility(visible_to)
         rows = self._read(
-            """SELECT assigned_agent, COUNT(*) FROM tasks
+            f"""SELECT assigned_agent, COUNT(*) FROM tasks
                WHERE status NOT IN ('completed', 'cancelled') AND assigned_agent != ''
-               GROUP BY assigned_agent"""
+               AND {visibility} GROUP BY assigned_agent""", params,
         )
         return {r[0]: r[1] for r in rows}
 
@@ -848,18 +868,19 @@ class TaskStore:
         """Set sprint status to completed."""
         return self.update_sprint(sprint_id, status="completed")
 
-    def count_tasks_by_sprint(self, sprint_id: int) -> dict:
+    def count_tasks_by_sprint(self, sprint_id: int, *, visible_to: str = "") -> dict:
         """Return total and completed task counts for a sprint."""
+        visibility, params = _task_visibility(visible_to)
         rows = self._read(
-            "SELECT status, COUNT(*) FROM tasks WHERE sprint_id=? GROUP BY status",
-            (sprint_id,),
+            f"SELECT status, COUNT(*) FROM tasks WHERE sprint_id=? AND {visibility} GROUP BY status",
+            (sprint_id, *params),
         )
         counts = {r[0]: r[1] for r in rows}
         total = sum(counts.values())
         completed = counts.get("completed", 0) + counts.get("cancelled", 0)
         return {"total": total, "completed": completed}
 
-    def get_sprint_burndown(self, sprint_id: int) -> list[dict]:
+    def get_sprint_burndown(self, sprint_id: int, *, visible_to: str = "") -> list[dict]:
         """Return daily burndown time series for a sprint.
 
         Each entry: {date, completed, cumulative, total}
@@ -871,9 +892,10 @@ class TaskStore:
         if not sprint:
             return []
 
+        visibility, params = _task_visibility(visible_to)
         rows = self._read(
-            "SELECT status, updated_at FROM tasks WHERE sprint_id=?",
-            (sprint_id,),
+            f"SELECT status, updated_at FROM tasks WHERE sprint_id=? AND {visibility}",
+            (sprint_id, *params),
         )
 
         total = len(rows)
@@ -925,20 +947,22 @@ class TaskStore:
 
         return series
 
-    def count_tasks_by_milestone(self, project_id: int) -> dict[int, int]:
+    def count_tasks_by_milestone(self, project_id: int, *, visible_to: str = "") -> dict[int, int]:
         """Return task counts keyed by milestone_id for a project."""
+        visibility, params = _task_visibility(visible_to)
         rows = self._read(
-            "SELECT milestone_id, COUNT(*) FROM tasks WHERE project_id=? GROUP BY milestone_id",
-            (project_id,),
+            f"SELECT milestone_id, COUNT(*) FROM tasks WHERE project_id=? AND {visibility} GROUP BY milestone_id",
+            (project_id, *params),
         )
         return {r[0]: r[1] for r in rows}
 
-    def count_completed_tasks_by_milestone(self, project_id: int) -> dict[int, int]:
+    def count_completed_tasks_by_milestone(self, project_id: int, *, visible_to: str = "") -> dict[int, int]:
         """Return completed task counts keyed by milestone_id for a project."""
+        visibility, params = _task_visibility(visible_to)
         rows = self._read(
             "SELECT milestone_id, COUNT(*) FROM tasks"
-            " WHERE project_id=? AND status IN ('completed', 'cancelled') GROUP BY milestone_id",
-            (project_id,),
+            f" WHERE project_id=? AND status IN ('completed', 'cancelled') AND {visibility} GROUP BY milestone_id",
+            (project_id, *params),
         )
         return {r[0]: r[1] for r in rows}
 
@@ -955,11 +979,17 @@ class TaskStore:
         return TaskComment(id=cursor.lastrowid, task_id=task_id,
                           author=author, content=content, created_at=now)
 
-    def get_comments(self, task_id: int, *, limit: int = 50) -> list[TaskComment]:
+    def get_comments(self, task_id: int, *, limit: int = 50, visible_to: str = "") -> list[TaskComment]:
         """Get comments for a task, newest first."""
+        visibility, params = _task_visibility(visible_to)
+        task_filter = (
+            " AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id=task_comments.task_id"
+            f" AND {visibility})" if visible_to else ""
+        )
         rows = self._read(
-            "SELECT id, task_id, author, content, created_at FROM task_comments WHERE task_id=? ORDER BY created_at DESC LIMIT ?",
-            (task_id, limit),
+            "SELECT id, task_id, author, content, created_at FROM task_comments WHERE task_id=?"
+            f"{task_filter} ORDER BY created_at DESC LIMIT ?",
+            (task_id, *params, limit),
         )
         return [
             TaskComment(id=r[0], task_id=r[1], author=r[2], content=r[3], created_at=r[4])

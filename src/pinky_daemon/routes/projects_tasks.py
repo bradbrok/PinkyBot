@@ -30,7 +30,7 @@ from pinky_daemon.api_models import (
     UpdateTaskRequest,
 )
 from pinky_daemon.autonomy import AgentEvent, EventType
-from pinky_daemon.isolated_policy import isolated_caller_policy
+from pinky_daemon.isolated_policy import isolated_caller_policy, isolation_flag
 from pinky_daemon.scheduler import _log
 
 router = APIRouter(tags=["projects-tasks"])
@@ -68,6 +68,14 @@ def set_dependencies(
 # ── Projects ──────────────────────────────────────────────────────────────────
 
 
+def _task_read_scope(request: Request) -> str:
+    """Scope signed readers in every policy mode; uncertain flags fail closed."""
+    caller = getattr(request.state, "internal_caller", "")
+    if caller and isolation_flag(getattr(request.app.state, "agents", None), caller) is not False:
+        return caller
+    return ""
+
+
 @router.post("/projects")
 async def create_project(req: CreateProjectRequest):
     project = _tasks.create_project(
@@ -87,11 +95,13 @@ async def list_projects():
 
 
 @router.get("/projects/{project_id}")
-async def get_project(project_id: int):
+async def get_project(project_id: int, request: Request):
     project = _tasks.get_project(project_id)
     if not project:
         raise HTTPException(404, "Project not found")
-    project_tasks = _tasks.list(project_id=project_id, include_completed=True)
+    project_tasks = _tasks.list(
+        project_id=project_id, include_completed=True, visible_to=_task_read_scope(request),
+    )
     return {
         "project": project.to_dict(),
         "tasks": [t.to_dict() for t in project_tasks],
@@ -123,10 +133,12 @@ async def update_project(project_id: int, req: UpdateProjectRequest):
 
 
 @router.get("/projects/{project_id}/hub")
-async def get_project_hub(project_id: int):
+async def get_project_hub(project_id: int, request: Request):
     project = _tasks.get_project(project_id)
     if not project:
         raise HTTPException(404, "Project not found")
+
+    caller = _task_read_scope(request)
 
     # Active sprint with progress
     sprints = _tasks.list_sprints(project_id, include_completed=False)
@@ -134,7 +146,7 @@ async def get_project_hub(project_id: int):
     for s in sprints:
         if s.status == "active":
             d = s.to_dict()
-            sprint_counts = _tasks.count_tasks_by_sprint(s.id)
+            sprint_counts = _tasks.count_tasks_by_sprint(s.id, visible_to=caller)
             total = sprint_counts.get("total", 0)
             completed = sprint_counts.get("completed", 0)
             d["progress_pct"] = round(completed / total * 100) if total else 0
@@ -145,8 +157,8 @@ async def get_project_hub(project_id: int):
 
     # Milestones with progress
     milestones = _tasks.list_milestones(project_id)
-    milestone_task_counts = _tasks.count_tasks_by_milestone(project_id)
-    milestone_completed_counts = _tasks.count_completed_tasks_by_milestone(project_id)
+    milestone_task_counts = _tasks.count_tasks_by_milestone(project_id, visible_to=caller)
+    milestone_completed_counts = _tasks.count_completed_tasks_by_milestone(project_id, visible_to=caller)
     milestones_data = []
     for m in milestones:
         d = m.to_dict()
@@ -158,7 +170,9 @@ async def get_project_hub(project_id: int):
         milestones_data.append(d)
 
     # Recent tasks (last 10 by updated_at)
-    all_tasks = _tasks.list(project_id=project_id, include_completed=True, limit=1000)
+    all_tasks = _tasks.list(
+        project_id=project_id, include_completed=True, limit=1000, visible_to=caller,
+    )
     all_tasks_sorted = sorted(all_tasks, key=lambda t: t.updated_at, reverse=True)
     recent_tasks = [t.to_dict() for t in all_tasks_sorted[:10]]
 
@@ -210,6 +224,10 @@ async def get_project_hub(project_id: int):
     for ev in all_activity:
         meta = ev.get("metadata") or {}
         if meta.get("project_id") == project_id or meta.get("project_name") == project.name:
+            if caller and ("task_id" in meta or ev.get("event_type", "").startswith("task_")):
+                task_id = meta.get("task_id")
+                if type(task_id) is not int or not _tasks.get(task_id, visible_to=caller):
+                    continue
             project_activity.append(ev)
             if len(project_activity) >= 10:
                 break
@@ -316,11 +334,11 @@ async def create_milestone(project_id: int, req: CreateMilestoneRequest):
 
 
 @router.get("/projects/{project_id}/milestones")
-async def list_milestones(project_id: int):
+async def list_milestones(project_id: int, request: Request):
     if not _tasks.get_project(project_id):
         raise HTTPException(404, "Project not found")
     milestones = _tasks.list_milestones(project_id)
-    task_counts = _tasks.count_tasks_by_milestone(project_id)
+    task_counts = _tasks.count_tasks_by_milestone(project_id, visible_to=_task_read_scope(request))
     result = []
     for m in milestones:
         d = m.to_dict()
@@ -359,33 +377,34 @@ async def create_sprint(project_id: int, req: CreateSprintRequest):
 
 
 @router.get("/projects/{project_id}/sprints")
-async def list_sprints(project_id: int, include_completed: bool = False):
+async def list_sprints(project_id: int, request: Request, include_completed: bool = False):
     if not _tasks.get_project(project_id):
         raise HTTPException(404, "Project not found")
     sprints = _tasks.list_sprints(project_id, include_completed=include_completed)
+    caller = _task_read_scope(request)
     result = []
     for s in sprints:
         d = s.to_dict()
-        d["task_counts"] = _tasks.count_tasks_by_sprint(s.id)
+        d["task_counts"] = _tasks.count_tasks_by_sprint(s.id, visible_to=caller)
         result.append(d)
     return {"sprints": result, "count": len(result)}
 
 
 @router.get("/sprints/{sprint_id}")
-async def get_sprint(sprint_id: int):
+async def get_sprint(sprint_id: int, request: Request):
     sprint = _tasks.get_sprint(sprint_id)
     if not sprint:
         raise HTTPException(404, "Sprint not found")
     d = sprint.to_dict()
-    d["task_counts"] = _tasks.count_tasks_by_sprint(sprint_id)
+    d["task_counts"] = _tasks.count_tasks_by_sprint(sprint_id, visible_to=_task_read_scope(request))
     return d
 
 
 @router.get("/sprints/{sprint_id}/burndown")
-async def get_sprint_burndown(sprint_id: int):
+async def get_sprint_burndown(sprint_id: int, request: Request):
     if not _tasks.get_sprint(sprint_id):
         raise HTTPException(404, "Sprint not found")
-    series = _tasks.get_sprint_burndown(sprint_id)
+    series = _tasks.get_sprint_burndown(sprint_id, visible_to=_task_read_scope(request))
     return {"sprint_id": sprint_id, "series": series}
 
 
@@ -491,6 +510,7 @@ async def create_task(req: CreateTaskRequest, request: Request):
 
 @router.get("/tasks")
 async def list_tasks(
+    request: Request,
     status: str = "",
     assigned_agent: str = "",
     priority: str = "",
@@ -502,15 +522,16 @@ async def list_tasks(
     task_list = _tasks.list(
         status=status, assigned_agent=assigned_agent,
         priority=priority, tag=tag, project_id=project_id,
-        include_completed=include_completed, limit=limit,
+        include_completed=include_completed, limit=limit, visible_to=_task_read_scope(request),
     )
     return {"tasks": [t.to_dict() for t in task_list], "count": len(task_list)}
 
 
 @router.get("/tasks/stats")
-async def task_stats():
-    by_status = _tasks.count_by_status()
-    by_agent = _tasks.count_by_agent()
+async def task_stats(request: Request):
+    caller = _task_read_scope(request)
+    by_status = _tasks.count_by_status(visible_to=caller)
+    by_agent = _tasks.count_by_agent(visible_to=caller)
     return {"by_status": by_status, "by_agent": by_agent}
 
 
@@ -518,16 +539,17 @@ async def task_stats():
 
 
 @router.get("/tasks/next")
-async def next_task(agent_name: str = "", priority: str = ""):
+async def next_task(request: Request, agent_name: str = "", priority: str = ""):
     """Get the next available task for an agent to work on."""
+    caller = _task_read_scope(request)
     if agent_name:
-        my_tasks = _tasks.list(assigned_agent=agent_name, status="pending")
+        my_tasks = _tasks.list(assigned_agent=agent_name, status="pending", visible_to=caller)
         if my_tasks:
             return {"task": my_tasks[0].to_dict(), "source": "assigned"}
-        my_tasks = _tasks.list(assigned_agent=agent_name, status="in_progress")
+        my_tasks = _tasks.list(assigned_agent=agent_name, status="in_progress", visible_to=caller)
         if my_tasks:
             return {"task": my_tasks[0].to_dict(), "source": "in_progress"}
-    unassigned = _tasks.list(assigned_agent="")
+    unassigned = _tasks.list(assigned_agent="", visible_to=caller)
     unassigned = [t for t in unassigned if not t.assigned_agent]
     if unassigned:
         return {"task": unassigned[0].to_dict(), "source": "unassigned"}
@@ -535,12 +557,13 @@ async def next_task(agent_name: str = "", priority: str = ""):
 
 
 @router.get("/tasks/{task_id}")
-async def get_task(task_id: int):
-    task = _tasks.get(task_id)
+async def get_task(task_id: int, request: Request):
+    caller = _task_read_scope(request)
+    task = _tasks.get(task_id, visible_to=caller)
     if not task:
         raise HTTPException(404, "Task not found")
-    subtasks = _tasks.get_subtasks(task_id)
-    comments = _tasks.get_comments(task_id)
+    subtasks = _tasks.get_subtasks(task_id, visible_to=caller)
+    comments = _tasks.get_comments(task_id, visible_to=caller)
     return {
         "task": task.to_dict(),
         "subtasks": [s.to_dict() for s in subtasks],
@@ -679,8 +702,11 @@ async def add_comment(task_id: int, req: AddCommentRequest):
 
 
 @router.get("/tasks/{task_id}/comments")
-async def list_comments(task_id: int, limit: int = 50):
-    comments = _tasks.get_comments(task_id, limit=limit)
+async def list_comments(task_id: int, request: Request, limit: int = 50):
+    caller = _task_read_scope(request)
+    if caller and not _tasks.get(task_id, visible_to=caller):
+        raise HTTPException(404, "Task not found")
+    comments = _tasks.get_comments(task_id, limit=limit, visible_to=caller)
     return {"comments": [c.to_dict() for c in comments], "count": len(comments)}
 
 
