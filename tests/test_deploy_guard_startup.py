@@ -433,3 +433,39 @@ def test_dependency_install_has_one_implementation():
         and any(isinstance(v, ast.Constant) and v.value == "pip" for v in n.elts)
         for n in ast.walk(application)
     )
+
+
+def test_alert_sender_does_not_follow_redirects(tmp_path, caplog):
+    g = guard_module()
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            calls.append("POST")
+            self.send_response(302)
+            self.send_header("Location", "/followed")
+            self.end_headers()
+
+        def do_GET(self):
+            calls.append("GET")
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+
+        def log_message(self, *args):
+            pass
+
+    state = tmp_path / "deploy"
+    g.refresh_alert_route(state, [dict(platform="telegram", account_id="fixture-account",
+                                     conversation_id="fixture-chat", token=TOKEN)])
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        assert not g.send_alert(state, "fixture alert", base_url=f"http://127.0.0.1:{server.server_port}")
+        assert calls == ["POST"]
+        assert TOKEN not in caplog.text
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=2)

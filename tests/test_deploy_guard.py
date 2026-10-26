@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import logging
@@ -577,3 +578,45 @@ def test_dependency_installer_preserves_commands_and_environment(tmp_path, proje
     calls.clear()
     g.install_dependencies(str(tmp_path), runner, command=command)
     assert len(calls) == 1 and calls[0][0] == command
+
+
+def test_stale_transition_does_not_open_an_incident(harness):
+    h = harness(rec={}, history=[dict(ts=990.0 + n, pid=n + 1, ref=P) for n in range(5)])
+    h.runner.head = P
+    h.ctx.activate()
+    assert load(h.state)["state"] == "stale"
+    assert not h.alerts and not h.waits and not (h.state / "incident.json").exists()
+
+
+@pytest.mark.parametrize("elapsed,alerted", [(0, False), (21599.999, False), (21600, True)])
+def test_open_incident_reminds_only_after_six_hours(harness, elapsed, alerted):
+    h = harness(now=30000.0,
+                history=[dict(ts=29990.0 + n, pid=n + 1, ref=P) for n in range(5)])
+    save(h.state, "incident.json", dict(open=True, started_at=29990.0,
+                                       last_alert_at=30000.0 - elapsed, failed_starts=5))
+    h.ctx.activate()
+    assert len(h.alerts) == int(alerted)
+    assert load(h.state, "incident.json")["open"] is True
+
+
+@pytest.mark.parametrize("early", [True, False])
+async def test_ready_requires_a_surviving_settle_period(harness, early):
+    g = guard_module()
+    h = harness(rec={}, settings=g.GuardSettings(settle_seconds=0.01))
+    h.ctx.activate()
+    task = h.ctx.ready()
+    if early:
+        h.ctx.close()
+    await asyncio.gather(task, return_exceptions=True)
+    assert load(h.state)["state"] == ("armed" if early else "confirmed")
+    assert len(load(h.state)["attempts"]) == 1
+
+
+async def test_success_after_failed_checkout_reports_recovery_duration(harness):
+    h = harness(rec={"state": "rollback_failed", "rollback": {"tries": 2}})
+    h.ctx.activate()
+    owner = AsyncMock(return_value=True)
+    await h.ctx.ready(owner_notify=owner)
+    assert load(h.state)["state"] == "reported"
+    assert "serving again" in owner.call_args.args[0]
+    assert "over" in owner.call_args.args[0]
