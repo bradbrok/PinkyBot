@@ -33,6 +33,11 @@ try:
 except (TypeError, ValueError):
     _API_HTTP_TIMEOUT = 45.0
 
+_SEND_PATHS = frozenset({
+    "/broker/send", "/broker/thread", "/broker/send-photo", "/broker/send-document",
+    "/broker/send-video", "/broker/send-gif", "/broker/send-voice", "/broker/broadcast",
+})
+
 
 def create_server(
     *,
@@ -56,6 +61,7 @@ def create_server(
 
     def _api(method: str, path: str, body: dict | None = None) -> dict:
         """Call the PinkyBot API."""
+        is_send = method == "POST" and path in _SEND_PATHS
         url = f"{api_url}{path}"
         data = json.dumps(resolve_lazy(body)).encode() if body else None
         headers = {"Content-Type": "application/json"} if data else {}
@@ -75,8 +81,26 @@ def create_server(
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8", errors="replace")
+            if is_send and e.code == 504:
+                try:
+                    decoded = json.loads(error_body)
+                except ValueError:
+                    detail = error_body
+                else:
+                    detail = decoded.get("detail") if isinstance(decoded, dict) else error_body
+                if isinstance(detail, str) and detail.startswith("delivery unknown:"):
+                    return {"error": detail, "status": e.code, "delivery": "unknown"}
             return {"error": error_body, "status": e.code}
         except Exception as e:
+            cause = e.reason if isinstance(e, urllib.error.URLError) else e
+            if is_send and isinstance(cause, TimeoutError):
+                return {
+                    "error": (
+                        f"delivery unknown: {e}; the message may already be delivered; "
+                        "do not resend; check the chat first"
+                    ),
+                    "delivery": "unknown",
+                }
             return {"error": str(e)}
 
     def _link_preview_options(
