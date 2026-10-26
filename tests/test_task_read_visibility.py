@@ -4,6 +4,7 @@ from datetime import date
 from types import SimpleNamespace
 
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 from pinky_daemon.auth import (
@@ -13,8 +14,8 @@ from pinky_daemon.auth import (
 )
 from pinky_daemon.routes import projects_tasks
 from tests.conftest import TEST_SESSION_SECRET
+from tests.isolated_policy_support import closure, replace_cell, signed
 from tests.isolated_policy_support import daemon as daemon
-from tests.isolated_policy_support import signed
 
 pytestmark = pytest.mark.real_auth
 
@@ -275,17 +276,31 @@ def test_health_unknown_verified_caller_has_scoped_workload(workload, monkeypatc
         "by_agent": {},
     }
     response = get("/agents/peer/health")
-    assert response.status_code == 200
-    assert response.json()["tasks"] == {"total_active": 0, "pending": 0, "in_progress": 0, "blocked": 0}
+    assert response.status_code == 403
+
+
+async def _direct_health(workload, caller):
+    request = Request({
+        "type": "http", "method": "GET", "path": "/agents/peer/health",
+        "headers": [], "app": workload.d.app, "state": {"internal_caller": caller},
+    })
+    return await closure(workload.d.app, "agent_health")("peer", request)
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+async def test_health_handler_unknown_caller_keeps_exact_counts(workload, monkeypatch, mode):
+    monkeypatch.setenv("PINKY_ISOLATED_POLICY_MODE", mode)
+    assert workload.d.agents.get("unknown") is None
+    response = await _direct_health(workload, "unknown")
+    assert response["tasks"] == {"total_active": 0, "pending": 0, "in_progress": 0, "blocked": 0}
 
     # A caller-created peer assignment is visible; unrelated visible rows are
     # still excluded by the health route's target-assignment filter.
     workload.store.create("Created assignment", assigned_agent="peer", created_by="unknown", status="blocked")
     workload.store.create("Own assignment", assigned_agent="unknown", created_by="peer")
     workload.store.create("Unassigned work", created_by="unknown")
-    response = get("/agents/peer/health")
-    assert response.status_code == 200
-    assert response.json()["tasks"] == {"total_active": 1, "pending": 0, "in_progress": 0, "blocked": 1}
+    response = await _direct_health(workload, "unknown")
+    assert response["tasks"] == {"total_active": 1, "pending": 0, "in_progress": 0, "blocked": 1}
 
 
 @pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
@@ -305,8 +320,40 @@ def test_health_uncertain_caller_has_scoped_workload(workload, monkeypatch, stat
 
     monkeypatch.setattr(workload.d.agents, "get", get)
     response = workload.client.get(path, headers=headers)
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("state", ["missing", "null_flag", "zero_flag"])
+async def test_health_handler_uncertain_caller_keeps_exact_counts(workload, monkeypatch, state, mode):
+    monkeypatch.setenv("PINKY_ISOLATED_POLICY_MODE", mode)
+    original = workload.d.agents.get
+
+    def get(name):
+        if name == "tenant":
+            if state == "missing":
+                return None
+            return SimpleNamespace(isolated=None if state == "null_flag" else 0)
+        return original(name)
+
+    monkeypatch.setattr(workload.d.agents, "get", get)
+    response = await _direct_health(workload, "tenant")
+    assert response["tasks"] == {"total_active": 4, "pending": 2, "in_progress": 1, "blocked": 1}
+
+
+def test_signed_health_request_supplies_verified_caller_state(workload, monkeypatch):
+    handler = closure(workload.d.app, "agent_health")
+    original_scope = projects_tasks._task_read_scope
+    observed = []
+
+    def capture(request):
+        observed.append((request.state.internal_caller, request.scope["state"]["internal_caller"]))
+        return original_scope(request)
+
+    replace_cell(monkeypatch, handler, "_task_read_scope", capture)
+    response = read(workload, "/agents/tenant/health")
     assert response.status_code == 200
-    assert response.json()["tasks"] == {"total_active": 4, "pending": 2, "in_progress": 1, "blocked": 1}
+    assert observed == [("tenant", "tenant")]
 
 
 @pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
