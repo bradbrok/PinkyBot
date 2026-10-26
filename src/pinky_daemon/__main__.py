@@ -137,32 +137,27 @@ def _argument_parser():
     return parser
 
 
-def _minimal_start_args(parser=None):
-    parser = _argument_parser() if parser is None else parser
-    values = {"mode": parser.get_default("mode"), "db_path": parser.get_default("db_path")}
-    options = {"--mode": "mode", "--db-path": "db_path"}
-    arguments = sys.argv[1:]
-    for index, argument in enumerate(arguments):
-        if argument == "--":
-            break
-        if not isinstance(argument, str):
-            continue
-        option, attached, value = argument.partition("=")
-        if option not in options:
-            continue
-        if attached:
-            values[options[option]] = value
-        elif index + 1 < len(arguments):
-            candidate = arguments[index + 1]
-            if isinstance(candidate, str) and (
-                not candidate.startswith("-")
-                or (
-                    parser._negative_number_matcher.match(candidate)
-                    and not parser._has_negative_number_optionals
-                )
-            ):
-                values[options[option]] = candidate
-    return SimpleNamespace(**values)
+class _ArgumentRecoveryError(Exception):
+    pass
+
+
+def _minimal_start_args():
+    def refuse(*_args, **_kwargs):
+        raise _ArgumentRecoveryError()
+
+    try:
+        parser = _argument_parser()
+        for action in parser._actions:
+            action.type = None
+            action.choices = None
+        parser.error = refuse
+        parser.exit = refuse
+        parser.print_help = refuse
+        parser.print_usage = refuse
+        args, _ = parser.parse_known_args(sys.argv[1:])
+        return SimpleNamespace(mode=args.mode, db_path=args.db_path)
+    except BaseException:
+        return SimpleNamespace(mode=None, db_path=None)
 
 
 def _record_bootstrap_failure(args, exc):
@@ -193,7 +188,9 @@ def main() -> None:
         args = parser.parse_args()
     except BaseException as exc:
         if not isinstance(exc, SystemExit) or exc.code:
-            _record_bootstrap_failure(_minimal_start_args(parser), exc)
+            mode = _minimal_start_args()
+            if mode.mode == "api":
+                _record_bootstrap_failure(mode, exc)
         raise
     guard = _start_api_guard(args)
 

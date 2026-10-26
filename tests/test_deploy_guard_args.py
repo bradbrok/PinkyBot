@@ -102,6 +102,14 @@ PARSER_CASES = [
         "poll",
         "data/conversations.db",
     ),
+    ("review-separated-abbreviation", ["--db", "value"], True, "api", "value"),
+    (
+        "review-last-negative-decimal",
+        ["--db-path", "first", "--db-path", "-1.25"],
+        True,
+        "api",
+        "-1.25",
+    ),
 ]
 
 
