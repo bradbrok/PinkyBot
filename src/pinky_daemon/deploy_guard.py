@@ -331,13 +331,15 @@ def _write_history(state_dir, rows):
     _atomic(state_dir, "starts.jsonl", "".join(json.dumps(row) + "\n" for row in rows), raw=True)
 
 
-def _enabled(state_dir) -> bool:
+def _enabled(state_dir, *, strict=False) -> bool:
     if os.environ.get("PINKY_DEPLOY_GUARD") == "0":
         return False
     try:
         with _open_state(state_dir, "guard.off", os.O_RDONLY, missing_ok=True, private=False) as fd:
             return fd is None
     except OSError as exc:
+        if strict:
+            raise
         report_error(state_dir, "guard state unavailable", exc)
         return False
 
@@ -531,49 +533,53 @@ def arm_deploy(
     settings=None,
     clock=None,
 ):
-    if not _enabled(state_dir):
-        return _arm_result(state_dir, {"armed": False, "reason": "switched off"})
     try:
-        root_info = Path(state_dir).parent.lstat()
-    except (FileNotFoundError, NotADirectoryError):
-        root_info = None
-    if root_info is None or not stat.S_ISDIR(root_info.st_mode):
-        _LOG.warning("WARNING deploy guard: data root absent; update not armed")
-        return _arm_result(state_dir, {"armed": False, "reason": "data_root_absent"})
-    settings, clock = settings or load_settings(), clock or time.time
-    if not _REF.fullmatch(previous_ref) or not _REF.fullmatch(target_ref):
-        raise ValueError("invalid deploy refs")
-    # A failed route write must not leave an apparently usable armed record.
-    _write_route(state_dir, list(routes), clock)
-    record = {
-        "schema": 1,
-        "deploy_id": uuid.uuid4().hex,
-        "created_at": clock(),
-        "repo_dir": os.path.realpath(repo_dir),
-        "previous_ref": previous_ref,
-        "previous_label": previous_label,
-        "target_ref": target_ref,
-        "target_label": target_label,
-        "deps_rebuilt": bool(deps_rebuilt),
-        "forced_reset": bool(forced_reset),
-        "requested_by": requested_by,
-        "max_attempts": settings.max_attempts,
-        "state": "armed",
-        "attempts": [],
-        "post_rollback_attempts": [],
-        "rollback": None,
-    }
-    with _locked(state_dir):
-        _atomic(state_dir, "deploy.json", record)
-    return _arm_result(
-        state_dir,
-        {
-            "armed": True,
-            "deploy_id": record["deploy_id"],
+        if not _enabled(state_dir, strict=True):
+            return _arm_result(state_dir, {"armed": False, "reason": "switched off"})
+        try:
+            root_info = Path(state_dir).parent.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            root_info = None
+        if root_info is None or not stat.S_ISDIR(root_info.st_mode):
+            _LOG.warning("WARNING deploy guard: data root absent; update not armed")
+            return _arm_result(state_dir, {"armed": False, "reason": "data_root_absent"})
+        settings, clock = settings or load_settings(), clock or time.time
+        if not _REF.fullmatch(previous_ref) or not _REF.fullmatch(target_ref):
+            raise ValueError("invalid deploy refs")
+        # A failed route write must not leave an apparently usable armed record.
+        _write_route(state_dir, list(routes), clock)
+        record = {
+            "schema": 1,
+            "deploy_id": uuid.uuid4().hex,
+            "created_at": clock(),
+            "repo_dir": os.path.realpath(repo_dir),
             "previous_ref": previous_ref,
+            "previous_label": previous_label,
+            "target_ref": target_ref,
+            "target_label": target_label,
+            "deps_rebuilt": bool(deps_rebuilt),
+            "forced_reset": bool(forced_reset),
+            "requested_by": requested_by,
             "max_attempts": settings.max_attempts,
-        },
-    )
+            "state": "armed",
+            "attempts": [],
+            "post_rollback_attempts": [],
+            "rollback": None,
+        }
+        with _locked(state_dir):
+            _atomic(state_dir, "deploy.json", record)
+        return _arm_result(
+            state_dir,
+            {
+                "armed": True,
+                "deploy_id": record["deploy_id"],
+                "previous_ref": previous_ref,
+                "max_attempts": settings.max_attempts,
+            },
+        )
+    except Exception as exc:
+        report_error(state_dir, "deploy record could not be armed", exc)
+        return _arm_result(state_dir, {"armed": False, "reason": "state_unusable"})
 
 
 def guard_status(repo_dir, state_dir):

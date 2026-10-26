@@ -13852,7 +13852,7 @@ npm run build</pre>
                 ):
                     raise RuntimeError("send callback did not confirm delivery")
             except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
+                error = type(exc).__name__
                 failures.append(error)
                 _log(
                     "api: OWNER_NOTIFY_DELIVERY_FAILURE for scheduler alert "
@@ -13912,7 +13912,7 @@ npm run build</pre>
                 list_all_approved_users=agents.list_all_approved_users,
             )
         except Exception as exc:
-            error = f"default owner channel resolution failed: {type(exc).__name__}: {exc}"
+            error = f"default owner channel resolution failed: {type(exc).__name__}"
             failures.append(error)
             _log(
                 "api: OWNER_NOTIFY_DELIVERY_FAILURE for scheduler alert "
@@ -15769,12 +15769,13 @@ npm run build</pre>
                     requested_by=getattr(request.state, "internal_caller", "") if request else "",
                     routes=_deploy_alert_routes(agents), **arm_details,
                 )
-                if result["guard"].get("reason") == "data_root_absent":
+                guard_reason = result["guard"].get("reason")
+                if guard_reason in {"data_root_absent", "state_unusable"}:
                     result = await asyncio.to_thread(
                         undo_update, {
                             "error": "deploy guard could not be armed",
                             "target_check": result["target_check"],
-                            "guard": result["guard"], "reason": "data_root_absent",
+                            "guard": result["guard"], "reason": guard_reason,
                         },
                     )
             except Exception as exc:
@@ -15783,9 +15784,10 @@ npm run build</pre>
                     undo_update, {
                         "error": "deploy guard could not be armed",
                         "target_check": result["target_check"],
+                        "reason": "state_unusable",
                     },
                 )
-                result["guard"] = {"armed": False, "reason": "record not writable"}
+                result["guard"] = {"armed": False, "reason": "state_unusable"}
 
         # Schedule graceful restart if anything changed
         if result.get("restarting"):

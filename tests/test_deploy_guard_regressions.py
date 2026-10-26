@@ -290,8 +290,6 @@ async def test_recovery_owner_failure_logs_keep_exception_text_private(
                 principal_id="fixture-owner",
             )
         ]
-        if failure_path == "transport"
-        else []
     )
     owner = fx.app.state.dream_runner._owner_notify_callback
     private_url = "http://127.0.0.1/bot" + TOKEN + "/sendMessage"
@@ -301,11 +299,13 @@ async def test_recovery_owner_failure_logs_keep_exception_text_private(
         AsyncMock(side_effect=urllib.error.URLError(private_url)),
     )
     if failure_path == "resolution":
+        monkeypatch.setattr(agents, "get_owner_notification_destinations", lambda: [])
 
         def refused(**kwargs):
             raise ValueError(private_url)
 
-        monkeypatch.setattr(api, "resolve_operator_chat", refused)
+        bindings = dict(zip(owner.__code__.co_freevars, owner.__closure__))
+        monkeypatch.setattr(bindings["resolve_operator_chat"], "cell_contents", refused)
     logs = []
     monkeypatch.setattr(api, "_log", logs.append)
     state = fx.data / "deploy"

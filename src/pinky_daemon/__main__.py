@@ -27,6 +27,10 @@ import signal
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
+
+_DEFAULT_MODE = "api"
+_DEFAULT_DB_PATH = "data/conversations.db"
 
 
 def _install_faulthandler() -> None:
@@ -100,11 +104,24 @@ def _start_api_guard(args):
 
 
 def _minimal_start_args():
-    mode_parser = argparse.ArgumentParser(add_help=False)
-    mode_parser.add_argument("--mode", default="api")
-    mode_parser.add_argument("--db-path", default="data/conversations.db")
-    mode, _ = mode_parser.parse_known_args()
-    return mode
+    values = {"mode": _DEFAULT_MODE, "db_path": _DEFAULT_DB_PATH}
+    options = {"--mode": "mode", "--db-path": "db_path"}
+    arguments = sys.argv[1:]
+    for index, argument in enumerate(arguments):
+        if argument == "--":
+            break
+        if not isinstance(argument, str):
+            continue
+        option, attached, value = argument.partition("=")
+        if option not in options:
+            continue
+        if attached:
+            values[options[option]] = value
+        elif index + 1 < len(arguments):
+            candidate = arguments[index + 1]
+            if isinstance(candidate, str) and not candidate.startswith("-"):
+                values[options[option]] = candidate
+    return SimpleNamespace(**values)
 
 
 def _record_bootstrap_failure(args, exc):
@@ -120,7 +137,7 @@ def main() -> None:
     _install_faulthandler()
     try:
         _load_dotenv()
-    except (Exception, SystemExit) as exc:
+    except BaseException as exc:
         mode = _minimal_start_args()
         if mode.mode == "api":
             _record_bootstrap_failure(mode, exc)
@@ -132,7 +149,7 @@ def main() -> None:
     parser.add_argument(
         "--mode",
         choices=["api", "poll", "check-startup"],
-        default="api",
+        default=_DEFAULT_MODE,
         help="Run mode: api (HTTP server), poll (message polling), or check-startup (inspection)",
     )
     parser.add_argument("--host", default="0.0.0.0", help="API server host")
@@ -155,13 +172,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--db-path",
-        default="data/conversations.db",
+        default=_DEFAULT_DB_PATH,
         help="Canonical conversations DB path (api mode)",
     )
     try:
         args = parser.parse_args()
-    except SystemExit as exc:
-        if exc.code:
+    except BaseException as exc:
+        if not isinstance(exc, SystemExit) or exc.code:
             _record_bootstrap_failure(_minimal_start_args(), exc)
         raise
     guard = _start_api_guard(args)
