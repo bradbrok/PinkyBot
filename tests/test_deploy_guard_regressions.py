@@ -225,6 +225,9 @@ def test_api_base_exits_record_one_start_and_preserve_exception(tmp_path, monkey
     with pytest.raises(BaseException) as caught:
         entry.main()
     assert caught.value is (parsed_errors[0] if parsed_errors else failure)
+    if cause in {"missing-db-value", "missing-mode-value"}:
+        assert not (root / "deploy").exists()
+        return
     rows = [json.loads(line) for line in (root / "deploy/starts.jsonl").read_text().splitlines()]
     assert len(rows) == 1 and not rows[0].get("pending")
     recorded = load(root / "deploy", "last_failure.json")
@@ -235,15 +238,15 @@ def test_api_base_exits_record_one_start_and_preserve_exception(tmp_path, monkey
     "arguments,expected",
     [
         ([], ("api", "data/conversations.db")),
-        (["--mode", "poll", "--mode", "api", "--mode"], ("api", "data/conversations.db")),
-        (["--db-path", "first", "--db-path", "last", "--db-path"], ("api", "last")),
-        (["--mode", "poll", "--mode"], ("poll", "data/conversations.db")),
-        (["--db-path", "--mode", "api"], ("api", "data/conversations.db")),
+        (["--mode", "poll", "--mode", "api", "--mode"], (None, None)),
+        (["--db-path", "first", "--db-path", "last", "--db-path"], (None, None)),
+        (["--mode", "poll", "--mode"], (None, None)),
+        (["--db-path", "--mode", "api"], (None, None)),
         (["--mode=api", "--db-path=fixture-db"], ("api", "fixture-db")),
         (["--mode", "poll", "--", "--mode", "api"], ("poll", "data/conversations.db")),
     ],
 )
-def test_fallback_argument_scan_is_total_and_last_value_wins(monkeypatch, arguments, expected):
+def test_fallback_parser_resolves_or_returns_unknown(monkeypatch, arguments, expected):
     from pinky_daemon import __main__ as entry
 
     monkeypatch.setattr(sys, "argv", ["pinky", *arguments])
