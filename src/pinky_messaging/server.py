@@ -39,6 +39,16 @@ _SEND_PATHS = frozenset({
 })
 
 
+def _delivery_unknown_timeout(error: Exception) -> dict:
+    return {
+        "error": (
+            f"delivery unknown: {error}; the message may already be delivered; "
+            "do not resend; check the chat first"
+        ),
+        "delivery": "unknown",
+    }
+
+
 def create_server(
     *,
     agent_name: str = "",
@@ -80,7 +90,14 @@ def create_server(
             with urllib.request.urlopen(req, timeout=_API_HTTP_TIMEOUT) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8", errors="replace")
+            try:
+                error_body = e.read().decode("utf-8", errors="replace")
+            except (TimeoutError, urllib.error.URLError) as read_error:
+                cause = (read_error.reason if isinstance(read_error, urllib.error.URLError)
+                         else read_error)
+                if is_send and isinstance(cause, TimeoutError):
+                    return _delivery_unknown_timeout(read_error)
+                raise
             if is_send and e.code == 504:
                 try:
                     decoded = json.loads(error_body)
@@ -94,13 +111,7 @@ def create_server(
         except Exception as e:
             cause = e.reason if isinstance(e, urllib.error.URLError) else e
             if is_send and isinstance(cause, TimeoutError):
-                return {
-                    "error": (
-                        f"delivery unknown: {e}; the message may already be delivered; "
-                        "do not resend; check the chat first"
-                    ),
-                    "delivery": "unknown",
-                }
+                return _delivery_unknown_timeout(e)
             return {"error": str(e)}
 
     def _link_preview_options(

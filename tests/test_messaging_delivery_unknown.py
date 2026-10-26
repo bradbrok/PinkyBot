@@ -77,23 +77,18 @@ def test_other_outer_error_keeps_existing_shape(error):
     assert result == {"error": str(error)}
 
 
+@pytest.mark.parametrize("name,kwargs", SEND_CASES, ids=[case[0] for case in SEND_CASES])
 @pytest.mark.parametrize("json_body", [False, True])
-def test_delivery_unknown_504_reaches_send_tool(json_body):
+def test_delivery_unknown_504_reaches_send_tool(name, kwargs, json_body):
     detail = "delivery unknown: may already be delivered; do not resend; check the chat first"
     body = json.dumps({"detail": detail}) if json_body else detail
     error = urllib.error.HTTPError(
         "http://test", 504, "Gateway Timeout", {}, BytesIO(body.encode())
     )
-    with patch("urllib.request.urlopen", side_effect=error):
-        result = json.loads(
-            _tools()["send"](
-                chat_id="12345",
-                platform="telegram",
-                text="hello",
-            )
-        )
-    assert result["status"] == 504
-    assert detail in result["error"]
+    with patch("urllib.request.urlopen", side_effect=error) as request:
+        result = json.loads(_tools()[name](**kwargs))
+    request.assert_called_once()
+    assert result == {"error": detail, "status": 504, "delivery": "unknown"}
 
 
 def test_broadcast_preserves_partial_unknown_result():
@@ -116,3 +111,69 @@ def test_broadcast_preserves_partial_unknown_result():
         result = json.loads(_tools()["broadcast"](text="hello"))
     request.assert_called_once()
     assert result == payload
+
+
+@pytest.mark.parametrize("name,kwargs", SEND_CASES, ids=[case[0] for case in SEND_CASES])
+def test_send_http_error_body_url_timeout_is_unknown(name, kwargs):
+    body = MagicMock()
+    body.read.side_effect = urllib.error.URLError(TimeoutError("body timed out"))
+    error = urllib.error.HTTPError("http://test", 504, "Gateway Timeout", {}, body)
+    with patch("urllib.request.urlopen", side_effect=error) as request:
+        result = json.loads(_tools()[name](**kwargs))
+    request.assert_called_once()
+    body.read.assert_called_once()
+    assert result.get("delivery") == "unknown", result
+    assert result["error"].startswith("delivery unknown:")
+    assert "may already be delivered" in result["error"]
+    assert "do not resend" in result["error"]
+    assert "check the chat first" in result["error"]
+
+
+@pytest.mark.parametrize("target", ["read", "react"])
+@pytest.mark.parametrize("error", [
+    TimeoutError("body timed out"), urllib.error.URLError(TimeoutError("body timed out")),
+])
+def test_non_send_http_error_body_timeout_keeps_raising(target, error):
+    tools = _tools()
+    api = inspect.getclosurevars(tools["send"]).nonlocals["_api"]
+    body = MagicMock()
+    body.read.side_effect = error
+    response = urllib.error.HTTPError("http://test", 504, "Gateway Timeout", {}, body)
+    with patch("urllib.request.urlopen", side_effect=response) as request:
+        with pytest.raises(type(error)) as raised:
+            if target == "read":
+                api("GET", "/broker/status")
+            else:
+                tools["react"](message_id="101", emoji="ok")
+    assert raised.value is error
+    request.assert_called_once()
+    body.read.assert_called_once()
+
+
+@pytest.mark.parametrize("error", [
+    ValueError("broken body"), urllib.error.URLError("connection refused"),
+])
+def test_send_other_http_error_body_failure_keeps_raising(error):
+    body = MagicMock()
+    body.read.side_effect = error
+    response = urllib.error.HTTPError("http://test", 502, "Bad Gateway", {}, body)
+    with patch("urllib.request.urlopen", side_effect=response) as request:
+        with pytest.raises(type(error)) as raised:
+            _tools()["send"](chat_id="12345", platform="telegram", text="hello")
+    assert raised.value is error
+    request.assert_called_once()
+
+
+@pytest.mark.parametrize("target", ["read", "react"])
+@pytest.mark.parametrize("json_body", [False, True])
+def test_non_send_delivery_unknown_504_keeps_existing_shape(target, json_body):
+    tools = _tools()
+    api = inspect.getclosurevars(tools["send"]).nonlocals["_api"]
+    detail = "delivery unknown: may already be delivered; do not resend; check the chat first"
+    raw = json.dumps({"detail": detail}) if json_body else detail
+    error = urllib.error.HTTPError("http://test", 504, "Gateway Timeout", {}, BytesIO(raw.encode()))
+    with patch("urllib.request.urlopen", side_effect=error) as request:
+        result = (api("GET", "/broker/status") if target == "read" else
+                  json.loads(tools["react"](message_id="101", emoji="ok")))
+    request.assert_called_once()
+    assert result == {"error": raw, "status": 504}

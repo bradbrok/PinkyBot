@@ -11820,23 +11820,31 @@ npm run build</pre>
                     with urllib.request.urlopen(gif_url, timeout=30) as resp:
                         with open(tmp_path, "wb") as f:
                             f.write(resp.read())
-                    return adapter.send_animation(chat_id, tmp_path, caption=caption, reply_to_message_id=int(reply_to) if reply_to else None)
+                    return _send_telegram_once(
+                        adapter.send_animation, chat_id, tmp_path, caption=caption,
+                        reply_to_message_id=int(reply_to) if reply_to else None,
+                    )
                 finally:
                     try:
                         os.unlink(tmp_path)
                     except Exception:
                         pass
 
-            # Issue #395 follow-up: wrap the download+send in try/except so a
-            # failure surfaces as a structured 502 (not 500/unhandled). The
-            # outer finally below ensures _stop_typing fires on every exit path.
+            # Keep download failures as 502; only an uncertain final Telegram
+            # send becomes 504. The outer finally stops typing on every exit path.
             try:
                 msg = await loop.run_in_executor(None, _download_and_send)
+            except DeliveryUnknownError as error:
+                _outreach_attempt_log(
+                    agent_name=agent_name_req, platform=platform, method="send_gif",
+                    chat_id=chat_id, file_path="", caption_len=len(caption),
+                    outcome="error_upstream",
+                    error=f"delivery_unknown: {type(error.cause).__name__}: {error.cause}",
+                )
+                raise
             except HTTPException:
-                # _download_and_send wraps urlopen + adapter.send_animation;
-                # neither raises HTTPException directly today, so this branch
-                # is defensive. If an HTTPException ever does surface here it
-                # came from a config-side check, so bucket as `rejected`.
+                # Preserve structured config-side rejections. Uncertain
+                # delivery is handled separately above.
                 _outreach_attempt_log(
                     agent_name=agent_name_req, platform=platform, method="send_gif",
                     chat_id=chat_id, file_path="", caption_len=len(caption),
