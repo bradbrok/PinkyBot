@@ -623,6 +623,112 @@ def test_reconcile_symlink_cycle_terminates_cleanly(tmp_path: Path) -> None:
     assert catalog.validate() == []
 
 
+def _workspace_alias_tree(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "root"
+    workspace = root / "agents" / "worker" / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "unclaimed.db").touch()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / "escape").symlink_to(outside, target_is_directory=True)
+    (workspace.parent / "data").symlink_to(workspace, target_is_directory=True)
+    return root, workspace
+
+
+def _assert_workspace_alias_pruned(
+    root: Path, workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_scandir = os.scandir
+    scanned = []
+
+    def scandir(path):
+        scanned.append(os.fspath(path))
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    catalog = StoreCatalog(expected_root=root, silence_allowlist={})
+    report = catalog.inspect_layout()
+    assert report.findings == []
+    assert report.warnings == []
+    assert report.skipped_unmanaged_subtrees == 1
+    assert catalog.reconcile_filesystem() == []
+    assert catalog.validate() == []
+    assert scanned
+    assert not any(os.path.samefile(path, workspace) for path in scanned)
+
+
+def test_workspace_alias_with_preserved_parent_case_is_pruned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, workspace = _workspace_alias_tree(tmp_path)
+    alternate_parent = root / "Agents"
+    if not alternate_parent.exists():
+        # Give the preserved spelling a real target on case-sensitive volumes.
+        alternate_parent.symlink_to(root / "agents", target_is_directory=True)
+    alternate_workspace = alternate_parent / "worker" / "workspace"
+    alias = workspace.parent / "custom"
+    alias.symlink_to(alternate_workspace, target_is_directory=True)
+    assert alternate_workspace.samefile(workspace)
+    assert alias.samefile(workspace.parent / "data")
+    original_realpath = os.path.realpath
+    resolved_aliases = []
+
+    def realpath(path, *args, **kwargs):
+        if os.fspath(path) == str(alias):
+            resolved_aliases.append(os.fspath(path))
+            return str(alternate_workspace)
+        return original_realpath(path, *args, **kwargs)
+
+    # Model realpath retaining a link target's spelling, without replacing any
+    # policy or identity check. All stat and directory operations remain real.
+    monkeypatch.setattr(os.path, "realpath", realpath)
+    _assert_workspace_alias_pruned(root, workspace, monkeypatch)
+    assert resolved_aliases
+
+
+def test_workspace_alias_on_case_insensitive_filesystem_is_pruned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, workspace = _workspace_alias_tree(tmp_path)
+    alternate_parent = root / "Agents"
+    if not alternate_parent.exists() or not alternate_parent.samefile(root / "agents"):
+        pytest.skip("temporary filesystem is case-sensitive")
+    alternate_workspace = alternate_parent / "worker" / "workspace"
+    alias = workspace.parent / "custom"
+    alias.symlink_to(alternate_workspace, target_is_directory=True)
+    assert alias.samefile(workspace.parent / "data")
+    assert os.path.realpath(alias) == str(alternate_workspace)
+    _assert_workspace_alias_pruned(root, workspace, monkeypatch)
+
+
+def test_lowercase_workspace_alias_is_pruned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, workspace = _workspace_alias_tree(tmp_path)
+    (workspace.parent / "custom").symlink_to(workspace, target_is_directory=True)
+    _assert_workspace_alias_pruned(root, workspace, monkeypatch)
+
+
+def test_owned_data_alias_still_discovers_stores(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    data = root / "agents" / "worker" / "data"
+    data.mkdir(parents=True)
+    store = data / "unclaimed.db"
+    store.touch()
+    (data.parent / "custom").symlink_to(data, target_is_directory=True)
+    catalog = StoreCatalog(expected_root=root, silence_allowlist={})
+
+    report = catalog.inspect_layout()
+
+    assert report.findings == []
+    assert report.skipped_unmanaged_subtrees == 0
+    assert len(report.warnings) == 1
+    assert "unclaimed database file" in report.warnings[0]
+    assert str(store) in report.warnings[0]
+    assert catalog.reconcile_filesystem() == report.warnings
+    assert catalog.validate() == report.warnings
+
+
 def test_reconcile_recognizes_nested_kb_store_as_claimed(tmp_path: Path) -> None:
     kb_dir = tmp_path / "kb"
     kb_dir.mkdir()
