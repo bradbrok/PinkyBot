@@ -221,7 +221,7 @@ def _open_state(state_dir, name, flags, *, missing_ok=False, private=True, expec
             flags = (flags & ~os.O_TRUNC) | os.O_NOFOLLOW | os.O_NONBLOCK
             flags |= getattr(os, "O_CLOEXEC", 0)
             descriptor = os.open(path / name, flags, 0o600)
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             if missing_ok:
                 yield None
                 return
