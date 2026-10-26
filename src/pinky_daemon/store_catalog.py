@@ -928,7 +928,10 @@ class _FilesystemLayoutInspector:
                 for pattern_segments in (
                     pattern.split("/") for pattern in _UNMANAGED_SUBTREES
                 )
-            ) or self._is_unmanaged_workspace(relative_segments, directory_identity)
+            ) or any(
+                self._is_unmanaged_workspace(segments, directory_identity)
+                for segments in (discovered_segments, relative_segments)
+            )
             owned_visit = not unmanaged_workspace and (
                 owned_visit or any(
                     len(segments) >= 3 and segments[0] == "agents"
