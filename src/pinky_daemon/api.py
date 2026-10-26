@@ -5972,9 +5972,9 @@ def create_api(
         )
 
     def _internal_isolation_denied(request: Request, caller_name: str) -> bool:
-        """#149/#1187 tenant isolation: an authenticated *isolated* agent may
-        only act on its OWN resources and cannot mutate the fleet skill
-        catalog. Returns True when either boundary is crossed.
+        """Tenant isolation: cross-agent access requires a proven non-isolated
+        caller, except for isolated peers sharing a message group. Isolated
+        agents also cannot mutate the fleet skill catalog.
 
         Only reached after _has_valid_internal_auth succeeds, so ``caller_name``
         is the verified signed identity (the signature binds the name). The
@@ -5991,8 +5991,9 @@ def create_api(
         Defense-in-depth on top of tool-gating: isolated agents are provisioned
         without admin/register gates, but this enforces the tenant boundary at
         the daemon regardless of what tools the agent manages to invoke. A
-        missing caller row fails closed for admin/registration and fleet
-        catalog writes; existing cross-agent behavior remains unchanged.
+        missing caller row fails closed for admin/registration, fleet catalog
+        writes and cross-agent access. Uncertain isolation flags also deny
+        cross-agent access.
         """
         if not caller_name:
             return False
@@ -6039,20 +6040,23 @@ def create_api(
                 f"{request.url.path} — failing closed (deny)"
             )
             return True
-        if caller and getattr(caller, "isolated", False):
-            if fleet_write:
+        if fleet_write:
+            if caller and getattr(caller, "isolated", False):
                 _log(
                     f"isolation: denied isolated agent '{caller_name}' fleet "
                     f"skill catalog write {request.method} {request.url.path}"
                 )
                 return True
+            return False
+        flag = isolation_flag(agents, caller_name)
+        if flag is not False:
             # #637: an isolated agent may still MESSAGE a peer it shares a
             # group with (teammate coordination) — the inter-agent message
             # endpoint ONLY, never admin/config/autonomy. Only a message-path
             # target pays the extra peer lookup; every other cross-agent
             # attempt short-circuits to the deny below. Fail CLOSED if the peer
             # can't be resolved.
-            if request.method == "POST" and legacy_path == f"/agents/{target}/message":
+            if flag is True and request.method == "POST" and legacy_path == f"/agents/{target}/message":
                 try:
                     peer = agents.get(target)
                 except Exception as e:
