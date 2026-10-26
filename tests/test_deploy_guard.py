@@ -620,3 +620,26 @@ async def test_success_after_failed_checkout_reports_recovery_duration(harness):
     assert load(h.state)["state"] == "reported"
     assert "serving again" in owner.call_args.args[0]
     assert "over" in owner.call_args.args[0]
+
+
+@pytest.mark.parametrize("kind", ["missing", "file", "symlink", "directory"])
+def test_arming_requires_an_existing_real_data_root(tmp_path, kind):
+    g = guard_module()
+    root = tmp_path / "data-root"
+    if kind == "directory":
+        root.mkdir(mode=0o700)
+    elif kind == "file":
+        root.write_text("fixture")
+    elif kind == "symlink":
+        actual = tmp_path / "actual"
+        actual.mkdir(mode=0o700)
+        root.symlink_to(actual, target_is_directory=True)
+    result = g.arm_deploy(str(tmp_path), root / "deploy", previous_ref=P, target_ref=T,
+                         previous_label="previous", target_label="target", deps_rebuilt=False,
+                         forced_reset=False)
+    assert result["armed"] is (kind == "directory")
+    if kind != "directory":
+        assert result["reason"] == "data_root_absent"
+        assert not (root / "deploy").exists()
+    if kind == "missing":
+        assert not root.exists()

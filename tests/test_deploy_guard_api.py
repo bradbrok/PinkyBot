@@ -270,3 +270,38 @@ def test_fixture_path_guard_rejects_symlinked_live_roots(tmp_path):
     with pytest.raises(RuntimeError, match="live data root"):
         helper([alias / "fixture"], [live])
     helper([tmp_path / "private"], [live])
+
+
+@pytest.mark.parametrize("present", [False, True], ids=["absent", "present"])
+@pytest.mark.parametrize("deps", [False, True], ids=["plain", "deps"])
+async def test_missing_data_root_uses_undo_without_creating_it(
+    deployment, tmp_path, caplog, present, deps,
+):
+    guard_module()
+    fx = deployment
+    fx.set_target(report=clean_report(fx.data))
+    moved = tmp_path / "moved-data"
+    if not present:
+        fx.data.rename(moved)
+    caplog.clear()
+    try:
+        result = await fx.update(force_deps=deps)
+        if present:
+            assert result["guard"]["armed"] is True and fx.scheduled
+            assert load(fx.data / "deploy")["state"] == "armed"
+        else:
+            assert not fx.data.exists() and not (fx.data / "deploy").exists()
+            assert not fx.scheduled and not result.get("restarting")
+            assert result["guard"] == {"armed": False, "reason": "data_root_absent"}
+            assert result["reason"] == "data_root_absent"
+            assert result["undo"] == dict(checked_out=fx.previous, ok=True,
+                                         deps_restored=True if deps else None, error=None)
+            assert fx.git("rev-parse", "HEAD") == fx.previous
+            assert len([r for r in caplog.records
+                        if "WARNING deploy guard: data root absent" in r.message]) == 1
+            assert [ref for ref, _ in fx.installs] == ([fx.target, fx.previous] if deps else [])
+    finally:
+        if not present:
+            if fx.data.exists():
+                fx.data.rename(tmp_path / "unexpected-created-root")
+            moved.rename(fx.data)
