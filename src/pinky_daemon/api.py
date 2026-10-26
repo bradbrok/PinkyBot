@@ -62,7 +62,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from starlette._utils import get_route_path
 
-from pinky_daemon import runtime_model_catalog
+from pinky_daemon import deploy_guard, runtime_model_catalog
 from pinky_daemon import schedule_fire_trace as _schedule_fire_trace
 from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
@@ -1830,6 +1830,22 @@ _STARTUP_ALERT_WINDOW_SECONDS = 20 * 60 * 60
 _startup_alert_now = time.monotonic
 
 
+def _deploy_alert_routes(registry) -> list[dict]:
+    routes = []
+    for destination in registry.get_owner_notification_destinations()[:2]:
+        sender, _ = registry.resolve_owner_notification_sender(
+            "", destination["platform"], destination["account_id"],
+        )
+        if not sender:
+            continue
+        token = registry.get_raw_token_for_account(
+            sender, destination["platform"], destination["account_id"],
+        )
+        if token:
+            routes.append({**destination, "token": token})
+    return routes
+
+
 def _startup_layout_preflight(catalog: StoreCatalog) -> dict:
     """Inspect detached metadata without refreshing the serving catalog."""
     try:
@@ -2055,6 +2071,8 @@ def create_api(
 
     db_path = os.path.realpath(db_path)
     _data_dir = Path(db_path).parent
+    _guard_repo_dir = str(Path(__file__).resolve().parents[2])
+    _guard_state_dir = _data_dir / "deploy"
     store_manifest = _derive_api_store_manifest(db_path)
     store_catalog = DaemonStoreCatalog(expected_root=_data_dir, log=_log)
     store_catalog.configure_manifest(store_manifest)
@@ -2086,6 +2104,30 @@ def create_api(
     from pinky_daemon.api_readiness import ApiReadiness
 
     app.state.api_readiness = ApiReadiness()
+
+    def _refresh_guard_route():
+        try:
+            deploy_guard.refresh_alert_route(_guard_state_dir, _deploy_alert_routes(agents))
+        except Exception as exc:
+            deploy_guard.report_error(_guard_state_dir, "guard state unavailable", exc)
+
+    @app.middleware("http")
+    async def _refresh_guard_after_route_change(request: Request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        route_change = (
+            path.startswith("/bot-tokens")
+            or path in {
+                "/system/primary-user", "/system/owner-notification-destinations", "/agents",
+            }
+            or (path.startswith("/agents/") and (
+                "/tokens/" in path or path.count("/") == 2
+                or path.endswith(("/enable", "/disable"))))
+        )
+        if (request.method in {"POST", "PUT", "PATCH", "DELETE"}
+                and response.status_code < 400 and route_change):
+            await asyncio.to_thread(_refresh_guard_route)
+        return response
     app.state.startup_started_at = startup_started_at
     app.state.store_snapshot_service = store_snapshot_service
     app.state.storage_observability = storage_observability
@@ -13810,7 +13852,7 @@ npm run build</pre>
                 ):
                     raise RuntimeError("send callback did not confirm delivery")
             except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
+                error = type(exc).__name__
                 failures.append(error)
                 _log(
                     "api: OWNER_NOTIFY_DELIVERY_FAILURE for scheduler alert "
@@ -13870,7 +13912,7 @@ npm run build</pre>
                 list_all_approved_users=agents.list_all_approved_users,
             )
         except Exception as exc:
-            error = f"default owner channel resolution failed: {type(exc).__name__}: {exc}"
+            error = f"default owner channel resolution failed: {type(exc).__name__}"
             failures.append(error)
             _log(
                 "api: OWNER_NOTIFY_DELIVERY_FAILURE for scheduler alert "
@@ -14633,8 +14675,26 @@ npm run build</pre>
                         start()
                 pending_pollers.clear()
 
+        async def _guard_owner_notice(text):
+            return await scheduler._owner_notify_callback("admin", text)
+
+        async def _guard_internal_notice(name, text):
+            if not agents.get(name):
+                return False
+            comms.send("system", name, text)
+            result = await broker.inject_agent_message("system", name, text)
+            return result.delivered
+
+        async def _after_listener_ready():
+            deploy_guard.mark_ready(
+                _guard_repo_dir, _guard_state_dir, owner_notify=_guard_owner_notice,
+                internal_notify=_guard_internal_notice,
+                route_provider=lambda: _deploy_alert_routes(agents),
+            )
+            await _finish_startup_replay()
+
         if listener_readiness.attached:
-            listener_readiness.after_ready(_finish_startup_replay)
+            listener_readiness.after_ready(_after_listener_ready)
         else:
             await _finish_startup_replay()
 
@@ -14958,6 +15018,7 @@ npm run build</pre>
             roster_sync.mark_closing()
         if app.state.api_readiness.attached:
             await app.state.api_readiness.close()
+        await deploy_guard.close_guard(_guard_state_dir)
         if roster_sync is not None:
             await roster_sync.close()
         roster_task = getattr(app.state, "model_roster_sync_task", None)
@@ -15200,6 +15261,7 @@ npm run build</pre>
             "git_hash": _git_hash,
             "git_branch": _git_branch,
             "frontend": frontend_status,
+            "guard": deploy_guard.guard_status(_guard_repo_dir, _guard_state_dir),
         }
 
     startup_alert_slots: dict[tuple, float] = {}
@@ -15254,6 +15316,7 @@ npm run build</pre>
         force: bool = False,
         force_deps: bool = False,
         preflight: bool = False,
+        request: Request = None,
     ):
         """Update to a verified release (or a pinned ref) and restart.
 
@@ -15284,7 +15347,6 @@ npm run build</pre>
         """
         import shutil
         import subprocess as sp
-        import sys
 
         if branch and branch != "main":
             raise HTTPException(
@@ -15307,13 +15369,19 @@ npm run build</pre>
         layout_preflight: dict | None = None
         alert_ref = target
         alert_label = target or "latest release"
+        undo_update = None
+        arm_details = None
 
         # The whole update pipeline (git fetch/checkout, release
         # verification over TLS, pip install, npm build) is blocking and can
         # take minutes; run it off the event loop so the daemon keeps
         # routing messages while the update proceeds.
         def _run_update() -> dict:
-            nonlocal layout_preflight, alert_ref, alert_label
+            nonlocal layout_preflight, alert_ref, alert_label, undo_update, arm_details
+            if deploy_guard.check_update_pending(
+                repo_dir, _guard_state_dir, runner=sp.check_output,
+            ):
+                return {"error": "previous deploy is not confirmed yet"}
             # Current state
             try:
                 before_hash = sp.check_output(
@@ -15538,52 +15606,13 @@ npm run build</pre>
                     deps_drift = []
 
                 if changed or force_deps or deps_drift:
-                    # Prefer a functional project venv pip, else use the running
-                    # daemon's interpreter (sys.executable). A vestigial .venv can
-                    # retain bin/pip even after pip disappears from its interpreter,
-                    # so file existence alone is not enough to select it.
-                    venv_pip = Path(repo_dir) / ".venv" / "bin" / "pip"
-                    venv_python = Path(repo_dir) / ".venv" / "bin" / "python"
-                    if venv_pip.exists():
-                        try:
-                            sp.check_output(
-                                [str(venv_python), "-B", "-m", "pip", "--version"],
-                                cwd=repo_dir, stderr=sp.STDOUT, timeout=10,
-                                env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
-                            )
-                        except Exception as probe_exc:
-                            probe_output = getattr(probe_exc, "output", None)
-                            if isinstance(probe_output, bytes):
-                                probe_detail = probe_output.decode(errors="replace")
-                            elif probe_output:
-                                probe_detail = str(probe_output)
-                            else:
-                                probe_detail = f"{type(probe_exc).__name__}: {probe_exc}"
-                            probe_detail = " ".join(probe_detail.split())[:500]
-                            if not probe_detail:
-                                probe_detail = f"{type(probe_exc).__name__}: {probe_exc}"
-                            _log(
-                                "admin: .venv exists but its pip is broken "
-                                f"({probe_detail}) — treating it as vestigial and "
-                                f"falling back to {sys.executable}"
-                            )
-                        else:
-                            pip_cmd = [
-                                str(venv_python), "-B", "-m", "pip", "install",
-                                "-e", ".[all]", "--quiet",
-                            ]
+                    def _install_attempted(command):
+                        nonlocal deps_attempted, pip_cmd
+                        deps_attempted, pip_cmd = True, command
 
-                    if pip_cmd is None:
-                        # PEP 668: system pythons (Homebrew, Debian) mark themselves
-                        # externally-managed. --break-system-packages lets us install
-                        # into the same env the daemon imports from.
-                        pip_cmd = [
-                            sys.executable, "-B", "-m", "pip", "install",
-                            "-e", ".[all]", "--quiet", "--break-system-packages",
-                        ]
-                    deps_attempted = True
-                    sp.check_output(pip_cmd, cwd=repo_dir, stderr=sp.STDOUT, timeout=180,
-                                    env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+                    deploy_guard.install_dependencies(
+                        repo_dir, sp.check_output, log=_log, on_attempt=_install_attempted,
+                    )
                     deps_rebuilt = True
             except sp.CalledProcessError as e:
                 deps_error = f"pip install failed: {e.output.decode()[:500] if e.output else e}"
@@ -15592,8 +15621,7 @@ npm run build</pre>
                 deps_error = f"deps rebuild failed: {e}"
                 _log(f"admin: {deps_error}")
 
-            target_check = _check_target_startup(repo_dir, db_path, alert_ref)
-            if target_check.get("reason"):
+            def _undo_update(failure: dict) -> dict:
                 undo = {"checked_out": previous_ref, "ok": False,
                         "deps_restored": False if deps_attempted else None, "error": None}
                 observed_ref = "unknown"
@@ -15608,8 +15636,9 @@ npm run build</pre>
                         raise RuntimeError("undo HEAD does not match previous ref")
                     checkout_confirmed = True
                     if deps_attempted:
-                        sp.check_output(pip_cmd, cwd=repo_dir, stderr=sp.STDOUT, timeout=180,
-                                        env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+                        deploy_guard.install_dependencies(
+                            repo_dir, sp.check_output, command=pip_cmd,
+                        )
                         undo["deps_restored"] = True
                     undo["ok"] = True
                 except Exception as exc:
@@ -15620,7 +15649,7 @@ npm run build</pre>
                         except Exception:
                             observed_ref = "unknown"
                 result = {
-                    "error": "target release failed its startup check", "target_check": target_check,
+                    **failure,
                     "undo": undo, "staying_on_version": observed_ref,
                     "deps_rebuilt": deps_rebuilt, "deps_error": deps_error or None,
                 }
@@ -15630,6 +15659,13 @@ npm run build</pre>
                         "commit; the next restart would start it."
                     )
                 return result
+
+            undo_update = _undo_update
+            target_check = _check_target_startup(repo_dir, db_path, alert_ref)
+            if target_check.get("reason"):
+                return _undo_update({
+                    "error": "target release failed its startup check", "target_check": target_check,
+                })
 
             # Always rebuild frontend on update to keep compiled assets fresh
             frontend_rebuilt = False
@@ -15692,6 +15728,11 @@ npm run build</pre>
                 "restarting": before_hash != after_hash or deps_rebuilt,
             }
 
+            arm_details = {
+                "previous_ref": previous_ref, "target_ref": alert_ref,
+                "previous_label": current_tag or before_hash, "target_label": alert_label,
+                "deps_rebuilt": deps_rebuilt, "forced_reset": forced_reset,
+            }
             return result
 
         result = await asyncio.to_thread(_run_update)
@@ -15720,6 +15761,33 @@ npm run build</pre>
             or result.get("target_check", {}).get("reason")
         ):
             await _notify_startup_decline(result, alert_ref, alert_label)
+
+        if result.get("restarting") and not dry_run:
+            try:
+                result["guard"] = await asyncio.to_thread(
+                    deploy_guard.arm_deploy, repo_dir, _guard_state_dir,
+                    requested_by=getattr(request.state, "internal_caller", "") if request else "",
+                    routes=_deploy_alert_routes(agents), **arm_details,
+                )
+                guard_reason = result["guard"].get("reason")
+                if guard_reason in {"data_root_absent", "state_unusable"}:
+                    result = await asyncio.to_thread(
+                        undo_update, {
+                            "error": "deploy guard could not be armed",
+                            "target_check": result["target_check"],
+                            "guard": result["guard"], "reason": guard_reason,
+                        },
+                    )
+            except Exception as exc:
+                deploy_guard.report_error(_guard_state_dir, "deploy record could not be armed", exc)
+                result = await asyncio.to_thread(
+                    undo_update, {
+                        "error": "deploy guard could not be armed",
+                        "target_check": result["target_check"],
+                        "reason": "state_unusable",
+                    },
+                )
+                result["guard"] = {"armed": False, "reason": "state_unusable"}
 
         # Schedule graceful restart if anything changed
         if result.get("restarting"):

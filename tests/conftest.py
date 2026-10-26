@@ -31,6 +31,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -39,6 +40,24 @@ from fastapi.testclient import TestClient
 from pinky_daemon.tmux_launch_env_loader import DAEMON_ONLY
 from tests._tmp_hygiene import restore_tree_readability
 from tests.tmux_socket_support import check_tmux_argv
+
+_LIVE_FIXTURE_ROOTS = (
+    Path(__file__).resolve().parents[1] / "data" / "agents",
+    *(Path(value) for value in os.environ.get("PYTEST_LIVE_DATA_ROOTS", "").split(os.pathsep)
+      if value),
+)
+
+
+def _assert_private_fixture_paths(paths, live_roots) -> None:
+    roots = [Path(root).resolve() for root in live_roots]
+    for path in paths:
+        resolved = Path(path).resolve()
+        if any(resolved == root or root in resolved.parents for root in roots):
+            raise RuntimeError("test fixture path resolves inside a live data root")
+
+
+# Check before the import-time configuration directories are created.
+_assert_private_fixture_paths([tempfile.gettempdir()], _LIVE_FIXTURE_ROOTS)
 
 # Test session secret. Long-enough random-looking value; never used in
 # production. Tests that need to override (e.g. test_auth.py) do so via
@@ -110,6 +129,8 @@ _scrub_test_env()
 
 def pytest_configure(config: pytest.Config) -> None:
     """Register suite-specific opt-in markers."""
+    if config.option.basetemp:
+        _assert_private_fixture_paths([config.option.basetemp], _LIVE_FIXTURE_ROOTS)
     config.addinivalue_line(
         "markers",
         "real_auth: test exercises real auth flow — skip conftest auto-cookie patch",

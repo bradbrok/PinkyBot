@@ -531,7 +531,8 @@ class TestAdminUpdateStoragePreflight:
         try:
             with (
                 patch("subprocess.check_output", side_effect=gm),
-                patch.dict(os.environ, {"PINKYBOT_CHANNEL": "stable"}),
+                # E4/A3 over E5: isolate legacy absent-root preflight from arming.
+                patch.dict(os.environ, {"PINKYBOT_CHANNEL": "stable", "PINKY_DEPLOY_GUARD": "0"}),
                 patch("pinky_daemon.api._log", side_effect=logs.append),
                 patch("shutil.which", return_value=None),
                 patch("os.kill"),
