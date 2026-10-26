@@ -87,14 +87,43 @@ def _quiet_http_client_loggers() -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
+def _start_api_guard(args):
+    if args.mode != "api":
+        return None
+    from pinky_daemon.deploy_guard import begin_start
+
+    args._deploy_guard = begin_start(
+        str(Path(__file__).resolve().parents[2]),
+        Path(os.path.realpath(args.db_path)).parent / "deploy",
+    )
+    return args._deploy_guard
+
+
+def _minimal_start_args():
+    mode_parser = argparse.ArgumentParser(add_help=False)
+    mode_parser.add_argument("--mode", default="api")
+    mode_parser.add_argument("--db-path", default="data/conversations.db")
+    mode, _ = mode_parser.parse_known_args()
+    return mode
+
+
+def _record_bootstrap_failure(args, exc):
+    guard = _start_api_guard(args)
+    if guard is not None:
+        try:
+            guard.failed(exc)
+        finally:
+            guard.close()
+
+
 def main() -> None:
     _install_faulthandler()
     try:
         _load_dotenv()
     except (Exception, SystemExit) as exc:
-        mode_parser = argparse.ArgumentParser(add_help=False)
-        mode_parser.add_argument("--mode", default="api")
-        mode, _ = mode_parser.parse_known_args()
+        mode = _minimal_start_args()
+        if mode.mode == "api":
+            _record_bootstrap_failure(mode, exc)
         if mode.mode != "check-startup":
             raise
         sys.exit(_startup_check_incomplete(exc))
@@ -129,12 +158,24 @@ def main() -> None:
         default="data/conversations.db",
         help="Canonical conversations DB path (api mode)",
     )
-    args = parser.parse_args()
+    try:
+        args = parser.parse_args()
+    except SystemExit as exc:
+        if exc.code:
+            _record_bootstrap_failure(_minimal_start_args(), exc)
+        raise
+    guard = _start_api_guard(args)
 
     if args.mode == "check-startup":
         sys.exit(_run_startup_check(args))
     elif args.mode == "api":
-        _run_api(args)
+        try:
+            _run_api(args)
+        except BaseException as exc:
+            guard.failed(exc)
+            raise
+        finally:
+            guard.close()
     elif args.mode == "poll":
         _run_poll(args)
 
@@ -162,10 +203,13 @@ def _run_startup_check(args) -> int:
             manifest = api._derive_api_store_manifest(db_path)
             identities = read_store_identities(os.path.realpath(target.path) for target in manifest.values())
             inspection = inspect_filesystem_layout(root, identities)
+            from pinky_daemon import deploy_guard
+
+            deploy_guard.selftest()
             report = json.dumps({
                 "ok": not inspection.findings,
                 "root": str(root),
-                "checked": ["import", "layout"],
+                "checked": ["import", "layout", "guard_selftest"],
                 "findings": inspection.findings,
                 "warnings_count": len(inspection.warnings),
                 "warnings": inspection.warnings[:20],
@@ -184,6 +228,9 @@ def _run_api(args) -> None:
     from pinky_daemon.store_authority import store_authority_lock
 
     with store_authority_lock(args.db_path):
+        guard = getattr(args, "_deploy_guard", None)
+        if guard is not None:
+            guard.activate()
         _run_api_with_authority(args)
 
 
