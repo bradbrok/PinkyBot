@@ -153,3 +153,16 @@ def test_all_state_opens_share_one_validating_helper():
     constants = {node.value for node in ast.walk(helper) if isinstance(node, ast.Constant)}
     assert {"O_NOFOLLOW", "O_NONBLOCK", "fstat", "S_ISREG"} <= attributes
     assert "O_CLOEXEC" in attributes | constants
+    calls = [node for node in ast.walk(helper) if isinstance(node, ast.Call)]
+    fstat = next(node for node in calls if getattr(node.func, "attr", None) == "fstat")
+    regular = next(node for node in calls if getattr(node.func, "attr", None) == "S_ISREG")
+    yields = [node for node in ast.walk(helper) if isinstance(node, ast.Yield)]
+    descriptor_yield = next(
+        node for node in yields if isinstance(node.value, ast.Name)
+    )
+    assert opens[0].lineno < fstat.lineno < regular.lineno < descriptor_yield.lineno
+    assert not any(
+        getattr(call.func, "attr", None) in {"read", "write", "ftruncate"}
+        and call.lineno < regular.lineno
+        for call in calls
+    )

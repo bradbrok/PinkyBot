@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import fcntl
 import inspect
 import json
@@ -15,7 +16,6 @@ import socket
 import stat
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.error
@@ -139,13 +139,58 @@ def _key(state_dir) -> str:
     return os.path.abspath(os.fspath(state_dir))
 
 
+class UnusableStateError(OSError):
+    """Carry safe metadata about an unusable state node, never its contents."""
+
+    def __init__(self, state_kind, node_kind, open_errno=None):
+        super().__init__("guard state is unusable")
+        self.state_kind = state_kind
+        self.node_kind = node_kind
+        self.open_errno = open_errno
+
+
+def _state_kind(name):
+    kinds = {
+        "deploy.json": "deploy record",
+        "starts.jsonl": "start history",
+        "last_failure.json": "failure record",
+        "incident.json": "incident record",
+        "alert-route.json": "alert route",
+        ".guard.lock": "lock",
+        "guard.off": "switch",
+    }
+    return "temporary file" if name.startswith(".guard-") else kinds.get(name, "state file")
+
+
+def _node_kind(mode):
+    for predicate, label in (
+        (stat.S_ISFIFO, "fifo"),
+        (stat.S_ISLNK, "symlink"),
+        (stat.S_ISDIR, "directory"),
+        (stat.S_ISSOCK, "socket"),
+        (stat.S_ISBLK, "block device"),
+        (stat.S_ISCHR, "character device"),
+        (stat.S_ISREG, "regular file"),
+    ):
+        if predicate(mode):
+            return label
+    return "unknown node"
+
+
 def report_error(state_dir, message: str, exc=None, *, repeat: bool = False) -> None:
     # Exception strings can carry credentials or a request URL.
-    safe = message + (f" ({type(exc).__name__})" if exc is not None else "")
+    if isinstance(exc, UnusableStateError):
+        diagnostic = f"unusable {exc.state_kind} ({exc.node_kind})"
+        safe = diagnostic
+        if exc.open_errno in errno.errorcode:
+            safe += f" [{errno.errorcode[exc.open_errno]}]"
+    else:
+        safe = message + (f" ({type(exc).__name__})" if exc is not None else "")
+        diagnostic = safe
     key = _key(state_dir)
     _ERRORS[key] = safe
-    if repeat or (key, safe) not in _LOGGED:
-        _LOGGED.add((key, safe))
+    if repeat or (key, diagnostic) not in _LOGGED:
+        _LOGGED.add((key, diagnostic))
         _LOG.error("ERROR deploy guard: %s", safe)
 
 
@@ -160,38 +205,75 @@ def _directory(state_dir, *, create=False, expected_uid=None) -> Path:
     return path
 
 
-def _checked_file(fd, expected_uid=None) -> None:
-    info = os.fstat(fd)
-    uid = os.getuid() if expected_uid is None else expected_uid
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_mode & 0o077:
-        raise PermissionError("unsafe guard file")
+@contextlib.contextmanager
+def _open_state(state_dir, name, flags, *, missing_ok=False, private=True, expected_uid=None):
+    """Validate a nonblocking descriptor before exposing it to any state I/O."""
+    descriptor = None
+    path = None
+    try:
+        try:
+            path = _directory(
+                state_dir,
+                create=bool(flags & os.O_CREAT),
+                expected_uid=expected_uid,
+            )
+            truncate = bool(flags & os.O_TRUNC)
+            flags = (flags & ~os.O_TRUNC) | os.O_NOFOLLOW | os.O_NONBLOCK
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            descriptor = os.open(path / name, flags, 0o600)
+        except FileNotFoundError:
+            if missing_ok:
+                yield None
+                return
+            raise
+        except OSError as exc:
+            if path is None:
+                raise
+            try:
+                kind = _node_kind((Path(state_dir) / name).lstat().st_mode)
+            except OSError:
+                kind = "unopenable node"
+            if kind != "regular file" or exc.errno == errno.ENXIO:
+                raise UnusableStateError(_state_kind(name), kind, exc.errno) from None
+            raise
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise UnusableStateError(_state_kind(name), _node_kind(info.st_mode))
+        uid = os.getuid() if expected_uid is None else expected_uid
+        if info.st_uid != uid or (private and info.st_mode & 0o077):
+            raise PermissionError("unsafe guard file")
+        if truncate:
+            os.ftruncate(descriptor, 0)
+        yield descriptor
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 @contextlib.contextmanager
 def _locked(state_dir):
-    path = _directory(state_dir, create=True)
-    fd = os.open(path / ".guard.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    try:
-        _checked_file(fd)
+    with _open_state(state_dir, ".guard.lock", os.O_RDWR | os.O_CREAT) as fd:
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
-            yield path
+            yield Path(state_dir)
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
 
 
 def _read(state_dir, name, *, expected_uid=None):
-    try:
-        path = _directory(state_dir, expected_uid=expected_uid)
-        fd = os.open(path / name, os.O_RDONLY | os.O_NOFOLLOW)
-    except FileNotFoundError:
-        return None
-    with os.fdopen(fd, "rb") as source:
-        _checked_file(source.fileno(), expected_uid)
-        data = source.read(1024 * 1024 + 1)
-        if len(data) > 1024 * 1024:
+    with _open_state(
+        state_dir, name, os.O_RDONLY, missing_ok=True, expected_uid=expected_uid
+    ) as fd:
+        if fd is None:
+            return None
+        limit = 1024 * 1024
+        data = bytearray()
+        while len(data) <= limit:
+            block = os.read(fd, limit + 1 - len(data))
+            if not block:
+                break
+            data.extend(block)
+        if len(data) > limit:
             raise ValueError("guard file too large")
         return data.decode("utf-8")
 
@@ -208,17 +290,28 @@ def _json(state_dir, name):
 
 def _atomic(state_dir, name, value, *, raw=False):
     path = _directory(state_dir, create=True)
-    fd, temporary = tempfile.mkstemp(prefix=".guard-", dir=path)
+    # Validate an existing destination without truncating or writing to it.
+    with _open_state(state_dir, name, os.O_WRONLY, missing_ok=True):
+        pass
+    temporary = ".guard-" + uuid.uuid4().hex
+    created = False
     try:
-        with os.fdopen(fd, "w") as output:
-            os.fchmod(output.fileno(), 0o600)
-            output.write(value if raw else json.dumps(value, separators=(",", ":")) + "\n")
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path / name)
+        with _open_state(state_dir, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL) as fd:
+            created = True
+            os.fchmod(fd, 0o600)
+            data = value if raw else json.dumps(value, separators=(",", ":")) + "\n"
+            remaining = memoryview(data.encode("utf-8"))
+            while remaining:
+                written = os.write(fd, remaining)
+                if written <= 0:
+                    raise OSError("incomplete guard write")
+                remaining = remaining[written:]
+            os.fsync(fd)
+        os.replace(path / temporary, path / name)
     finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(temporary)
+        if created:
+            with contextlib.suppress(FileNotFoundError):
+                (path / temporary).unlink()
 
 
 def _history(state_dir) -> list[dict]:
@@ -242,10 +335,11 @@ def _enabled(state_dir) -> bool:
     if os.environ.get("PINKY_DEPLOY_GUARD") == "0":
         return False
     try:
-        return not (Path(state_dir) / "guard.off").exists()
+        with _open_state(state_dir, "guard.off", os.O_RDONLY, missing_ok=True, private=False) as fd:
+            return fd is None
     except OSError as exc:
         report_error(state_dir, "guard state unavailable", exc)
-        return True
+        return False
 
 
 def _head(repo_dir, runner) -> str:
@@ -317,25 +411,29 @@ def refresh_alert_route(state_dir, routes, *, clock=None) -> bool:
         return False
 
 
-def read_alert_route(state_dir, *, expected_uid=None):
-    try:
-        text = _read(state_dir, "alert-route.json", expected_uid=expected_uid)
-        if text is None:
-            return None
-        route = json.loads(text)
-        if (
-            route.get("schema") != 1
-            or not isinstance(route.get("routes"), list)
-            or len(route["routes"]) > 2
+def _alert_route_value(state_dir, expected_uid=None):
+    text = _read(state_dir, "alert-route.json", expected_uid=expected_uid)
+    if text is None:
+        return None
+    route = json.loads(text)
+    if (
+        route.get("schema") != 1
+        or not isinstance(route.get("routes"), list)
+        or len(route["routes"]) > 2
+    ):
+        raise ValueError("invalid alert route")
+    for item in route["routes"]:
+        if not all(
+            isinstance(item.get(key), str)
+            for key in ("platform", "account_id", "conversation_id", "token")
         ):
             raise ValueError("invalid alert route")
-        for item in route["routes"]:
-            if not all(
-                isinstance(item.get(key), str)
-                for key in ("platform", "account_id", "conversation_id", "token")
-            ):
-                raise ValueError("invalid alert route")
-        return route
+    return route
+
+
+def read_alert_route(state_dir, *, expected_uid=None):
+    try:
+        return _alert_route_value(state_dir, expected_uid)
     except Exception as exc:
         report_error(state_dir, "guard state unavailable", exc)
         return None
@@ -347,7 +445,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def send_alert(state_dir, text, *, base_url="https://api.telegram.org", opener=None) -> bool:
-    route = read_alert_route(state_dir)
+    try:
+        route = _alert_route_value(state_dir)
+    except Exception as exc:
+        report_error(state_dir, "guard state unavailable", exc)
+        return False
     selected = next(
         (
             item
