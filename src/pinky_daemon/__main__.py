@@ -103,48 +103,7 @@ def _start_api_guard(args):
     return args._deploy_guard
 
 
-def _minimal_start_args():
-    values = {"mode": _DEFAULT_MODE, "db_path": _DEFAULT_DB_PATH}
-    options = {"--mode": "mode", "--db-path": "db_path"}
-    arguments = sys.argv[1:]
-    for index, argument in enumerate(arguments):
-        if argument == "--":
-            break
-        if not isinstance(argument, str):
-            continue
-        option, attached, value = argument.partition("=")
-        if option not in options:
-            continue
-        if attached:
-            values[options[option]] = value
-        elif index + 1 < len(arguments):
-            candidate = arguments[index + 1]
-            if isinstance(candidate, str) and not candidate.startswith("-"):
-                values[options[option]] = candidate
-    return SimpleNamespace(**values)
-
-
-def _record_bootstrap_failure(args, exc):
-    guard = _start_api_guard(args)
-    if guard is not None:
-        try:
-            guard.failed(exc)
-        finally:
-            guard.close()
-
-
-def main() -> None:
-    _install_faulthandler()
-    try:
-        _load_dotenv()
-    except BaseException as exc:
-        mode = _minimal_start_args()
-        if mode.mode == "api":
-            _record_bootstrap_failure(mode, exc)
-        if mode.mode != "check-startup":
-            raise
-        sys.exit(_startup_check_incomplete(exc))
-    _quiet_http_client_loggers()
+def _argument_parser():
     parser = argparse.ArgumentParser(description="Pinky — headless Claude Code")
     parser.add_argument(
         "--mode",
@@ -175,11 +134,66 @@ def main() -> None:
         default=_DEFAULT_DB_PATH,
         help="Canonical conversations DB path (api mode)",
     )
+    return parser
+
+
+def _minimal_start_args(parser=None):
+    parser = _argument_parser() if parser is None else parser
+    values = {"mode": parser.get_default("mode"), "db_path": parser.get_default("db_path")}
+    options = {"--mode": "mode", "--db-path": "db_path"}
+    arguments = sys.argv[1:]
+    for index, argument in enumerate(arguments):
+        if argument == "--":
+            break
+        if not isinstance(argument, str):
+            continue
+        option, attached, value = argument.partition("=")
+        if option not in options:
+            continue
+        if attached:
+            values[options[option]] = value
+        elif index + 1 < len(arguments):
+            candidate = arguments[index + 1]
+            if isinstance(candidate, str) and (
+                not candidate.startswith("-")
+                or (
+                    parser._negative_number_matcher.match(candidate)
+                    and not parser._has_negative_number_optionals
+                )
+            ):
+                values[options[option]] = candidate
+    return SimpleNamespace(**values)
+
+
+def _record_bootstrap_failure(args, exc):
+    guard = _start_api_guard(args)
+    if guard is not None:
+        try:
+            guard.failed(exc)
+        finally:
+            guard.close()
+
+
+def main() -> None:
+    _install_faulthandler()
+    try:
+        _load_dotenv()
+    except BaseException as exc:
+        mode = _minimal_start_args()
+        if mode.mode == "api":
+            _record_bootstrap_failure(mode, exc)
+        elif not isinstance(exc, (Exception, SystemExit)):
+            raise
+        if mode.mode != "check-startup":
+            raise
+        sys.exit(_startup_check_incomplete(exc))
+    _quiet_http_client_loggers()
+    parser = _argument_parser()
     try:
         args = parser.parse_args()
     except BaseException as exc:
         if not isinstance(exc, SystemExit) or exc.code:
-            _record_bootstrap_failure(_minimal_start_args(), exc)
+            _record_bootstrap_failure(_minimal_start_args(parser), exc)
         raise
     guard = _start_api_guard(args)
 
