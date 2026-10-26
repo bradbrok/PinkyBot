@@ -39,6 +39,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
 
+import httpx
 from fastapi import (
     FastAPI,
     HTTPException,
@@ -298,6 +299,7 @@ from pinky_daemon.tool_policy_store import ToolPolicyStore
 from pinky_daemon.transport_state import SessionState as TransportSessionState
 from pinky_daemon.trigger_store import TriggerStore
 from pinky_daemon.wake_prompt import WakeReason
+from pinky_outreach.telegram import TelegramError
 
 # Feature flag: shared MCP mode uses a single HTTP/SSE server instead of per-agent stdio
 SHARED_MCP_ENABLED = os.environ.get("PINKY_SHARED_MCP", "0") == "1"
@@ -661,6 +663,30 @@ _STOP_FAILURE_AUTH_TYPES = frozenset(
 #   - error_internal  — genuinely unexpected exception we should have caught
 #                       (bare `except Exception` paths with no upstream context)
 OutreachOutcome = Literal["success", "rejected", "error_upstream", "error_internal"]
+
+
+class DeliveryUnknownError(HTTPException):
+    """A Telegram request may have landed despite a missing usable response."""
+
+    def __init__(self, cause: Exception):
+        self.cause = cause
+        super().__init__(
+            status_code=504,
+            detail=(
+                "delivery unknown: the platform did not answer in time or returned an "
+                f"unreadable response ({type(cause).__name__}: {cause}); "
+                "the message may already have been delivered; do not resend; check the chat first"
+            ),
+        )
+
+
+def _send_telegram_once(send, *args, **kwargs):
+    """Classify uncertain network results without retrying a delivery."""
+    try:
+        return send(*args, **kwargs)
+    except (httpx.TransportError, httpx.DecodingError, json.JSONDecodeError,
+            UnicodeDecodeError) as error:
+        raise DeliveryUnknownError(error) from error
 
 
 def resolve_provider_config(
@@ -2563,25 +2589,24 @@ def create_api(
             reply_markup = {"inline_keyboard": [buttons]} if buttons else None
 
             def _tg_send(rp, markup):
-                # Send with the existing MarkdownV2->plain degradation; ``rp`` is
-                # the reply_parameters (or None for a normal/unquoted reply).
+                # Retry plain only after Telegram explicitly rejects MarkdownV2.
                 if parse_mode:
-                    return adapter.send_message(
+                    return _send_telegram_once(adapter.send_message,
                         chat_id, content, reply_to_message_id=reply_to_id,
                         parse_mode=parse_mode, disable_notification=silent,
                         link_preview_options=link_preview_options, reply_parameters=rp,
                         reply_markup=markup,
                     )
                 try:
-                    return adapter.send_message(
+                    return _send_telegram_once(adapter.send_message,
                         chat_id, _md_to_tg_mdv2(content), reply_to_message_id=reply_to_id,
                         parse_mode="MarkdownV2", disable_notification=silent,
                         link_preview_options=link_preview_options, reply_parameters=rp,
                         reply_markup=markup,
                     )
-                except Exception as e:
+                except TelegramError as e:
                     _log(f"broker-send: MarkdownV2 failed ({e}), trying plain")
-                    return adapter.send_message(
+                    return _send_telegram_once(adapter.send_message,
                         chat_id, content, reply_to_message_id=reply_to_id,
                         disable_notification=silent,
                         link_preview_options=link_preview_options, reply_parameters=rp,
@@ -2590,16 +2615,14 @@ def create_api(
 
             try:
                 result = _tg_send(reply_parameters, reply_markup)
-            except Exception as e:
+            except TelegramError as e:
                 # An invalid quote (not an exact substring / too long) makes
                 # Telegram reject the send. Don't sink the whole reply — degrade
                 # to a normal threaded reply (no quote, reply_to preserved) so
                 # the message still lands. Scoped to quote errors so a transient
                 # failure on a VALID quote isn't silently downgraded.
-                from pinky_outreach.telegram import TelegramError
                 quote_rejected = (
                     reply_parameters is not None
-                    and isinstance(e, TelegramError)
                     and "quote" in (getattr(e, "description", "") or "").lower()
                 )
                 if quote_rejected:
@@ -2703,16 +2726,16 @@ def create_api(
 
             if caption:
                 try:
-                    result = _dispatch(_md_to_tg_mdv2(caption), "MarkdownV2")
+                    result = _send_telegram_once(_dispatch, _md_to_tg_mdv2(caption), "MarkdownV2")
                 except FileNotFoundError:
                     # Caller-side bad path — no send happened; let the route
                     # bucket it as `rejected` instead of masking it with a retry.
                     raise
-                except Exception as e:
+                except TelegramError as e:
                     _log(f"broker-send-file: MarkdownV2 caption failed ({e}), trying plain")
-                    result = _dispatch(caption, None)
+                    result = _send_telegram_once(_dispatch, caption, None)
             else:
-                result = _dispatch(caption, None)
+                result = _send_telegram_once(_dispatch, caption, None)
             return SimpleNamespace(message_id=_extract_message_id(result))
 
         if platform == "discord":
@@ -2789,24 +2812,34 @@ def create_api(
         loop = asyncio.get_running_loop()
 
         async def _deliver() -> dict:
-            msg = await loop.run_in_executor(
-                None,
-                lambda: _send_text_message(
-                    agent_name,
-                    platform,
-                    chat_id,
-                    content,
-                    account_id=account_id,
-                    reply_to=reply_to,
-                    parse_mode=parse_mode,
-                    silent=silent,
-                    link_preview_options=link_preview_options,
-                    quote=quote,
-                    blocks=delivery_blocks,
-                    reply_metadata=reply_metadata,
-                    buttons=button_row,
-                ),
-            )
+            try:
+                msg = await loop.run_in_executor(
+                    None,
+                    lambda: _send_text_message(
+                        agent_name,
+                        platform,
+                        chat_id,
+                        content,
+                        account_id=account_id,
+                        reply_to=reply_to,
+                        parse_mode=parse_mode,
+                        silent=silent,
+                        link_preview_options=link_preview_options,
+                        quote=quote,
+                        blocks=delivery_blocks,
+                        reply_metadata=reply_metadata,
+                        buttons=button_row,
+                    ),
+                )
+            except DeliveryUnknownError as error:
+                broker._stop_typing(agent_name, chat_id)
+                _outreach_attempt_log(
+                    agent_name=agent_name, platform=platform, method="send",
+                    chat_id=chat_id, file_path="", caption_len=len(content),
+                    outcome="error_upstream",
+                    error=f"delivery_unknown: {type(error.cause).__name__}: {error.cause}",
+                )
+                raise
             # Once an outbound message lands, the typing indicator becomes noise —
             # Telegram has no "stop typing" API, but cancelling our 4s
             # sendChatAction loop prevents the indicator from popping back up
@@ -11405,6 +11438,16 @@ npm run build</pre>
 
         deliveries: list[dict] = []
         errors: list[str] = []
+        delivery_unknown: list[str] = []
+
+        def record_unknown(platform: str, chat_id: str, error: DeliveryUnknownError) -> None:
+            delivery_unknown.append(chat_id)
+            deliveries.append({
+                "platform": platform, "chat_id": chat_id,
+                "delivery": "unknown", "error": error.detail,
+            })
+            errors.append(f"{platform}:{chat_id}: {error.detail}")
+
         for user in agents.list_approved_users(agent_name):
             if user.status != "approved":
                 continue
@@ -11418,6 +11461,8 @@ npm run build</pre>
                     content=content,
                     metadata={"tool": "broadcast", "delivery": result},
                 )
+            except DeliveryUnknownError as error:
+                record_unknown("telegram", user.chat_id, error)
             except Exception as e:
                 errors.append(f"telegram:{user.chat_id}: {e}")
                 _log(f"broker-broadcast: failed for {agent_name} -> telegram:{user.chat_id}: {e}")
@@ -11433,11 +11478,16 @@ npm run build</pre>
                     content=content,
                     metadata={"tool": "broadcast", "delivery": result},
                 )
+            except DeliveryUnknownError as error:
+                record_unknown(group["platform"], group["chat_id"], error)
             except Exception as e:
                 errors.append(f"{group['platform']}:{group['chat_id']}: {e}")
                 _log(f"broker-broadcast: failed for {agent_name} -> {group['platform']}:{group['chat_id']}: {e}")
 
-        return {"sent": True, "count": len(deliveries), "errors": errors, "deliveries": deliveries}
+        return {
+            "sent": True, "count": sum(item.get("sent") is True for item in deliveries),
+            "errors": errors, "deliveries": deliveries, "delivery_unknown": delivery_unknown,
+        }
 
     def _outreach_attempt_log(
         *,
@@ -11573,6 +11623,14 @@ npm run build</pre>
                 outcome="rejected", error=error_repr,
             )
             raise HTTPException(400, f"Failed to {method}: {error_repr}") from e
+        except DeliveryUnknownError as error:
+            _outreach_attempt_log(
+                agent_name=agent_name, platform=platform, method=method,
+                chat_id=chat_id, file_path=file_path, caption_len=len(caption),
+                outcome="error_upstream",
+                error=f"delivery_unknown: {type(error.cause).__name__}: {error.cause}",
+            )
+            raise
         except HTTPException:
             # Already structured — let FastAPI render it. Still stop typing.
             # HTTPExceptions reachable here come from _send_file_message's
@@ -11762,23 +11820,31 @@ npm run build</pre>
                     with urllib.request.urlopen(gif_url, timeout=30) as resp:
                         with open(tmp_path, "wb") as f:
                             f.write(resp.read())
-                    return adapter.send_animation(chat_id, tmp_path, caption=caption, reply_to_message_id=int(reply_to) if reply_to else None)
+                    return _send_telegram_once(
+                        adapter.send_animation, chat_id, tmp_path, caption=caption,
+                        reply_to_message_id=int(reply_to) if reply_to else None,
+                    )
                 finally:
                     try:
                         os.unlink(tmp_path)
                     except Exception:
                         pass
 
-            # Issue #395 follow-up: wrap the download+send in try/except so a
-            # failure surfaces as a structured 502 (not 500/unhandled). The
-            # outer finally below ensures _stop_typing fires on every exit path.
+            # Keep download failures as 502; only an uncertain final Telegram
+            # send becomes 504. The outer finally stops typing on every exit path.
             try:
                 msg = await loop.run_in_executor(None, _download_and_send)
+            except DeliveryUnknownError as error:
+                _outreach_attempt_log(
+                    agent_name=agent_name_req, platform=platform, method="send_gif",
+                    chat_id=chat_id, file_path="", caption_len=len(caption),
+                    outcome="error_upstream",
+                    error=f"delivery_unknown: {type(error.cause).__name__}: {error.cause}",
+                )
+                raise
             except HTTPException:
-                # _download_and_send wraps urlopen + adapter.send_animation;
-                # neither raises HTTPException directly today, so this branch
-                # is defensive. If an HTTPException ever does surface here it
-                # came from a config-side check, so bucket as `rejected`.
+                # Preserve structured config-side rejections. Uncertain
+                # delivery is handled separately above.
                 _outreach_attempt_log(
                     agent_name=agent_name_req, platform=platform, method="send_gif",
                     chat_id=chat_id, file_path="", caption_len=len(caption),
