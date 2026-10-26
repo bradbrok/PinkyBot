@@ -16342,6 +16342,7 @@ npm run build</pre>
         return _serve_spa_or_html("tasks.html")
 
     # ── Project / Task / Sprint / Milestone Routes ──────────────
+    from pinky_daemon.routes.projects_tasks import _task_read_scope
     from pinky_daemon.routes.projects_tasks import router as _pt_router
     from pinky_daemon.routes.projects_tasks import set_dependencies as _pt_set_deps
 
@@ -16358,7 +16359,7 @@ npm run build</pre>
     # Self-monitoring endpoints
 
     @app.get("/agents/{agent_name}/health")
-    async def agent_health(agent_name: str):
+    async def agent_health(agent_name: str, request: Request):
         """Comprehensive health check for an agent.
 
         Returns: session status, context usage, heartbeat health,
@@ -16405,7 +16406,7 @@ npm run build</pre>
             }
 
         # Task workload
-        agent_tasks = tasks.list(assigned_agent=agent_name)
+        agent_tasks = tasks.list(assigned_agent=agent_name, visible_to=_task_read_scope(request))
         task_info = {
             "total_active": len(agent_tasks),
             "pending": sum(1 for t in agent_tasks if t.status == "pending"),
