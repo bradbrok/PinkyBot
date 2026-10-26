@@ -283,13 +283,13 @@ def test_off_start_only_records_one_start(harness, monkeypatch, switch):
     assert not any("checkout" in cmd for cmd, _ in h.runner.calls)
 
 
-@pytest.mark.parametrize("problem", ["json", "directory", "git"])
+@pytest.mark.parametrize("problem", ["json", "directory", "unreadable", "git"])
 def test_guard_trouble_continues_and_status_is_safe(harness, caplog, problem):
     h = harness()
     if problem == "json":
         (h.state / "deploy.json").write_text("{invalid")
-    elif problem == "directory":
-        h.state.chmod(0o755)
+    elif problem in {"directory", "unreadable"}:
+        h.state.chmod(0o755 if problem == "directory" else 0)
     else:
 
         def missing(*args, **kwargs):
@@ -679,3 +679,39 @@ def test_route_file_owner_is_checked_separately_from_directory(tmp_path, monkeyp
         patch.setattr(g.os, "fstat", foreign_file)
         assert g.read_alert_route(state) is None
     assert g.read_alert_route(state) is not None
+
+
+def test_rollback_intent_is_durable_before_checkout(harness):
+    h = harness(rec={"attempts": [{}, {}, {}]})
+    runner, observed = h.ctx.runner, []
+
+    def inspect_checkout(cmd, **kwargs):
+        if cmd[:2] == ["git", "checkout"]:
+            current = load(h.state)
+            observed.append((current["state"], current["rollback"]["tries"]))
+        return runner(cmd, **kwargs)
+
+    h.ctx.runner = inspect_checkout
+    with pytest.raises(SystemExit) as ended:
+        h.ctx.activate()
+    assert ended.value.code == 75
+    assert observed == [("rolling_back", 1)]
+
+
+def test_hostname_failure_never_stops_start(tmp_path, monkeypatch, caplog):
+    g = guard_module()
+    state = tmp_path / "data" / "deploy"
+
+    def unavailable():
+        raise OSError(TOKEN)
+
+    monkeypatch.setattr(g.socket, "gethostname", unavailable)
+    ctx = g.begin_start(str(tmp_path), state, runner=Runner(), sleep=lambda seconds: None)
+    try:
+        ctx.activate()
+        assert len((state / "starts.jsonl").read_text().splitlines()) == 1
+        status = g.guard_status(str(tmp_path), state)
+        assert status["last_error"]
+        assert TOKEN not in caplog.text + json.dumps(status)
+    finally:
+        ctx.close()
