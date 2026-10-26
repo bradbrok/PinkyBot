@@ -135,7 +135,8 @@ def test_route_refresh_tracks_shared_token_and_destination_changes(deployment):
     )
     client = TestClient(fx.app)
     destination = dict(
-        platform="telegram", account_id="fixture-account", conversation_id="fixture-chat"
+        platform="telegram", account_id="fixture-account", conversation_id="fixture-chat",
+        principal_id="fixture-owner",
     )
     answer = client.put(
         "/system/owner-notification-destinations", json={"destinations": [destination]}
@@ -169,7 +170,8 @@ async def test_arming_refreshes_route_and_status_discloses_frontend_limit(deploy
     agents.register("sender", enabled=True)
     agents.set_token("sender", "telegram", TOKEN, settings={"account_id": "fixture-account"})
     agents.set_owner_notification_destinations(
-        [dict(platform="telegram", account_id="fixture-account", conversation_id="fixture-chat")]
+        [dict(platform="telegram", account_id="fixture-account", conversation_id="fixture-chat",
+              principal_id="fixture-owner")]
     )
     fx.set_target(report=clean_report(fx.data))
     await fx.update()

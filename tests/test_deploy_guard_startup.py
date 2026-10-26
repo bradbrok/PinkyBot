@@ -334,6 +334,7 @@ def test_dotenv_failure_is_accounted_only_for_api(tmp_path, monkeypatch, capsys,
         raise PermissionError("synthetic dotenv unreadable")
 
     monkeypatch.setattr(entry, "_load_dotenv", unreadable)
+    monkeypatch.setattr(entry, "_install_faulthandler", lambda: None)
     if mode == "check-startup":
         with pytest.raises(SystemExit) as ended:
             entry.main()
@@ -363,6 +364,7 @@ def test_five_authority_exits_do_not_count_busy_starts(tmp_path, monkeypatch, bu
     monkeypatch.setattr(entry, "_load_dotenv", lambda: None)
     notices = []
     monkeypatch.setattr(g, "send_alert", lambda directory, text: notices.append(text) or True)
+    monkeypatch.setattr(g.socket, "gethostname", lambda: "fixture-node")
     monkeypatch.setattr(g.time, "sleep", lambda seconds: None)
 
     def stopped(args):
