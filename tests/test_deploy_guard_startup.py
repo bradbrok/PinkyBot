@@ -456,13 +456,24 @@ def test_alert_sender_does_not_follow_redirects(tmp_path, caplog):
             pass
 
     state = tmp_path / "deploy"
-    g.refresh_alert_route(state, [dict(platform="telegram", account_id="fixture-account",
-                                     conversation_id="fixture-chat", token=TOKEN)])
+    g.refresh_alert_route(
+        state,
+        [
+            dict(
+                platform="telegram",
+                account_id="fixture-account",
+                conversation_id="fixture-chat",
+                token=TOKEN,
+            )
+        ],
+    )
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
     try:
-        assert not g.send_alert(state, "fixture alert", base_url=f"http://127.0.0.1:{server.server_port}")
+        assert not g.send_alert(
+            state, "fixture alert", base_url=f"http://127.0.0.1:{server.server_port}"
+        )
         assert calls == ["POST"]
         assert TOKEN not in caplog.text
     finally:

@@ -135,7 +135,9 @@ def test_route_refresh_tracks_shared_token_and_destination_changes(deployment):
     )
     client = TestClient(fx.app)
     destination = dict(
-        platform="telegram", account_id="fixture-account", conversation_id="fixture-chat",
+        platform="telegram",
+        account_id="fixture-account",
+        conversation_id="fixture-chat",
         principal_id="fixture-owner",
     )
     answer = client.put(
@@ -170,8 +172,14 @@ async def test_arming_refreshes_route_and_status_discloses_frontend_limit(deploy
     agents.register("sender", enabled=True)
     agents.set_token("sender", "telegram", TOKEN, settings={"account_id": "fixture-account"})
     agents.set_owner_notification_destinations(
-        [dict(platform="telegram", account_id="fixture-account", conversation_id="fixture-chat",
-              principal_id="fixture-owner")]
+        [
+            dict(
+                platform="telegram",
+                account_id="fixture-account",
+                conversation_id="fixture-chat",
+                principal_id="fixture-owner",
+            )
+        ]
     )
     fx.set_target(report=clean_report(fx.data))
     await fx.update()
@@ -275,7 +283,11 @@ def test_fixture_path_guard_rejects_symlinked_live_roots(tmp_path):
 @pytest.mark.parametrize("present", [False, True], ids=["absent", "present"])
 @pytest.mark.parametrize("deps", [False, True], ids=["plain", "deps"])
 async def test_missing_data_root_uses_undo_without_creating_it(
-    deployment, tmp_path, caplog, present, deps,
+    deployment,
+    tmp_path,
+    caplog,
+    present,
+    deps,
 ):
     guard_module()
     fx = deployment
@@ -294,11 +306,20 @@ async def test_missing_data_root_uses_undo_without_creating_it(
             assert not fx.scheduled and not result.get("restarting")
             assert result["guard"] == {"armed": False, "reason": "data_root_absent"}
             assert result["reason"] == "data_root_absent"
-            assert result["undo"] == dict(checked_out=fx.previous, ok=True,
-                                         deps_restored=True if deps else None, error=None)
+            assert result["undo"] == dict(
+                checked_out=fx.previous, ok=True, deps_restored=True if deps else None, error=None
+            )
             assert fx.git("rev-parse", "HEAD") == fx.previous
-            assert len([r for r in caplog.records
-                        if "WARNING deploy guard: data root absent" in r.message]) == 1
+            assert (
+                len(
+                    [
+                        r
+                        for r in caplog.records
+                        if "WARNING deploy guard: data root absent" in r.message
+                    ]
+                )
+                == 1
+            )
             assert [ref for ref, _ in fx.installs] == ([fx.target, fx.previous] if deps else [])
     finally:
         if not present:

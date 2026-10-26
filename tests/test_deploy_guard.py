@@ -590,10 +590,12 @@ def test_stale_transition_does_not_open_an_incident(harness):
 
 @pytest.mark.parametrize("elapsed,alerted", [(0, False), (21599.999, False), (21600, True)])
 def test_open_incident_reminds_only_after_six_hours(harness, elapsed, alerted):
-    h = harness(now=30000.0,
-                history=[dict(ts=29990.0 + n, pid=n + 1, ref=P) for n in range(5)])
-    save(h.state, "incident.json", dict(open=True, started_at=29990.0,
-                                       last_alert_at=30000.0 - elapsed, failed_starts=5))
+    h = harness(now=30000.0, history=[dict(ts=29990.0 + n, pid=n + 1, ref=P) for n in range(5)])
+    save(
+        h.state,
+        "incident.json",
+        dict(open=True, started_at=29990.0, last_alert_at=30000.0 - elapsed, failed_starts=5),
+    )
     h.ctx.activate()
     assert len(h.alerts) == int(alerted)
     assert load(h.state, "incident.json")["open"] is True
@@ -634,12 +636,46 @@ def test_arming_requires_an_existing_real_data_root(tmp_path, kind):
         actual = tmp_path / "actual"
         actual.mkdir(mode=0o700)
         root.symlink_to(actual, target_is_directory=True)
-    result = g.arm_deploy(str(tmp_path), root / "deploy", previous_ref=P, target_ref=T,
-                         previous_label="previous", target_label="target", deps_rebuilt=False,
-                         forced_reset=False)
+    result = g.arm_deploy(
+        str(tmp_path),
+        root / "deploy",
+        previous_ref=P,
+        target_ref=T,
+        previous_label="previous",
+        target_label="target",
+        deps_rebuilt=False,
+        forced_reset=False,
+    )
     assert result["armed"] is (kind == "directory")
     if kind != "directory":
         assert result["reason"] == "data_root_absent"
         assert not (root / "deploy").exists()
     if kind == "missing":
         assert not root.exists()
+
+
+def test_route_file_owner_is_checked_separately_from_directory(tmp_path, monkeypatch):
+    g = guard_module()
+    state = tmp_path / "deploy"
+    g.refresh_alert_route(
+        state,
+        [
+            dict(
+                platform="telegram",
+                account_id="fixture-account",
+                conversation_id="fixture-chat",
+                token=TOKEN,
+            )
+        ],
+    )
+    real_fstat = os.fstat
+
+    def foreign_file(fd):
+        fields = list(real_fstat(fd))
+        fields[4] += 1
+        return os.stat_result(fields)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(g.os, "fstat", foreign_file)
+        assert g.read_alert_route(state) is None
+    assert g.read_alert_route(state) is not None
