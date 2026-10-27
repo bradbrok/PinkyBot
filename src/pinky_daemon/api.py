@@ -3282,23 +3282,37 @@ def create_api(
 
     app.state.storage_holds = {}
     app.state.storage_hold_overrides = set()
+    delivered_main_storage_notices: set[str] = set()
 
-    def _storage_hold_for(name: str | None = None):
-        """Return a detached effective view; this is the only state reader."""
+    def _storage_hold_for(name: str | None = None, *, registering: bool = False):
+        """The sole state reader; registration projects a detached view without saving."""
         if name is None:
             return [_storage_hold_for(subject) for subject in app.state.storage_holds]
         findings = app.state.storage_holds.get(name)
         if not name or not findings:
             return None
         registered = agents.get(name) is not None
-        main_exempt = registered and name == agents.get_main_agent()
+        main_name = agents.get_main_agent()
+        registration_main = registering and not registered and not main_name
+        main_exempt = (registered or registering) and (name == main_name or registration_main)
         overridden = name in app.state.storage_hold_overrides
-        return {
+        view = {
             "agent": name, "findings": copy.deepcopy(findings),
-            "held": registered and not main_exempt and not overridden,
+            "held": (registered or registering) and not main_exempt and not overridden,
             "main_exempt": main_exempt, "overridden": overridden,
             "registered": registered,
         }
+        if registering and not registered:
+            view["prospective_registration"] = True
+        return view
+
+    def _main_storage_notice(agent_name: str) -> str:
+        if agent_name in delivered_main_storage_notices:
+            return ""
+        hold = _storage_hold_for(agent_name)
+        if not hold or not hold["main_exempt"]:
+            return ""
+        return "WARNING STORAGE HOLD: main agent exemption\n" + json.dumps(hold["findings"])
 
     def _storage_hold_error(hold):
         return HTTPException(409, {"code": "storage_hold", **hold})
@@ -4023,9 +4037,7 @@ def create_api(
                 f"{agent_name}: {type(e).__name__}"
             )
 
-        hold = _storage_hold_for(agent_name)
-        if hold and hold["main_exempt"]:
-            notice = "WARNING STORAGE HOLD: main agent exemption\n" + json.dumps(hold["findings"])
+        if notice := _main_storage_notice(agent_name):
             wake_ctx = notice + ("\n\n" + wake_ctx if wake_ctx else "")
         return wake_ctx
 
@@ -4702,6 +4714,48 @@ def create_api(
             )
             return outcome.delivered
 
+        pending_main_storage_notice = False
+        preview_storage_notice = _main_storage_notice(agent_name)
+
+        def _session_wake_context(name, reason=WakeReason.NEW_SESSION, *, commit=True):
+            nonlocal pending_main_storage_notice
+            removed_storage_notice = False
+            if commit:
+                pending_main_storage_notice = False
+                # An older preview remains the transport's fallback if a later
+                # rebuild fails. Keep its other context, but never replay a
+                # notice already delivered by another session in this app.
+                if (preview_storage_notice and name in delivered_main_storage_notices
+                        and config.wake_context.startswith(preview_storage_notice)):
+                    config.wake_context = config.wake_context[len(preview_storage_notice):].removeprefix("\n\n")
+                    removed_storage_notice = True
+            try:
+                text = _build_streaming_wake_context(name, reason, commit=commit)
+            except Exception as exc:
+                if removed_storage_notice:
+                    _log(
+                        f"wake_context: rebuild failed for {name}: {type(exc).__name__}; "
+                        "using stored context without the delivered storage notice"
+                    )
+                    return config.wake_context
+                if commit:
+                    pending_main_storage_notice = bool(
+                        preview_storage_notice and name not in delivered_main_storage_notices
+                        and config.wake_context.startswith(preview_storage_notice)
+                    )
+                raise
+            if commit:
+                notice = _main_storage_notice(name)
+                pending_main_storage_notice = bool(notice and text.startswith(notice))
+            return text
+
+        def _session_wake_delivered(name, reason):
+            nonlocal pending_main_storage_notice
+            if pending_main_storage_notice:
+                delivered_main_storage_notices.add(name)
+                pending_main_storage_notice = False
+            _log_agent_wake_event(name, reason)
+
         config = StreamingSessionConfig(
             agent_name=agent_name,
             label=label,
@@ -4719,9 +4773,9 @@ def create_api(
             resume_handle=resume_id,
             # Rebuild committed text at submission. The initial preview below
             # leaves the manifest intact while the listener is unavailable.
-            wake_context_builder=_build_streaming_wake_context,
+            wake_context_builder=_session_wake_context,
             api_readiness=app.state.api_readiness,
-            on_wake_delivered=_log_agent_wake_event,
+            on_wake_delivered=_session_wake_delivered,
             on_turn_idle=_notify_scheduler_turn_idle,
             wake_submission_recovery_injector=_inject_wake_context_reload,
             wake_failure_callback=_notify_owner_alert,
@@ -8541,6 +8595,10 @@ npm run build</pre>
             )
             raise HTTPException(403, "isolated agent may not register or modify agents")
 
+        hold = _storage_hold_for(name, registering=True)
+        if hold and hold["held"] and req.isolation_mode == "container":
+            raise _storage_hold_error(hold)
+
         _validate_model_runtime(req)
         raw_work_dir = req.working_dir or f"data/agents/{name}"
         try:
@@ -8568,9 +8626,9 @@ npm run build</pre>
                 500,
                 {"code": "agent_registration_failed"},
             ) from exc
-        # No availability read: agents.name is a PRIMARY KEY and the registry
-        # executes INSERT OR ABORT. That database decision is authoritative
-        # when concurrent clients race on the same name.
+        # Name availability remains the registry's INSERT OR ABORT decision.
+        # The hold projection does not reserve a name or replace the PRIMARY
+        # KEY check when concurrent clients race on the same name.
         try:
             agent = agents.register(
                 name,
@@ -8704,7 +8762,10 @@ npm run build</pre>
             ) from exc
 
         _discard_registration_workspace_capture(workspace_state)
-        return agent.to_dict()
+        result = agent.to_dict()
+        if hold := _storage_hold_for(name):
+            result["storage_hold"] = hold
+        return result
 
     @app.get("/agents")
     async def list_agents(group: str = "", enabled_only: bool = False):
