@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+import json
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -251,19 +253,20 @@ async def test_invalid_date_still_returns_bad_request(history, field):
 
 
 @pytest.mark.parametrize("total,logged", [(1.2, True), (0.9, False), (1.0, False)])
-async def test_phase_log_contains_only_metadata(history, monkeypatch, caplog, total, logged):
+async def test_phase_log_contains_only_metadata(history, monkeypatch, capsys, total, logged):
     query = "privatequery"
     content = "privatequery confidential message"
     history.store.append("opaque-own", "user", content)
     times = iter([10.0, 10.2, 10.7, 10.0 + total])
     monkeypatch.setattr(memory, "perf_counter", lambda: next(times), raising=False)
-    with caplog.at_level(logging.INFO, logger=memory.__name__):
-        response = await request(history, q=query)
+    response = await request(history, q=query)
     assert response.status_code == 200
-    records = [r for r in caplog.records if r.name == memory.__name__]
-    assert len(records) == int(logged)
+    captured = capsys.readouterr()
+    lines = captured.err.splitlines()
+    assert len(lines) == int(logged)
     if logged:
-        line = records[0].getMessage()
+        line = lines[0]
+        assert line.startswith("chat-history:")
         for key in ["collection_ms=", "store_read_ms=", "response_build_ms=", "total_ms=",
                     "agent=sample", "has_query=True", "row_count=1"]:
             assert key in line
@@ -273,6 +276,43 @@ async def test_phase_log_contains_only_metadata(history, monkeypatch, caplog, to
         assert "total_ms=1200.0" in line
         assert query not in line
         assert content not in line
+
+
+def test_phase_log_reaches_stderr_under_daemon_config(tmp_path, capsys):
+    script = tmp_path / "logging_probe.py"
+    script.write_text('''import json
+import logging
+from types import SimpleNamespace
+from fastapi import FastAPI
+import uvicorn
+from pinky_daemon.routes import memory
+from pinky_daemon.routes.triggers import uvicorn_log_config
+
+uvicorn.Config(FastAPI(), log_config=uvicorn_log_config())
+memory._agents = SimpleNamespace(get=lambda name: object())
+memory._store = SimpleNamespace(search=lambda *args, **kwargs: [])
+memory._collect_agent_session_ids = lambda name: set()
+times = iter([10.0, 10.2, 10.7, 11.2])
+memory.perf_counter = lambda: next(times)
+response = memory.search_agent_chat_history('reader', q='sensitive-query')
+print(json.dumps({'count': response['count'],
+                  'info_enabled': logging.getLogger(memory.__name__).isEnabledFor(logging.INFO)}))
+''')
+    result = subprocess.run(
+        [sys.executable, "-B", str(script)], capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report == {"count": 0, "info_enabled": False}
+    # Relay the isolated child's actual stderr into pytest's capture stream.
+    print(result.stderr, file=sys.stderr, end="")
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("chat-history:")
+    for field in ["agent=reader", "has_query=True", "row_count=0", "collection_ms=200.0",
+                  "store_read_ms=500.0", "response_build_ms=500.0", "total_ms=1200.0"]:
+        assert field in lines[0]
+    assert "sensitive-query" not in lines[0]
 
 
 @pytest.mark.parametrize(
