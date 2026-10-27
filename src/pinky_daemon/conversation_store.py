@@ -271,6 +271,9 @@ class ConversationStore:
         platform: str = "",
         chat_id: str = "",
         limit: int = 50,
+        after_ts: float = 0.0,
+        before_ts: float = 0.0,
+        role: str = "",
     ) -> list[StoredMessage]:
         """Full-text search across all conversations.
 
@@ -283,6 +286,9 @@ class ConversationStore:
             platform: Filter by platform.
             chat_id: Filter by chat.
             limit: Max results.
+            after_ts: Inclusive earliest timestamp (zero means no filter).
+            before_ts: Inclusive latest timestamp (zero means no filter).
+            role: Filter by role (empty means no filter).
         """
         # Build query with optional filters
         conditions = ["messages_fts MATCH ?"]
@@ -308,6 +314,15 @@ class ConversationStore:
         if chat_id:
             conditions.append("m.chat_id = ?")
             params.append(chat_id)
+        if after_ts:
+            conditions.append("m.timestamp >= ?")
+            params.append(after_ts)
+        if before_ts:
+            conditions.append("m.timestamp <= ?")
+            params.append(before_ts)
+        if role:
+            conditions.append("m.role = ?")
+            params.append(role)
 
         where = " AND ".join(conditions)
         params.append(limit)

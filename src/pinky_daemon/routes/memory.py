@@ -200,6 +200,7 @@ def search_agent_chat_history(
             results = _store.search(
                 q, session_ids=agent_session_ids,
                 session_prefix=f"{agent_name}-", limit=limit,
+                after_ts=after_ts, before_ts=before_ts, role=role,
             )
         except Exception:
             pass
@@ -217,13 +218,6 @@ def search_agent_chat_history(
     read = perf_counter()
 
     if q:
-        # Apply date filters after search results
-        if after_ts:
-            results = [m for m in results if m.timestamp >= after_ts]
-        if before_ts:
-            results = [m for m in results if m.timestamp <= before_ts]
-        if role:
-            results = [m for m in results if m.role == role]
         results.sort(key=lambda m: m.timestamp, reverse=True)
         results = results[:limit]
 
