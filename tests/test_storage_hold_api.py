@@ -854,3 +854,23 @@ async def test_broker_replay_and_pre_authorized_delivery_preserve_a_held_backlog
         assert delivered == (0 if held else 1)
         assert len(registry.get_pending_messages("sample", "fixture-chat")) == (1 if held else 0)
     assert h.subject.send.await_count == (0 if held else 1)
+
+
+async def test_startup_diagnostic_keeps_a_newline_path_on_one_line(held_subject, monkeypatch, capsys):
+    from pinky_daemon import api, tmux_session
+
+    h = held_subject
+    renamed = h.escape.with_name("escape\nERROR STORAGE HOLD injected")
+    h.escape.rename(renamed)
+    finding = h.app.state.store_catalog.inspect_layout().findings[0]
+    h.app.state.storage_holds = {"sample": [finding]}
+    h.app.state.agents.set_main_agent("")
+    monkeypatch.setattr(api, "SHARED_MCP_ENABLED", False)
+    monkeypatch.setenv("PINKY_LOG_ROTATION", "off")
+    monkeypatch.setattr(tmux_session, "reap_legacy_tmux_sessions", AsyncMock())
+    monkeypatch.setattr(tmux_session, "reconcile_tmux_spawn_cleanup_debts", AsyncMock(return_value=(0, 0)))
+    h.app.state.scheduler._owner_notify_callback = AsyncMock(return_value=True)
+    async with h.app.router.lifespan_context(h.app):
+        lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith("ERROR STORAGE HOLD ")]
+        assert len(lines) == 1
+        assert str(renamed).encode("unicode_escape").decode("ascii") in lines[0]
