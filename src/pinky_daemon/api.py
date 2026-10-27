@@ -4731,13 +4731,13 @@ def create_api(
                     header, _, after_header = config.wake_context.partition("\n")
                     encoded, separator, after_json = after_header.partition("\n")
                     if (header == "WARNING STORAGE HOLD: main agent exemption"
-                            and separator and after_json.startswith("\n")):
+                            and (not separator or after_json.startswith("\n"))):
                         try:
                             json.loads(encoded)
                         except (ValueError, RecursionError):
                             pass
                         else:
-                            config.wake_context = after_json[1:]
+                            config.wake_context = after_json[1:] if separator else ""
                             removed_storage_notice = True
             try:
                 text = _build_streaming_wake_context(name, reason, commit=commit)
