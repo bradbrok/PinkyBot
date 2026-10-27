@@ -1,0 +1,576 @@
+"""Storage holds gate work while leaving operator controls available."""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import os
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
+
+from pinky_daemon.auth import (
+    SESSION_COOKIE_NAME,
+    build_internal_auth_headers,
+    create_session_cookie,
+)
+from pinky_daemon.broker import BrokerMessage
+from tests.recovery_test_support import closure_value, set_flags
+from tests.recovery_test_support import lifecycle_harness as _lifecycle_harness
+
+
+@pytest.fixture
+async def lifecycle_harness(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    root.mkdir(mode=0o700)
+    generator = inspect.unwrap(_lifecycle_harness)(root, monkeypatch)
+    try:
+        yield await anext(generator)
+    finally:
+        await generator.aclose()
+
+
+@pytest.fixture
+async def held_subject(lifecycle_harness, tmp_path):
+    h = lifecycle_harness
+    h.subject = h.seed()
+    h.subject.send = AsyncMock(return_value=True)
+    h.subject._client.query.side_effect = None
+    h.subject._client.set_model = AsyncMock()
+    root = Path(h.app.state.store_catalog.expected_root)
+    primary = root / "primary"
+    primary.mkdir()
+    h.app.state.agents.register("primary", working_dir=str(primary), model="sonnet")
+    h.app.state.agents.set_main_agent("primary")
+    directory = root / "agents" / "sample" / "data"
+    directory.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    h.escape = directory / "escape"
+    h.escape.symlink_to(outside, target_is_directory=True)
+    finding = h.app.state.store_catalog.inspect_layout().findings[0]
+    h.finding = {**finding, "scope": "sample"}
+    h.app.state.storage_holds = {"sample": [h.finding]}
+    h.app.state.storage_hold_overrides = set()
+    return h
+
+
+def active(h, held):
+    h.app.state.storage_holds = {"sample": [h.finding]} if held else {}
+
+
+def refused(response, h):
+    assert response.status_code == 409, response.text
+    detail = response.json().get("detail")
+    assert isinstance(detail, dict) and detail.get("code") == "storage_hold", response.text
+    assert detail["findings"] == [h.finding]
+
+
+def reported(body, h):
+    hold = body.get("storage_hold")
+    assert isinstance(hold, dict) and hold["held"] is True, body
+    assert hold["findings"] == [h.finding]
+
+
+@pytest.mark.parametrize("mode", ["off", "both"])
+@pytest.mark.parametrize("held", [False, True])
+@pytest.mark.parametrize("entry", ["chat", "forward", "wake", "compact", "message"])
+async def test_http_delivery_checks_holds_before_connected_session_work(
+    held_subject, monkeypatch, mode, held, entry,
+):
+    h = held_subject
+    set_flags(monkeypatch, mode)
+    active(h, held)
+    routes = {
+        "chat": ("/agents/sample/chat", {"content": "fixture turn"}),
+        "forward": ("/agents/sample/forward", {"content": "fixture turn"}),
+        "wake": ("/agents/sample/wake", {}),
+        "compact": ("/agents/sample/streaming/compact", {}),
+        "message": ("/agents/sample/message", {"from_agent": "primary", "message": "fixture turn"}),
+    }
+    path, payload = routes[entry]
+    response = await h.client.post(path, json=payload)
+    if held:
+        refused(response, h)
+        assert h.subject.send.await_count == h.subject._client.query.await_count == 0
+    else:
+        assert response.status_code == 200, response.text
+        observed = h.subject._client.query.await_count if entry == "compact" else h.subject.send.await_count
+        assert observed == 1
+
+
+@pytest.mark.parametrize("mode", ["off", "both"])
+@pytest.mark.parametrize("held", [False, True])
+@pytest.mark.parametrize("entry", ["inbound", "internal"])
+async def test_installed_broker_delegates_gate_existing_connected_sessions(
+    held_subject, monkeypatch, mode, held, entry,
+):
+    h = held_subject
+    set_flags(monkeypatch, mode)
+    active(h, held)
+    if entry == "internal":
+        result = await h.app.state.broker.inject_agent_message("primary", "sample", "fixture turn")
+        assert result.delivered is (not held)
+    else:
+        h.app.state.agents.approve_user("sample", "fixture-chat", "Fixture", "fixture")
+        message = BrokerMessage(agent_name="sample", platform="telegram", chat_id="fixture-chat", sender_id="fixture-chat",
+                                sender_name="Fixture", content="fixture turn")
+        await h.app.state.broker.handle_inbound(message)
+        for _ in range(8):
+            await asyncio.sleep(0)
+    assert h.subject.send.await_count == (0 if held else 1)
+
+
+@pytest.mark.parametrize("name", ["handle_inbound", "inject_agent_message"])
+async def test_live_app_broker_binding_contains_its_storage_guard(held_subject, name):
+    broker = held_subject.app.state.broker
+    installed = getattr(broker, name)
+    assert inspect.isfunction(installed), "The live app must install its guarded delegate"
+    cells = inspect.getclosurevars(installed).nonlocals
+    assert callable(cells.get("_storage_hold_for"))
+    assert any(inspect.ismethod(value) and value.__self__ is broker for value in cells.values())
+
+
+@pytest.mark.parametrize("held", [False, True])
+@pytest.mark.parametrize("entry", ["model", "provider", "update", "disable", "skills"])
+async def test_operator_configuration_saves_without_waking_a_held_subject(
+    held_subject, monkeypatch, held, entry,
+):
+    h = held_subject
+    active(h, held)
+    if entry == "skills":
+        response = await h.client.post("/agents/sample/skills/apply")
+    else:
+        method, path, payload = {
+            "model": ("POST", "/agents/sample/streaming/model", {"model": "opus"}),
+            "provider": ("PUT", "/agents/sample/provider", {"provider_model": "fixture-model"}),
+            "update": ("PUT", "/agents/sample", {"display_name": "Fixture subject"}),
+            "disable": ("PUT", "/agents/sample", {"enabled": False}),
+        }[entry]
+        response = await h.client.request(method, path, json=payload)
+    assert response.status_code == 200, response.text
+    if held:
+        reported(response.json(), h)
+        assert len(h.clients) == 1
+        assert h.subject._client.query.await_count == 0
+        assert h.subject._client.set_model.await_count == 0
+    current = h.app.state.agents.get("sample")
+    if entry == "model":
+        assert current.model == "opus"
+        if not held:
+            assert h.subject._client.set_model.await_count == 1
+    elif entry == "provider":
+        assert current.provider_model == "fixture-model"
+    elif entry == "update":
+        assert current.display_name == "Fixture subject"
+    elif entry == "disable":
+        assert current.enabled is False
+    else:
+        assert response.json()["applied"] is True
+        assert response.json()["session_restarted"] is (not held)
+
+
+@pytest.mark.parametrize("held", [False, True])
+@pytest.mark.parametrize("entry", ["containerize", "decontainerize", "mode-change"])
+async def test_container_runtime_actions_refuse_before_any_work_when_held(
+    held_subject, monkeypatch, held, entry,
+):
+    from pinky_daemon import provisioning
+
+    h = held_subject
+    active(h, held)
+    before = h.app.state.agents.get("sample").to_dict()
+    lifecycle = closure_value(h.app, "_container_lifecycle")
+    action = "containerize" if entry == "containerize" else "decontainerize"
+    runtime = AsyncMock()
+    monkeypatch.setattr(lifecycle, action, runtime)
+    monkeypatch.setattr(provisioning, "container_runtime_enabled", lambda: True)
+    monkeypatch.setattr(provisioning, "container_runtime_supported", lambda: True)
+    if entry == "mode-change":
+        response = await h.client.put("/agents/sample", json={
+            "isolation_mode": "container", "container_image": "fixture/image:v1", "transport": "tmux",
+        })
+    else:
+        response = await h.client.post(f"/agents/sample/{entry}", json={
+            "force": True, "start": True, **({"image": "fixture/image:v1"} if entry == "containerize" else {}),
+        })
+        await asyncio.sleep(0)
+    if held:
+        refused(response, h)
+        assert h.app.state.agents.get("sample").to_dict() == before
+        assert runtime.await_count == 0
+        assert not h.trace
+    else:
+        assert response.status_code == (200 if entry == "mode-change" else 202), response.text
+        if entry == "mode-change":
+            assert h.app.state.agents.get("sample").isolation_mode == "container"
+        else:
+            assert runtime.await_count == 1
+
+
+@pytest.mark.parametrize("held", [False, True])
+@pytest.mark.parametrize("entry", ["stop", "delete", "rename"])
+async def test_explicit_operator_session_controls_remain_available(held_subject, held, entry):
+    h = held_subject
+    active(h, held)
+    if entry == "stop":
+        response = await h.client.post("/agents/sample/stop")
+    else:
+        h.seed(label="work")
+        if entry == "delete":
+            response = await h.client.delete("/agents/sample/streaming-sessions/work")
+        else:
+            response = await h.client.patch("/agents/sample/streaming-sessions/work", json={"label": "renamed"})
+    assert response.status_code == 200, response.text
+    assert h.subject.send.await_count == 0
+    assert h.app.state.storage_holds == ({"sample": [h.finding]} if held else {})
+
+
+@pytest.mark.parametrize("held", [False, True])
+async def test_explicit_archive_skips_prompt_and_relaunch_while_held(held_subject, held):
+    h = held_subject
+    active(h, held)
+    peer = h.subject._client
+    response = await h.client.post("/agents/sample/streaming/archive")
+    assert response.status_code == 200, response.text
+    assert response.json()["archived"] is True
+    if held:
+        reported(response.json(), h)
+        assert peer.query.await_count == 0
+        assert len(h.clients) == 1
+    else:
+        assert peer.query.await_count == 1
+        assert len(h.clients) == 2
+
+
+@pytest.mark.parametrize("identity", ["owner", "viewer", "internal", "anonymous"])
+async def test_start_anyway_requires_the_owner_and_keeps_the_registry_unchanged(
+    held_subject, identity,
+):
+    h = held_subject
+    before = h.app.state.agents.get("sample").to_dict()
+    path = "/admin/agents/sample/storage/start-anyway"
+    if identity != "owner":
+        h.client.cookies.clear()
+    if identity == "viewer":
+        h.client.cookies.set(SESSION_COOKIE_NAME, create_session_cookie(
+            os.environ["PINKY_SESSION_SECRET"], user="viewer",
+        ))
+    headers = build_internal_auth_headers(
+        os.environ["PINKY_SESSION_SECRET"], agent_name="primary", method="POST", path=path,
+    ) if identity == "internal" else {}
+    response = await h.client.post(path, headers=headers)
+    if identity == "owner":
+        assert response.status_code == 200, response.text
+        assert response.json()["storage_hold"]["overridden"] is True
+        assert response.json()["storage_hold"]["findings"] == [h.finding]
+    else:
+        assert response.status_code in {401, 403}, response.text
+        assert h.app.state.storage_hold_overrides == set()
+    assert h.app.state.agents.get("sample").to_dict() == before
+
+
+@pytest.mark.parametrize("removed", [False, True])
+async def test_recheck_retains_unsafe_findings_or_clears_a_repaired_scope(held_subject, removed):
+    h = held_subject
+    if removed:
+        h.escape.unlink()
+    response = await h.client.post("/agents/sample/storage/recheck")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["cleared"] is removed
+    if not removed:
+        assert body["findings"] == [h.finding]
+    h.subject.send.reset_mock()
+    wake = await h.client.post("/agents/sample/wake")
+    if removed:
+        assert wake.status_code == 200, wake.text
+        assert h.subject.send.await_count == 1
+    else:
+        refused(wake, h)
+        assert h.subject.send.await_count == 0
+
+
+@pytest.mark.parametrize("main", [False, True])
+async def test_main_exemption_puts_the_finding_in_wake_context(held_subject, main):
+    h = held_subject
+    if main:
+        h.app.state.agents.set_main_agent("sample")
+    build = h.app.state._build_streaming_wake_context
+    for _ in range(2):
+        text = build("sample", commit=False)
+        assert (h.finding["path"] in text) is main
+    response = await h.client.post("/agents/sample/wake")
+    if main:
+        assert response.status_code == 200, response.text
+        assert h.subject.send.await_count == 1
+    else:
+        refused(response, h)
+
+
+async def test_hold_findings_are_visible_on_detail_health_and_update_status(held_subject):
+    h = held_subject
+    detail = await h.client.get("/agents/sample")
+    reported(detail.json(), h)
+    for path in ("/system/health", "/admin/update/status"):
+        response = await h.client.get(path)
+        assert response.status_code == 200
+        holds = response.json().get("storage_holds")
+        assert isinstance(holds, list)
+        assert any(row["agent"] == "sample" and row["held"] and row["findings"] == [h.finding]
+                   for row in holds)
+
+
+async def test_owner_stop_command_on_a_held_route_still_executes(held_subject):
+    h = held_subject
+    h.app.state.agents.set_primary_user("fixture-chat", "Fixture")
+    peer = h.subject._client
+    h.app.state.broker._send_callback = AsyncMock(return_value={"sent": True})
+    message = BrokerMessage(agent_name="sample", platform="telegram", chat_id="fixture-chat", sender_id="fixture-chat",
+                            sender_name="Fixture", content="/stop")
+    await h.app.state.broker.handle_inbound(message)
+    assert peer.disconnect.await_count == 1
+    assert h.subject.send.await_count == 0
+
+
+@pytest.mark.parametrize("held", [False, True])
+@pytest.mark.parametrize("entry", ["scheduler", "heartbeat", "watchdog", "mcp-notice", "restart-worker"])
+async def test_automatic_callbacks_leave_a_held_transport_untouched(held_subject, held, entry):
+    h = held_subject
+    active(h, held)
+    peer = h.subject._client
+    callbacks = {
+        "scheduler": ("_wake_callback", ("sample", "", "fixture turn")),
+        "heartbeat": ("_heartbeat_resurrect", ("sample", "")),
+        "watchdog": ("_watchdog_recover", ("sample", "main", "fixture recovery")),
+        "mcp-notice": ("_watchdog_mcp_notice", ("sample", "fixture notice")),
+        "restart-worker": ("_restart_streaming_session_after_response", ("sample",)),
+    }
+    name, args = callbacks[entry]
+    if entry == "restart-worker":
+        # The public restart endpoint owns the worker's handoff parameters.
+        response = await h.client.post("/agents/sample/streaming/restart")
+        if held:
+            refused(response, h)
+    else:
+        callback = next(value for obj in (h.app.state.scheduler, h.app.state.watchdog)
+                        for value in vars(obj).values()
+                        if inspect.isfunction(value) and value.__name__ == name)
+        await callback(*args)
+    if held:
+        assert peer.disconnect.await_count == 0
+        assert peer.query.await_count == 0 and h.subject.send.await_count == 0
+        assert len(h.clients) == 1 and not h.trace
+    elif entry in {"scheduler", "mcp-notice"}:
+        assert h.subject.send.await_count == 1
+
+
+@pytest.mark.parametrize("held", [False, True])
+async def test_automatic_shutdown_preserves_only_the_held_survivor(held_subject, monkeypatch, held):
+    h = held_subject
+    active(h, held)
+    peer = h.subject._client
+    shutdown = next(fn for fn in h.app.router.on_shutdown if fn.__name__ == "on_shutdown")
+    await shutdown()
+    assert peer.disconnect.await_count == (0 if held else 1)
+    assert (h.app.state.broker.get_streaming_session("sample") is h.subject) is held
+
+
+@pytest.mark.parametrize("main", ["", "primary", "sample"])
+@pytest.mark.parametrize("registered", [False, True])
+async def test_real_boot_installs_scoped_holds_and_keeps_management_running(
+    held_subject, monkeypatch, capsys, main, registered,
+):
+    from pinky_daemon import api, tmux_session
+    from pinky_daemon.store_catalog import StoreCatalogError
+    from pinky_daemon.transport_state import SessionState
+
+    h = held_subject
+    root = Path(h.app.state.store_catalog.expected_root)
+    registry = h.app.state.agents
+    registry.set_main_agent(main)
+    if not registered:
+        # Retain the lexical scope, but no matching registered subject.
+        registry._db.execute("DELETE FROM agents WHERE name='sample'")
+        registry._db.commit()
+    h.app.state.agents._fire_trace.close()
+    h.app.state.store_catalog.shutdown(deadline_seconds=10)
+    monkeypatch.setenv("PINKY_LOG_ROTATION", "off")
+    monkeypatch.setenv("PINKY_MCP_READINESS_CAP_SEC", "0")
+    monkeypatch.setattr(api, "SHARED_MCP_ENABLED", False)
+    monkeypatch.setattr(tmux_session, "reap_legacy_tmux_sessions", AsyncMock())
+    monkeypatch.setattr(tmux_session, "reconcile_tmux_spawn_cleanup_debts", AsyncMock(return_value=(0, 0)))
+    try:
+        app = api.create_api(db_path=str(root / "api.db"), default_working_dir=str(root))
+    except StoreCatalogError as exc:
+        pytest.fail(f"A scoped finding must allow application construction: {exc}")
+    app.state.agents.set_main_agent(main)
+    launches = []
+
+    async def connect(ss):
+        launches.append((ss.agent_name, ss._config.wake_context))
+        ss._state_machine._state = SessionState.CONNECTED
+
+    monkeypatch.setattr("pinky_daemon.streaming_session.StreamingSession.connect", connect)
+    notify = AsyncMock(return_value=True)
+    app.state.scheduler._owner_notify_callback = notify
+    # The fixture registry's transports are SDK-backed; the real boot path
+    # still builds and submits each selected session's initial context.
+    try:
+        async with app.router.lifespan_context(app):
+            assert app.state.api_readiness.closed is False
+            assert [name for name, _ in launches] == ([main] if main and (registered or main != "sample") else [])
+            if registered and main != "sample":
+                hold = closure_value(app, "_storage_hold_for")("sample")
+                assert hold["held"] and hold["findings"][0]["path"] == h.finding["path"]
+            if registered and main == "sample":
+                assert h.finding["path"] in launches[0][1]
+                assert h.finding["resolved_path"] in launches[0][1]
+            assert notify.await_count == 1
+            assert h.finding["path"] in notify.call_args.args[1]
+    finally:
+        app.state.agents._fire_trace.close()
+        app.state.store_catalog.shutdown(deadline_seconds=10)
+    lines = [line for line in capsys.readouterr().err.splitlines() if "STORAGE HOLD" in line]
+    expected = "WARNING" if registered and main == "sample" else "ERROR"
+    assert len(lines) == 1 and expected in lines[0]
+
+
+async def test_an_owner_override_does_not_survive_a_fresh_application(held_subject):
+    from pinky_daemon.api import create_api
+    from pinky_daemon.store_catalog import StoreCatalogError
+
+    h = held_subject
+    response = await h.client.post("/admin/agents/sample/storage/start-anyway")
+    assert response.status_code == 200, response.text
+    root = Path(h.app.state.store_catalog.expected_root)
+    h.app.state.agents._fire_trace.close()
+    h.app.state.store_catalog.shutdown(deadline_seconds=10)
+    try:
+        fresh = create_api(db_path=str(root / "api.db"), default_working_dir=str(root))
+    except StoreCatalogError as exc:
+        pytest.fail(f"A scoped finding must allow a fresh application: {exc}")
+    try:
+        hold = closure_value(fresh, "_storage_hold_for")("sample")
+        assert hold["held"] is True and hold["overridden"] is False
+        assert hold["findings"][0]["path"] == h.finding["path"]
+    finally:
+        fresh.state.agents._fire_trace.close()
+        fresh.state.store_catalog.shutdown(deadline_seconds=10)
+
+
+@pytest.mark.parametrize("held", [False, True])
+async def test_startup_alert_uses_the_daemon_sender_even_when_its_subject_is_held(
+    held_subject, monkeypatch, held,
+):
+    from types import SimpleNamespace
+
+    from pinky_daemon import api, tmux_session
+
+    h = held_subject
+    active(h, held)
+    # Keep the same finding visible as a main exemption in the clean twin.
+    h.app.state.storage_holds = {"sample": [h.finding]}
+    h.app.state.agents.set_main_agent("" if held else "sample")
+    h.app.state.agents.set_owner_notification_destinations([{
+        "platform": "telegram", "account_id": "fixture-account",
+        "conversation_id": "fixture-owner", "principal_id": "fixture-owner",
+    }])
+    h.app.state.agents.set_token("sample", "telegram", "fixture-token", settings={"account_id": "fixture-account"})
+    sent = []
+
+    def send(*args, **kwargs):
+        sent.append((args, kwargs))
+        return SimpleNamespace(id="fixture-delivery")
+
+    callback = h.app.state.broker.send_callback
+    cell = dict(zip(callback.__code__.co_freevars, callback.__closure__))["_send_text_message"]
+    original = cell.cell_contents
+    cell.cell_contents = send
+    monkeypatch.setenv("PINKY_LOG_ROTATION", "off")
+    monkeypatch.setenv("PINKY_MCP_READINESS_CAP_SEC", "0")
+    monkeypatch.setattr(api, "SHARED_MCP_ENABLED", False)
+    monkeypatch.setattr("pinky_daemon.pollers.BrokerTelegramPoller.start", AsyncMock())
+    monkeypatch.setattr(tmux_session, "reap_legacy_tmux_sessions", AsyncMock())
+    monkeypatch.setattr(tmux_session, "reconcile_tmux_spawn_cleanup_debts", AsyncMock(return_value=(0, 0)))
+    try:
+        async with h.app.router.lifespan_context(h.app):
+            assert len(sent) == 1
+            args, kwargs = sent[0]
+            assert args[:3] == ("sample", "telegram", "fixture-owner")
+            assert h.finding["path"] in args[3] and h.finding["resolved_path"] in args[3]
+            assert kwargs["account_id"] == "fixture-account"
+            assert h.subject.send.await_count == 0
+            if held:
+                assert not h.trace
+    finally:
+        cell.cell_contents = original
+
+
+async def test_real_tenant_composition_keeps_scoped_looking_findings_fatal(held_subject, tmp_path, monkeypatch):
+    from pinky_daemon import api
+    from pinky_daemon.store_catalog import StoreCatalogError
+    from pinky_daemon.store_manifest import derive_standalone_tenant_store_manifest
+
+    h = held_subject
+    h.escape.unlink()
+    h.app.state.agents.register("sample", isolation_mode="unix_user", isolated=True)
+    root = Path(h.app.state.store_catalog.expected_root)
+    tenant = tmp_path / "tenant"
+    directory = tenant / "agents/sample/data"
+    directory.mkdir(parents=True)
+    (directory / "escape").symlink_to(tmp_path / "outside", target_is_directory=True)
+    manifest = derive_standalone_tenant_store_manifest(tenant / "keys.db")
+    monkeypatch.setattr(api, "_derive_standalone_tenant_store_manifest", lambda name: manifest)
+    h.app.state.agents._fire_trace.close()
+    h.app.state.store_catalog.shutdown(deadline_seconds=10)
+    with pytest.raises(StoreCatalogError, match="directory symlink escapes"):
+        api.create_api(db_path=str(root / "api.db"), default_working_dir=str(root))
+
+
+@pytest.mark.parametrize("held", [False, True])
+async def test_boot_purge_keeps_the_held_legacy_record_and_resume_identity(held_subject, monkeypatch, held):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from pinky_daemon import api, tmux_session
+
+    h = held_subject
+    active(h, held)
+    h.app.state.agents.set_main_agent("")
+    h.app.state.agents.set_streaming_session_id("sample", "fixture-survivor")
+    manager = closure_value(h.app, "manager")
+    monkeypatch.setattr(manager, "list", lambda: [SimpleNamespace(id="fixture-legacy", agent_name="sample")])
+    delete = Mock()
+    monkeypatch.setattr(manager, "delete", delete)
+    monkeypatch.setenv("PINKY_LOG_ROTATION", "off")
+    monkeypatch.setattr(api, "SHARED_MCP_ENABLED", False)
+    monkeypatch.setattr(tmux_session, "reap_legacy_tmux_sessions", AsyncMock())
+    monkeypatch.setattr(tmux_session, "reconcile_tmux_spawn_cleanup_debts", AsyncMock(return_value=(0, 0)))
+    h.app.state.scheduler._owner_notify_callback = AsyncMock(return_value=True)
+    peer = h.subject._client
+    async with h.app.router.lifespan_context(h.app):
+        assert delete.call_count == (0 if held else 1)
+        assert h.app.state.agents.get_streaming_session_id("sample") == "fixture-survivor"
+        assert peer.disconnect.await_count == 0
+        assert h.subject.send.await_count == 0
+
+
+@pytest.mark.parametrize("failure", ["incomplete", "fatal"])
+async def test_recheck_never_clears_after_an_incomplete_or_fatal_scan(held_subject, monkeypatch, failure):
+    from pinky_daemon.store_catalog import LayoutInspection
+
+    h = held_subject
+    if failure == "incomplete":
+        def inspect_layout(**kwargs):
+            raise PermissionError("fixture scan unavailable")
+    else:
+        def inspect_layout(**kwargs):
+            return LayoutInspection([{**h.finding, "kind": "alias_of_registered_store", "scope": None}], [])
+    monkeypatch.setattr(h.app.state.store_catalog, "inspect_layout", inspect_layout)
+    response = await h.client.post("/agents/sample/storage/recheck")
+    assert response.status_code == 200, response.text
+    assert response.json()["cleared"] is False
+    hold = closure_value(h.app, "_storage_hold_for")("sample")
+    assert hold["held"] is True
