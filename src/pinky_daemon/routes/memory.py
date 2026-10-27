@@ -12,7 +12,7 @@ callables.
 
 from __future__ import annotations
 
-import logging
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -29,7 +29,10 @@ except ImportError:
     MemoryQueryFilters = None  # type: ignore[assignment, misc]
 
 router = APIRouter(tags=["memory"])
-logger = logging.getLogger(__name__)
+
+
+def _log(msg: str) -> None:
+    print(f"chat-history: {msg}", file=sys.stderr, flush=True)
 
 
 # ── Shared dependency state ───────────────────────────────────────────────────
@@ -240,12 +243,12 @@ def search_agent_chat_history(
     }
     built = perf_counter()
     if built - started > 1.0:
-        logger.info(
-            "Slow chat history agent=%s has_query=%s row_count=%d "
-            "collection_ms=%.1f store_read_ms=%.1f response_build_ms=%.1f total_ms=%.1f",
-            agent_name, bool(q), len(results),
-            (collected - started) * 1000, (read - collected) * 1000,
-            (built - read) * 1000, (built - started) * 1000,
+        _log(
+            f"Slow chat history agent={agent_name} has_query={bool(q)} row_count={len(results)} "
+            f"collection_ms={(collected - started) * 1000:.1f} "
+            f"store_read_ms={(read - collected) * 1000:.1f} "
+            f"response_build_ms={(built - read) * 1000:.1f} "
+            f"total_ms={(built - started) * 1000:.1f}"
         )
     return response
 
