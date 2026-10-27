@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -364,3 +365,127 @@ async def test_an_older_preview_cannot_replay_a_delivered_notice_on_builder_fall
     await asyncio.wait_for(asyncio.shield(second._initial_wake_task), timeout=10)
     assert [NOTICE in text for text in submitted] == [True, False]
     assert "fixture retained wake context" in submitted[1]
+
+
+@pytest.mark.parametrize("case", ["updated-findings", "same-findings", "clean-main"])
+async def test_archive_refresh_then_retained_reconnect_keeps_notice_consumed(
+    application_factory, monkeypatch, case,
+):
+    dirty = case != "clean-main"
+    f = await application_factory(dirty=dirty, registered=True, main="sample")
+    attempted, submitted, archive_queries = [], [], []
+    fail_first = True
+
+    async def connect_peer(ss):
+        async def query(prompt):
+            nonlocal fail_first
+            if asyncio.current_task() is not getattr(ss, "_initial_wake_task", None):
+                archive_queries.append(str(prompt))
+                return
+            attempted.append(str(prompt))
+            if fail_first:
+                fail_first = False
+                raise RuntimeError("fixture first submission failed")
+            submitted.append(str(prompt))
+
+        ss._client.query.side_effect = query
+
+    f.h.control.start_hook = connect_peer
+    prepare = closure_value(f.app, "_prepare_streaming_session")
+    connect = closure_value(f.app, "_connect_prepared_session")
+    reconnect = closure_value(f.app, "_connect_retained_session")
+    ss = await prepare("sample", label="main")
+    config = ss._config
+    initial_cache = config.wake_context
+    await connect(ss)
+    await asyncio.wait_for(asyncio.shield(ss._initial_wake_task), timeout=10)
+    assert len(attempted) == 1 and submitted == []
+    assert (NOTICE in f.app.state._build_streaming_wake_context("sample", commit=False)) is dirty
+
+    if case == "updated-findings":
+        outside = f.root.parent / "second-outside"
+        outside.mkdir()
+        (f.root / "agents/sample/data/second-escape").symlink_to(outside, target_is_directory=True)
+    response = await f.client.post("/agents/sample/storage/recheck")
+    assert response.status_code == 200, response.text
+    findings = response.json()["findings"]
+    assert len(findings) == (2 if case == "updated-findings" else 1 if dirty else 0)
+    retained_task = "fixture retained task\n\n  preserve spacing and Unicode: Ω\n"
+    f.app.state.agents.set_context(
+        "sample", task=retained_task,
+        metadata={"source": "save_my_context"}, updated_by="saved",
+    )
+    response = await f.client.post("/agents/sample/streaming/archive")
+    assert response.status_code == 200, response.text
+    assert response.json()["archived"] is True and len(archive_queries) == 1
+    assert f.app.state.broker._streaming["sample"]["main"] is ss
+    assert ss._config is config
+    await asyncio.wait_for(asyncio.shield(ss._initial_wake_task), timeout=10)
+    assert len(submitted) == 1 and (NOTICE in submitted[0]) is dirty
+    assert NOTICE not in f.app.state._build_streaming_wake_context("sample", commit=False)
+
+    cached = config.wake_context
+    if dirty:
+        notice, separator, expected_context = cached.partition("\n\n")
+        assert separator and notice.splitlines()[0] == NOTICE
+        assert json.loads(notice.splitlines()[1]) == findings
+        if case == "updated-findings":
+            assert notice != initial_cache.partition("\n\n")[0]
+    else:
+        expected_context = cached
+    assert retained_task in expected_context
+    await ss.disconnect()
+
+    def unreadable_context(name):
+        raise RuntimeError("fixture reconnect context read failed")
+
+    monkeypatch.setattr(f.app.state.agents, "get_context", unreadable_context)
+    await reconnect("sample", "main", ss)
+    await asyncio.wait_for(asyncio.shield(ss._initial_wake_task), timeout=10)
+    assert [NOTICE in text for text in submitted] == ([True, False] if dirty else [False, False])
+    assert config.wake_context == expected_context
+    assert expected_context in submitted[1]
+
+
+@pytest.mark.parametrize("case", [
+    "different-header", "leading-text", "invalid-json", "missing-separator", "json-scalar",
+])
+async def test_consumed_notice_fallback_requires_the_exact_leading_block(
+    application_factory, monkeypatch, case,
+):
+    f = await application_factory(dirty=True, registered=True, main="sample")
+    submitted = []
+
+    async def connect_peer(ss):
+        async def query(prompt):
+            submitted.append(str(prompt))
+
+        ss._client.query.side_effect = query
+
+    f.h.control.start_hook = connect_peer
+    ss = await closure_value(f.app, "_prepare_streaming_session")("sample", label="main")
+    await closure_value(f.app, "_connect_prepared_session")(ss)
+    await asyncio.wait_for(asyncio.shield(ss._initial_wake_task), timeout=10)
+    assert NOTICE in submitted[0]
+    assert NOTICE not in f.app.state._build_streaming_wake_context("sample", commit=False)
+    body = "\nfixture context must survive\n\n  exact tail Ω\n"
+    contexts = {
+        "different-header": NOTICE[:-1] + "N\n[]\n\n" + body,
+        "leading-text": "prefix\n" + NOTICE + "\n[]\n\n" + body,
+        "invalid-json": NOTICE + "\n[invalid]\n\n" + body,
+        "missing-separator": NOTICE + "\n[]\n" + body.lstrip("\n"),
+        "json-scalar": NOTICE + "\n42\n\n" + body,
+    }
+    cached = contexts[case]
+    expected = body if case == "json-scalar" else cached
+    ss._config.wake_context = cached
+    await ss.disconnect()
+
+    def unreadable_context(name):
+        raise RuntimeError("fixture context read failed")
+
+    monkeypatch.setattr(f.app.state.agents, "get_context", unreadable_context)
+    await closure_value(f.app, "_connect_retained_session")("sample", "main", ss)
+    await asyncio.wait_for(asyncio.shield(ss._initial_wake_task), timeout=10)
+    assert ss._config.wake_context == expected
+    assert expected in submitted[1]
