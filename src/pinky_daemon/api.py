@@ -3314,6 +3314,20 @@ def create_api(
             return ""
         return "WARNING STORAGE HOLD: main agent exemption\n" + json.dumps(hold["findings"])
 
+    def _main_storage_notice_block(context: str) -> tuple[bool, str]:
+        """Recognize one complete leading notice and preserve its exact remainder."""
+        header, newline, after_header = context.partition("\n")
+        if header != "WARNING STORAGE HOLD: main agent exemption" or not newline:
+            return False, context
+        encoded, separator, after_json = after_header.partition("\n")
+        if separator and not after_json.startswith("\n"):
+            return False, context
+        try:
+            json.loads(encoded)
+        except (ValueError, RecursionError):
+            return False, context
+        return True, after_json[1:] if separator else ""
+
     def _storage_hold_error(hold):
         return HTTPException(409, {"code": "storage_hold", **hold})
 
@@ -4715,7 +4729,6 @@ def create_api(
             return outcome.delivered
 
         pending_main_storage_notice = False
-        preview_storage_notice = _main_storage_notice(agent_name)
 
         def _session_wake_context(name, reason=WakeReason.NEW_SESSION, *, commit=True):
             nonlocal pending_main_storage_notice
@@ -4726,19 +4739,10 @@ def create_api(
                 # rebuild fails. Keep its other context, but never replay a
                 # notice already delivered by another session in this app.
                 if name in delivered_main_storage_notices:
-                    # A recheck can change the findings before this preview
-                    # is refreshed. Recognize the current block by structure.
-                    header, _, after_header = config.wake_context.partition("\n")
-                    encoded, separator, after_json = after_header.partition("\n")
-                    if (header == "WARNING STORAGE HOLD: main agent exemption"
-                            and (not separator or after_json.startswith("\n"))):
-                        try:
-                            json.loads(encoded)
-                        except (ValueError, RecursionError):
-                            pass
-                        else:
-                            config.wake_context = after_json[1:] if separator else ""
-                            removed_storage_notice = True
+                    has_notice, remainder = _main_storage_notice_block(config.wake_context)
+                    if has_notice:
+                        config.wake_context = remainder
+                        removed_storage_notice = True
             try:
                 text = _build_streaming_wake_context(name, reason, commit=commit)
             except Exception as exc:
@@ -4749,14 +4753,16 @@ def create_api(
                     )
                     return config.wake_context
                 if commit:
-                    pending_main_storage_notice = bool(
-                        preview_storage_notice and name not in delivered_main_storage_notices
-                        and config.wake_context.startswith(preview_storage_notice)
+                    has_notice, _ = _main_storage_notice_block(config.wake_context)
+                    pending_main_storage_notice = (
+                        has_notice and name not in delivered_main_storage_notices
                     )
                 raise
             if commit:
-                notice = _main_storage_notice(name)
-                pending_main_storage_notice = bool(notice and text.startswith(notice))
+                has_notice, _ = _main_storage_notice_block(text)
+                pending_main_storage_notice = (
+                    has_notice and name not in delivered_main_storage_notices
+                )
             return text
 
         def _session_wake_delivered(name, reason):
