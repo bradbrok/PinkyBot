@@ -489,3 +489,39 @@ async def test_consumed_notice_fallback_requires_the_exact_leading_block(
     await asyncio.wait_for(asyncio.shield(ss._initial_wake_task), timeout=10)
     assert ss._config.wake_context == expected
     assert expected in submitted[1]
+
+
+@pytest.mark.parametrize("trailing_newline", [False, True])
+async def test_notice_only_cached_fallback_accepts_json_at_exact_end(
+    application_factory, monkeypatch, trailing_newline,
+):
+    f = await application_factory(dirty=True, registered=True, main="sample")
+    submitted = []
+
+    async def connect_peer(ss):
+        async def query(prompt):
+            submitted.append(str(prompt))
+
+        ss._client.query.side_effect = query
+
+    f.h.control.start_hook = connect_peer
+    ss = await closure_value(f.app, "_prepare_streaming_session")("sample", label="main")
+    notice = ss._config.wake_context.partition("\n\n")[0]
+    assert notice.splitlines()[0] == NOTICE
+    assert json.loads(notice.splitlines()[1]) == f.hold["findings"]
+    await closure_value(f.app, "_connect_prepared_session")(ss)
+    await asyncio.wait_for(asyncio.shield(ss._initial_wake_task), timeout=10)
+    assert NOTICE in submitted[0]
+    assert NOTICE not in f.app.state._build_streaming_wake_context("sample", commit=False)
+    cached = notice + ("\n" if trailing_newline else "")
+    ss._config.wake_context = cached
+    await ss.disconnect()
+
+    def unreadable_context(name):
+        raise RuntimeError("fixture notice-only context read failed")
+
+    monkeypatch.setattr(f.app.state.agents, "get_context", unreadable_context)
+    await closure_value(f.app, "_connect_retained_session")("sample", "main", ss)
+    await asyncio.wait_for(asyncio.shield(ss._initial_wake_task), timeout=10)
+    assert [NOTICE in text for text in submitted] == [True, trailing_newline]
+    assert ss._config.wake_context == (cached if trailing_newline else "")
