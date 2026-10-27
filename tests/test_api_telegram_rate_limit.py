@@ -5,10 +5,11 @@ from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from pinky_outreach.telegram import TelegramAdapter, TelegramError
-from tests.test_api_delivery_unknown import _file, _quote, _text
+from tests.test_api_delivery_unknown import _assert_unknown, _file, _quote, _text
 from tests.test_api_delivery_unknown import sender as sender
 
 
@@ -182,3 +183,20 @@ async def test_non_rate_callback_error_is_reraised_without_plain_fallback(sender
             await sender.app.state.broker.send_callback("sender", "telegram", "12345", "hello")
     assert caught.value is error
     assert send.call_count == 1
+
+
+def test_quote_rejection_then_unquoted_timeout_does_not_resend(sender):
+    with patch.object(
+        TelegramAdapter, "send_message",
+        side_effect=[
+            TelegramError("Bad Request: QUOTE_TEXT_INVALID", 400),
+            httpx.ReadTimeout("unquoted delivery timed out"),
+        ],
+    ) as send:
+        response = _quote(sender)
+    assert send.call_count == 2
+    assert send.call_args_list[0].kwargs["reply_parameters"]["quote"] == "passage"
+    assert send.call_args_list[1].kwargs["reply_parameters"] is None
+    assert send.call_args_list[1].kwargs["parse_mode"] == "MarkdownV2"
+    assert send.call_args_list[1].kwargs["reply_to_message_id"] == 101
+    _assert_unknown(sender, response)

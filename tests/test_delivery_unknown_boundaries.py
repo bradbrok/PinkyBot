@@ -109,7 +109,7 @@ def test_real_adapter_http_boundary_is_unknown(sender, monkeypatch, kind, failur
 
 def test_quote_plain_transport_error_does_not_degrade_again(sender):
     with patch.object(TelegramAdapter, 'send_message', side_effect=[
-        TelegramError('QUOTE_TEXT_INVALID', 400), httpx.ReadTimeout('plain quote timed out'),
+        TelegramError("Bad Request: can't parse entities: quote markup", 400), httpx.ReadTimeout('plain quote timed out'),
     ]) as send:
         response = _quote(sender)
     assert send.call_count == 2
