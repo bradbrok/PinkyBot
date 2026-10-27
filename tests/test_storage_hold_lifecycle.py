@@ -532,6 +532,7 @@ async def test_archive_cached_notice_is_consumed_when_committed_rebuild_fails(
     application_factory, monkeypatch, case,
 ):
     f = await application_factory(dirty=True, registered=True, main="sample")
+    f.app.state.api_readiness.attach(SimpleNamespace(started=True, should_exit=False))
     attempted, submitted, failed_reads = [], [], []
     fail_first = True
 
