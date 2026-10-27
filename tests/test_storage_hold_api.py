@@ -874,3 +874,34 @@ async def test_startup_diagnostic_keeps_a_newline_path_on_one_line(held_subject,
         lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith("ERROR STORAGE HOLD ")]
         assert len(lines) == 1
         assert str(renamed).encode("unicode_escape").decode("ascii") in lines[0]
+
+
+@pytest.mark.parametrize("held", [False, True])
+@pytest.mark.parametrize("name", ["handle_inbound", "inject_agent_message", "_route_streaming"])
+async def test_guarded_broker_uses_late_class_replacement(held_subject, monkeypatch, held, name):
+    h = held_subject
+    active(h, held)
+    broker = h.app.state.broker
+    calls = []
+
+    async def replacement(owner, *args):
+        from pinky_daemon.broker import InjectResult
+
+        calls.append((owner, args))
+        return InjectResult(True, True) if name == "inject_agent_message" else True
+
+    monkeypatch.setattr(type(broker), name, replacement)
+    message = BrokerMessage(agent_name="sample", platform="telegram", chat_id="fixture-chat",
+                            sender_id="fixture-chat", sender_name="Fixture", content="fixture turn")
+    h.app.state.agents.approve_user("sample", "fixture-chat", "Fixture", "fixture")
+    args = {
+        "handle_inbound": (message,),
+        "inject_agent_message": ("primary", "sample", "fixture turn"),
+        "_route_streaming": ("sample", message),
+    }[name]
+    result = await getattr(broker, name)(*args)
+    assert calls == ([] if held else [(broker, args)])
+    if name == "inject_agent_message":
+        assert result.delivered is (not held)
+    elif name == "_route_streaming":
+        assert result is (not held)
