@@ -363,11 +363,12 @@ class Session:
 
     def _active_history(self) -> list[SessionMessage]:
         """Messages since the last checkpoint/restart."""
+        history = list(self.history)
         if not self.checkpoints:
-            return self.history
+            return history
 
         last_cp = self.checkpoints[-1]
-        return [m for m in self.history if m.timestamp > last_cp.timestamp]
+        return [m for m in history if m.timestamp > last_cp.timestamp]
 
     async def send(self, content: str) -> SessionMessage:
         """Send a message and get the response.
@@ -875,7 +876,7 @@ class SessionManager:
         return self._sessions.get(session_id)
 
     def list(self) -> list[SessionInfo]:
-        return [s.info for s in self._sessions.values() if s.state != SessionState.closed]
+        return [s.info for s in list(self._sessions.values()) if s.state != SessionState.closed]
 
     def refresh(self, session_id: str) -> Session | None:
         """Refresh a session — reinit runner with fresh MCP config, keep conversation."""

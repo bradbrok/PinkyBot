@@ -15,6 +15,7 @@ import json
 import sqlite3
 import threading
 import time
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -265,18 +266,29 @@ class ConversationStore:
         query: str,
         *,
         session_id: str = "",
+        session_ids: Collection[str] | None = None,
+        session_prefix: str = "",
         platform: str = "",
         chat_id: str = "",
         limit: int = 50,
+        after_ts: float = 0.0,
+        before_ts: float = 0.0,
+        role: str = "",
     ) -> list[StoredMessage]:
         """Full-text search across all conversations.
 
         Args:
             query: Search query (FTS5 syntax supported).
             session_id: Filter to specific session.
+            session_ids: Allowed sessions, combined with session_prefix by OR.
+                None omits the ID filter; an empty collection matches no IDs.
+            session_prefix: Literal session prefix, also allowed by the scope.
             platform: Filter by platform.
             chat_id: Filter by chat.
             limit: Max results.
+            after_ts: Inclusive earliest timestamp (zero means no filter).
+            before_ts: Inclusive latest timestamp (zero means no filter).
+            role: Filter by role (empty means no filter).
         """
         # Build query with optional filters
         conditions = ["messages_fts MATCH ?"]
@@ -285,12 +297,32 @@ class ConversationStore:
         if session_id:
             conditions.append("m.session_id = ?")
             params.append(session_id)
+        if session_ids is not None or session_prefix:
+            scope = []
+            if session_ids is not None:
+                # One parameter avoids SQLite's variable limit for large scopes.
+                scope.append("m.session_id IN (SELECT value FROM json_each(?))")
+                params.append(json.dumps(list(session_ids)))
+            if session_prefix:
+                escaped = session_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                scope.append("m.session_id LIKE ? ESCAPE '\\'")
+                params.append(f"{escaped}%")
+            conditions.append(f"({' OR '.join(scope)})")
         if platform:
             conditions.append("m.platform = ?")
             params.append(platform)
         if chat_id:
             conditions.append("m.chat_id = ?")
             params.append(chat_id)
+        if after_ts:
+            conditions.append("m.timestamp >= ?")
+            params.append(after_ts)
+        if before_ts:
+            conditions.append("m.timestamp <= ?")
+            params.append(before_ts)
+        if role:
+            conditions.append("m.role = ?")
+            params.append(role)
 
         where = " AND ".join(conditions)
         params.append(limit)
