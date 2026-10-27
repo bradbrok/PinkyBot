@@ -100,6 +100,7 @@ async def test_target_scoped_refusal_undo_and_explicit_acceptance(deployment, ac
     assert result["target_check"]["findings"] == [finding]
     if accept:
         assert result["restarting"] is True and result["target_check"]["accepted"] is True
+        assert result["target_check"]["ok"] is False
         assert fx.git("rev-parse", "HEAD") == fx.target and fx.scheduled
     else:
         assert result["target_check"]["reason"] == "findings"

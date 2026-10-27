@@ -642,7 +642,7 @@ async def test_core_lifecycle_boundaries_gate_before_transport_work(held_subject
 
 
 @pytest.mark.parametrize("held", [False, True])
-@pytest.mark.parametrize("entry", ["fork", "clone", "send", "restart", "refresh", "refresh-all", "legacy-send", "spawn", "force-restart"])
+@pytest.mark.parametrize("entry", ["fork", "clone", "send", "restart", "refresh", "refresh-all", "legacy-send", "legacy-send-agent", "spawn", "force-restart"])
 async def test_legacy_and_worker_routes_use_the_same_subject_policy(held_subject, monkeypatch, held, entry):
     from types import SimpleNamespace
     from unittest.mock import Mock
@@ -677,6 +677,7 @@ async def test_legacy_and_worker_routes_use_the_same_subject_policy(held_subject
         "refresh": ("/sessions/fixture-legacy/refresh", {}),
         "refresh-all": ("/agents/sample/sessions/refresh", {}),
         "legacy-send": ("/sessions/fixture-sender/send", {"to": "fixture-legacy", "content": "fixture turn"}),
+        "legacy-send-agent": ("/sessions/fixture-sender/send", {"to": "sample", "content": "fixture turn"}),
         "spawn": ("/agents/sample/sessions", {"session_id": "fixture-spawn", "session_type": "worker"}),
         "force-restart": ("/admin/force-restart-agent/sample", {"reason": "fixture recovery", "min_heartbeat_age_sec": 0}),
     }[entry]
