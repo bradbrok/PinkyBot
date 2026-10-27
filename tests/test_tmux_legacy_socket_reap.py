@@ -284,7 +284,7 @@ async def test_unexpected_startup_reap_error_blocks_all_and_logs_no_values(rig, 
     assert len(blocks) == 1
     wrapper = ast.parse("async def startup_reap():\n    pass\n")
     wrapper.body[0].body = [blocks[0]]
-    namespace = {"asyncio": asyncio, "agents": rig.registry, "_log": rig.logs.append}
+    namespace = {"asyncio": asyncio, "agents": rig.registry, "_log": rig.logs.append, "held_names": set()}
     exec(compile(ast.fix_missing_locations(wrapper), "<startup-reap-test>", "exec"), namespace)
     await namespace["startup_reap"]()
     assert rig.logs == ["ERROR legacy tmux startup cleanup failed; tmux launches blocked"]

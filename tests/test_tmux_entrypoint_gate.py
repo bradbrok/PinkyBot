@@ -202,7 +202,7 @@ async def test_startup_import_failure_rearms_previously_open_gate(tmp_path, monk
         assert len(blocks) == 1
         wrapper = ast.parse("async def startup_reap():\n    pass\n")
         wrapper.body[0].body = [blocks[0]]
-        namespace = {"asyncio": asyncio, "agents": registry, "_log": logs.append}
+        namespace = {"asyncio": asyncio, "agents": registry, "_log": logs.append, "held_names": set()}
         exec(compile(ast.fix_missing_locations(wrapper), "<startup-import-test>", "exec"), namespace)
         with monkeypatch.context() as imports:
             imports.setattr(builtins, "__import__", fail_import)

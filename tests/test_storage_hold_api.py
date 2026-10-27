@@ -122,7 +122,7 @@ async def test_installed_broker_delegates_gate_existing_connected_sessions(
     assert h.subject.send.await_count == (0 if held else 1)
 
 
-@pytest.mark.parametrize("name", ["handle_inbound", "inject_agent_message"])
+@pytest.mark.parametrize("name", ["handle_inbound", "inject_agent_message", "_route_streaming"])
 async def test_live_app_broker_binding_contains_its_storage_guard(held_subject, name):
     broker = held_subject.app.state.broker
     installed = getattr(broker, name)
@@ -574,3 +574,282 @@ async def test_recheck_never_clears_after_an_incomplete_or_fatal_scan(held_subje
     assert response.json()["cleared"] is False
     hold = closure_value(h.app, "_storage_hold_for")("sample")
     assert hold["held"] is True
+
+
+@pytest.mark.parametrize("mode", ["off", "both"])
+@pytest.mark.parametrize("held", [False, True])
+@pytest.mark.parametrize("entry", ["prepare", "connect", "connect-unchecked", "start", "start-unchecked",
+                                  "replace", "retained", "restart", "ensure", "ensure-idle",
+                                  "ensure-cold", "deliver"])
+async def test_core_lifecycle_boundaries_gate_before_transport_work(held_subject, monkeypatch, mode, held, entry):
+    from fastapi import HTTPException
+
+    from pinky_daemon.transport_state import SessionState
+
+    h = held_subject
+    active(h, held)
+    set_flags(monkeypatch, mode)
+    peer = h.subject._client
+    connect = AsyncMock()
+    agent = h.app.state.agents.get("sample")
+    h.subject._launch_snapshot = closure_value(h.app, "_launch_fingerprint")(agent)
+    h.subject._launch_provider_snapshot = closure_value(h.app, "_effective_launch_model")(agent)
+    h.subject._launch_runtime, h.subject._launch_transport = "claude_sdk", "sdk"
+    if entry in {"connect", "connect-unchecked", "retained", "ensure-idle"}:
+        async def connected():
+            h.subject._state_machine._state = SessionState.CONNECTED
+        connect.side_effect = connected
+        monkeypatch.setattr(h.subject, "connect", connect)
+    if entry == "ensure-idle":
+        h.subject._state_machine._state = SessionState.IDLE_SLEEPING
+    if entry in {"ensure-cold", "start", "start-unchecked"}:
+        h.app.state.broker.unregister_streaming("sample")
+    name, args, kwargs = {
+        "prepare": ("_prepare_streaming_session", ("sample",), {}),
+        "connect": ("_connect_prepared_session", (h.subject,), {}),
+        "connect-unchecked": ("_connect_prepared_session_unchecked", (h.subject,), {}),
+        "start": ("_start_streaming_session", ("sample",), {}),
+        "start-unchecked": ("_start_streaming_session_unchecked", ("sample",), {}),
+        "replace": ("_replace_session_locked", ("sample", "main", h.subject), {"reason": "fixture"}),
+        "retained": ("_connect_retained_session", ("sample", "main", h.subject), {}),
+        "restart": ("_restart_compatible", ("sample", h.subject), {"configure": lambda: None, "reason": "fixture"}),
+        "ensure": ("_ensure_streaming_session", ("sample",), {}),
+        "ensure-idle": ("_ensure_streaming_session", ("sample",), {}),
+        "ensure-cold": ("_ensure_streaming_session", ("sample",), {}),
+        "deliver": ("_deliver_streaming", ("sample", "fixture turn"), {}),
+    }[entry]
+    call = closure_value(h.app, name)
+    if held:
+        with pytest.raises(HTTPException) as raised:
+            await call(*args, **kwargs)
+        assert raised.value.status_code == 409 and raised.value.detail["code"] == "storage_hold"
+        assert raised.value.detail["findings"] == [h.finding]
+        assert len(h.clients) == len(h.sessions) == 1
+        assert connect.await_count == peer.disconnect.await_count == h.subject.send.await_count == 0
+        assert not h.trace
+    else:
+        result = await call(*args, **kwargs)
+        if entry in {"prepare", "start", "start-unchecked", "ensure-cold", "replace", "restart"}:
+            assert len(h.sessions) >= (1 if entry == "restart" else 2)
+            if entry != "prepare":
+                assert len(h.clients) == 2
+        elif entry in {"connect", "connect-unchecked", "retained", "ensure-idle"}:
+            assert connect.await_count == 1
+        elif entry == "deliver":
+            assert result == (h.subject, True) and h.subject.send.await_count == 1
+        else:
+            assert result is h.subject
+
+
+@pytest.mark.parametrize("held", [False, True])
+@pytest.mark.parametrize("entry", ["fork", "clone", "send", "restart", "refresh", "refresh-all", "legacy-send", "spawn", "force-restart"])
+async def test_legacy_and_worker_routes_use_the_same_subject_policy(held_subject, monkeypatch, held, entry):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import claude_agent_sdk
+
+    from pinky_daemon.sessions import Session
+
+    h = held_subject
+    active(h, held)
+    manager = h.app.state.manager
+    legacy = manager.create(session_id="fixture-legacy", agent_name="sample", session_type="main",
+                            working_dir=h.subject._config.working_dir, model="sonnet")
+    legacy._sdk_session_id = "fixture-transcript"
+    manager.create(session_id="fixture-sender", agent_name="primary", model="sonnet")
+    fork = Mock(return_value=SimpleNamespace(session_id="fixture-fork"))
+    monkeypatch.setattr(claude_agent_sdk, "fork_session", fork)
+    send = AsyncMock(return_value=SimpleNamespace(role="assistant", content="fixture answer", timestamp=1.0,
+                                                duration_ms=0, error=""))
+    monkeypatch.setattr(Session, "send", send)
+    restart = AsyncMock(return_value=SimpleNamespace(summary="fixture", message_count=1, estimated_tokens_at_checkpoint=2))
+    monkeypatch.setattr(legacy, "restart", restart)
+    create = Mock(wraps=manager.create)
+    refresh = Mock(wraps=manager.refresh)
+    monkeypatch.setattr(manager, "create", create)
+    monkeypatch.setattr(manager, "refresh", refresh)
+    path, payload = {
+        "fork": ("/sessions/fixture-legacy/fork", {}),
+        "clone": ("/agents/sample/clone-worker", {"task": "fixture turn"}),
+        "send": ("/sessions/fixture-legacy/message", {"content": "fixture turn"}),
+        "restart": ("/sessions/fixture-legacy/restart", {}),
+        "refresh": ("/sessions/fixture-legacy/refresh", {}),
+        "refresh-all": ("/agents/sample/sessions/refresh", {}),
+        "legacy-send": ("/sessions/fixture-sender/send", {"to": "fixture-legacy", "content": "fixture turn"}),
+        "spawn": ("/agents/sample/sessions", {"session_id": "fixture-spawn", "session_type": "worker"}),
+        "force-restart": ("/admin/force-restart-agent/sample", {"reason": "fixture recovery", "min_heartbeat_age_sec": 0}),
+    }[entry]
+    response = await h.client.post(path, json=payload)
+    await asyncio.sleep(0)
+    if held:
+        refused(response, h)
+        assert fork.call_count == create.call_count == refresh.call_count == 0
+        assert send.await_count == restart.await_count == 0
+        assert len(h.clients) == 1 and not h.trace
+    else:
+        assert response.status_code == 200, response.text
+        if entry in {"fork", "clone"}:
+            assert fork.call_count == 1
+        if entry in {"clone", "spawn"}:
+            assert create.call_count == 1
+        if entry == "send":
+            assert send.await_count == 1
+        if entry == "restart":
+            assert restart.await_count == 1
+        if entry in {"refresh", "refresh-all"}:
+            assert refresh.call_count == 1
+        if entry == "force-restart":
+            assert len(h.clients) == 2
+
+
+@pytest.mark.parametrize("held", [False, True])
+@pytest.mark.parametrize("entry", ["config", "liveness", "login-probe", "login-freeze"])
+async def test_watchdog_never_probes_or_changes_a_held_terminal(held_subject, monkeypatch, held, entry):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+
+    h = held_subject
+    active(h, held)
+    h.app.state.agents.register("sample", transport="tmux")
+    tmux = SimpleNamespace(session_name="fixture-terminal", has_session=AsyncMock(return_value=True),
+                           capture_pane=AsyncMock(return_value=SimpleNamespace(ok=True, stdout="fixture pane")),
+                           rename_session=AsyncMock(return_value=SimpleNamespace(ok=True)))
+    session = SimpleNamespace(_tmux=tmux)
+    attr = {"config": "_config_fn", "liveness": "_tmux_liveness_fn",
+            "login-probe": "_login_wall_probe_fn", "login-freeze": "_login_wall_freeze_fn"}[entry]
+    callback = getattr(h.app.state.watchdog, attr)
+    if entry == "config":
+        assert callback("sample").enabled is (not held)
+    elif held and entry == "login-freeze":
+        with pytest.raises(HTTPException) as raised:
+            await callback("sample", "main", session)
+        assert raised.value.detail["code"] == "storage_hold"
+    else:
+        result = await callback("sample", "main", session)
+        if held:
+            assert result is None
+        elif entry == "liveness":
+            assert result == (True, "fixture-terminal")
+        else:
+            assert tmux.capture_pane.await_count == 1
+    if held:
+        assert tmux.has_session.await_count == tmux.capture_pane.await_count == tmux.rename_session.await_count == 0
+
+
+@pytest.mark.parametrize("kind", ["directory", "database"])
+async def test_daemon_starts_when_every_registered_subject_is_held(held_subject, monkeypatch, tmp_path, kind):
+    from pinky_daemon import api, tmux_session
+    from pinky_daemon.store_catalog import StoreCatalogError
+
+    h = held_subject
+    root = Path(h.app.state.store_catalog.expected_root)
+    directory = root / "agents/primary/data"
+    directory.mkdir(parents=True)
+    target = tmp_path / "outside"
+    name = "escape"
+    if kind == "database":
+        h.escape.unlink()
+        target = target / "fixture-content"
+        target.write_bytes(b"fixture")
+        name += ".db"
+        h.escape.with_name(name).symlink_to(target)
+    (directory / name).symlink_to(target, target_is_directory=kind == "directory")
+    h.app.state.agents.set_main_agent("")
+    h.app.state.agents._fire_trace.close()
+    h.app.state.store_catalog.shutdown(deadline_seconds=10)
+    monkeypatch.setattr(api, "SHARED_MCP_ENABLED", False)
+    monkeypatch.setenv("PINKY_LOG_ROTATION", "off")
+    cleanup = AsyncMock()
+    monkeypatch.setattr(tmux_session, "reap_legacy_tmux_sessions", cleanup)
+    monkeypatch.setattr(tmux_session, "reconcile_tmux_spawn_cleanup_debts", AsyncMock(return_value=(0, 0)))
+    try:
+        app = api.create_api(db_path=str(root / "api.db"), default_working_dir=str(root))
+    except StoreCatalogError as exc:
+        pytest.fail(f"An entirely held registry must still start the daemon: {exc}")
+    app.state.agents.set_main_agent("")
+    app.state.scheduler._owner_notify_callback = AsyncMock(return_value=True)
+    before = len(h.clients), len(h.sessions)
+    async with app.router.lifespan_context(app):
+        holds = closure_value(app, "_storage_hold_for")()
+        assert {view["agent"] for view in holds if view["held"]} == {a.name for a in app.state.agents.list()}
+        assert len(holds) == 2
+        assert (len(h.clients), len(h.sessions)) == before
+        assert app.state.api_readiness.closed is False
+        assert app.state.scheduler._owner_notify_callback.await_count == 1
+        assert cleanup.call_args.args[0].list() == []
+
+
+@pytest.mark.parametrize("held", [False, True])
+async def test_boot_cleanup_keeps_a_held_debt_and_reaps_an_unheld_debt(held_subject, monkeypatch, held):
+    import time
+    from types import SimpleNamespace
+
+    from pinky_daemon import api, tmux_session
+
+    h = held_subject
+    active(h, held)
+    root = Path(h.app.state.store_catalog.expected_root)
+    h.app.state.agents.set_main_agent("")
+    paths = {}
+    for name in ("sample", "primary"):
+        debt = tmux_session._TmuxSpawnCleanupDebt(
+            agent_name=name, session_name=f"fixture-{name}", socket_name="fixture-server", socket_path="",
+            tmux_binary="fixture-tmux", runner={"kind": "local"}, site="fixture", created_at=time.time(),
+        )
+        paths[name] = tmux_session._persist_tmux_spawn_cleanup_debt(root, debt)
+    before = paths["sample"].read_bytes()
+    controls = []
+
+    def control(session_name, **kwargs):
+        controls.append(session_name)
+        return SimpleNamespace(kill_session=AsyncMock(return_value=SimpleNamespace(ok=True)))
+
+    monkeypatch.setattr(tmux_session, "production_tmux_control", control)
+    monkeypatch.setattr(tmux_session, "reap_legacy_tmux_sessions", AsyncMock())
+    monkeypatch.setattr(api, "SHARED_MCP_ENABLED", False)
+    monkeypatch.setenv("PINKY_LOG_ROTATION", "off")
+    h.app.state.scheduler._owner_notify_callback = AsyncMock(return_value=True)
+    async with h.app.router.lifespan_context(h.app):
+        assert not paths["primary"].exists()
+        assert paths["sample"].exists() is held
+        assert set(controls) == ({"fixture-primary"} if held else {"fixture-primary", "fixture-sample"})
+        if held:
+            assert paths["sample"].read_bytes() == before
+            assert h.subject._client.disconnect.await_count == 0
+
+
+@pytest.mark.parametrize("mode", ["off", "both"])
+@pytest.mark.parametrize("held", [False, True])
+@pytest.mark.parametrize("entry", ["pre-authorized", "pending-replay", "approval"])
+async def test_broker_replay_and_pre_authorized_delivery_preserve_a_held_backlog(
+    held_subject, monkeypatch, mode, held, entry,
+):
+    h = held_subject
+    active(h, held)
+    set_flags(monkeypatch, mode)
+    registry = h.app.state.agents
+    if entry == "pre-authorized":
+        message = BrokerMessage(agent_name="sample", platform="telegram", chat_id="fixture-chat",
+                                sender_id="fixture-chat", sender_name="Fixture", content="fixture turn")
+        result = await h.app.state.broker.dispatch_pre_authorized("sample", message)
+        assert bool(result) is (not held)
+    else:
+        registry.add_pending_user("sample", "fixture-chat", "Fixture")
+        registry.queue_pending_message("sample", "telegram", "fixture-chat", "Fixture", "fixture turn")
+        if entry == "pending-replay":
+            registry.approve_user("sample", "fixture-chat", "Fixture", "fixture")
+            delivered = await h.app.state.broker.reconcile_approved_pending_messages()
+        else:
+            response = await h.client.post("/agents/sample/approved-users", json={
+                "chat_id": "fixture-chat", "display_name": "Fixture",
+            })
+            assert response.status_code == 200, response.text
+            assert registry.get_user_status("sample", "fixture-chat") == "approved"
+            if held:
+                reported(response.json(), h)
+            delivered = response.json()["pending_delivered"]
+        assert delivered == (0 if held else 1)
+        assert len(registry.get_pending_messages("sample", "fixture-chat")) == (1 if held else 0)
+    assert h.subject.send.await_count == (0 if held else 1)

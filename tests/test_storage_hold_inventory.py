@@ -15,7 +15,7 @@ BLOCKED = (
     "_connect_prepared_session_unchecked", "_start_streaming_session",
     "_start_streaming_session_unchecked", "_replace_session_locked",
     "_connect_retained_session", "_restart_compatible", "_ensure_streaming_session",
-    "_deliver_streaming", "_guarded_handle_inbound", "_guarded_inject_agent_message",
+    "_deliver_streaming", "_guarded_handle_inbound", "_guarded_inject_agent_message", "_guarded_route_streaming",
     "fork_session", "clone_worker", "send_message", "restart_session", "refresh_session",
     "refresh_agent_sessions", "send_agent_message", "spawn_agent_session",
     "create_streaming_session", "restart_streaming_session",
@@ -25,10 +25,12 @@ BLOCKED = (
     "_dream_callback", "_librarian_callback", "_trigger_librarian", "_heartbeat_resurrect",
     "_is_resurrectable", "_notify_scheduler_agent", "_watchdog_recover",
     "_watchdog_mcp_notice", "_watchdog_mcp_recover", "admin_force_restart_agent",
+    "_get_watchdog_config", "_watchdog_tmux_liveness", "_watchdog_login_wall_probe", "_watchdog_login_wall_freeze",
+    "_storage_cleanup_control",
     "_container_start_main", "containerize_agent", "decontainerize_agent",
     "start_agent_loop", "push_agent_event", "on_startup", "_launch_boot_session", "on_shutdown",
 )
-CONFIGURATION = ("update_agent", "apply_agent_skills", "set_streaming_model", "set_agent_provider")
+CONFIGURATION = ("update_agent", "apply_agent_skills", "set_streaming_model", "set_agent_provider", "approve_user")
 ADMINISTRATION = ("stop_agent", "stop_all_agents", "delete_streaming_session",
                   "rename_streaming_session", "archive_streaming_session", "transport_wake")
 
@@ -57,6 +59,24 @@ def test_each_launch_delivery_or_configuration_boundary_reads_the_one_policy(nam
 def test_effective_hold_state_has_one_reader():
     found = functions()
     assert "_storage_hold_for" in found
+    tree = ast.parse(Path(api.__file__).read_text())
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute) or node.attr not in {"storage_holds", "storage_hold_overrides"}:
+            continue
+        if isinstance(node.ctx, ast.Store):
+            continue
+        parent = parents[node]
+        if isinstance(parent, ast.Subscript) and isinstance(parent.ctx, ast.Store):
+            continue
+        if isinstance(parent, ast.Attribute) and parent.attr in {"pop", "add", "discard", "clear", "update"}:
+            call = parents[parent]
+            if isinstance(call, ast.Call) and isinstance(parents[call], ast.Expr):
+                continue
+        owner = parent
+        while owner in parents and not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            owner = parents[owner]
+        assert isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)) and owner.name == "_storage_hold_for"
     for name, fn in found.items():
         for node in direct_nodes(fn):
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
