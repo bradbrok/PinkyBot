@@ -690,6 +690,23 @@ def _send_telegram_once(send, *args, **kwargs):
         raise DeliveryUnknownError(error) from error
 
 
+def _mdv2_rejected(error: TelegramError) -> bool:
+    return (
+        not error.rate_limited
+        and error.error_code == 400
+        and "can't parse entities" in error.description.casefold()
+    )
+
+
+def _telegram_rate_limit_error(error: TelegramError) -> HTTPException:
+    detail = "rate limited by Telegram"
+    headers = None
+    if error.retry_after is not None:
+        detail += f", retry after {error.retry_after} s"
+        headers = {"Retry-After": str(error.retry_after)}
+    return HTTPException(429, detail, headers=headers)
+
+
 def resolve_provider_config(
     *,
     agent_provider_url: str,
@@ -2669,6 +2686,8 @@ def create_api(
                         reply_markup=markup,
                     )
                 except TelegramError as e:
+                    if not _mdv2_rejected(e):
+                        raise
                     _log(f"broker-send: MarkdownV2 failed ({e}), trying plain")
                     return _send_telegram_once(adapter.send_message,
                         chat_id, content, reply_to_message_id=reply_to_id,
@@ -2687,6 +2706,7 @@ def create_api(
                 # failure on a VALID quote isn't silently downgraded.
                 quote_rejected = (
                     reply_parameters is not None
+                    and not e.rate_limited
                     and "quote" in (getattr(e, "description", "") or "").lower()
                 )
                 if quote_rejected:
@@ -2796,6 +2816,8 @@ def create_api(
                     # bucket it as `rejected` instead of masking it with a retry.
                     raise
                 except TelegramError as e:
+                    if not _mdv2_rejected(e):
+                        raise
                     _log(f"broker-send-file: MarkdownV2 caption failed ({e}), trying plain")
                     result = _send_telegram_once(_dispatch, caption, None)
             else:
@@ -2904,6 +2926,16 @@ def create_api(
                     error=f"delivery_unknown: {type(error.cause).__name__}: {error.cause}",
                 )
                 raise
+            except TelegramError as error:
+                if not error.rate_limited:
+                    raise
+                broker._stop_typing(agent_name, chat_id)
+                _outreach_attempt_log(
+                    agent_name=agent_name, platform=platform, method="send",
+                    chat_id=chat_id, file_path="", caption_len=len(content),
+                    outcome="error_upstream", error=str(error),
+                )
+                raise _telegram_rate_limit_error(error) from error
             # Once an outbound message lands, the typing indicator becomes noise —
             # Telegram has no "stop typing" API, but cancelling our 4s
             # sendChatAction loop prevents the indicator from popping back up
@@ -3175,6 +3207,8 @@ def create_api(
                 chat_id=chat_id, file_path="", caption_len=len(text),
                 outcome="error_upstream", error=error_repr,
             )
+            if isinstance(e, TelegramError) and e.rate_limited:
+                raise _telegram_rate_limit_error(e) from e
             raise HTTPException(502, f"Failed to send_voice: {error_repr}") from e
         finally:
             broker._stop_typing(agent_name, chat_id)
@@ -12039,6 +12073,8 @@ npm run build</pre>
                 chat_id=chat_id, file_path=file_path, caption_len=len(caption),
                 outcome="error_upstream", error=error_repr,
             )
+            if isinstance(e, TelegramError) and e.rate_limited:
+                raise _telegram_rate_limit_error(e) from e
             raise HTTPException(502, f"Failed to {method}: {error_repr}") from e
         finally:
             # Typing indicator must stop regardless of success/failure so a
@@ -12228,6 +12264,8 @@ npm run build</pre>
                     chat_id=chat_id, file_path="", caption_len=len(caption),
                     outcome="error_upstream", error=error_repr,
                 )
+                if isinstance(e, TelegramError) and e.rate_limited:
+                    raise _telegram_rate_limit_error(e) from e
                 raise HTTPException(502, f"Failed to send_gif: {error_repr}") from e
         finally:
             broker._stop_typing(agent_name_req, chat_id)

@@ -335,7 +335,7 @@ async def test_every_text_fallback_and_unquoted_retry_keeps_buttons(gateway, out
     def send(*args, **kwargs):
         calls.append(kwargs)
         if branch == "plain" and len(calls) == 1:
-            raise TelegramError("synthetic formatting failure")
+            raise TelegramError("Bad Request: can't parse entities: synthetic", 400)
         if branch == "unquoted" and kwargs.get("reply_parameters") is not None:
             raise TelegramError("synthetic quote rejection")
         return SimpleNamespace(message_id="501")

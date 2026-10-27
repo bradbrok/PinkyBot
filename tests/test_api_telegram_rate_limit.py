@@ -1,5 +1,7 @@
 """Telegram throttling is one failed send, never a formatting retry."""
 
+import json
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -51,7 +53,11 @@ def test_markdown_parse_rejection_still_falls_back(sender, media):
 
 
 @pytest.mark.parametrize("media", [False, True], ids=["text", "photo"])
-@pytest.mark.parametrize("code,description", [(400, "Bad Request: chat not found"), (403, "Forbidden")])
+@pytest.mark.parametrize("code,description", [
+    (400, "Bad Request: chat not found"),
+    (403, "Forbidden"),
+    (500, "can't parse entities: internal failure"),
+])
 def test_non_parse_telegram_error_is_not_retried(sender, media, code, description):
     with patch.object(
         TelegramAdapter, "send_photo" if media else "send_message",
@@ -75,7 +81,7 @@ def test_rate_limit_without_numeric_delay_still_returns_429_once(sender, media):
     assert "Retry-After" not in response.headers
 
 
-@pytest.mark.parametrize("kind", ["photo", "document", "video"])
+@pytest.mark.parametrize("kind", ["photo", "document", "video", "animation"])
 def test_media_rate_limit_never_reuploads(sender, kind):
     error = TelegramError("Too Many Requests", 429, retry_after=13)
     with patch.object(TelegramAdapter, f"send_{kind}", side_effect=error) as send:
@@ -84,6 +90,57 @@ def test_media_rate_limit_never_reuploads(sender, kind):
     assert response.status_code == 429
     assert response.headers["Retry-After"] == "13"
     assert response.json()["detail"] == "rate limited by Telegram, retry after 13 s"
+
+
+@pytest.mark.parametrize("media", [False, True], ids=["text", "photo"])
+def test_rate_limit_on_plain_fallback_stops_after_that_attempt(sender, media):
+    with patch.object(
+        TelegramAdapter, "send_photo" if media else "send_message",
+        side_effect=[
+            TelegramError("Bad Request: can't parse entities", 400),
+            TelegramError("Too Many Requests: retry after 8", 429),
+        ],
+    ) as send:
+        response = _file(sender) if media else _text(sender)
+    assert send.call_count == 2
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "8"
+    sender.stopped.assert_called_once_with("sender", "12345")
+
+
+def test_explicit_parse_mode_rate_limit_is_returned_without_retry(sender):
+    with patch.object(
+        TelegramAdapter, "send_message",
+        side_effect=TelegramError("Too Many Requests: retry after 8", 429),
+    ) as send:
+        response = _text(sender, parse_mode="HTML")
+    send.assert_called_once()
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "8"
+
+
+@pytest.mark.parametrize("kind", ["gif", "voice"])
+def test_generated_media_rate_limit_reaches_caller_without_resending(sender, kind):
+    sender.app.state.agents.set_setting("OPENAI_API_KEY", "synthetic-key")
+    search = {"data": [{"images": {"original": {"url": "https://example.invalid/image.gif"}}}]}
+    replies = [BytesIO(json.dumps(search).encode()), BytesIO(b"synthetic-media")]
+    body = {"query": "sample"} if kind == "gif" else {"text": "sample", "provider": "openai"}
+    error = TelegramError("Too Many Requests: retry after 8", 429)
+    with (
+        patch("urllib.request.urlopen", side_effect=replies if kind == "gif" else replies[1:]),
+        patch.object(
+            TelegramAdapter, "send_animation" if kind == "gif" else "send_voice",
+            side_effect=error,
+        ) as send,
+    ):
+        response = sender.client.post(f"/broker/send-{kind}", json={
+            "agent_name": "sender", "platform": "telegram", "chat_id": "12345", **body,
+        })
+    send.assert_called_once()
+    assert response.status_code == 429, response.text
+    assert response.headers["Retry-After"] == "8"
+    assert response.json()["detail"] == "rate limited by Telegram, retry after 8 s"
+    sender.stopped.assert_called_once_with("sender", "12345")
 
 
 @pytest.mark.parametrize("code", [429, 400])

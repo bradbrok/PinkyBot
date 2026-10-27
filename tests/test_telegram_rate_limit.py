@@ -5,7 +5,6 @@ import pytest
 
 from pinky_outreach.telegram import TelegramAdapter, TelegramError
 
-
 METHODS = ["request", "send_photo", "send_document", "send_animation", "send_video", "send_voice"]
 
 
@@ -101,6 +100,7 @@ def test_existing_positional_telegram_error_construction_is_unchanged():
 @pytest.mark.parametrize("description,code,delay,expected", [
     ("Bad Request: CAN'T PARSE ENTITIES: markup", 400, None, True),
     ("Bad Request: can't parse entities", 429, None, False),
+    ("can't parse entities: internal failure", 500, None, False),
     ("Bad Request: can't parse entities", 400, 8, False),
     ("Bad Request: chat not found", 400, None, False),
 ])

@@ -25,10 +25,31 @@ CALLBACK_CHOSEN_MARKER = "__chosen__"
 class TelegramError(Exception):
     """Telegram API error."""
 
-    def __init__(self, description: str, error_code: int = 0):
+    def __init__(
+        self, description: str, error_code: int = 0, *, retry_after: int | None = None,
+    ):
         self.description = description
         self.error_code = error_code
+        if retry_after is None:
+            match = re.search(r"retry after (\d+)", description, re.IGNORECASE)
+            if match and int(match.group(1)) > 0:
+                retry_after = int(match.group(1))
+        self.retry_after = retry_after
         super().__init__(f"Telegram API error {error_code}: {description}")
+
+    @property
+    def rate_limited(self) -> bool:
+        return (
+            self.error_code == 429
+            or self.retry_after is not None
+            or "too many requests" in self.description.casefold()
+        )
+
+
+def _retry_after_parameter(data: dict) -> int | None:
+    parameters = data.get("parameters")
+    value = parameters.get("retry_after") if isinstance(parameters, dict) else None
+    return value if type(value) is int and value > 0 else None
 
 
 def _telegram_id(value: object) -> str | None:
@@ -120,6 +141,7 @@ class TelegramAdapter:
             raise TelegramError(
                 data.get("description", "Unknown error"),
                 data.get("error_code", 0),
+                retry_after=_retry_after_parameter(data),
             )
 
         return data.get("result", {})
@@ -219,6 +241,7 @@ class TelegramAdapter:
             raise TelegramError(
                 data.get("description", "Unknown error"),
                 data.get("error_code", 0),
+                retry_after=_retry_after_parameter(data),
             )
         result = data["result"]
         return Message(
@@ -264,6 +287,7 @@ class TelegramAdapter:
             raise TelegramError(
                 data.get("description", "Unknown error"),
                 data.get("error_code", 0),
+                retry_after=_retry_after_parameter(data),
             )
         result = data["result"]
         return Message(
@@ -315,6 +339,7 @@ class TelegramAdapter:
             raise TelegramError(
                 data.get("description", "Unknown error"),
                 data.get("error_code", 0),
+                retry_after=_retry_after_parameter(data),
             )
         result = data["result"]
         return Message(
@@ -381,6 +406,7 @@ class TelegramAdapter:
             raise TelegramError(
                 data.get("description", "Unknown error"),
                 data.get("error_code", 0),
+                retry_after=_retry_after_parameter(data),
             )
         result = data["result"]
         return Message(
@@ -419,6 +445,7 @@ class TelegramAdapter:
             raise TelegramError(
                 result_data.get("description", "Unknown error"),
                 result_data.get("error_code", 0),
+                retry_after=_retry_after_parameter(result_data),
             )
         result = result_data["result"]
         return Message(
