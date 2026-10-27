@@ -4725,10 +4725,20 @@ def create_api(
                 # An older preview remains the transport's fallback if a later
                 # rebuild fails. Keep its other context, but never replay a
                 # notice already delivered by another session in this app.
-                if (preview_storage_notice and name in delivered_main_storage_notices
-                        and config.wake_context.startswith(preview_storage_notice)):
-                    config.wake_context = config.wake_context[len(preview_storage_notice):].removeprefix("\n\n")
-                    removed_storage_notice = True
+                if name in delivered_main_storage_notices:
+                    # A recheck can change the findings before this preview
+                    # is refreshed. Recognize the current block by structure.
+                    header, _, after_header = config.wake_context.partition("\n")
+                    encoded, separator, after_json = after_header.partition("\n")
+                    if (header == "WARNING STORAGE HOLD: main agent exemption"
+                            and separator and after_json.startswith("\n")):
+                        try:
+                            json.loads(encoded)
+                        except (ValueError, RecursionError):
+                            pass
+                        else:
+                            config.wake_context = after_json[1:]
+                            removed_storage_notice = True
             try:
                 text = _build_streaming_wake_context(name, reason, commit=commit)
             except Exception as exc:
