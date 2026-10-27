@@ -80,7 +80,10 @@ async def concurrent_probe(app, path, entered):
 async def test_slow_history_store_does_not_block_other_requests(history, monkeypatch, query):
     entered = threading.Event()
 
-    def slow_search(query, *, limit=50, session_ids=None, session_prefix=""):
+    def slow_search(
+        query, *, limit=50, session_ids=None, session_prefix="",
+        after_ts=0.0, before_ts=0.0, role="",
+    ):
         entered.set()
         time.sleep(1.0)
         return []
@@ -106,6 +109,51 @@ async def test_own_match_is_not_crowded_out_by_newer_foreign_matches(history):
     response = await request(history, q="needle", limit=3)
     assert response.status_code == 200
     assert [m["id"] for m in response.json()["messages"]] == [own.id]
+
+
+@pytest.mark.parametrize(
+    "filters,target_offset,newer_offsets,other_role",
+    [
+        ({"role": "user"}, 0, range(1, 6), "assistant"),
+        ({"before": "2026-01-02"}, 86400, range(86401, 86406), "user"),
+        ({"after": "2026-01-02", "role": "user"}, 0, range(1, 6), "assistant"),
+        ({"after": "2026-01-02"}, 0, range(-5, 0), "user"),
+    ],
+    ids=["role", "before-inclusive", "after-and-role", "after-inclusive"],
+)
+async def test_search_filters_apply_before_result_limit(
+    history, filters, target_offset, newer_offsets, other_role,
+):
+    start = datetime(2026, 1, 2, tzinfo=timezone.utc).timestamp()
+    target = history.store.append(
+        "opaque-own", "user", "needle selected", timestamp=start + target_offset,
+    )
+    for offset in newer_offsets:
+        history.store.append(
+            "opaque-own", other_role, "needle outside filter", timestamp=start + offset,
+        )
+    response = await request(history, q="needle", limit=1, **filters)
+    assert response.status_code == 200
+    assert [m["id"] for m in response.json()["messages"]] == [target.id]
+
+
+def test_search_without_new_filters_retains_global_results(history):
+    history.store.append("opaque-own", "user", "needle own", timestamp=1)
+    newest = history.store.append("foreign", "assistant", "needle foreign", timestamp=2)
+    assert [m.id for m in history.store.search("needle", limit=1)] == [newest.id]
+
+
+def test_fts_retry_keeps_date_role_and_session_filters_before_limit(history):
+    first = history.store.append("opaque-own", "user", "don't forget", timestamp=10)
+    last = history.store.append("opaque-own", "user", "don't forget", timestamp=40)
+    history.store.append("opaque-own", "user", "don't forget", timestamp=5)
+    history.store.append("opaque-own", "user", "don't forget", timestamp=60)
+    history.store.append("opaque-own", "assistant", "don't forget", timestamp=30)
+    history.store.append("foreign", "user", "don't forget", timestamp=40)
+    results = history.store.search(
+        "don't", session_ids=history.ids, after_ts=10, before_ts=40, role="user", limit=2,
+    )
+    assert [m.id for m in results] == [last.id, first.id]
 
 
 @pytest.mark.parametrize(
