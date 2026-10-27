@@ -525,3 +525,72 @@ async def test_notice_only_cached_fallback_accepts_json_at_exact_end(
     await asyncio.wait_for(asyncio.shield(ss._initial_wake_task), timeout=10)
     assert [NOTICE in text for text in submitted] == [True, trailing_newline]
     assert ss._config.wake_context == (cached if trailing_newline else "")
+
+
+@pytest.mark.parametrize("case", ["updated-findings", "same-findings"])
+async def test_archive_cached_notice_is_consumed_when_committed_rebuild_fails(
+    application_factory, monkeypatch, case,
+):
+    f = await application_factory(dirty=True, registered=True, main="sample")
+    attempted, submitted, failed_reads = [], [], []
+    fail_first = True
+
+    async def connect_peer(ss):
+        async def query(prompt):
+            nonlocal fail_first
+            if asyncio.current_task() is not getattr(ss, "_initial_wake_task", None):
+                return
+            attempted.append(str(prompt))
+            if fail_first:
+                fail_first = False
+                raise RuntimeError("fixture first submission failed")
+            submitted.append(str(prompt))
+
+        ss._client.query.side_effect = query
+
+    f.h.control.start_hook = connect_peer
+    ss = await closure_value(f.app, "_prepare_streaming_session")("sample", label="main")
+    config = ss._config
+    initial_notice = config.wake_context.partition("\n\n")[0]
+    await closure_value(f.app, "_connect_prepared_session")(ss)
+    await asyncio.wait_for(asyncio.shield(ss._initial_wake_task), timeout=10)
+    assert len(attempted) == 1 and submitted == []
+    if case == "updated-findings":
+        outside = f.root.parent / "second-outside"
+        outside.mkdir()
+        (f.root / "agents/sample/data/second-escape").symlink_to(outside, target_is_directory=True)
+    response = await f.client.post("/agents/sample/storage/recheck")
+    assert response.status_code == 200, response.text
+    findings = response.json()["findings"]
+    assert len(findings) == (2 if case == "updated-findings" else 1)
+    f.app.state.agents.set_context(
+        "sample", task="fixture fallback task\n\n  retain exact context Ω\n",
+        metadata={"source": "save_my_context"}, updated_by="saved",
+    )
+    get_context = f.app.state.agents.get_context
+
+    def unreadable_during_wake(name):
+        if asyncio.current_task() is getattr(ss, "_initial_wake_task", None):
+            failed_reads.append(name)
+            raise RuntimeError("fixture committed context read failed")
+        return get_context(name)
+
+    monkeypatch.setattr(f.app.state.agents, "get_context", unreadable_during_wake)
+    response = await f.client.post("/agents/sample/streaming/archive")
+    assert response.status_code == 200, response.text
+    assert response.json()["archived"] is True
+    assert f.app.state.broker._streaming["sample"]["main"] is ss and ss._config is config
+    await asyncio.wait_for(asyncio.shield(ss._initial_wake_task), timeout=10)
+    assert len(submitted) == 1 and NOTICE in submitted[0]
+    notice, separator, expected_context = config.wake_context.partition("\n\n")
+    assert separator and json.loads(notice.splitlines()[1]) == findings
+    assert "fixture fallback task\n\n  retain exact context Ω\n" in expected_context
+    if case == "updated-findings":
+        assert notice != initial_notice
+    await ss.disconnect()
+    await closure_value(f.app, "_connect_retained_session")("sample", "main", ss)
+    await asyncio.wait_for(asyncio.shield(ss._initial_wake_task), timeout=10)
+    assert failed_reads == ["sample", "sample"]
+    assert [NOTICE in text for text in submitted] == [True, False]
+    assert config.wake_context == expected_context
+    assert expected_context in submitted[1]
