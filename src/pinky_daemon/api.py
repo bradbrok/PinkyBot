@@ -264,6 +264,7 @@ from pinky_daemon.store_catalog import (
     StoreCatalogError,
     StoreIntegrityTarget,
     StorePathAuthorityError,
+    storage_hold_scope,
 )
 from pinky_daemon.store_manifest import (
     derive_fleet_store_manifest,
@@ -1862,6 +1863,21 @@ def _startup_layout_preflight(catalog: StoreCatalog) -> dict:
     }
 
 
+def _accept_scoped_findings(check: dict, accept_findings: bool, root) -> bool:
+    """Keep the failed report intact while recording an explicit acceptance."""
+    findings = check.get("findings")
+    if (not accept_findings or check.get("incomplete") or check.get("cleanup_failed")
+            or check.get("reason") not in (None, "findings")
+            or not isinstance(findings, list) or not findings):
+        return False
+    if not all(isinstance(finding, dict) and finding.get("scope")
+               and storage_hold_scope(root, finding) == finding["scope"] for finding in findings):
+        return False
+    check["ok"] = False
+    check["accepted"] = True
+    return True
+
+
 def _startup_full_ref(repo_dir: str, ref: str = "HEAD") -> str:
     import subprocess as sp
 
@@ -1903,8 +1919,12 @@ def _startup_target_report(stdout: str | bytes, rc: int) -> dict:
             or not all(isinstance(warning, str) for warning in warnings)
             or len(warnings) != min(20, count)):
         raise ValueError("invalid startup warnings")
-    if rc not in (0, 1) or report["ok"] is not (rc == 0) or bool(findings) != (rc == 1):
+    if rc not in (0, 1, 3) or report["ok"] is not (rc == 0) or bool(findings) != (rc in (1, 3)):
         raise ValueError("startup report disagrees with exit status")
+    if rc == 3 and not all(finding.get("scope")
+                          and storage_hold_scope(report["root"], finding) == finding["scope"]
+                          for finding in findings):
+        raise ValueError("exit status 3 requires eligible scoped findings")
     return report
 
 
@@ -2019,7 +2039,9 @@ def _check_target_startup(repo_dir: str, db_path: str, target_ref: str) -> dict:
     except Exception:
         return {**result, "reason": "invalid_report"}
     result["findings"] = report["findings"]
-    if child.returncode == 1:
+    if child.cleanup_failed:
+        result["cleanup_failed"] = True
+    if child.returncode in (1, 3):
         result["reason"] = "findings"
     elif child.cleanup_failed:
         result.update(reason="invalid_report", stderr_tail="target process group cleanup failed")
@@ -3258,6 +3280,73 @@ def create_api(
     app.state.session_store = session_store
     app.state.session_event_store = session_event_store
 
+    app.state.storage_holds = {}
+    app.state.storage_hold_overrides = set()
+
+    def _storage_hold_for(name: str | None = None):
+        """Return a detached effective view; this is the only state reader."""
+        if name is None:
+            return [_storage_hold_for(subject) for subject in app.state.storage_holds]
+        findings = app.state.storage_holds.get(name)
+        if not name or not findings:
+            return None
+        registered = agents.get(name) is not None
+        main_exempt = registered and name == agents.get_main_agent()
+        overridden = name in app.state.storage_hold_overrides
+        return {
+            "agent": name, "findings": copy.deepcopy(findings),
+            "held": registered and not main_exempt and not overridden,
+            "main_exempt": main_exempt, "overridden": overridden,
+            "registered": registered,
+        }
+
+    def _storage_hold_error(hold):
+        return HTTPException(409, {"code": "storage_hold", **hold})
+
+    def _storage_log_value(value):
+        """Keep untrusted filesystem metadata on one diagnostic line."""
+        return str(value).encode("unicode_escape").decode("ascii")
+
+    def _storage_cleanup_control(debt):
+        """Keep held cleanup records while preserving other recorded routes."""
+        from pinky_daemon import tmux_session
+
+        if (hold := _storage_hold_for(debt.agent_name)) and hold["held"]:
+            raise _storage_hold_error(hold)
+        return tmux_session.production_tmux_control(
+            debt.session_name, tmux_binary=debt.tmux_binary,
+            socket_name=debt.socket_name, socket_path=debt.socket_path,
+            command_runner=tmux_session._tmux_cleanup_runner_from_spec(debt.runner),
+            cleanup=True,
+        )
+
+    original_handle_inbound = broker.handle_inbound
+    original_inject_agent_message = broker.inject_agent_message
+    original_route_streaming = broker._route_streaming
+
+    async def _guarded_handle_inbound(message):
+        if (hold := _storage_hold_for(message.agent_name)) and hold["held"]:
+            if message.content.strip().startswith("/stop"):
+                await broker._handle_stop_command(message)
+            return None
+        return await original_handle_inbound(message)
+
+    async def _guarded_inject_agent_message(from_agent, to_agent, message):
+        if (hold := _storage_hold_for(to_agent)) and hold["held"]:
+            from pinky_daemon.broker import InjectResult
+
+            return InjectResult(delivered=False, confirmed=False)
+        return await original_inject_agent_message(from_agent, to_agent, message)
+
+    async def _guarded_route_streaming(agent_name, message):
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            return False
+        return await original_route_streaming(agent_name, message)
+
+    broker.handle_inbound = _guarded_handle_inbound
+    broker.inject_agent_message = _guarded_inject_agent_message
+    broker._route_streaming = _guarded_route_streaming
+
     _COST_MILESTONES = (1.0, 5.0, 10.0, 25.0, 50.0, 100.0)  # noqa: N806
 
     def _make_cost_callback(registry):
@@ -3918,6 +4007,10 @@ def create_api(
                 f"{agent_name}: {type(e).__name__}"
             )
 
+        hold = _storage_hold_for(agent_name)
+        if hold and hold["main_exempt"]:
+            notice = "WARNING STORAGE HOLD: main agent exemption\n" + json.dumps(hold["findings"])
+            wake_ctx = notice + ("\n\n" + wake_ctx if wake_ctx else "")
         return wake_ctx
 
     # Exposed for unit-test reach-in (#591 reason-gating verification).
@@ -4471,6 +4564,8 @@ def create_api(
         agent_snapshot=None,
     ):
         """Freeze launch inputs and construct an unconnected candidate."""
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         from pinky_daemon.streaming_session import (
             DEFAULT_STREAMING_ALLOWED_TOOLS,
             StreamingSessionConfig,
@@ -4679,10 +4774,14 @@ def create_api(
         return ss
 
     async def _connect_prepared_session(ss):
+        if (hold := _storage_hold_for(ss.agent_name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         if not _startup_fencing_enabled():
             return await _connect_prepared_session_unchecked(ss)
         name, label = ss.agent_name, ss._config.label
         async with _session_scope(name, label):
+            if (hold := _storage_hold_for(name)) and hold["held"]:
+                raise _storage_hold_error(hold)
             await _settle_startup_debt(name, label)
             current = broker._streaming.get(name, {}).get(label)
             if current is not None and current is not ss:
@@ -4713,6 +4812,8 @@ def create_api(
                 ss._startup_cleanup_owned = prior_owned
 
     async def _connect_prepared_session_unchecked(ss):
+        if (hold := _storage_hold_for(ss.agent_name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         agent_name, label = ss.agent_name, ss._config.label
         config = ss._config
         resume_id = config.resume_handle
@@ -4877,8 +4978,12 @@ def create_api(
         return ss
 
     async def _start_streaming_session(agent_name: str, *, label="main", resume_id=""):
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         if _startup_fencing_enabled():
             async with _session_scope(agent_name, label):
+                if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+                    raise _storage_hold_error(hold)
                 await _settle_startup_debt(agent_name, label)
                 return await _start_streaming_session_unchecked(
                     agent_name, label=label, resume_id=resume_id,
@@ -4886,6 +4991,8 @@ def create_api(
         return await _start_streaming_session_unchecked(agent_name, label=label, resume_id=resume_id)
 
     async def _start_streaming_session_unchecked(agent_name: str, *, label="main", resume_id=""):
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         ss = await _prepare_streaming_session(agent_name, label=label, resume_id=resume_id)
         if ss is None:
             return None
@@ -4990,6 +5097,8 @@ def create_api(
             ss._pending_resume_handle_update = ""
 
     async def _replace_session_locked(name, label, old, *, reason, implicit=False, launch_agent=None, updates=None):
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         agent = agents.get(name)
         if not agent or not agent.enabled:
             raise HTTPException(409, "Agent missing or disabled")
@@ -5014,6 +5123,8 @@ def create_api(
         _refresh_streaming_wake_context(name, candidate._config, commit=False)
 
         def configure():
+            if (hold := _storage_hold_for(name)) and hold["held"]:
+                raise _storage_hold_error(hold)
             if (_launch_fingerprint(agents.get(name)) != original_fingerprint or
                     _effective_launch_model(launch_agent or agents.get(name)) != candidate._launch_provider_snapshot):
                 raise HTTPException(409, "Launch configuration changed during preparation")
@@ -5048,15 +5159,23 @@ def create_api(
             )
 
     async def _connect_retained_session(name, label, ss, connect=None):
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         await _bind_retained_resume_owner(name, label, ss)
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         await (connect or ss.connect)()
 
     async def _restart_compatible(name, ss, *, configure, reason, **kwargs):
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         if not _startup_fencing_enabled():
             await ss.restart_transport(configure=configure, **kwargs)
             return ss
         label = getattr(ss._config, "label", "main") or "main"
         async with _session_scope(name, label):
+            if (hold := _storage_hold_for(name)) and hold["held"]:
+                raise _storage_hold_error(hold)
             current = broker._streaming.get(name, {}).get(label)
             if current is not ss:
                 if current is not None and current.state == TransportSessionState.CONNECTED:
@@ -5070,6 +5189,8 @@ def create_api(
                     return await _replace_session_locked(name, label, ss, reason=reason)
             if _startup_fencing_enabled():
                 async def configure_retained():
+                    if (hold := _storage_hold_for(name)) and hold["held"]:
+                        raise _storage_hold_error(hold)
                     _resume_epochs[(name, label)] = object()
                     _resume_owners.pop((name, label), None)
                     await ss._run_replacement_step(configure)
@@ -5111,12 +5232,16 @@ def create_api(
         Cold starts / reconnects are serialized per (agent, label); the
         connected fast path stays lock-free.
         """
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         if _rebuild_enabled():
             from pinky_daemon.broker import _INBOUND_RECONNECT_POLL_SEC, _INBOUND_RECONNECT_WAIT_SEC
 
             deadline = time.monotonic() + _INBOUND_RECONNECT_WAIT_SEC
             while True:
                 async with _session_scope(agent_name, label):
+                    if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+                        raise _storage_hold_error(hold)
                     await _settle_startup_debt(agent_name, label)
                     ss = broker._streaming.get(agent_name, {}).get(label)
                     agent = agents.get(agent_name)
@@ -5167,6 +5292,8 @@ def create_api(
         # half-applied isolation row. The CONNECTED fast path above stays
         # lock-free, so this adds no contention on the hot inbound path.
         async with _lifecycle(agent_name), (_label_scope(agent_name, label) if _startup_fencing_enabled() else lock):
+            if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+                raise _storage_hold_error(hold)
             # Re-check under the lock: a concurrent caller may have started
             # or reconnected the session while we waited.
             sessions = broker._streaming.get(agent_name, {})
@@ -5233,9 +5360,13 @@ def create_api(
                 _log(f"schedule fire trace SDK callback failed ({type(exc).__name__})")
 
     async def _deliver_streaming(name, prompt, *, label="main", schedule_receipt=None, scheduler=False, busy_deliver_at=None, require_api_ready=False, **kwargs):
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         for _ in range(3):
             ss = await _ensure_streaming_session(name, label=label)
             async with _session_scope(name, label):
+                if (hold := _storage_hold_for(name)) and hold["held"]:
+                    raise _storage_hold_error(hold)
                 if broker._streaming.get(name, {}).get(label) is not ss:
                     continue
                 if _rebuild_enabled() and type(ss) is not _expected_session_class(agents.get(name)):
@@ -5626,6 +5757,8 @@ def create_api(
 
         # Resolve an agent to use for working_dir (use main agent)
         main_name = agents.get_main_agent()
+        if (hold := _storage_hold_for(main_name)) and hold["held"]:
+            return
         if not main_name:
             _log("librarian: no main agent configured — skipping")
             return
@@ -7057,6 +7190,8 @@ npm run build</pre>
         new SDK transcript file and can be resumed by spawning a new session
         with resume=<forked_session_id>.
         """
+        if (hold := _storage_hold_for(getattr(manager.get(session_id), "agent_name", ""))) and hold["held"]:
+            raise _storage_hold_error(hold)
         session = manager.get(session_id)
         if not session:
             raise HTTPException(404, f"Session '{session_id}' not found")
@@ -7101,6 +7236,8 @@ npm run build</pre>
         The worker runs autonomously and reports back through the normal
         message broker. Multiple clones can be spawned in parallel.
         """
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -7178,6 +7315,8 @@ npm run build</pre>
         The session maintains conversation context across calls.
         Each call resumes the previous Claude Code session.
         """
+        if (hold := _storage_hold_for(getattr(manager.get(session_id), "agent_name", ""))) and hold["held"]:
+            raise _storage_hold_error(hold)
         session = manager.get(session_id)
         if not session:
             raise HTTPException(404, f"Session '{session_id}' not found")
@@ -7433,6 +7572,8 @@ npm run build</pre>
         Claude Code session, and prepares for fresh messages.
         The session ID stays the same — callers don't notice.
         """
+        if (hold := _storage_hold_for(getattr(manager.get(session_id), "agent_name", ""))) and hold["held"]:
+            raise _storage_hold_error(hold)
         session = manager.get(session_id)
         if not session:
             raise HTTPException(404, f"Session '{session_id}' not found")
@@ -7462,6 +7603,8 @@ npm run build</pre>
         new MCP tools or config changes. The agent keeps its conversation
         context and resumes where it left off.
         """
+        if (hold := _storage_hold_for(getattr(manager.get(session_id), "agent_name", ""))) and hold["held"]:
+            raise _storage_hold_error(hold)
         session = manager.refresh(session_id)
         if not session:
             raise HTTPException(404, f"Session '{session_id}' not found")
@@ -7521,6 +7664,8 @@ npm run build</pre>
 
         Rewrites .mcp.json and CLAUDE.md, then refreshes each session's runner.
         """
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -7558,6 +7703,13 @@ npm run build</pre>
         session = manager.get(session_id)
         if not session:
             raise HTTPException(404, f"Session '{session_id}' not found")
+
+        recipients = ([s.id for s in manager.list()] if req.to == "*" else
+                      comms.get_group_members(req.to) or [req.to])
+        for recipient in recipients:
+            target = manager.get(recipient)
+            if (hold := _storage_hold_for(getattr(target, "agent_name", recipient))) and hold["held"]:
+                raise _storage_hold_error(hold)
 
         extra = dict(
             metadata=req.metadata,
@@ -7772,9 +7924,10 @@ npm run build</pre>
         # Dynamic parts (directives, skills, users) are injected at session start via system_prompt
 
         # 5. Restart streaming session if one exists
+        hold = _storage_hold_for(name)
         restarted = False
         streaming = broker._get_streaming_session(name)
-        if streaming:
+        if streaming and not (hold and hold["held"]):
             guard = _get_streaming_restart_guard(name, streaming)
             if not guard["restart_safe"]:
                 raise HTTPException(409, _guard_message("restart", guard))
@@ -7791,6 +7944,7 @@ npm run build</pre>
             "tool_patterns": materialized.get("tool_patterns", []),
             "directives_count": len(materialized.get("directives", [])),
             "session_restarted": restarted,
+            **({"storage_hold": hold, "runtime_skipped": True} if hold and hold["held"] else {}),
         }
 
     @app.post("/agents/{name}/skills/{skill_name}")
@@ -7900,6 +8054,7 @@ npm run build</pre>
             "scheduler": app.state.scheduler.health_snapshot(),
             "access_log": app.state.access_log.status(),
             "sqlite_locks": getattr(app.state, "sqlite_lock_health", {"healthy": None}),
+            "storage_holds": _storage_hold_for(),
         }
 
     @app.get("/system/timezone")
@@ -8617,7 +8772,61 @@ npm run build</pre>
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
-        return agent.to_dict()
+        hold = _storage_hold_for(name)
+        return {**agent.to_dict(), **({"storage_hold": hold} if hold else {})}
+
+    @app.post("/agents/{name}/storage/recheck")
+    async def recheck_storage_hold(name: str, request: Request):
+        """Clear a hold only after a complete, safe scan of its lexical scope."""
+        name = _agent_name_or_400(name)
+        caller = getattr(request.state, "internal_caller", "")
+        if caller:
+            actor = agents.get(caller)
+            if actor is None or actor.isolated:
+                raise HTTPException(403, "storage recheck requires admin authority")
+        if agents.get(name) is None:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        async with _lifecycle(name):
+            hold = _storage_hold_for(name)
+            try:
+                inspection = await asyncio.to_thread(store_catalog.inspect_layout, scope=name)
+            except OSError as exc:
+                return {"cleared": False, "reason": "incomplete", "findings": [],
+                        "error": type(exc).__name__, "storage_hold": hold}
+            incomplete = any(warning.startswith("could not inspect") for warning in inspection.warnings)
+            if inspection.findings or incomplete:
+                if hold and inspection.findings and all(
+                    storage_hold_scope(store_catalog.expected_root, finding) == name
+                    for finding in inspection.findings
+                ):
+                    app.state.storage_holds[name] = copy.deepcopy(inspection.findings)
+                return {"cleared": False, "reason": "incomplete" if incomplete else "findings",
+                        "findings": inspection.findings, "warnings": inspection.warnings,
+                        "storage_hold": _storage_hold_for(name)}
+            app.state.storage_holds.pop(name, None)
+            app.state.storage_hold_overrides.discard(name)
+            return {"cleared": True, "findings": []}
+
+    @app.post("/admin/agents/{name}/storage/start-anyway")
+    async def start_storage_hold_anyway(name: str, request: Request):
+        """Let the authenticated owner bypass one hold until the next start."""
+        from pinky_daemon.auth import OWNER_SESSION_USER
+
+        actor = _owner_control_actor(request)
+        session = verify_session_cookie(_session_secret(), request.cookies.get(SESSION_COOKIE_NAME, ""))
+        if not session or session.get("user") != OWNER_SESSION_USER:
+            raise HTTPException(403, "authenticated owner session required")
+        name = _agent_name_or_400(name)
+        if agents.get(name) is None:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        async with _lifecycle(name):
+            hold = _storage_hold_for(name)
+            _log(f"storage start-anyway actor={actor} agent={name} findings="
+                 + json.dumps(hold["findings"] if hold else []))
+            app.state.storage_hold_overrides.add(name)
+            ss = await _ensure_streaming_session(name)
+            return {"agent": name, "started": ss is not None,
+                    "storage_hold": _storage_hold_for(name)}
 
     @app.post("/agents/{name}/status")
     async def set_agent_working_status(name: str, req: AgentStatusRequest):
@@ -9592,6 +9801,12 @@ npm run build</pre>
         if not existing:
             raise HTTPException(404, f"Agent '{name}' not found")
 
+        hold = _storage_hold_for(name)
+        next_mode = req.isolation_mode if req.isolation_mode is not None else existing.isolation_mode
+        if (hold and hold["held"] and next_mode != existing.isolation_mode
+                and "container" in {next_mode, existing.isolation_mode}):
+            raise _storage_hold_error(hold)
+
         kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
         _validate_model_runtime(_merged_agent(existing, kwargs), kwargs)
         policy_enabled = kwargs.pop("tool_policy_enabled", None)
@@ -9689,11 +9904,12 @@ npm run build</pre>
         # CLAUDE.md is agent-owned after spawn — don't overwrite on soul field updates.
         # The file is written once at spawn; agents edit it directly after that.
 
-        if "auto_sleep_hours" in kwargs:
+        if "auto_sleep_hours" in kwargs and not (hold and hold["held"]):
             for ss in broker._streaming.get(name, {}).values():
                 ss._config.idle_timeout = max(0, agent.auto_sleep_hours) * 3600
 
-        return agent.to_dict()
+        return {**agent.to_dict(), **({"storage_hold": hold, "runtime_skipped": True}
+                                     if hold and hold["held"] else {})}
 
     # ── One-click containerize (#204 / specs/one-click-containerize.md) ──────
     # Operator/UI-only endpoints to enable (and disable) Podman container
@@ -9740,6 +9956,8 @@ npm run build</pre>
         # updated row (sdk→tmux needs a rebuild, not a reconnect). Calls
         # _start_streaming_session DIRECTLY, never _ensure_streaming_session,
         # which would try to re-take the lifecycle lock we already hold.
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         return await _start_streaming_session(agent_name, label="main", resume_id="")
 
     def _container_agent_busy(agent_name: str) -> tuple[bool, str]:
@@ -9871,6 +10089,8 @@ npm run build</pre>
         Returns 202 with the initial op record; the UI polls container-status
         while the (possibly minutes-long) provision + probe runs."""
         _require_operator(request, "POST containerize")
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -9950,6 +10170,8 @@ npm run build</pre>
         secret (KEEP the home volume), flip isolation_mode=local, bounce the
         session. Returns 202; the UI polls container-status."""
         _require_operator(request, "POST decontainerize")
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -10006,7 +10228,8 @@ npm run build</pre>
         if updates:
             _validate_model_runtime(_merged_agent(agent, updates), updates)
             agents.register(name, **updates)
-        return {"saved": True, **updates}
+        hold = _storage_hold_for(name)
+        return {"saved": True, **updates, **({"storage_hold": hold} if hold else {})}
 
     # ── Global Providers / Models / Bot Tokens ──────────────
     # _provider_public_row_to_dict is used by /settings/default-provider too,
@@ -10698,6 +10921,10 @@ npm run build</pre>
             raise HTTPException(404, f"Agent '{name}' not found")
         user = agents.approve_user(name, req.chat_id, req.display_name or "", req.approved_by or "admin")
         agents.settle_approval_request(name, req.chat_id, "approved")
+        hold = _storage_hold_for(name)
+        if hold and hold["held"]:
+            return {**user.to_dict(), "pending_delivered": 0, "storage_hold": hold,
+                    "runtime_skipped": True}
         # Deliver pending messages in background
         delivered = 0
         try:
@@ -11188,6 +11415,8 @@ npm run build</pre>
     @_locked_agent
     async def create_streaming_session(name: str, label: str = "main"):
         """Create a new streaming session for an agent."""
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -12035,6 +12264,8 @@ npm run build</pre>
     ) -> None:
         """Run a restart handed off after the acknowledgement send returns."""
         try:
+            if (hold := _storage_hold_for(name)) and hold["held"]:
+                return
             # #667 diag: capture pre-restart live-session state so an orphan
             # recovered by this restart isn't a black box. Diagnostics are
             # deliberately inside the cleanup-safe lifetime: cancellation at
@@ -12105,6 +12336,8 @@ npm run build</pre>
         request: Request,
     ):
         """Schedule a fresh-context restart after acknowledging its caller."""
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         ss = broker._get_streaming_session(name)
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
@@ -12171,6 +12404,16 @@ npm run build</pre>
         CLI renegotiates the window itself, so no restart is forced);
         ``applied`` in the response reports how far the change got.
         """
+        hold = _storage_hold_for(name)
+        if hold and hold["held"]:
+            agent = agents.get(name)
+            if agent is None:
+                raise HTTPException(404, "Agent not found")
+            _validate_model_runtime(_merged_agent(agent, {"model": req.model}), {"model": req.model})
+            agents.register(name, model=req.model)
+            return {"updated": True, "agent": name, "model": req.model,
+                    "restarted": False, "applied": "saved", "runtime_skipped": True,
+                    "storage_hold": hold}
         if _rebuild_enabled() or os.environ.get("PINKY_MODEL_RUNTIME_GUARD", "0") == "1":
             agent = agents.get(name)
             if agent is None:
@@ -12306,6 +12549,8 @@ npm run build</pre>
     @app.post("/agents/{name}/streaming/compact")
     async def compact_streaming_session(name: str):
         """Send /compact to an agent's streaming session to compress context."""
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         ss = broker._get_streaming_session(name)
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
@@ -12330,6 +12575,16 @@ npm run build</pre>
         ss = broker._get_streaming_session(name)
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
+        hold = _storage_hold_for(name)
+        if hold and hold["held"]:
+            old_resume_handle, old_turns = ss.resume_handle, ss._stats["turns"]
+            await _retire_streaming_session(name, "main", ss)
+            broker.unregister_streaming(name, label="main")
+            _clear_resume(name, "main", ss)
+            return {"archived": True, "agent": name,
+                    "old_session_id": old_resume_handle[:12] if old_resume_handle else "",
+                    "old_turns": old_turns, "restarted": False,
+                    "runtime_skipped": True, "storage_hold": hold}
         if ss.state != TransportSessionState.CONNECTED:
             raise HTTPException(409, f"Streaming session for '{name}' not connected")
 
@@ -12485,6 +12740,8 @@ npm run build</pre>
         Always stores in comms DB for audit trail. If the target agent is
         online, also injects into their streaming context immediately.
         """
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         if not agents.get(name):
             raise HTTPException(404, f"Agent '{name}' not found")
         # #149/#637 body-actor guard: an isolated caller is now permitted to
@@ -12539,6 +12796,8 @@ npm run build</pre>
         The message gets formatted with [web | dm | ...] metadata and routed
         through the streaming session. Response comes back via the callback.
         """
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -12724,6 +12983,8 @@ npm run build</pre>
 
         404 unknown agent · 409 not a tmux session · 400 bad input.
         """
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         from pinky_daemon.tmux_session import TmuxSession
 
         agent = agents.get(agent_name)
@@ -12886,6 +13147,8 @@ npm run build</pre>
     @app.post("/agents/{name}/upload")
     async def upload_file_to_agent(name: str, file: UploadFile):
         """Upload a file to an agent via the web UI."""
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -13024,6 +13287,8 @@ npm run build</pre>
         tools, permissions, and active directives. Writes CLAUDE.md to
         the agent's working directory before spawning.
         """
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         name = _agent_name_or_400(name)
         agent = agents.get(name)
         if not agent:
@@ -13473,6 +13738,8 @@ npm run build</pre>
     @app.post("/agents/{agent_name}/forward")
     async def forward_to_agent(agent_name: str, req: dict):
         """Forward a message to an agent's streaming session."""
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         agent = agents.get(agent_name)
         if not agent:
             raise HTTPException(404, f"Agent '{agent_name}' not found")
@@ -13496,6 +13763,8 @@ npm run build</pre>
     @app.post("/agents/{agent_name}/wake")
     async def wake_agent(agent_name: str, prompt: str = ""):
         """Manually trigger a wake for an agent's streaming main session."""
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         agent = agents.get(agent_name)
         if not agent:
             raise HTTPException(404, f"Agent '{agent_name}' not found")
@@ -13529,6 +13798,8 @@ npm run build</pre>
         busy_deliver_at=None,
     ):
         """Queue a wake and return its exact per-prompt delivery receipt."""
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            return False
         del session_id  # Streaming is now the canonical main runtime.
         ss = await _ensure_streaming_session(agent_name, label="main")
         if not ss:
@@ -13613,6 +13884,8 @@ npm run build</pre>
 
     async def _dream_callback(agent_name: str, agent_config) -> None:
         """Callback for the scheduler to run nightly dream consolidation."""
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            return False
         _log(f"scheduler: triggering dream for '{agent_name}'")
         try:
             await dream_runner.run_dream(agent_name, agent_config)
@@ -13639,6 +13912,8 @@ npm run build</pre>
 
     async def _librarian_callback(agent_name: str, agent_config) -> None:
         """Callback for the scheduler to run KB librarian curation."""
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            return False
         if not librarian_runner.should_run(agent_name):
             _log(f"scheduler: librarian skipped for '{agent_name}' — no new sources or cooldown")
             return
@@ -13667,6 +13942,8 @@ npm run build</pre>
         silent" case (reader loop wedged on a stalled LLM call) — see the
         follow-up issue noted on #338.
         """
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            return False
         ss = broker._get_streaming_session(agent_name)
         if not ss:
             _log(
@@ -13739,6 +14016,8 @@ npm run build</pre>
         anyway, but at the cost of a budget slot and a noisy log line every
         scheduler tick). See #348/#349 for the original API-layer skip.
         """
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            return False
         ss = broker._get_streaming_session(agent_name)
         if not ss:
             return False  # nothing to resurrect
@@ -13786,6 +14065,8 @@ npm run build</pre>
         return getattr(ss._config, "timezone", "") if ss else ""
 
     async def _notify_scheduler_agent(agent_name: str, message: str) -> bool:
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            return False
         result = await broker.inject_agent_message("system", agent_name, message)
         return result.delivered
 
@@ -13998,6 +14279,8 @@ npm run build</pre>
     # ── Session Watchdog ───────────────────────────────────────
     def _get_watchdog_config(agent_name: str) -> WatchdogConfig:
         """Merge per-agent watchdog_config onto global defaults."""
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            return WatchdogConfig(enabled=False)
         agent = agents.get(agent_name)
         if not agent:
             return WatchdogConfig()
@@ -14008,6 +14291,8 @@ npm run build</pre>
     @_locked_agent
     async def _watchdog_recover(agent_name: str, label: str, reason: str) -> None:
         """Recovery callback: stop + reconnect a single stuck streaming session."""
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            return False
         _log(f"watchdog: recovering {agent_name}/{label} — {reason}")
         try:
             activity.log(
@@ -14108,6 +14393,8 @@ npm run build</pre>
         transport state is CONNECTED ("registered active"). This callback only
         observes ``tmux has-session`` and never starts or stops a session.
         """
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            return None
         agent = agents.get(agent_name)
         if (
             not agent
@@ -14140,6 +14427,8 @@ npm run build</pre>
         session: Any,
     ) -> LoginWallProbe | None:
         """Capture and classify one eligible pane through its tmux plumbing."""
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            return None
         agent = agents.get(agent_name)
         agent_runtime = str(
             getattr(agent, "runtime", "") or "claude_sdk"
@@ -14209,6 +14498,8 @@ npm run build</pre>
         session: Any,
     ) -> FrozenLoginPane:
         """Rename one positive pane first, then recapture its joined OAuth URL."""
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         tmux = getattr(session, "_tmux", None)
         rename_session = getattr(tmux, "rename_session", None)
         capture_pane = getattr(tmux, "capture_pane", None)
@@ -14290,6 +14581,8 @@ npm run build</pre>
 
     async def _watchdog_mcp_notice(agent_name: str, message: str) -> bool:
         """Use the normal daemon notice route without reading MCP credentials."""
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            return False
         result = await broker.inject_agent_message("system", agent_name, message)
         return result.delivered
 
@@ -14307,6 +14600,8 @@ npm run build</pre>
         stale *by construction* (that IS the signal), and the watchdog has
         already applied its own deadline + rate limits.
         """
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            return False
         sessions = broker._streaming.get(agent_name, {})
         ss = sessions.get(label)
         # This predicate runs INSIDE lifecycle serialization. The caller's
@@ -14551,11 +14846,38 @@ npm run build</pre>
 
         storage_observability.enable_runtime()
 
+        holds = _storage_hold_for()
+        for hold in holds:
+            first = hold["findings"][0]
+            level = "WARNING" if hold["main_exempt"] else "ERROR"
+            _log(f"{level} STORAGE HOLD agent={_storage_log_value(hold['agent'])} "
+                 f"kind={first['kind']} path={_storage_log_value(first['path'])} "
+                 f"resolved_path={_storage_log_value(first.get('resolved_path'))}")
+        if holds:
+            try:
+                await scheduler._owner_notify_callback(
+                    "admin", "STORAGE HOLD startup findings: " + json.dumps(holds),
+                )
+            except Exception as exc:
+                _log(f"storage hold owner notification failed: {type(exc).__name__}")
+        held_names = {hold["agent"] for hold in holds if hold["held"]}
+
         # Migrate only exact registered legacy sessions before any boot launch.
         try:
             from pinky_daemon.tmux_session import reap_legacy_tmux_sessions
 
-            await reap_legacy_tmux_sessions(agents, log=_log)
+            cleanup_registry = agents
+            if held_names:
+                from types import SimpleNamespace
+
+                # Defer the global completion marker until every subject has
+                # actually participated in a cleanup pass.
+                cleanup_registry = SimpleNamespace(
+                    get_setting=agents.get_setting,
+                    list=lambda **kwargs: [a for a in agents.list(**kwargs) if a.name not in held_names],
+                    set_setting=lambda *args: None,
+                )
+            await reap_legacy_tmux_sessions(cleanup_registry, log=_log)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -14572,7 +14894,8 @@ npm run build</pre>
 
             reaped_debts, outstanding_debts = (
                 await reconcile_tmux_spawn_cleanup_debts(
-                    Path(db_path).resolve().parent
+                    Path(db_path).resolve().parent,
+                    **({"_control_factory": _storage_cleanup_control} if held_names else {}),
                 )
             )
             if reaped_debts:
@@ -14748,6 +15071,8 @@ npm run build</pre>
         boot_launches = []
 
         async def _launch_boot_session(name, label, resume_id):
+            if (hold := _storage_hold_for(name)) and hold["held"]:
+                return False
             nonlocal streaming_count
             try:
                 # Use the existing lifecycle/ensure locks so an inbound wake
@@ -14765,6 +15090,8 @@ npm run build</pre>
                     agents.set_streaming_session_id(name, "", label=label)
 
         for agent in all_agents:
+            if (hold := _storage_hold_for(agent.name)) and hold["held"]:
+                continue
             # Regenerate .mcp.json on every startup so paths match the current machine.
             # Critical for migration scenarios (e.g. Mac Mini → RPi) where old paths linger.
             work_dir = Path(agent.working_dir).resolve() if agent.working_dir else None
@@ -14929,6 +15256,8 @@ npm run build</pre>
         legacy_purged = 0
         ghost_purged = 0
         for s in manager.list():
+            if (hold := _storage_hold_for(s.agent_name)) and hold["held"]:
+                continue
             if is_purgeable_legacy_session(s.agent_name, streaming_agents):
                 if not s.agent_name:
                     ghost_purged += 1
@@ -15054,6 +15383,8 @@ npm run build</pre>
             "agents": {},
         }
         for name in list(broker._streaming.keys()):
+            if (hold := _storage_hold_for(name)) and hold["held"]:
+                continue
             sessions = broker._streaming.get(name, {})
             if not sessions:
                 continue
@@ -15100,6 +15431,8 @@ npm run build</pre>
 
         # Disconnect streaming sessions
         for name in list(broker._streaming.keys()):
+            if (hold := _storage_hold_for(name)) and hold["held"]:
+                continue
             sessions = broker._streaming.get(name, {})
             for label, ss in list(sessions.items()):
                 if _startup_fencing_enabled():
@@ -15266,6 +15599,7 @@ npm run build</pre>
             "git_branch": _git_branch,
             "frontend": frontend_status,
             "guard": deploy_guard.guard_status(_guard_repo_dir, _guard_state_dir),
+            "storage_holds": _storage_hold_for(),
         }
 
     startup_alert_slots: dict[tuple, float] = {}
@@ -15320,6 +15654,7 @@ npm run build</pre>
         force: bool = False,
         force_deps: bool = False,
         preflight: bool = False,
+        accept_findings: bool = False,
         request: Request = None,
     ):
         """Update to a verified release (or a pinned ref) and restart.
@@ -15442,6 +15777,7 @@ npm run build</pre>
             if dry_run:
                 if preflight:
                     layout_preflight = _startup_layout_preflight(store_catalog)
+                    _accept_scoped_findings(layout_preflight, accept_findings, store_catalog.expected_root)
                 try:
                     pending = sp.check_output(
                         ["git", "log", "--oneline", f"HEAD..origin/{branch}"],
@@ -15512,7 +15848,9 @@ npm run build</pre>
                 return {"error": f"could not record full target ref: {type(exc).__name__}",
                         "staying_on_version": before_hash}
             layout_preflight = _startup_layout_preflight(store_catalog)
-            if not layout_preflight["ok"]:
+            if not layout_preflight["ok"] and not _accept_scoped_findings(
+                layout_preflight, accept_findings, store_catalog.expected_root,
+            ):
                 return {
                     "error": ("startup layout pre-flight could not complete"
                               if layout_preflight.get("incomplete")
@@ -15666,7 +16004,9 @@ npm run build</pre>
 
             undo_update = _undo_update
             target_check = _check_target_startup(repo_dir, db_path, alert_ref)
-            if target_check.get("reason"):
+            if target_check.get("reason") and not _accept_scoped_findings(
+                target_check, accept_findings, store_catalog.expected_root,
+            ):
                 return _undo_update({
                     "error": "target release failed its startup check", "target_check": target_check,
                 })
@@ -15761,8 +16101,8 @@ npm run build</pre>
                 _log(f"admin: dependency rebuild owner alert failed: {notify_exc}")
 
         if not dry_run and (
-            (layout_preflight is not None and not layout_preflight["ok"])
-            or result.get("target_check", {}).get("reason")
+            (layout_preflight is not None and not layout_preflight["ok"] and not layout_preflight.get("accepted"))
+            or (result.get("target_check", {}).get("reason") and not result["target_check"].get("accepted"))
         ):
             await _notify_startup_decline(result, alert_ref, alert_label)
 
@@ -15807,12 +16147,14 @@ npm run build</pre>
         return result
 
     @app.post("/admin/restart")
-    async def admin_restart():
+    async def admin_restart(accept_findings: bool = False):
         """Graceful daemon restart. Requires process manager for auto-restart."""
         import signal
 
         preflight = await asyncio.to_thread(_startup_layout_preflight, store_catalog)
-        if not preflight["ok"]:
+        if not preflight["ok"] and not _accept_scoped_findings(
+            preflight, accept_findings, store_catalog.expected_root,
+        ):
             return {
                 "error": ("startup layout pre-flight could not complete"
                           if preflight.get("incomplete") else "startup layout pre-flight failed"),
@@ -15859,6 +16201,8 @@ npm run build</pre>
         (wedged 12h) + Ivan (wedged 9h); both recovered cleanly.
         Reference memory: a29089c4e81a.
         """
+        if (hold := _storage_hold_for(name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         request = req or ForceRestartAgentRequest()
         ss = broker._get_streaming_session(name)
         if not ss:
@@ -16290,6 +16634,8 @@ npm run build</pre>
     @app.post("/autonomy/{agent_name}/start")
     async def start_agent_loop(agent_name: str):
         """Start the autonomous work loop for an agent."""
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         agent = agents.get(agent_name)
         if not agent:
             raise HTTPException(404, f"Agent '{agent_name}' not found")
@@ -16309,6 +16655,8 @@ npm run build</pre>
         Event types: message_received, task_assigned, task_updated,
         schedule_wake, manual_wake, worker_report, alert
         """
+        if (hold := _storage_hold_for(agent_name)) and hold["held"]:
+            raise _storage_hold_error(hold)
         agent = agents.get(agent_name)
         if not agent:
             raise HTTPException(404, f"Agent '{agent_name}' not found")
@@ -16666,7 +17014,12 @@ npm run build</pre>
     app.state.store_catalog = store_catalog
     phase_started = time.monotonic()
     try:
-        warnings = store_catalog.validate() or []
+        reconciliation = store_catalog.validate(scoped_hold=True)
+        warnings = reconciliation.warnings if reconciliation else []
+        holds = {}
+        for finding in reconciliation.holds if reconciliation else []:
+            holds.setdefault(finding["scope"], []).append(finding)
+        app.state.storage_holds = holds
     except StoreCatalogError as exc:
         storage_observability.record_boot_failure()
         _log(f"ERROR startup: store catalog validation failed: {exc}")

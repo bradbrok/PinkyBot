@@ -2140,6 +2140,8 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
                         parts.append(f"    Resolved path: {resolved or 'unresolved'}")
                     if "detail" in finding:
                         parts.append(f"    {finding['detail']}")
+                    if finding.get("scope"):
+                        parts.append(f"    Scope: {finding['scope']}")
 
             preflight = result.get("preflight")
             if preflight is not None:
@@ -2149,6 +2151,8 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
                     outcome = "passed" if preflight["ok"] else "failed"
                     parts.append(f"Layout pre-flight: {outcome}.")
                 findings_text(preflight.get("findings", []))
+                if preflight.get("accepted"):
+                    parts.append("Scoped findings accepted by the operator.")
                 if "warnings_count" in preflight:
                     parts.append(f"Layout warnings: {preflight['warnings_count']}")
 
@@ -2161,6 +2165,8 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
                     rc = target_check.get("rc")
                     parts.append(f"Target startup check: {reason}; exit status: {rc}.")
                 findings_text(target_check.get("findings", []))
+                if target_check.get("accepted"):
+                    parts.append("Scoped findings accepted by the operator.")
                 if target_check.get("stderr_tail"):
                     parts.append(f"Child stderr: {target_check['stderr_tail']}")
 
@@ -2189,7 +2195,7 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
             return "\n".join(parts)
 
         @mcp.tool()
-        def check_for_updates(preflight: bool = False) -> str:
+        def check_for_updates(preflight: bool = False, accept_findings: bool = False) -> str:
             """Check for pending code updates (dry run, no changes applied).
 
             preflight=True also inspects the current startup layout; this can
@@ -2198,6 +2204,8 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
             url = "/admin/update?dry_run=true"
             if preflight:
                 url += "&preflight=true"
+            if accept_findings:
+                url += "&accept_findings=true"
             result = _api("POST", url, timeout=1800 if preflight else 30)
             if "error" in result:
                 return _with_startup_check(f"Failed to check for updates: {result['error']}", result)
@@ -2230,6 +2238,7 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
             target: str = "",
             force: bool = False,
             force_deps: bool = False,
+            accept_findings: bool = False,
         ) -> str:
             """Update to a verified release (or a pinned ref) and restart.
 
@@ -2257,6 +2266,8 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
                 params.append("force=true")
             if force_deps:
                 params.append("force_deps=true")
+            if accept_findings:
+                params.append("accept_findings=true")
             if params:
                 url += "?" + "&".join(params)
             result = _api("POST", url, timeout=1800)
@@ -2305,9 +2316,10 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
             return _with_startup_check("\n".join(parts), result)
 
         @mcp.tool()
-        def restart_daemon() -> str:
+        def restart_daemon(accept_findings: bool = False) -> str:
             """Restart the daemon without pulling code updates. Session resumes automatically."""
-            result = _api("POST", "/admin/restart", timeout=1800)
+            url = "/admin/restart" + ("?accept_findings=true" if accept_findings else "")
+            result = _api("POST", url, timeout=1800)
             if "error" in result:
                 return _with_startup_check(f"Restart failed: {result['error']}", result)
             return _with_startup_check(

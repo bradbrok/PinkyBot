@@ -247,7 +247,9 @@ def _run_startup_check(args) -> int:
 
     sys.stderr.write(diagnostics.getvalue())
     print(report)
-    return 1 if inspection.findings else 0
+    if inspection.findings:
+        return 3 if all(finding.get("scope") for finding in inspection.findings) else 1
+    return 0
 
 
 def _run_api(args) -> None:
