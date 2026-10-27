@@ -3323,25 +3323,41 @@ def create_api(
     original_handle_inbound = broker.handle_inbound
     original_inject_agent_message = broker.inject_agent_message
     original_route_streaming = broker._route_streaming
+    instance_broker_delegates = frozenset(
+        name for name in ("handle_inbound", "inject_agent_message", "_route_streaming")
+        if name in getattr(broker, "__dict__", {})
+    )
+
+    def _current_broker_delegate(name, original):
+        """Preserve instance overrides and resolve current class descriptors."""
+        if name in instance_broker_delegates:
+            return original
+        descriptor = inspect.getattr_static(type(broker), name)
+        bind = getattr(descriptor, "__get__", None)
+        return bind(broker, type(broker)) if bind is not None else descriptor
 
     async def _guarded_handle_inbound(message):
         if (hold := _storage_hold_for(message.agent_name)) and hold["held"]:
             if message.content.strip().startswith("/stop"):
                 await broker._handle_stop_command(message)
             return None
-        return await original_handle_inbound(message)
+        return await _current_broker_delegate("handle_inbound", original_handle_inbound)(message)
 
     async def _guarded_inject_agent_message(from_agent, to_agent, message):
         if (hold := _storage_hold_for(to_agent)) and hold["held"]:
             from pinky_daemon.broker import InjectResult
 
             return InjectResult(delivered=False, confirmed=False)
-        return await original_inject_agent_message(from_agent, to_agent, message)
+        return await _current_broker_delegate(
+            "inject_agent_message", original_inject_agent_message,
+        )(from_agent, to_agent, message)
 
     async def _guarded_route_streaming(agent_name, message):
         if (hold := _storage_hold_for(agent_name)) and hold["held"]:
             return False
-        return await original_route_streaming(agent_name, message)
+        return await _current_broker_delegate("_route_streaming", original_route_streaming)(
+            agent_name, message,
+        )
 
     broker.handle_inbound = _guarded_handle_inbound
     broker.inject_agent_message = _guarded_inject_agent_message
