@@ -329,3 +329,38 @@ async def test_real_owner_action_keeps_original_override_object_and_next_app_is_
     hold = closure_value(second, "_storage_hold_for")("sample")
     assert hold["registered"] and hold["held"] and not hold["overridden"]
     assert hold["findings"] == f.hold["findings"]
+
+
+async def test_an_older_preview_cannot_replay_a_delivered_notice_on_builder_fallback(
+    application_factory, monkeypatch,
+):
+    f = await application_factory(dirty=True, registered=True, main="sample")
+    f.app.state.agents.set_context(
+        "sample", task="fixture retained wake context",
+        metadata={"source": "save_my_context"}, updated_by="saved",
+    )
+    submitted = []
+
+    async def connect_peer(ss):
+        async def query(prompt):
+            submitted.append(str(prompt))
+
+        ss._client.query.side_effect = query
+
+    f.h.control.start_hook = connect_peer
+    prepare = closure_value(f.app, "_prepare_streaming_session")
+    connect = closure_value(f.app, "_connect_prepared_session")
+    first = await prepare("sample", label="first")
+    second = await prepare("sample", label="second")
+    assert NOTICE in first._config.wake_context and NOTICE in second._config.wake_context
+    await connect(first)
+    await asyncio.wait_for(asyncio.shield(first._initial_wake_task), timeout=10)
+
+    def unreadable_context(name):
+        raise RuntimeError("fixture wake-context read failed")
+
+    monkeypatch.setattr(f.app.state.agents, "get_context", unreadable_context)
+    await connect(second)
+    await asyncio.wait_for(asyncio.shield(second._initial_wake_task), timeout=10)
+    assert [NOTICE in text for text in submitted] == [True, False]
+    assert "fixture retained wake context" in submitted[1]
