@@ -598,10 +598,10 @@ def test_create_api_fails_closed_with_unreadable_store_footprint(
     kb_dir = tmp_path / "kb"
     original_validate = StoreCatalog.validate
 
-    def validate_with_unreadable_kb(catalog: StoreCatalog) -> list[str]:
+    def validate_with_unreadable_kb(catalog: StoreCatalog, **kwargs):
         kb_dir.chmod(0o000)
         try:
-            return original_validate(catalog)
+            return original_validate(catalog, **kwargs)
         finally:
             kb_dir.chmod(0o755)
 
@@ -830,9 +830,9 @@ def test_create_api_registers_all_authoritative_stores_and_validates_once(
     validation_snapshots: list[list[StoreRecord]] = []
     original_validate = StoreCatalog.validate
 
-    def validate_spy(catalog: StoreCatalog) -> None:
+    def validate_spy(catalog: StoreCatalog, **kwargs):
         validation_snapshots.append(catalog.snapshot())
-        original_validate(catalog)
+        return original_validate(catalog, **kwargs)
 
     monkeypatch.setattr(StoreCatalog, "validate", validate_spy)
 
@@ -901,7 +901,7 @@ def test_create_api_logs_and_reraises_catalog_failure(
 ) -> None:
     from pinky_daemon.api import create_api
 
-    def fail_validation(_catalog: StoreCatalog) -> None:
+    def fail_validation(_catalog: StoreCatalog, **kwargs) -> None:
         raise StoreCatalogError("incoherent test layout")
 
     monkeypatch.setattr(StoreCatalog, "validate", fail_validation)

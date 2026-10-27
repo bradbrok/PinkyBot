@@ -826,6 +826,33 @@ class LayoutInspection:
     skipped_unmanaged_subtrees: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class StorageReconciliation:
+    """Warnings and scoped findings returned only to an opted-in caller."""
+
+    warnings: list[str]
+    holds: list[dict[str, str | None]]
+
+
+def storage_hold_scope(expected_root, finding: Mapping) -> str | None:
+    """Attribute eligible findings to their lexical discovery entry."""
+    if finding.get("kind") not in {"directory_outside_root", "database_outside_root"}:
+        return None
+    path = finding.get("path")
+    if not isinstance(path, str) or not os.path.isabs(path):
+        return None
+    parent = os.path.join(os.path.abspath(expected_root), "agents")
+    path = os.path.normpath(path)
+    try:
+        relative = os.path.relpath(path, parent)
+    except ValueError:
+        return None
+    parts = relative.split(os.sep)
+    if parts[0] in {"", ".", ".."}:
+        return None
+    return parts[0]
+
+
 def read_store_identities(
     paths: Iterable[str | os.PathLike[str]],
 ) -> dict[str, tuple[int, int] | None]:
@@ -857,11 +884,14 @@ def inspect_filesystem_layout(
     registered_identities: Mapping[str, tuple[int, int] | None],
     *,
     silence_allowlist: Mapping[str, str] | None = None,
+    scope: str | None = None,
 ) -> LayoutInspection:
     """Inspect metadata once without changing catalog state or opening files."""
-    return _FilesystemLayoutInspector(
-        expected_root, registered_identities, silence_allowlist
-    ).inspect()
+    inspector = _FilesystemLayoutInspector(expected_root, registered_identities, silence_allowlist)
+    if scope is not None and (not scope or scope in {".", ".."} or os.path.basename(scope) != scope):
+        raise ValueError("invalid storage scope")
+    inspector.scope = scope
+    return inspector.inspect()
 
 
 class _FilesystemLayoutInspector:
@@ -882,9 +912,11 @@ class _FilesystemLayoutInspector:
         self.skipped_unmanaged_subtrees = 0
         self._agent_child_identities: dict[str, dict[str, tuple[int, int] | None]] = {}
         self._registered_ancestor_identities: set[tuple[int, int]] | None = None
+        self.scope: str | None = None
 
     def inspect(self) -> LayoutInspection:
-        pending_directories: list[tuple[str, bool]] = [(self.root, False)]
+        start = os.path.join(self.root, "agents", self.scope) if self.scope else self.root
+        pending_directories: list[tuple[str, bool]] = [(start, False)]
         # Scan each inode once, but propagate a later owned visit through cached
         # child edges. This preserves alias context without duplicate findings.
         visited_directories: dict[tuple[int, int], bool] = {}
@@ -916,6 +948,8 @@ class _FilesystemLayoutInspector:
                 continue
             if not self._under_root(resolved_directory):
                 self._outside_root("directory", directory, resolved_directory)
+                continue
+            if self.scope and not self._in_selected_scope(resolved_directory):
                 continue
             directory_identity = (directory_stat.st_dev, directory_stat.st_ino)
             relative_directory = os.path.relpath(resolved_directory, self.root).replace(os.sep, "/")
@@ -1123,7 +1157,7 @@ class _FilesystemLayoutInspector:
         )
         registered_inode_paths = self.registered_paths_by_inode.get(database.dev_ino, set())
         if registered_inode_paths and resolved_path not in registered_inode_paths:
-            self.findings.append({
+            self._record_finding({
                 "kind": "alias_of_registered_store",
                 "path": os.path.abspath(discovered_path),
                 "resolved_path": resolved_path,
@@ -1149,7 +1183,7 @@ class _FilesystemLayoutInspector:
         self.unclaimed_databases.append(database)
 
     def _outside_root(self, kind: str, path: str, resolved_path: str) -> None:
-        self.findings.append({
+        self._record_finding({
             "kind": f"{kind}_outside_root",
             "path": os.path.abspath(path),
             "resolved_path": resolved_path,
@@ -1169,7 +1203,7 @@ class _FilesystemLayoutInspector:
             registered == footprint or registered.startswith(prefix)
             for registered in self.registered_realpaths
         ):
-            self.findings.append({
+            self._record_finding({
                 "kind": "uninspectable_in_store_footprint",
                 "path": os.path.abspath(path),
                 "resolved_path": resolved_path,
@@ -1184,6 +1218,16 @@ class _FilesystemLayoutInspector:
             f"could not inspect database {kind} outside registered store footprint; "
             f"skipping: path={path!r} error={type(exc).__name__}: {exc}"
         )
+
+    def _record_finding(self, finding) -> None:
+        scope = storage_hold_scope(self.root, finding)
+        if scope is not None:
+            finding = {**finding, "scope": scope}
+        self.findings.append(finding)
+
+    def _in_selected_scope(self, path: str) -> bool:
+        selected = os.path.join(self.root, "agents", self.scope)
+        return os.path.commonpath((selected, path)) == selected
 
     def _under_root(self, path: str) -> bool:
         try:
@@ -1671,7 +1715,7 @@ class StoreCatalog:
                     if observation is not entry.observation
                 ]
 
-    def validate(self) -> list[str]:
+    def validate(self, *, scoped_hold: bool = False) -> list[str] | StorageReconciliation:
         """Raise for an unsafe layout and return filesystem hygiene warnings."""
         with self._lock:
             self._require_observations_unchanged()
@@ -1751,7 +1795,10 @@ class StoreCatalog:
 
         for warning in warnings:
             logger.warning("STORE CATALOG WARNING: %s", warning)
-        return [*warnings, *self.reconcile_filesystem()]
+        result = self.reconcile_filesystem(scoped_hold=scoped_hold)
+        if scoped_hold:
+            return StorageReconciliation([*warnings, *result.warnings], result.holds)
+        return [*warnings, *result]
 
     def preflight_integrity(
         self,
@@ -2075,7 +2122,7 @@ class StoreCatalog:
             raise error from detail
         raise error
 
-    def inspect_layout(self) -> LayoutInspection:
+    def inspect_layout(self, *, scope: str | None = None) -> LayoutInspection:
         """Inspect current metadata without refreshing records or logging warnings."""
         with self._lock:
             paths = [
@@ -2087,9 +2134,10 @@ class StoreCatalog:
             self._expected_root,
             read_store_identities(paths),
             silence_allowlist=allowlist,
+            **({"scope": scope} if scope is not None else {}),
         )
 
-    def reconcile_filesystem(self) -> list[str]:
+    def reconcile_filesystem(self, *, scoped_hold: bool = False) -> list[str] | StorageReconciliation:
         """Raise legacy layout errors and log filesystem hygiene warnings."""
         with self._lock:
             self._require_observations_unchanged()
@@ -2108,17 +2156,21 @@ class StoreCatalog:
             f"STORE CATALOG: skipped {report.skipped_unmanaged_subtrees} unmanaged subtree(s)"
         )
         # Traversal failures preceded deferred inode-alias checks historically.
-        for finding in report.findings:
+        holds = [finding for finding in report.findings
+                 if scoped_hold and storage_hold_scope(self._expected_root, finding) == finding.get("scope")
+                 and finding.get("scope")]
+        fatal = [finding for finding in report.findings if finding not in holds]
+        for finding in fatal:
             if finding["kind"] != "alias_of_registered_store":
                 raise StoreCatalogError(finding["detail"])
-        if report.findings:
+        if fatal:
             raise StoreCatalogError(
                 "Store catalog filesystem reconciliation failed:\n- "
-                + "\n- ".join(finding["detail"] for finding in report.findings)
+                + "\n- ".join(finding["detail"] for finding in fatal)
             )
         for warning in report.warnings:
             logger.warning("STORE CATALOG WARNING: %s", warning)
-        return report.warnings
+        return StorageReconciliation(report.warnings, holds) if scoped_hold else report.warnings
 
     def snapshot(self) -> list[StoreRecord]:
         """Return the current canonical records in registration order."""
