@@ -52,7 +52,6 @@ async def held_subject(lifecycle_harness, tmp_path):
     finding = h.app.state.store_catalog.inspect_layout().findings[0]
     h.finding = {**finding, "scope": "sample"}
     h.app.state.storage_holds = {"sample": [h.finding]}
-    h.app.state.storage_hold_overrides = set()
     return h
 
 

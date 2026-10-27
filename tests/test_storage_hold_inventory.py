@@ -30,9 +30,74 @@ BLOCKED = (
     "_container_start_main", "containerize_agent", "decontainerize_agent",
     "start_agent_loop", "push_agent_event", "on_startup", "_launch_boot_session", "on_shutdown",
 )
-CONFIGURATION = ("update_agent", "apply_agent_skills", "set_streaming_model", "set_agent_provider", "approve_user")
+CONFIGURATION = ("register_agent", "update_agent", "apply_agent_skills", "set_streaming_model", "set_agent_provider", "approve_user")
 ADMINISTRATION = ("stop_agent", "stop_all_agents", "delete_streaming_session",
                   "rename_streaming_session", "archive_streaming_session", "transport_wake")
+
+# Each real effect is exercised through its owning API entry, with a held/clean
+# pair and an in-memory container-operations recorder at the external boundary.
+CONTAINER_RUNTIME_CALLERS = (
+    ("src/pinky_daemon/api.py", "create_api.register_agent", "provision", "registration"),
+    ("src/pinky_daemon/api.py", "create_api.containerize_agent", "containerize", "containerize"),
+    ("src/pinky_daemon/api.py", "create_api._container_start_main", "_start_streaming_session", "cold"),
+    ("src/pinky_daemon/container_ops.py", "ContainerLifecycle._containerize", "provision", "containerize"),
+    ("src/pinky_daemon/container_ops.py", "ContainerLifecycle._containerize", "start", "containerize"),
+    ("src/pinky_daemon/tmux_session.py", "TmuxSession._ensure_container_started", "ensure_started", "cold"),
+    ("src/pinky_daemon/provisioning.py", "ContainerProvisioner.ensure_started", "provision", "cold"),
+    ("src/pinky_daemon/provisioning.py", "ContainerProvisioner.ensure_started", "start", "cold"),
+    ("src/pinky_daemon/provisioning.py", "ContainerProvisioner._recreate_if_image_changed", "provision", "image-recreate"),
+    ("src/pinky_daemon/provisioning.py", "ContainerProvisioner.provision", "_create_argv", "registration"),
+    ("src/pinky_daemon/provisioning.py", "ContainerProvisioner.start", "container-start-command", "cold"),
+)
+
+
+def source_sites(path):
+    tree = ast.parse(path.read_text())
+    result = []
+
+    def walk(node, owner=""):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            owner = owner + "." + node.name if owner else node.name
+        if isinstance(node, ast.Attribute) and node.attr in {"provision", "start", "ensure_started", "containerize", "_create_argv"}:
+            result.append((owner, node.attr, node.lineno))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_start_streaming_session":
+            result.append((owner, node.func.id, node.lineno))
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "run" and node.args and isinstance(node.args[0], ast.List)
+                and any(isinstance(value, ast.Constant) and value.value == "start" for value in node.args[0].elts)):
+            result.append((owner, "container-start-command", node.lineno))
+        for child in ast.iter_child_nodes(node):
+            walk(child, owner)
+
+    walk(tree)
+    return result
+
+
+def test_container_effect_inventory_covers_every_provision_reference():
+    root = Path(api.__file__).resolve().parents[2]
+    found = {
+        (str(path.relative_to(root)), owner, effect)
+        for path in (root / "src").rglob("*.py")
+        for owner, effect, _ in source_sites(path) if effect == "provision"
+    }
+    expected = {(path, owner, effect) for path, owner, effect, _ in CONTAINER_RUNTIME_CALLERS if effect == "provision"}
+    assert found == expected
+
+
+def test_container_effect_inventory_links_all_create_and_start_paths_to_twins():
+    root = Path(api.__file__).resolve().parents[2]
+    for path, owner, effect, scenario in CONTAINER_RUNTIME_CALLERS:
+        assert scenario in {"registration", "containerize", "cold", "image-recreate"}
+        assert sum(candidate == owner and call == effect for candidate, call, _ in source_sites(root / path)) == 1
+    found = {
+        (path, owner, effect)
+        for path in {row[0] for row in CONTAINER_RUNTIME_CALLERS}
+        for owner, effect, _ in source_sites(root / path)
+        if effect in {"ensure_started", "container-start-command", "_create_argv"}
+        or (effect == "start" and owner in {"ContainerProvisioner.ensure_started", "ContainerLifecycle._containerize"})
+    }
+    expected = {(path, owner, effect) for path, owner, effect, _ in CONTAINER_RUNTIME_CALLERS if (path, owner, effect) in found}
+    assert found == expected
 
 
 def functions():
