@@ -12,8 +12,10 @@ callables.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace
 from typing import Any, Callable
 
@@ -27,6 +29,7 @@ except ImportError:
     MemoryQueryFilters = None  # type: ignore[assignment, misc]
 
 router = APIRouter(tags=["memory"])
+logger = logging.getLogger(__name__)
 
 
 # ── Shared dependency state ───────────────────────────────────────────────────
@@ -100,7 +103,7 @@ def _reflection_to_dict(r) -> dict:
 
 
 @router.get("/agents/{agent_name}/memories")
-async def list_memories(
+def list_memories(
     agent_name: str,
     type: str = "",
     project: str = "",
@@ -138,7 +141,7 @@ async def list_memories(
 
 
 @router.get("/agents/{agent_name}/memories/search")
-async def search_memories(agent_name: str, q: str = "", limit: int = 20):
+def search_memories(agent_name: str, q: str = "", limit: int = 20):
     """Keyword search across an agent's memories."""
     if not q:
         raise HTTPException(400, "Query parameter 'q' is required")
@@ -153,7 +156,7 @@ async def search_memories(agent_name: str, q: str = "", limit: int = 20):
 
 
 @router.get("/agents/{agent_name}/chat-history")
-async def search_agent_chat_history(
+def search_agent_chat_history(
     agent_name: str, q: str = "", limit: int = 50,
     after: str = "", before: str = "", role: str = "",
 ):
@@ -166,6 +169,7 @@ async def search_agent_chat_history(
         before: ISO date (YYYY-MM-DD) — only messages before this date.
         role: Filter by role (user, assistant).
     """
+    started = perf_counter()
     agent = _agents.get(agent_name)
     if not agent:
         raise HTTPException(404, f"Agent '{agent_name}' not found")
@@ -188,13 +192,15 @@ async def search_agent_chat_history(
     # Build set of session IDs belonging to this agent from both
     # active sessions AND the persistent conversation store
     agent_session_ids = _collect_agent_session_ids(agent_name)
+    collected = perf_counter()
 
     results = []
     if q:
-        # Search globally then filter to agent's sessions
         try:
-            all_results = _store.search(q, limit=limit * 3)
-            results = [m for m in all_results if m.session_id in agent_session_ids or m.session_id.startswith(f"{agent_name}-")]
+            results = _store.search(
+                q, session_ids=agent_session_ids,
+                session_prefix=f"{agent_name}-", limit=limit,
+            )
         except Exception:
             pass
     else:
@@ -208,6 +214,7 @@ async def search_agent_chat_history(
                 role=role,
             )
         ]
+    read = perf_counter()
 
     if q:
         # Apply date filters after search results
@@ -220,7 +227,7 @@ async def search_agent_chat_history(
         results.sort(key=lambda m: m.timestamp, reverse=True)
         results = results[:limit]
 
-    return {
+    response = {
         "messages": [
             {
                 "id": m.id,
@@ -237,10 +244,20 @@ async def search_agent_chat_history(
         "count": len(results),
         "sessions_searched": len(agent_session_ids),
     }
+    built = perf_counter()
+    if built - started > 1.0:
+        logger.info(
+            "Slow chat history agent=%s has_query=%s row_count=%d "
+            "collection_ms=%.1f store_read_ms=%.1f response_build_ms=%.1f total_ms=%.1f",
+            agent_name, bool(q), len(results),
+            (collected - started) * 1000, (read - collected) * 1000,
+            (built - read) * 1000, (built - started) * 1000,
+        )
+    return response
 
 
 @router.get("/agents/{agent_name}/memories/stats")
-async def memory_stats(agent_name: str, timeframe: str = "all"):
+def memory_stats(agent_name: str, timeframe: str = "all"):
     """Get memory statistics for an agent."""
     store = _get_memory_store(agent_name)
     stats = store.introspect(timeframe=timeframe)
@@ -249,7 +266,7 @@ async def memory_stats(agent_name: str, timeframe: str = "all"):
 
 
 @router.get("/agents/{agent_name}/memories/{memory_id}")
-async def get_memory(agent_name: str, memory_id: str):
+def get_memory(agent_name: str, memory_id: str):
     """Get a single memory by ID."""
     store = _get_memory_store(agent_name)
     reflection = store.get(memory_id)
@@ -260,7 +277,7 @@ async def get_memory(agent_name: str, memory_id: str):
 
 
 @router.get("/agents/{agent_name}/memories/{memory_id}/links")
-async def get_memory_links(agent_name: str, memory_id: str):
+def get_memory_links(agent_name: str, memory_id: str):
     """Get linked memories for a reflection."""
     store = _get_memory_store(agent_name)
     links = store.get_links(memory_id)
@@ -281,7 +298,7 @@ async def get_memory_links(agent_name: str, memory_id: str):
 
 
 @router.get("/agents/{agent_name}/memory/kg-graph")
-async def get_memory_kg_graph(agent_name: str):
+def get_memory_kg_graph(agent_name: str):
     """Get the knowledge graph as nodes + edges for visualization."""
     store = _get_memory_store(agent_name)
     try:
@@ -331,7 +348,7 @@ async def get_memory_kg_graph(agent_name: str):
 
 
 @router.get("/agents/{agent_name}/memory/kg-stats")
-async def get_memory_kg_stats(agent_name: str):
+def get_memory_kg_stats(agent_name: str):
     """Get knowledge graph statistics for an agent."""
     store = _get_memory_store(agent_name)
     try:
