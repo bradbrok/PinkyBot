@@ -109,4 +109,3 @@ def test_markdown_rejection_is_specific_to_parse_errors(description, code, delay
 
     error = TelegramError(description, code, retry_after=delay)
     assert _mdv2_rejected(error) is expected
-
