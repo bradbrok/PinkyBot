@@ -3486,9 +3486,7 @@ def create_api(
                 session_ids.add(f"{agent_name}-{label}")
 
         try:
-            for conv in store.list_conversations(limit=5000):
-                if conv.session_id.startswith(f"{agent_name}-"):
-                    session_ids.add(conv.session_id)
+            session_ids.update(store.list_session_ids_with_prefix(f"{agent_name}-"))
         except Exception:
             pass
 
@@ -3497,6 +3495,7 @@ def create_api(
     def _resolve_agent_history(
         agent_name: str,
         *,
+        session_ids: set[str] | None = None,
         after_ts: float = 0.0,
         before_ts: float = 0.0,
         limit: int = 50,
@@ -3506,7 +3505,8 @@ def create_api(
         if not agents.get(agent_name):
             return []
 
-        session_ids = _collect_agent_session_ids(agent_name)
+        if session_ids is None:
+            session_ids = _collect_agent_session_ids(agent_name)
         if not session_ids:
             return []
 
