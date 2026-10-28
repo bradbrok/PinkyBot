@@ -854,6 +854,11 @@ def _active_matches(path, value):
     return ca.hmac.compare_digest(path.read_bytes(), value.encode())
 
 
+def _assert_active_matches(path, value):
+    matches = _active_matches(path, value)
+    assert matches, "Active file does not match the expected assignment"
+
+
 def _active_run(capsys, *argv):
     try:
         try:
@@ -890,7 +895,7 @@ def test_switch_publishes_private_atomic_active_file(store, monkeypatch, capsys,
     rc, _ = _active_run(capsys, "switch", "acct")
     assert rc == 0
     assert mirror.is_file(), "A successful switch must publish the active file"
-    assert _active_matches(mirror, _ACTIVE_NEW)
+    _assert_active_matches(mirror, _ACTIVE_NEW)
     assert observed == [(True, 0o600, True)]
     assert mirror.stat().st_mode & 0o777 == 0o600
     assert not list(mirror.parent.glob(".active.token.*.tmp"))
@@ -948,7 +953,7 @@ def test_every_switch_revert_resynchronizes_the_restored_assignment(
     assert restored
     assert at_restart == [True]
     if previous == "present":
-        assert _active_matches(mirror, _ACTIVE_OLD)
+        _assert_active_matches(mirror, _ACTIVE_OLD)
         assert mirror.stat().st_mode & 0o777 == 0o600
     else:
         assert not mirror.exists()
@@ -963,7 +968,7 @@ def test_direct_revert_resynchronizes_the_restored_assignment(store, capsys):
     rc = ca._revert(store["env"], backup, "synthetic rollback")
     capsys.readouterr()
     assert rc == 0
-    assert _active_matches(mirror, _ACTIVE_OLD)
+    _assert_active_matches(mirror, _ACTIVE_OLD)
 
 
 @pytest.mark.parametrize("failure", ["copy", "mirror"])
@@ -1021,10 +1026,14 @@ def test_switch_mirror_failure_restores_environment_before_restart(
             raise OSError("injected restore failure")
         return copy(source, destination, mode)
 
+    def no_restart(*args):
+        restarts.append(True)
+        raise AssertionError("A failed mirror write must not restart the service")
+
     monkeypatch.setattr(ca, "_atomic_write", maybe_write)
     monkeypatch.setattr(ca, "_atomic_copy", maybe_copy)
     monkeypatch.setattr(ca, "daemon_generation", lambda: "previous-generation")
-    monkeypatch.setattr(ca, "restart_daemon", lambda *args: restarts.append(True))
+    monkeypatch.setattr(ca, "restart_daemon", no_restart)
     rc, _ = _active_run(capsys, "switch", "acct", "--restart", "--as-agent", "operator")
     assert rc == 1
     assert restarts == []
@@ -1109,7 +1118,7 @@ def test_sync_active_uses_last_live_assignment_under_lock(
     rc, output = _active_run(capsys, "sync-active")
     assert rc == 0
     assert writes == [True]
-    assert _active_matches(mirror, _ACTIVE_NEW)
+    _assert_active_matches(mirror, _ACTIVE_NEW)
     assert mirror.stat().st_mode & 0o777 == 0o600
     assert _active_state(store["env"]) == before
     assert output.out.strip() == "active.token: matches"
