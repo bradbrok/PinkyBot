@@ -120,7 +120,8 @@ def test_empty_container_workdir_sets_home_config_and_one_warning(
     if spelling == "missing-attribute":
         del f.agent.working_dir
     env = _build(f)
-    assert env.get("CLAUDE_CONFIG_DIR") == "/home/agent/.claude"
+    config_dir = env.get("CLAUDE_CONFIG_DIR")
+    assert config_dir == "/home/agent/.claude"
     _assert_fallback_log(capsys)
 
 
@@ -175,7 +176,8 @@ def test_launch_create_and_runtime_config_directory_parity(tmp_path, monkeypatch
         "symlink", "absolute", "different-session",
     ) else "/home/agent/.claude"
     env = _build(f)
-    assert env.get("CLAUDE_CONFIG_DIR") == expected
+    config_dir = env.get("CLAUDE_CONFIG_DIR")
+    assert config_dir == expected
     provisioner = provisioning.ContainerProvisioner()
     names = provisioner.names(f.agent)
     assert env["CLAUDE_CONFIG_DIR"] == provisioner._config_dir_for(f.agent, names)
@@ -214,5 +216,7 @@ def test_noncontainer_serialized_environment_matches_established_contract(
                 mode=mode, kind=kind, custom=custom)
     actual = _serialized_env(_build(f), tmp_path)
     expected = BASE_DIGESTS[f"{mode}/{kind}/{custom}"]
-    assert hashlib.sha256(actual).hexdigest() == expected["sha256"]
-    assert len(actual) == expected["bytes"]
+    actual_digest = hashlib.sha256(actual).hexdigest()
+    actual_length = len(actual)
+    assert actual_digest == expected["sha256"]
+    assert actual_length == expected["bytes"]
