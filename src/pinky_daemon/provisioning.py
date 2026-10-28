@@ -159,6 +159,14 @@ def container_config_dir(working_dir: str) -> str:
     return str(Path(working_dir) / CONTAINER_CONFIG_DIRNAME)
 
 
+def container_runtime_config_dir(working_dir: str | None, names_config_dir: str) -> str:
+    """Use the canonical same-path mount, or the container's home-volume config."""
+    wd = (working_dir or "").strip()
+    if wd and Path(wd).is_absolute():
+        return container_config_dir(str(Path(wd).resolve()))
+    return names_config_dir
+
+
 def local_config_dir(working_dir: str) -> str:
     """The CLAUDE_CONFIG_DIR for a LOCAL agent with ``dedicated_config_dir`` —
     a working-dir-scoped config dir (``<working_dir>/.claude-local``) holding
@@ -812,7 +820,7 @@ class ContainerProvisioner(AgentProvisioner):
         ``str(Path(working_dir).resolve())`` — the mount, ``exec -w``,
         CLAUDE_CONFIG_DIR, trust seed, and tailer slug must all agree on ONE
         canonical path or hooks/transcripts silently miss."""
-        wd = (agent.working_dir or "").strip()
+        wd = (getattr(agent, "working_dir", "") or "").strip()
         if wd and Path(wd).is_absolute():
             return str(Path(wd).resolve())
         return wd
@@ -822,10 +830,7 @@ class ContainerProvisioner(AgentProvisioner):
         working_dir when one is configured (host-visible — transcripts, trust,
         creds), else the home-volume fallback. Only an ABSOLUTE working_dir
         qualifies — a relative one can't be same-path bind-mounted."""
-        wd = self._host_workdir(agent)
-        if wd and Path(wd).is_absolute():
-            return container_config_dir(wd)
-        return n.config_dir
+        return container_runtime_config_dir(getattr(agent, "working_dir", None), n.config_dir)
 
     def is_provisioned(self, agent: "Agent") -> bool:
         # The static per-agent resources the runtime depends on: the home
