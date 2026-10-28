@@ -134,6 +134,7 @@ def _argument_parser():
         default=_DEFAULT_DB_PATH,
         help="Canonical conversations DB path (api mode)",
     )
+    parser.add_argument("--storage-agent", action="append", default=[], help=argparse.SUPPRESS)
     return parser
 
 
@@ -224,13 +225,15 @@ def _run_startup_check(args) -> int:
             from pinky_daemon.store_catalog import (
                 inspect_filesystem_layout,
                 read_store_identities,
+                storage_hold_scope,
             )
 
             db_path = os.path.realpath(args.db_path)
             root = Path(db_path).parent
             manifest = api._derive_api_store_manifest(db_path)
             identities = read_store_identities(os.path.realpath(target.path) for target in manifest.values())
-            inspection = inspect_filesystem_layout(root, identities)
+            registered_agents = frozenset(getattr(args, "storage_agent", ()))
+            inspection = inspect_filesystem_layout(root, identities, registered_agents=registered_agents)
             from pinky_daemon import deploy_guard
 
             deploy_guard.selftest()
@@ -248,7 +251,9 @@ def _run_startup_check(args) -> int:
     sys.stderr.write(diagnostics.getvalue())
     print(report)
     if inspection.findings:
-        return 3 if all(finding.get("scope") for finding in inspection.findings) else 1
+        return 3 if all(finding.get("scope")
+                        and storage_hold_scope(root, finding, registered_agents) == finding["scope"]
+                        for finding in inspection.findings) else 1
     return 0
 
 
