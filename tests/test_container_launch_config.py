@@ -43,7 +43,8 @@ async def test_config_directory_reaches_exec_under_launch_policy(
     container = kind == "container"
     agent = SimpleNamespace(
         name="unit", isolation_mode="container" if kind in ("container", "gate-off") else "local",
-        isolated=True, working_dir=str(registry_dir), dedicated_config_dir=dedicated,
+        isolated=True, working_dir=resolved_dir if container else str(registry_dir),
+        dedicated_config_dir=dedicated,
         tool_policy_enabled=False,
     )
     registry = SimpleNamespace(
