@@ -4925,13 +4925,18 @@ class TmuxSession(TransportReplacementMixin):
         if dedicated_config_dir:
             env["CLAUDE_CONFIG_DIR"] = dedicated_config_dir
         elif (container_agent := self._container_agent()) is not None:
-            from pinky_daemon.provisioning import container_config_dir
+            from pinky_daemon.provisioning import ContainerNames, container_runtime_config_dir
 
-            working_dir = (self._config.working_dir or "").strip() or (
-                (getattr(container_agent, "working_dir", "") or "").strip()
+            names = ContainerNames.for_agent(container_agent.name)
+            config_dir = container_runtime_config_dir(
+                getattr(container_agent, "working_dir", None), names.config_dir,
             )
-            if working_dir:
-                env["CLAUDE_CONFIG_DIR"] = container_config_dir(working_dir)
+            env["CLAUDE_CONFIG_DIR"] = config_dir
+            if config_dir == names.config_dir:
+                _log(
+                    f"tmux[{self.agent_name}]: WARNING working_dir not absolute; "
+                    f"using container home config dir: {config_dir}"
+                )
         # Static OAuth token forwarding (#780): inject a long-lived, never-
         # refreshed CLAUDE_CODE_OAUTH_TOKEN so claude authenticates with it
         # instead of the single-use refresh token in .credentials.json (no
