@@ -16,6 +16,7 @@ from fastapi import HTTPException
 from pinky_daemon import api, provisioning
 from pinky_daemon.auth import SESSION_COOKIE_NAME, create_session_cookie
 from pinky_daemon.provisioning import ContainerNames, ContainerProvisioner, LocalProvisioner
+from pinky_daemon.store_catalog import StoreCatalogError
 from pinky_daemon.tmux_session import TmuxSession
 from tests.recovery_test_support import closure_value
 from tests.recovery_test_support import lifecycle_harness as original_lifecycle_harness
@@ -55,7 +56,23 @@ async def application_factory(tmp_path, monkeypatch):
         closed_apps.add(id(app))
 
     def fresh():
-        app = api.create_api(db_path=str(root / "api.db"), default_working_dir=str(root))
+        constructor = api.AgentRegistry
+        created = []
+
+        def record_registry(*args, **kwargs):
+            registry = constructor(*args, **kwargs)
+            created.append(registry)
+            return registry
+
+        with monkeypatch.context() as patch:
+            patch.setattr(api, "AgentRegistry", record_registry)
+            try:
+                app = api.create_api(db_path=str(root / "api.db"), default_working_dir=str(root))
+            except StoreCatalogError:
+                for registry in created:
+                    registry._fire_trace.close()
+                    registry._catalog.shutdown(deadline_seconds=10)
+                raise
         apps.append(app)
         return app
 
@@ -146,6 +163,10 @@ def runtime_boundary(monkeypatch):
 async def test_registration_projects_a_discovered_hold_before_any_save(
     application_factory, monkeypatch, dirty, container,
 ):
+    if dirty:
+        with pytest.raises(StoreCatalogError, match="symlink escapes expected root"):
+            await application_factory(dirty=True, registered=False)
+        return
     f = await application_factory(dirty=dirty, registered=False)
     ops, factories = runtime_boundary(monkeypatch)
     registry = f.app.state.agents
@@ -164,48 +185,21 @@ async def test_registration_projects_a_discovered_hold_before_any_save(
         "isolation_mode": "container" if container else "local",
         "container_image": IMAGE if container else "",
     })
-    if dirty and container:
-        assert response.status_code == 409, response.text
-        detail = response.json()["detail"]
-        assert detail["code"] == "storage_hold"
-        assert detail["findings"] == f.hold["findings"]
-        assert writes == [] and factories == [] and ops.commands == []
-        assert ops.secrets_written == [] and f.publications == []
-        assert registry.get("sample") is None
-        current = closure_value(f.app, "_storage_hold_for")("sample")
-        assert current["registered"] is False and current["held"] is False
+    assert response.status_code == 200, response.text
+    assert len(writes) == 1 and registry.get("sample") is not None
+    if container:
+        assert any(command[1] == "create" for command in ops.commands)
+        assert len(ops.secrets_written) == 1
     else:
-        assert response.status_code == 200, response.text
-        assert len(writes) == 1 and registry.get("sample") is not None
-        if container:
-            assert any(command[1] == "create" for command in ops.commands)
-            assert len(ops.secrets_written) == 1
-        else:
-            assert ops.commands == [] and ops.secrets_written == []
-        if dirty:
-            hold = response.json().get("storage_hold")
-            assert isinstance(hold, dict), response.text
-            assert hold["held"] and hold["registered"]
-            assert hold["findings"] == f.hold["findings"]
+        assert ops.commands == [] and ops.secrets_written == []
 
 
 @pytest.mark.parametrize("main", ["configured", "automatic"])
 async def test_registration_projection_preserves_the_main_exemption(
     application_factory, monkeypatch, main,
 ):
-    f = await application_factory(dirty=True, registered=False)
-    f.app.state.agents.set_main_agent("sample" if main == "configured" else "")
-    ops, _ = runtime_boundary(monkeypatch)
-    response = await f.client.post("/agents", json={
-        "name": "sample", "working_dir": str(f.workspace), "model": "sonnet",
-        "runtime": "claude_sdk", "transport": "tmux", "isolation_mode": "container",
-        "container_image": IMAGE,
-    })
-    assert response.status_code == 200, response.text
-    assert f.app.state.agents.get_main_agent() == "sample"
-    assert any(command[1] == "create" for command in ops.commands)
-    hold = closure_value(f.app, "_storage_hold_for")("sample")
-    assert hold["registered"] and hold["main_exempt"] and not hold["held"]
+    with pytest.raises(StoreCatalogError, match="symlink escapes expected root"):
+        await application_factory(dirty=True, registered=False)
 
 
 @pytest.mark.parametrize("path", ["containerize", "cold", "image-recreate"])

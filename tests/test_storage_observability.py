@@ -324,7 +324,7 @@ def test_final_catalog_failure_logs_bounded_boot_gate_failure_before_raise(
     caplog.set_level(logging.INFO)
     forbidden = os.fspath(tmp_path / "secret-layout.db")
 
-    def fail_validation(_catalog: StoreCatalog, *, scoped_hold: bool = False) -> list[str]:
+    def fail_validation(_catalog: StoreCatalog, *, scoped_hold: bool = False, registered_agents=()) -> list[str]:
         raise StoreCatalogError(f"unsafe layout at {forbidden}")
 
     monkeypatch.setattr(StoreCatalog, "validate", fail_validation)
