@@ -10,6 +10,7 @@ stubbed here.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import http.client
 import importlib.util
 import json
@@ -822,3 +823,444 @@ def test_probe_token_does_not_leak_the_candidate(monkeypatch):
     assert ok is False
     assert tok not in detail
     assert "SUPERSECRET" not in detail
+
+
+_ACTIVE_OLD = "sk-ant-oat01-TEST-previous"
+_ACTIVE_NEW = "sk-ant-oat01-TEST-selected"
+
+
+def _active_file(store, value=_ACTIVE_OLD):
+    ca.ensure_store()
+    path = store["accounts"] / "active.token"
+    path.write_text(value)
+    path.chmod(0o600)
+    return path
+
+
+def _active_state(path):
+    if not path.exists():
+        return None
+    info = path.stat()
+    data = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    return stat.S_IMODE(info.st_mode), info.st_ino, info.st_mtime_ns, info.st_ctime_ns, data
+
+
+def _active_snapshot(store):
+    paths = [store["env"], store["accounts"], *store["accounts"].rglob("*")]
+    return {str(path): _active_state(path) for path in paths}
+
+
+def _active_matches(path, value):
+    return ca.hmac.compare_digest(path.read_bytes(), value.encode())
+
+
+def _assert_active_matches(path, value):
+    matches = _active_matches(path, value)
+    assert matches, "Active file does not match the expected assignment"
+
+
+def _active_run(capsys, *argv):
+    try:
+        try:
+            rc = run(*argv)
+        except SystemExit as exc:
+            rc = exc.code if isinstance(exc.code, int) else 1
+    finally:
+        output = capsys.readouterr()
+    leaked = any(value in output.out + output.err for value in (_ACTIVE_OLD, _ACTIVE_NEW))
+    assert not leaked, "Command output exposed a synthetic token value"
+    return rc, output
+
+
+@pytest.mark.parametrize("existing", [False, True], ids=["missing", "replace"])
+def test_switch_publishes_private_atomic_active_file(store, monkeypatch, capsys, existing):
+    _seed_account(store, token=_ACTIVE_NEW)
+    write_env(store["env"], f"{ca.TOKEN_ENV_KEY}={_ACTIVE_OLD}\n")
+    mirror = store["accounts"] / "active.token"
+    if existing:
+        _active_file(store)
+    observed = []
+    replace = ca.os.replace
+
+    def inspect_replace(source, destination):
+        if Path(destination) == mirror:
+            source = Path(source)
+            live = ca.read_live_value(ca.read_env_lines(store["env"]), ca.TOKEN_ENV_KEY)
+            correct_value = _active_matches(source, live)
+            observed.append((source.parent == mirror.parent, source.stat().st_mode & 0o777,
+                             correct_value))
+        return replace(source, destination)
+
+    monkeypatch.setattr(ca.os, "replace", inspect_replace)
+    rc, _ = _active_run(capsys, "switch", "acct")
+    assert rc == 0
+    assert mirror.is_file(), "A successful switch must publish the active file"
+    _assert_active_matches(mirror, _ACTIVE_NEW)
+    assert observed == [(True, 0o600, True)]
+    assert mirror.stat().st_mode & 0o777 == 0o600
+    assert not list(mirror.parent.glob(".active.token.*.tmp"))
+
+
+@pytest.mark.parametrize("phase", ["fsync", "replace"])
+def test_active_sync_midwrite_failure_preserves_previous_file(
+    store, monkeypatch, capsys, phase,
+):
+    _seed_account(store, token=_ACTIVE_NEW)
+    write_env(store["env"], f"{ca.TOKEN_ENV_KEY}={_ACTIVE_NEW}\n")
+    mirror = _active_file(store)
+    before = _active_state(mirror)
+    sync = getattr(ca, "sync_active_token", None)
+    assert callable(sync), "Active-file synchronization needs a shared helper"
+
+    def fail(*args):
+        raise OSError("injected atomic write failure")
+
+    monkeypatch.setattr(ca.os, phase, fail)
+    try:
+        with pytest.raises(OSError, match="injected"):
+            sync(store["env"])
+    finally:
+        capsys.readouterr()
+    assert _active_state(mirror) == before
+    assert not list(mirror.parent.glob(".active.token.*.tmp"))
+
+
+@pytest.mark.parametrize("outcome", ["refused", "unchanged", "unknown"])
+@pytest.mark.parametrize("previous", ["present", "absent", "empty"])
+def test_every_switch_revert_resynchronizes_the_restored_assignment(
+    store, monkeypatch, capsys, outcome, previous,
+):
+    _seed_account(store, token=_ACTIVE_NEW)
+    original = {
+        "present": f"export {ca.TOKEN_ENV_KEY}='{_ACTIVE_OLD}'\n",
+        "absent": "OTHER=fixture\n",
+        "empty": f"{ca.TOKEN_ENV_KEY}=\n",
+    }[previous]
+    write_env(store["env"], original)
+    mirror = _active_file(store)
+    at_restart = []
+
+    def restart(*args):
+        at_restart.append(mirror.exists() and _active_matches(mirror, _ACTIVE_NEW))
+        return {"refused": False, "unchanged": True, "unknown": None}[outcome], "fixture"
+
+    monkeypatch.setattr(ca, "restart_daemon", restart)
+    monkeypatch.setattr(ca, "daemon_generation", lambda: "previous-generation")
+    monkeypatch.setattr(ca, "RESTART_HEALTH_TIMEOUT_S", 0)
+    rc, _ = _active_run(capsys, "switch", "acct", "--restart", "--as-agent", "operator")
+    assert rc == 1
+    restored = store["env"].read_text() == original
+    assert restored
+    assert at_restart == [True]
+    if previous == "present":
+        _assert_active_matches(mirror, _ACTIVE_OLD)
+        assert mirror.stat().st_mode & 0o777 == 0o600
+    else:
+        assert not mirror.exists()
+
+
+def test_direct_revert_resynchronizes_the_restored_assignment(store, capsys):
+    _seed_account(store, token=_ACTIVE_NEW)
+    write_env(store["env"], f"{ca.TOKEN_ENV_KEY}={_ACTIVE_NEW}\n")
+    mirror = _active_file(store, _ACTIVE_NEW)
+    backup = store["accounts"] / "manual.bak"
+    write_env(backup, f"export {ca.TOKEN_ENV_KEY}=\"{_ACTIVE_OLD}\"\n")
+    rc = ca._revert(store["env"], backup, "synthetic rollback")
+    capsys.readouterr()
+    assert rc == 0
+    _assert_active_matches(mirror, _ACTIVE_OLD)
+
+
+@pytest.mark.parametrize("failure", ["copy", "mirror"])
+def test_revert_failure_removes_the_active_file(store, monkeypatch, capsys, failure):
+    _seed_account(store, token=_ACTIVE_NEW)
+    write_env(store["env"], f"{ca.TOKEN_ENV_KEY}={_ACTIVE_NEW}\n")
+    mirror = _active_file(store, _ACTIVE_NEW)
+    backup = store["accounts"] / "manual.bak"
+    write_env(backup, f"{ca.TOKEN_ENV_KEY}={_ACTIVE_OLD}\n")
+    copy = ca._atomic_copy
+    write = ca._atomic_write
+
+    def maybe_copy(source, destination, mode):
+        if failure == "copy" and destination == store["env"]:
+            raise OSError("injected restore failure")
+        return copy(source, destination, mode)
+
+    def maybe_write(path, text, mode):
+        if failure == "mirror" and path == mirror:
+            raise OSError("injected mirror failure")
+        return write(path, text, mode)
+
+    monkeypatch.setattr(ca, "_atomic_copy", maybe_copy)
+    monkeypatch.setattr(ca, "_atomic_write", maybe_write)
+    rc = ca._revert(store["env"], backup, "synthetic rollback")
+    output = capsys.readouterr()
+    assert rc == 1
+    assert not mirror.exists()
+    expected = _ACTIVE_NEW if failure == "copy" else _ACTIVE_OLD
+    live = ca.read_live_value(ca.read_env_lines(store["env"]), ca.TOKEN_ENV_KEY)
+    correct_environment = live == expected
+    assert correct_environment
+    assert output.err.count("ACTIVE TOKEN SYNC FAILED") == 1
+
+
+@pytest.mark.parametrize("restore_fails", [False, True], ids=["restored", "restore-failed"])
+def test_switch_mirror_failure_restores_environment_before_restart(
+    store, monkeypatch, capsys, restore_fails,
+):
+    _seed_account(store, token=_ACTIVE_NEW)
+    write_env(store["env"], f"{ca.TOKEN_ENV_KEY}={_ACTIVE_OLD}\n")
+    mirror = _active_file(store)
+    before = _active_state(mirror)
+    write = ca._atomic_write
+    copy = ca._atomic_copy
+    restarts = []
+
+    def maybe_write(path, text, mode):
+        if path == mirror:
+            raise OSError("injected mirror failure")
+        return write(path, text, mode)
+
+    def maybe_copy(source, destination, mode):
+        if restore_fails and destination == store["env"]:
+            raise OSError("injected restore failure")
+        return copy(source, destination, mode)
+
+    def no_restart(*args):
+        restarts.append(True)
+        raise AssertionError("A failed mirror write must not restart the service")
+
+    monkeypatch.setattr(ca, "_atomic_write", maybe_write)
+    monkeypatch.setattr(ca, "_atomic_copy", maybe_copy)
+    monkeypatch.setattr(ca, "daemon_generation", lambda: "previous-generation")
+    monkeypatch.setattr(ca, "restart_daemon", no_restart)
+    rc, _ = _active_run(capsys, "switch", "acct", "--restart", "--as-agent", "operator")
+    assert rc == 1
+    assert restarts == []
+    live = ca.read_live_value(ca.read_env_lines(store["env"]), ca.TOKEN_ENV_KEY)
+    if restore_fails:
+        correct_environment = live == _ACTIVE_NEW
+        assert not mirror.exists()
+    else:
+        correct_environment = live == _ACTIVE_OLD
+        assert _active_state(mirror) == before
+    assert correct_environment
+
+
+@pytest.mark.parametrize("existing", [False, True], ids=["missing", "present"])
+@pytest.mark.parametrize("reason", [
+    "dry-run", "expired", "empty", "unsafe", "probe", "identity", "generation", "already-active",
+])
+def test_nonwriting_switch_preserves_the_active_file(
+    store, monkeypatch, capsys, existing, reason,
+):
+    _seed_account(store, token=_ACTIVE_NEW, days=-5 if reason == "expired" else 300)
+    write_env(store["env"], f"{ca.TOKEN_ENV_KEY}={_ACTIVE_OLD}\n")
+    mirror = store["accounts"] / "active.token"
+    if existing:
+        _active_file(store)
+    options = []
+    if reason == "dry-run":
+        options = ["--dry-run"]
+    elif reason in ("empty", "unsafe"):
+        ca.write_token("acct", "" if reason == "empty" else _ACTIVE_NEW + "\nOTHER=injected")
+        options = ["--no-probe"]
+    elif reason == "probe":
+        monkeypatch.setattr(ca, "probe_token", lambda *args: (False, "fixture refusal"))
+    elif reason == "identity":
+        monkeypatch.delenv("PINKY_AGENT_NAME", raising=False)
+        options = ["--restart"]
+    elif reason == "generation":
+        monkeypatch.setattr(ca, "daemon_generation", lambda: None)
+        options = ["--restart", "--as-agent", "operator"]
+    elif reason == "already-active":
+        write_env(store["env"], f"{ca.TOKEN_ENV_KEY}={_ACTIVE_NEW}\n{ca.FORWARD_FLAG_KEY}=1\n")
+    before = _active_state(mirror)
+    env_before = _active_state(store["env"])
+    rc, _ = _active_run(capsys, "switch", "acct", *options)
+    assert rc == (0 if reason in ("dry-run", "already-active") else 1)
+    assert _active_state(mirror) == before
+    assert _active_state(store["env"]) == env_before
+
+
+@pytest.mark.parametrize("form", ["bare", "single-quoted", "double-quoted", "export-last", "flag-off"])
+def test_sync_active_uses_last_live_assignment_under_lock(
+    store, monkeypatch, capsys, form,
+):
+    _seed_account(store, token=_ACTIVE_NEW)
+    values = {
+        "bare": f"{ca.TOKEN_ENV_KEY}={_ACTIVE_NEW}\n",
+        "single-quoted": f"{ca.TOKEN_ENV_KEY}='{_ACTIVE_NEW}'\n",
+        "double-quoted": f'{ca.TOKEN_ENV_KEY}="{_ACTIVE_NEW}"\n',
+        "export-last": f"{ca.TOKEN_ENV_KEY}={_ACTIVE_OLD}\nexport {ca.TOKEN_ENV_KEY}='{_ACTIVE_NEW}'\n",
+        "flag-off": f"{ca.TOKEN_ENV_KEY}={_ACTIVE_NEW}\n{ca.FORWARD_FLAG_KEY}=0\n",
+    }
+    write_env(store["env"], values[form])
+    mirror = _active_file(store)
+    before = _active_state(store["env"])
+    held = {"value": False}
+    writes = []
+    flock = ca.fcntl.flock
+    write = ca._atomic_write
+
+    def observe_lock(fd, operation):
+        result = flock(fd, operation)
+        held["value"] = operation != fcntl.LOCK_UN
+        return result
+
+    def observe_write(path, text, mode):
+        if path == mirror:
+            writes.append(held["value"])
+        return write(path, text, mode)
+
+    monkeypatch.setattr(ca.fcntl, "flock", observe_lock)
+    monkeypatch.setattr(ca, "_atomic_write", observe_write)
+    rc, output = _active_run(capsys, "sync-active")
+    assert rc == 0
+    assert writes == [True]
+    _assert_active_matches(mirror, _ACTIVE_NEW)
+    assert mirror.stat().st_mode & 0o777 == 0o600
+    assert _active_state(store["env"]) == before
+    assert output.out.strip() == "active.token: matches"
+
+
+@pytest.mark.parametrize("existing", [False, True], ids=["missing", "present"])
+@pytest.mark.parametrize("form", ["absent", "empty", "quoted-empty", "last-empty"])
+def test_sync_active_removes_file_when_no_live_value(store, capsys, existing, form):
+    _seed_account(store, token=_ACTIVE_NEW)
+    values = {
+        "absent": f"# {ca.TOKEN_ENV_KEY}={_ACTIVE_OLD}\nOTHER=fixture\n",
+        "empty": f"{ca.TOKEN_ENV_KEY}=\n",
+        "quoted-empty": f"export {ca.TOKEN_ENV_KEY}=''\n",
+        "last-empty": f"{ca.TOKEN_ENV_KEY}={_ACTIVE_OLD}\nexport {ca.TOKEN_ENV_KEY}=\n",
+    }
+    write_env(store["env"], values[form])
+    mirror = store["accounts"] / "active.token"
+    if existing:
+        _active_file(store)
+    before = _active_state(store["env"])
+    rc, output = _active_run(capsys, "sync-active")
+    assert rc == 0
+    assert not mirror.exists()
+    assert _active_state(store["env"]) == before
+    assert output.out.strip() == "active.token: missing"
+
+
+@pytest.mark.parametrize("live,mirror_value,status", [
+    (True, "new", "matches"), (True, "old", "STALE"), (True, None, "missing"),
+    (False, "old", "STALE"), (False, None, "missing"),
+], ids=["matches", "stale", "missing", "no-live-stale", "no-live-missing"])
+def test_current_reports_active_file_status_without_mutation(
+    store, capsys, live, mirror_value, status,
+):
+    _seed_account(store, token=_ACTIVE_NEW)
+    write_env(store["env"], f"{ca.TOKEN_ENV_KEY}={_ACTIVE_NEW}\n" if live else "OTHER=fixture\n")
+    if mirror_value:
+        _active_file(store, _ACTIVE_NEW if mirror_value == "new" else _ACTIVE_OLD)
+    before = _active_snapshot(store)
+    rc, output = _active_run(capsys, "current")
+    assert rc == 0
+    assert f"active.token: {status}" in output.out.splitlines()
+    assert _active_snapshot(store) == before
+
+
+def test_sync_active_refuses_held_store_lock(store, capsys):
+    _seed_account(store, token=_ACTIVE_NEW)
+    write_env(store["env"], f"{ca.TOKEN_ENV_KEY}={_ACTIVE_NEW}\n")
+    mirror = _active_file(store)
+    fd = os.open(str(store["accounts"] / ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    before = _active_state(mirror)
+    try:
+        rc, _ = _active_run(capsys, "sync-active")
+        assert rc == 1
+        assert _active_state(mirror) == before
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@pytest.mark.parametrize("failure", ["read", "write"])
+def test_sync_active_failure_removes_stale_file(store, monkeypatch, capsys, failure):
+    _seed_account(store, token=_ACTIVE_NEW)
+    write_env(store["env"], f"{ca.TOKEN_ENV_KEY}={_ACTIVE_NEW}\n")
+    mirror = _active_file(store)
+    before = _active_state(store["env"])
+    name = "read_env_lines" if failure == "read" else "_atomic_write"
+
+    def fail(*args):
+        raise OSError("injected synchronization failure")
+
+    monkeypatch.setattr(ca, name, fail)
+    rc, output = _active_run(capsys, "sync-active")
+    assert rc == 1
+    assert not mirror.exists()
+    assert _active_state(store["env"]) == before
+    assert output.err.count("ACTIVE TOKEN SYNC FAILED") == 1
+
+
+@pytest.mark.parametrize("name", ["active", "Active", "ACTIVE"])
+def test_active_account_name_is_reserved_for_command_and_direct_writes(
+    store, monkeypatch, capsys, name,
+):
+    _seed_account(store, token=_ACTIVE_NEW)
+    _active_file(store)
+    before = _active_snapshot(store)
+    assert not ca.valid_name(name)
+
+    def no_prompt(*args):
+        raise AssertionError("A reserved account name must be rejected before prompting")
+
+    monkeypatch.setattr(ca.getpass, "getpass", no_prompt)
+    rc, _ = _active_run(capsys, "add", name)
+    assert rc == 2
+    assert _active_snapshot(store) == before
+    with pytest.raises(SystemExit):
+        ca.write_token(name, _ACTIVE_NEW)
+    assert _active_snapshot(store) == before
+
+
+@pytest.mark.parametrize("name", ["AcTiVe", "../invalid"], ids=["reserved", "invalid"])
+@pytest.mark.parametrize("command", ["add", "switch", "remove"])
+@pytest.mark.parametrize("initial", ["missing", "permissive"])
+def test_invalid_named_command_preserves_whole_store_before_refusal(
+    store, monkeypatch, capsys, name, command, initial,
+):
+    write_env(store["env"], "OTHER=fixture\n")
+    if initial == "permissive":
+        store["accounts"].mkdir(mode=0o755)
+        store["accounts"].chmod(0o755)
+    before = _active_snapshot(store)
+
+    def no_prompt(*args):
+        raise AssertionError("An invalid account name must be rejected before prompting")
+
+    monkeypatch.setattr(ca.getpass, "getpass", no_prompt)
+    rc, output = _active_run(capsys, command, name)
+    assert rc == 2
+    assert "invalid name" in output.err
+    assert _active_snapshot(store) == before
+
+
+@pytest.mark.parametrize("name", ["active", "Active", "ACTIVE"])
+@pytest.mark.parametrize("command", ["switch", "sync-active", "revert"])
+def test_reserved_name_in_index_refuses_environment_and_mirror_mutations(
+    store, capsys, name, command,
+):
+    _seed_account(store, token=_ACTIVE_NEW)
+    index = ca.load_index()
+    index["accounts"][name] = {}
+    ca.save_index(index)
+    write_env(store["env"], f"{ca.TOKEN_ENV_KEY}={_ACTIVE_OLD}\n")
+    _active_file(store)
+    backup = store["accounts"] / "manual.bak"
+    write_env(backup, f"{ca.TOKEN_ENV_KEY}={_ACTIVE_NEW}\n")
+    before = _active_snapshot(store)
+    if command == "revert":
+        rc = ca._revert(store["env"], backup, "synthetic rollback")
+        output = capsys.readouterr()
+    else:
+        rc, output = _active_run(capsys, command, *(["acct"] if command == "switch" else []))
+    assert rc is not None and rc != 0
+    assert "reserved" in (output.out + output.err).lower()
+    assert _active_snapshot(store) == before

@@ -13,11 +13,15 @@ never flag-on-token-missing) → optionally restart → verify. The owner drives
 the interactive mint; the token is never passed on argv, never printed, never
 logged.
 
+``<store>/active.token`` is a private, atomic copy of the managed environment's live token.
+Use ``sync-active`` after hand edits; ``current`` reports whether that copy matches.
+
 Subcommands::
 
     claude-account add <name>        paste (from `claude setup-token`) + probe + store
     claude-account list              stored accounts, active one, days-to-expiry
     claude-account current           which stored token the .env currently uses
+    claude-account sync-active       synchronize the private active.token copy
     claude-account switch <name>     safe swap (backup + fail-closed write [+ restart])
     claude-account remove <name>     delete a stored token
     claude-account check-expiry      nudge (exit 3) if the active token expires soon
@@ -137,7 +141,7 @@ def token_serialization_safe(token: str) -> bool:
 
 def valid_name(name: str) -> bool:
     """A store name must be a safe filename fragment (no path traversal)."""
-    if not name or len(name) > 64:
+    if not name or len(name) > 64 or name.casefold() == "active":
         return False
     return all(c.isalnum() or c in ("-", "_", ".") for c in name) and name not in (
         ".",
@@ -234,6 +238,8 @@ def read_token(name: str) -> str:
 
 
 def write_token(name: str, token: str) -> None:
+    if not valid_name(name):
+        raise SystemExit(f"claude-account: invalid name {name!r}")
     ensure_store()
     _atomic_write(token_path(name), token + "\n", 0o600)
 
@@ -383,6 +389,54 @@ def write_env_lines(env_path: Path, lines: list[str]) -> None:
     # mode (e.g. a 0644 .env) would leave the freshly-written OAuth token
     # group/world-readable; clamp it closed on every write.
     _atomic_write(env_path, "\n".join(lines) + "\n", 0o600)
+
+
+class _ReservedActiveAccountError(ValueError):
+    """An existing named account occupies the active-file path."""
+
+
+def _check_active_token_slot(index: dict | None = None) -> None:
+    if index is None:
+        index = load_index()
+    if any(name.casefold() == "active" for name in index["accounts"]):
+        raise _ReservedActiveAccountError(
+            "claude-account: stored account name 'active' is reserved for active.token; "
+            "move that account to another name before continuing."
+        )
+
+
+def sync_active_token(env_path: Path) -> str:
+    """Mirror the parsed live token atomically, or remove its obsolete copy."""
+    _check_active_token_slot()
+    ensure_store()
+    live = read_live_value(read_env_lines(env_path), TOKEN_ENV_KEY)
+    path = store_dir() / "active.token"
+    if not live:
+        path.unlink(missing_ok=True)
+        return "missing"
+    _atomic_write(path, live, 0o600)
+    return "matches"
+
+
+def _active_token_status(live: str | None) -> str:
+    try:
+        saved = (store_dir() / "active.token").read_bytes()
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "STALE"
+    return "matches" if live and hmac.compare_digest(saved, live.encode()) else "STALE"
+
+
+def _active_token_sync_failed() -> int:
+    try:
+        (store_dir() / "active.token").unlink(missing_ok=True)
+    except OSError:
+        message = "could not remove active.token; remove it before using a runner."
+    else:
+        message = "active.token removed; reconcile the environment before retrying."
+    print(f"ACTIVE TOKEN SYNC FAILED: {message}", file=sys.stderr)
+    return 1
 
 
 # ── isolation probe ──────────────────────────────────────────────────────────
@@ -758,6 +812,19 @@ def cmd_current(args: argparse.Namespace) -> int:
     if flag and not live:
         print("\n⚠ FAIL-OPEN RISK: forward flag is ON but no token is set — "
               "the fleet would hit a login wall on restart.")
+    print(f"active.token: {_active_token_status(live)}")
+    return 0
+
+
+def cmd_sync_active(args: argparse.Namespace) -> int:
+    try:
+        status = sync_active_token(args.env_file)
+    except _ReservedActiveAccountError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except (OSError, ValueError, SystemExit):
+        return _active_token_sync_failed()
+    print(f"active.token: {status}")
     return 0
 
 
@@ -766,6 +833,11 @@ def cmd_switch(args: argparse.Namespace) -> int:
         print(f"claude-account: invalid name {args.name!r}", file=sys.stderr)
         return 2
     index = load_index()
+    try:
+        _check_active_token_slot(index)
+    except _ReservedActiveAccountError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     if args.name not in index["accounts"]:
         print(f"claude-account: no stored account {args.name!r}", file=sys.stderr)
         return 2
@@ -873,6 +945,17 @@ def cmd_switch(args: argparse.Namespace) -> int:
     new_lines = set_env_var(lines, TOKEN_ENV_KEY, token)
     new_lines = set_env_var(new_lines, FORWARD_FLAG_KEY, "1")
     write_env_lines(env_path, new_lines)
+    try:
+        status = sync_active_token(env_path)
+    except (OSError, ValueError, SystemExit):
+        try:
+            _atomic_copy(backup, env_path, 0o600)
+        except OSError:
+            return _active_token_sync_failed()
+        print("ACTIVE TOKEN SYNC FAILED: environment restored; active.token unchanged.",
+              file=sys.stderr)
+        return 1
+    print(f"active.token: {status}")
     print(f"Wrote {env_path} (backup: {backup}). Active token → {args.name}.")
 
     if not args.restart:
@@ -925,16 +1008,28 @@ def cmd_switch(args: argparse.Namespace) -> int:
     return 1
 
 
-def _revert(env_path: Path, backup: Path, why: str) -> None:
+def _revert(env_path: Path, backup: Path, why: str) -> int:
+    try:
+        _check_active_token_slot()
+    except (ValueError, SystemExit) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     print(f"\nclaude-account: {why} — reverting {env_path} from {backup.name}.",
           file=sys.stderr)
     try:
         # 0600 — the restored .env still holds credentials (clamp, don't preserve).
         _atomic_copy(backup, env_path, 0o600)
-        print("Reverted. Restart the daemon to restore the previous token.", file=sys.stderr)
     except OSError as exc:
         print(f"REVERT FAILED ({exc}) — restore {backup} to {env_path} by hand.",
               file=sys.stderr)
+        return _active_token_sync_failed()
+    try:
+        status = sync_active_token(env_path)
+    except (OSError, ValueError, SystemExit):
+        return _active_token_sync_failed()
+    print("Reverted. Restart the daemon to restore the previous token.", file=sys.stderr)
+    print(f"active.token: {status}", file=sys.stderr)
+    return 0
 
 
 def cmd_remove(args: argparse.Namespace) -> int:
@@ -1013,6 +1108,9 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("current", help="which token the .env currently uses")
     c.set_defaults(func=cmd_current)
 
+    sync = sub.add_parser("sync-active", help="synchronize the private active.token copy")
+    sync.set_defaults(func=cmd_sync_active, mutating=True)
+
     s = sub.add_parser("switch", help="safe swap (backup + fail-closed write [+restart])")
     s.add_argument("name")
     s.add_argument("--restart", action="store_true", help="also restart the daemon")
@@ -1039,12 +1137,21 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.cmd in ("add", "switch", "remove") and not valid_name(args.name):
+        print(f"claude-account: invalid name {args.name!r}", file=sys.stderr)
+        return 2
     # resolve the env path once, after parsing (default is lazy so tests can patch)
     args.env_file = args.env_file or default_env_path()
-    # Mutating commands (add/switch/remove) run under the store lock for the whole
+    # Mutating commands (add/switch/remove/sync-active) run under the store lock for the whole
     # operation — including switch's restart/verify window — so two concurrent runs
     # can't clobber each other. Read-only commands take no lock.
     if getattr(args, "mutating", False):
+        if args.cmd in ("switch", "sync-active"):
+            try:
+                _check_active_token_slot()
+            except _ReservedActiveAccountError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
         with store_lock():
             return args.func(args)
     return args.func(args)
