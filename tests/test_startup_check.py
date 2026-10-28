@@ -38,7 +38,7 @@ def command_tree(tmp_path: Path) -> Path:
     return tree
 
 
-def run_check(tree: Path, db_path: Path) -> subprocess.CompletedProcess[str]:
+def run_check(tree: Path, db_path: Path, *, registered_agents=()) -> subprocess.CompletedProcess[str]:
     root = Path(os.path.realpath(db_path)).parent
     env = dict(os.environ)
     env.update(
@@ -46,8 +46,12 @@ def run_check(tree: Path, db_path: Path) -> subprocess.CompletedProcess[str]:
         PYTHONNOUSERSITE="1",
         CHECK_DATA_ROOT=str(root),
     )
+    command = [sys.executable, "-m", "pinky_daemon", "--mode", "check-startup", "--db-path", str(db_path)]
+    if b"--storage-agent" in (tree / "src/pinky_daemon/__main__.py").read_bytes():
+        for name in sorted(registered_agents):
+            command.extend(("--storage-agent", name))
     result = subprocess.run(
-        [sys.executable, "-m", "pinky_daemon", "--mode", "check-startup", "--db-path", str(db_path)],
+        command,
         cwd=tree,
         env=env,
         text=True,

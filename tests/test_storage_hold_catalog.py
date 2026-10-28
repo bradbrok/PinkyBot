@@ -9,6 +9,20 @@ from pathlib import Path
 import pytest
 
 from pinky_daemon import store_catalog as stores
+from tests.test_storage_hold_boundaries import registered_kwargs
+
+
+def inspect_catalog(catalog, **kwargs):
+    return catalog.inspect_layout(
+        **kwargs, **registered_kwargs(catalog.inspect_layout, {"first", "second"}),
+    )
+
+
+def inspect_filesystem(root):
+    return stores.inspect_filesystem_layout(
+        root, {}, silence_allowlist={},
+        **registered_kwargs(stores.inspect_filesystem_layout, {"first", "second"}),
+    )
 
 
 def escape(tmp_path: Path, kind: str = "directory", name: str = "first"):
@@ -27,7 +41,10 @@ def escape(tmp_path: Path, kind: str = "directory", name: str = "first"):
 
 def reconcile(catalog, *, enabled=True):
     try:
-        return catalog.reconcile_filesystem(scoped_hold=enabled)
+        return catalog.reconcile_filesystem(
+            scoped_hold=enabled,
+            **registered_kwargs(catalog.reconcile_filesystem, {"first", "second"}),
+        )
     except TypeError as exc:
         pytest.fail(f"Scoped reconciliation must be an explicit opt-in: {exc}")
 
@@ -35,7 +52,7 @@ def reconcile(catalog, *, enabled=True):
 @pytest.mark.parametrize("kind", ["directory", "database"])
 def test_outside_findings_carry_the_discovered_subject(tmp_path, kind):
     root, link, target = escape(tmp_path, kind)
-    report = stores.inspect_filesystem_layout(root, {}, silence_allowlist={})
+    report = inspect_filesystem(root)
     assert len(report.findings) == 1
     finding = report.findings[0]
     assert finding["kind"] == kind + "_outside_root"
@@ -48,7 +65,7 @@ def test_outside_findings_carry_the_discovered_subject(tmp_path, kind):
 def test_scoped_reconciliation_returns_holds_and_preserves_legacy_refusal(tmp_path, kind):
     root, _, _ = escape(tmp_path, kind)
     catalog = stores.StoreCatalog(expected_root=root, silence_allowlist={})
-    report = catalog.inspect_layout()
+    report = inspect_catalog(catalog)
     with pytest.raises(stores.StoreCatalogError) as raised:
         catalog.reconcile_filesystem()
     assert str(raised.value) == report.findings[0]["detail"]
@@ -64,7 +81,7 @@ def test_scope_includes_the_entry_itself(tmp_path):
     outside.mkdir()
     link = root / "agents" / "first"
     link.symlink_to(outside, target_is_directory=True)
-    report = stores.inspect_filesystem_layout(root, {}, silence_allowlist={})
+    report = inspect_filesystem(root)
     assert len(report.findings) == 1
     assert report.findings[0]["path"] == str(link)
     assert report.findings[0].get("scope") == "first"
@@ -79,7 +96,7 @@ def test_paths_outside_subject_entries_never_acquire_scope(tmp_path, relative):
     outside.mkdir()
     link.symlink_to(outside, target_is_directory=True)
     catalog = stores.StoreCatalog(expected_root=root, silence_allowlist={})
-    report = catalog.inspect_layout()
+    report = inspect_catalog(catalog)
     assert len(report.findings) == 1 and not report.findings[0].get("scope")
     with pytest.raises(stores.StoreCatalogError, match="directory symlink escapes"):
         reconcile(catalog)
@@ -105,7 +122,7 @@ def test_registered_store_findings_remain_fatal_inside_a_subject(tmp_path, monke
             return original(path)
 
         monkeypatch.setattr(os, "scandir", inaccessible)
-    report = catalog.inspect_layout()
+    report = inspect_catalog(catalog)
     expected = "alias_of_registered_store" if kind == "alias" else "uninspectable_in_store_footprint"
     assert [row["kind"] for row in report.findings] == [expected]
     assert "scope" not in report.findings[0]
@@ -117,7 +134,7 @@ def test_registered_store_findings_remain_fatal_inside_a_subject(tmp_path, monke
 def test_unscoped_findings_keep_the_original_failure_order(tmp_path, monkeypatch):
     root, _, _ = escape(tmp_path)
     catalog = stores.StoreCatalog(expected_root=root, silence_allowlist={})
-    scoped = catalog.inspect_layout().findings[0]
+    scoped = inspect_catalog(catalog).findings[0]
     scoped = {**scoped, "scope": "first"}
     alias = dict(kind="alias_of_registered_store", path=str(root / "alias.db"),
                  resolved_path=str(root / "tasks.db"), detail="fixture alias failure")
@@ -152,7 +169,7 @@ def test_recheck_walks_one_scope_with_the_main_containment_boundary(tmp_path, mo
     (second / "data" / "escape").symlink_to(outside, target_is_directory=True)
     (first / "data" / "peer").symlink_to(second, target_is_directory=True)
     catalog = stores.StoreCatalog(expected_root=root, silence_allowlist={})
-    assert catalog.inspect_layout().findings
+    assert inspect_catalog(catalog).findings
     scanned = []
     original = os.scandir
 
@@ -163,11 +180,11 @@ def test_recheck_walks_one_scope_with_the_main_containment_boundary(tmp_path, mo
 
     monkeypatch.setattr(os, "scandir", scandir)
     try:
-        report = catalog.inspect_layout(scope="first")
+        report = inspect_catalog(catalog, scope="first")
     except TypeError as exc:
         pytest.fail(f"A scope-only recheck must be available: {exc}")
     assert report.findings == []
-    assert report.warnings == []
+    assert any(warning.startswith("could not inspect") for warning in report.warnings)
     assert scanned and str(root) not in scanned
 
 

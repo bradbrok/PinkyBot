@@ -390,7 +390,7 @@ async def test_real_boot_installs_scoped_holds_and_keeps_management_running(
     registry = h.app.state.agents
     registry.set_main_agent(main)
     if not registered:
-        # Retain the lexical scope, but no matching registered subject.
+        # A retained directory cannot replace the removed registration.
         registry._db.execute("DELETE FROM agents WHERE name='sample'")
         registry._db.commit()
     h.app.state.agents._fire_trace.close()
@@ -400,6 +400,27 @@ async def test_real_boot_installs_scoped_holds_and_keeps_management_running(
     monkeypatch.setattr(api, "SHARED_MCP_ENABLED", False)
     monkeypatch.setattr(tmux_session, "reap_legacy_tmux_sessions", AsyncMock())
     monkeypatch.setattr(tmux_session, "reconcile_tmux_spawn_cleanup_debts", AsyncMock(return_value=(0, 0)))
+    if not registered:
+        created = []
+        constructor = api.AgentRegistry
+
+        def record_registry(*args, **kwargs):
+            result = constructor(*args, **kwargs)
+            created.append(result)
+            return result
+
+        monkeypatch.setattr(api, "AgentRegistry", record_registry)
+        rejected = False
+        try:
+            api.create_api(db_path=str(root / "api.db"), default_working_dir=str(root))
+        except StoreCatalogError:
+            rejected = True
+        finally:
+            for fresh_registry in created:
+                fresh_registry._fire_trace.close()
+                fresh_registry._catalog.shutdown(deadline_seconds=10)
+        assert rejected, "An unregistered directory must not become an inert storage hold"
+        return
     try:
         app = api.create_api(db_path=str(root / "api.db"), default_working_dir=str(root))
     except StoreCatalogError as exc:
@@ -904,3 +925,38 @@ async def test_guarded_broker_uses_late_class_replacement(held_subject, monkeypa
         assert result.delivered is (not held)
     elif name == "_route_streaming":
         assert result is (not held)
+
+
+async def test_relocated_in_root_directory_keeps_recheck_incomplete_and_hold_intact(held_subject):
+    import copy
+    import json
+    from dataclasses import asdict
+
+    from tests.test_storage_hold_boundaries import registered_kwargs
+
+    h = held_subject
+    catalog = h.app.state.store_catalog
+    root = Path(catalog.expected_root)
+    directory = h.escape.parent
+    moved = root / "relocated-data"
+    directory.rename(moved)
+    directory.symlink_to(moved, target_is_directory=True)
+    names = {agent.name for agent in h.app.state.agents.list()}
+
+    def full_report():
+        report = catalog.inspect_layout(**registered_kwargs(catalog.inspect_layout, names))
+        assert any(row["kind"] == "directory_outside_root" for row in report.findings)
+        return json.dumps(asdict(report), sort_keys=True, separators=(",", ":"))
+
+    before_full = full_report()
+    before_hold = copy.deepcopy(h.app.state.storage_holds)
+    response = await h.client.post("/agents/sample/storage/recheck")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    cleared, reason = body.get("cleared"), body.get("reason")
+    assert cleared is False
+    assert reason == "incomplete"
+    assert body["storage_hold"]["held"] is True
+    assert any(warning.startswith("could not inspect") for warning in body["warnings"])
+    assert h.app.state.storage_holds == before_hold
+    assert full_report() == before_full

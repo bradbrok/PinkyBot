@@ -14,7 +14,19 @@ from pinky_self.server import create_server
 from tests.test_startup_check import command_tree as command_tree
 from tests.test_startup_check import report_of, run_check, snapshot
 from tests.test_startup_preflight import clean_report
-from tests.test_startup_preflight import deployment as deployment
+from tests.test_startup_preflight import deployment as _deployment
+from tests.test_storage_hold_boundaries import registered_kwargs
+
+
+@pytest.fixture
+def deployment(tmp_path, monkeypatch):
+    generator = inspect.unwrap(_deployment)(tmp_path, monkeypatch)
+    fx = next(generator)
+    try:
+        fx.app.state.agents.register("sample", working_dir=str(fx.data / "sample-workspace"))
+        yield fx
+    finally:
+        generator.close()
 
 
 def scoped_finding(root, *, kind="directory_outside_root", scope="sample"):
@@ -35,7 +47,7 @@ def test_real_command_distinguishes_scoped_and_fatal_layouts(command_tree, tmp_p
     if layout == "mixed":
         (root / "fatal").symlink_to(outside, target_is_directory=True)
     before = snapshot(root)
-    result = run_check(command_tree, root / "conversations.db")
+    result = run_check(command_tree, root / "conversations.db", registered_agents={"sample"})
     assert result.returncode == rc, result.stderr + result.stdout
     report = report_of(result, root, ok=layout == "clean")
     assert snapshot(root) == before
@@ -44,11 +56,39 @@ def test_real_command_distinguishes_scoped_and_fatal_layouts(command_tree, tmp_p
     assert all(row["scope"] == "sample" for row in scoped)
 
 
+@pytest.mark.parametrize("layout", ["loose-database", "orphan-directory"])
+def test_real_startup_command_rejects_unregistered_entries(command_tree, tmp_path, layout):
+    from tests.test_storage_hold_boundaries import outward_entry
+
+    root, _ = outward_entry(tmp_path, layout)
+    before = snapshot(root)
+    result = run_check(command_tree, root / "conversations.db")
+    assert result.returncode == 1, result.stderr + result.stdout
+    report = report_of(result, root, ok=False)
+    assert report["findings"] and all(not row.get("scope") for row in report["findings"])
+    assert snapshot(root) == before
+
+
 @pytest.mark.parametrize("rc", [1, 3])
 def test_target_report_preserves_scope_and_future_report_fields(tmp_path, rc):
     report = clean_report(tmp_path, ok=False, findings=[scoped_finding(tmp_path)],
                           future_detail={"fixture": True})
-    assert api._startup_target_report(json.dumps(report), rc) == report
+    assert api._startup_target_report(
+        json.dumps(report), rc, **registered_kwargs(api._startup_target_report, {"sample"}),
+    ) == report
+
+
+async def test_older_target_registration_claim_cannot_override_parent_registry(deployment):
+    fx = deployment
+    finding = scoped_finding(fx.data, scope="orphan")
+    finding["path"] = str(fx.data / "agents/orphan/data/escape")
+    report = clean_report(fx.data, ok=False, findings=[finding], registered_agents=["orphan"])
+    fx.set_target(report=report, rc=3)
+    result = await fx.update(force=True, accept_findings=True)
+    assert result.get("restarting", False) is False
+    assert result["target_check"]["reason"] == "invalid_report"
+    assert result["undo"]["ok"] is True and not fx.scheduled
+    assert fx.children and "--storage-agent" not in fx.children[0]["command"]
 
 
 @pytest.mark.parametrize("kind", ["alias_of_registered_store", "uninspectable_in_store_footprint", "future_kind"])
