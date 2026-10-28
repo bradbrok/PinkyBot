@@ -1137,6 +1137,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.cmd in ("add", "switch", "remove") and not valid_name(args.name):
+        print(f"claude-account: invalid name {args.name!r}", file=sys.stderr)
+        return 2
     # resolve the env path once, after parsing (default is lazy so tests can patch)
     args.env_file = args.env_file or default_env_path()
     # Mutating commands (add/switch/remove/sync-active) run under the store lock for the whole
