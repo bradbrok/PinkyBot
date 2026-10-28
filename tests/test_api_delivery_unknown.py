@@ -171,7 +171,7 @@ def test_t5_quote_rejection_still_degrades(sender):
     with patch.object(TelegramAdapter, "send_message", side_effect=respond) as send:
         response = _quote(sender)
     assert response.status_code == 200, response.text
-    assert send.call_count == 3
+    assert send.call_count == 2
     assert send.call_args_list[0].kwargs["reply_parameters"]["quote"] == "passage"
     assert send.call_args.kwargs["reply_parameters"] is None
     assert send.call_args.kwargs["reply_to_message_id"] == 101
