@@ -33,9 +33,10 @@ def history(tmp_path, monkeypatch):
     monkeypatch.setattr(memory, "_store", store)
     monkeypatch.setattr(memory, "_collect_agent_session_ids", lambda name: set(state.ids))
 
-    def resolve(name, **filters):
+    def resolve(name, *, session_ids=None, **filters):
         assert name == state.name
-        return [m.to_dict() for m in store.get_messages_for_sessions(state.ids, **filters)]
+        ids = state.ids if session_ids is None else session_ids
+        return [m.to_dict() for m in store.get_messages_for_sessions(ids, **filters)]
 
     monkeypatch.setattr(memory, "_resolve_agent_history", resolve)
     app = FastAPI()

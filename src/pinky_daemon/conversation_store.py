@@ -237,9 +237,8 @@ class ConversationStore:
         if not ordered_ids:
             return []
 
-        placeholders = ",".join("?" for _ in ordered_ids)
-        conditions = [f"session_id IN ({placeholders})"]
-        params: list[object] = list(ordered_ids)
+        conditions = ["session_id IN (SELECT value FROM json_each(?))"]
+        params: list[object] = [json.dumps(ordered_ids)]
 
         if after_ts:
             conditions.append("timestamp >= ?")
@@ -347,6 +346,21 @@ class ConversationStore:
                 return []
 
         return [self._row_to_message(r) for r in rows]
+
+    def list_session_ids_with_prefix(self, prefix: str) -> list[str]:
+        """List distinct session IDs using an indexed, literal prefix range.
+
+        Agent prefixes end in ``-``, so their exclusive upper bound ends in ``.``.
+        """
+        if not prefix:
+            return []
+        prefix_upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+        rows = self._conn.execute(
+            """SELECT DISTINCT session_id FROM messages
+               WHERE session_id >= ? AND session_id < ?""",
+            (prefix, prefix_upper),
+        ).fetchall()
+        return [row["session_id"] for row in rows]
 
     def list_conversations(
         self,

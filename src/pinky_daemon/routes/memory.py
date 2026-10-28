@@ -212,6 +212,7 @@ def search_agent_chat_history(
             SimpleNamespace(**m)
             for m in _resolve_agent_history(
                 agent_name,
+                session_ids=agent_session_ids,
                 after_ts=after_ts,
                 before_ts=before_ts,
                 limit=limit,
