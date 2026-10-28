@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import sqlite3
 from unittest.mock import Mock
 
 import pytest
@@ -188,3 +189,107 @@ def test_unknown_agent_history_does_not_collect(history_app, monkeypatch):
     monkeypatch.setattr(history_app.state.manager, "list", listed)
     assert history_app.state.agent_history_resolver("unknown") == []
     assert listed.call_count == 0
+
+
+@pytest.mark.parametrize("filters", [
+    {},
+    {"after": "2025-01-01", "before": "2026-01-01", "role": "user"},
+], ids=["plain", "date-and-role"])
+def test_uncapped_history_remains_readable_with_a_finite_parameter_budget(
+    history_app, tmp_path, filters,
+):
+    history_app.state.agents.register("scope", working_dir=str(tmp_path / "scope"))
+    store = history_app.state.conversation_store
+    store._conn.executemany(
+        "INSERT INTO messages(session_id, role, content, timestamp) "
+        "VALUES (?, 'user', 'fixture message', ?)",
+        ((f"scope-session-{index:06d}", 1760000000 + index) for index in range(6000)),
+    )
+    store._conn.commit()
+    previous_limit = store._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 5004)
+    try:
+        assert len(memory._collect_agent_session_ids("scope")) == 6000
+        error = None
+        result = None
+        try:
+            result = memory.search_agent_chat_history("scope", limit=10, **filters)
+        except sqlite3.OperationalError as exc:
+            error = str(exc)
+        assert error is None, f"History could not read the complete session scope: {error}"
+        assert result["count"] == 10
+        assert [message["session_id"] for message in result["messages"]] == [
+            f"scope-session-{index:06d}" for index in range(5999, 5989, -1)
+        ]
+    finally:
+        store._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)
+
+
+def in_list_history(store, session_ids, **filters):
+    """Reference the previous reader on a small, complete scope."""
+    ordered_ids = [sid for sid in dict.fromkeys(session_ids) if sid]
+    if not ordered_ids:
+        return []
+    conditions = ["session_id IN (" + ",".join("?" for _ in ordered_ids) + ")"]
+    params = list(ordered_ids)
+    for name, condition in (
+        ("after_ts", "timestamp >= ?"),
+        ("before_ts", "timestamp <= ?"),
+        ("role", "role = ?"),
+    ):
+        if filters.get(name):
+            conditions.append(condition)
+            params.append(filters[name])
+    params.append(filters.get("limit", 50))
+    rows = store._conn.execute(
+        "SELECT * FROM messages WHERE " + " AND ".join(conditions)
+        + " ORDER BY timestamp DESC LIMIT ?",
+        params,
+    ).fetchall()
+    return [store._row_to_message(row) for row in rows]
+
+
+@pytest.mark.parametrize("filters", [
+    {},
+    {"limit": 3},
+    {"after_ts": 102, "limit": 3},
+    {"before_ts": 105, "limit": 3},
+    {"role": "assistant", "limit": 2},
+    {"after_ts": 101, "before_ts": 106, "role": "user", "limit": 3},
+    {"limit": 0},
+    {"after_ts": 1000, "limit": 3},
+], ids=["plain", "limit", "after", "before", "role", "all-filters", "zero", "no-match"])
+def test_history_scope_matches_in_list_order_filters_and_global_limit(history_app, filters):
+    store = history_app.state.conversation_store
+    store.append("unit-main", "assistant", "assistant fixture", timestamp=103.5)
+    store.append("unit-quote'", "assistant", "quoted fixture", timestamp=105.5)
+    store.append("unit-unicode-é", "user", "Unicode fixture", timestamp=106.5)
+    store.append("foreign-main", "user", "excluded newer fixture", timestamp=999)
+    session_ids = sorted(memory._collect_agent_session_ids("unit")) + ["", "unit-main"]
+    before = list(session_ids)
+    expected = in_list_history(store, session_ids, **filters)
+    actual = store.get_messages_for_sessions(session_ids, **filters)
+    assert actual == expected
+    assert [message.timestamp for message in actual] == sorted(
+        (message.timestamp for message in actual), reverse=True,
+    )
+    assert len(actual) <= filters.get("limit", 50)
+    assert session_ids == before
+
+
+def test_history_scope_read_uses_the_session_index(history_app):
+    store = history_app.state.conversation_store
+    session_ids = memory._collect_agent_session_ids("unit")
+    statements = []
+    store._conn.set_trace_callback(statements.append)
+    try:
+        assert store.get_messages_for_sessions(
+            session_ids, after_ts=100, before_ts=108, role="user", limit=3,
+        )
+    finally:
+        store._conn.set_trace_callback(None)
+    queries = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT")]
+    assert len(queries) == 1
+    plan = " ".join(
+        row[3] for row in store._conn.execute("EXPLAIN QUERY PLAN " + queries[0])
+    )
+    assert "SEARCH messages USING INDEX idx_messages_session" in plan
