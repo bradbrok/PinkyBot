@@ -237,9 +237,8 @@ class ConversationStore:
         if not ordered_ids:
             return []
 
-        placeholders = ",".join("?" for _ in ordered_ids)
-        conditions = [f"session_id IN ({placeholders})"]
-        params: list[object] = list(ordered_ids)
+        conditions = ["session_id IN (SELECT value FROM json_each(?))"]
+        params: list[object] = [json.dumps(ordered_ids)]
 
         if after_ts:
             conditions.append("timestamp >= ?")
