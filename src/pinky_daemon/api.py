@@ -35,6 +35,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
+from collections.abc import Collection
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -1864,10 +1865,10 @@ def _deploy_alert_routes(registry) -> list[dict]:
     return routes
 
 
-def _startup_layout_preflight(catalog: StoreCatalog) -> dict:
+def _startup_layout_preflight(catalog: StoreCatalog, *, registered_agents: Collection[str] = ()) -> dict:
     """Inspect detached metadata without refreshing the serving catalog."""
     try:
-        report = catalog.inspect_layout()
+        report = catalog.inspect_layout(registered_agents=registered_agents)
     except OSError as exc:
         return {
             "ok": False, "incomplete": True,
@@ -1880,7 +1881,9 @@ def _startup_layout_preflight(catalog: StoreCatalog) -> dict:
     }
 
 
-def _accept_scoped_findings(check: dict, accept_findings: bool, root) -> bool:
+def _accept_scoped_findings(
+    check: dict, accept_findings: bool, root, *, registered_agents: Collection[str] = (),
+) -> bool:
     """Keep the failed report intact while recording an explicit acceptance."""
     findings = check.get("findings")
     if (not accept_findings or check.get("incomplete") or check.get("cleanup_failed")
@@ -1888,7 +1891,7 @@ def _accept_scoped_findings(check: dict, accept_findings: bool, root) -> bool:
             or not isinstance(findings, list) or not findings):
         return False
     if not all(isinstance(finding, dict) and finding.get("scope")
-               and storage_hold_scope(root, finding) == finding["scope"] for finding in findings):
+               and storage_hold_scope(root, finding, registered_agents) == finding["scope"] for finding in findings):
         return False
     check["ok"] = False
     check["accepted"] = True
@@ -1912,7 +1915,9 @@ def _startup_stderr_tail(value: Any) -> str:
     return str(value or "")[-500:]
 
 
-def _startup_target_report(stdout: str | bytes, rc: int) -> dict:
+def _startup_target_report(
+    stdout: str | bytes, rc: int, *, registered_agents: Collection[str] = (),
+) -> dict:
     """Validate required fields while accepting additions from later releases."""
     report = json.loads(stdout)
     if not isinstance(report, dict):
@@ -1939,7 +1944,7 @@ def _startup_target_report(stdout: str | bytes, rc: int) -> dict:
     if rc not in (0, 1, 3) or report["ok"] is not (rc == 0) or bool(findings) != (rc in (1, 3)):
         raise ValueError("startup report disagrees with exit status")
     if rc == 3 and not all(finding.get("scope")
-                          and storage_hold_scope(report["root"], finding) == finding["scope"]
+                          and storage_hold_scope(report["root"], finding, registered_agents) == finding["scope"]
                           for finding in findings):
         raise ValueError("exit status 3 requires eligible scoped findings")
     return report
@@ -2016,9 +2021,12 @@ def _run_startup_child(command, *, cwd: str, env: dict, timeout: float):
                                cleanup_failed=not group_ended)
 
 
-def _check_target_startup(repo_dir: str, db_path: str, target_ref: str) -> dict:
+def _check_target_startup(
+    repo_dir: str, db_path: str, target_ref: str, *, registered_agents: Collection[str] = (),
+) -> dict:
     import subprocess as sp
 
+    registered_agents = frozenset(registered_agents)
     try:
         source = sp.check_output(
             ["git", "show", f"{target_ref}:src/pinky_daemon/__main__.py"],
@@ -2034,10 +2042,14 @@ def _check_target_startup(repo_dir: str, db_path: str, target_ref: str) -> dict:
     env = dict(os.environ)
     env["PYTHONPATH"] = str(Path(repo_dir) / "src")
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    command = [sys.executable, "-B", "-m", "pinky_daemon", "--mode", "check-startup",
+               "--db-path", db_path]
+    if b"--storage-agent" in source:
+        for name in sorted(registered_agents):
+            command.extend(("--storage-agent", name))
     try:
         child = _run_startup_child(
-            [sys.executable, "-B", "-m", "pinky_daemon", "--mode", "check-startup",
-             "--db-path", db_path],
+            command,
             cwd=repo_dir, env=env,
             timeout=_STARTUP_CHECK_TIMEOUT_SECONDS,
         )
@@ -2052,7 +2064,9 @@ def _check_target_startup(repo_dir: str, db_path: str, target_ref: str) -> dict:
     if child.returncode == 2:
         return {**result, "reason": "incomplete"}
     try:
-        report = _startup_target_report(child.stdout, child.returncode)
+        report = _startup_target_report(
+            child.stdout, child.returncode, registered_agents=registered_agents,
+        )
     except Exception:
         return {**result, "reason": "invalid_report"}
     result["findings"] = report["findings"]
@@ -2245,6 +2259,10 @@ def create_api(
     )
     store = ConversationStore(db_path=store_manifest["conversations"].path, catalog=store_catalog)
     agents = AgentRegistry(db_path=store_manifest["agents"].path, catalog=store_catalog)
+
+    def _storage_agent_names() -> frozenset[str]:
+        return frozenset(agent.name for agent in agents.list())
+
     runtime_model_catalog.bind_registry(agents)
     runtime_model_catalog.warm()
     analytics = AnalyticsStore(db_path=store_manifest["analytics"].path, catalog=store_catalog)
@@ -8916,14 +8934,16 @@ npm run build</pre>
         async with _lifecycle(name):
             hold = _storage_hold_for(name)
             try:
-                inspection = await asyncio.to_thread(store_catalog.inspect_layout, scope=name)
+                inspection = await asyncio.to_thread(
+                    store_catalog.inspect_layout, scope=name, registered_agents=_storage_agent_names(),
+                )
             except OSError as exc:
                 return {"cleared": False, "reason": "incomplete", "findings": [],
                         "error": type(exc).__name__, "storage_hold": hold}
             incomplete = any(warning.startswith("could not inspect") for warning in inspection.warnings)
             if inspection.findings or incomplete:
                 if hold and inspection.findings and all(
-                    storage_hold_scope(store_catalog.expected_root, finding) == name
+                    storage_hold_scope(store_catalog.expected_root, finding, _storage_agent_names()) == name
                     for finding in inspection.findings
                 ):
                     app.state.storage_holds[name] = copy.deepcopy(inspection.findings)
@@ -15907,8 +15927,11 @@ npm run build</pre>
             # Preview mode — report the planned deploy without mutating anything.
             if dry_run:
                 if preflight:
-                    layout_preflight = _startup_layout_preflight(store_catalog)
-                    _accept_scoped_findings(layout_preflight, accept_findings, store_catalog.expected_root)
+                    layout_preflight = _startup_layout_preflight(store_catalog, registered_agents=_storage_agent_names())
+                    _accept_scoped_findings(
+                        layout_preflight, accept_findings, store_catalog.expected_root,
+                        registered_agents=_storage_agent_names(),
+                    )
                 try:
                     pending = sp.check_output(
                         ["git", "log", "--oneline", f"HEAD..origin/{branch}"],
@@ -15978,9 +16001,10 @@ npm run build</pre>
             except Exception as exc:
                 return {"error": f"could not record full target ref: {type(exc).__name__}",
                         "staying_on_version": before_hash}
-            layout_preflight = _startup_layout_preflight(store_catalog)
+            layout_preflight = _startup_layout_preflight(store_catalog, registered_agents=_storage_agent_names())
             if not layout_preflight["ok"] and not _accept_scoped_findings(
                 layout_preflight, accept_findings, store_catalog.expected_root,
+                registered_agents=_storage_agent_names(),
             ):
                 return {
                     "error": ("startup layout pre-flight could not complete"
@@ -16134,9 +16158,12 @@ npm run build</pre>
                 return result
 
             undo_update = _undo_update
-            target_check = _check_target_startup(repo_dir, db_path, alert_ref)
+            target_check = _check_target_startup(
+                repo_dir, db_path, alert_ref, registered_agents=_storage_agent_names(),
+            )
             if target_check.get("reason") and not _accept_scoped_findings(
                 target_check, accept_findings, store_catalog.expected_root,
+                registered_agents=_storage_agent_names(),
             ):
                 return _undo_update({
                     "error": "target release failed its startup check", "target_check": target_check,
@@ -16282,9 +16309,12 @@ npm run build</pre>
         """Graceful daemon restart. Requires process manager for auto-restart."""
         import signal
 
-        preflight = await asyncio.to_thread(_startup_layout_preflight, store_catalog)
+        preflight = await asyncio.to_thread(
+            _startup_layout_preflight, store_catalog, registered_agents=_storage_agent_names(),
+        )
         if not preflight["ok"] and not _accept_scoped_findings(
             preflight, accept_findings, store_catalog.expected_root,
+            registered_agents=_storage_agent_names(),
         ):
             return {
                 "error": ("startup layout pre-flight could not complete"
@@ -17145,7 +17175,7 @@ npm run build</pre>
     app.state.store_catalog = store_catalog
     phase_started = time.monotonic()
     try:
-        reconciliation = store_catalog.validate(scoped_hold=True)
+        reconciliation = store_catalog.validate(scoped_hold=True, registered_agents=_storage_agent_names())
         warnings = reconciliation.warnings if reconciliation else []
         holds = {}
         for finding in reconciliation.holds if reconciliation else []:

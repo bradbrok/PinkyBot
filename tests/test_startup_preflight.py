@@ -332,9 +332,9 @@ async def test_update_preview_inspects_only_when_requested(deployment, monkeypat
     (fx.data / 'link').symlink_to(outside if unsafe else fx.data, target_is_directory=True)
     calls = []
     inspect_layout = getattr(fx.app.state.store_catalog, 'inspect_layout', None)
-    def record():
+    def record(**kwargs):
         calls.append(True)
-        return inspect_layout()
+        return inspect_layout(**kwargs)
     monkeypatch.setattr(fx.app.state.store_catalog, 'inspect_layout', record, raising=False)
     result = await fx.update(dry_run=True, preflight=requested)
     assert ('preflight' in result) is requested
@@ -598,7 +598,7 @@ async def test_startup_alert_distinguishes_preflight_from_confirmed_undo(deploym
     fx.set_target(report=clean_report(fx.data, ok=False, findings=[finding]), rc=1)
     findings = [finding]
     monkeypatch.setattr(fx.app.state.store_catalog, 'inspect_layout',
-                        lambda: SimpleNamespace(findings=list(findings), warnings=[]))
+                        lambda **kwargs: SimpleNamespace(findings=list(findings), warnings=[]))
     first = await fx.update()
     assert first['preflight']['findings'] == [finding] and 'undo' not in first
     findings.clear()
@@ -619,7 +619,7 @@ async def test_preflight_runs_outside_event_loop(deployment, monkeypatch, endpoi
     release = threading.Event()
     seen_threads = []
     loop_thread = threading.get_ident()
-    def inspect_layout():
+    def inspect_layout(**kwargs):
         seen_threads.append(threading.get_ident())
         entered.set()
         assert release.wait(3)
@@ -645,7 +645,7 @@ async def test_preflight_runs_outside_event_loop(deployment, monkeypatch, endpoi
 async def test_identity_failure_is_incomplete_preflight(deployment, monkeypatch, incomplete):
     fx = deployment
     fx.set_target(supports=False)
-    def inspect_layout():
+    def inspect_layout(**kwargs):
         if incomplete:
             raise PermissionError(13, 'fixture', str(fx.data / 'store.db'))
         return SimpleNamespace(findings=[], warnings=[])
@@ -667,7 +667,7 @@ async def test_update_alert_suppression_set_window_and_delivery(deployment, monk
     findings = [dict(kind='directory_outside_root', path=str(fx.data/'a')),
                 dict(kind='directory_outside_root', path=str(fx.data/'b'))]
     monkeypatch.setattr(fx.app.state.store_catalog, 'inspect_layout',
-                        lambda: SimpleNamespace(findings=list(findings), warnings=[]), raising=False)
+                        lambda **kwargs: SimpleNamespace(findings=list(findings), warnings=[]), raising=False)
     first = await fx.update()
     assert first['error'] == 'startup layout pre-flight failed'
     assert fx.owner.await_count == 1
@@ -698,7 +698,7 @@ async def test_alert_reservation_precedes_delivery(deployment, monkeypatch):
     fx.set_target(supports=False)
     finding = dict(kind='directory_outside_root', path=str(fx.data/'entry'))
     monkeypatch.setattr(fx.app.state.store_catalog, 'inspect_layout',
-                        lambda: SimpleNamespace(findings=[finding], warnings=[]), raising=False)
+                        lambda **kwargs: SimpleNamespace(findings=[finding], warnings=[]), raising=False)
     entered = asyncio.Event()
     release = asyncio.Event()
     async def notify(*args):
@@ -1001,7 +1001,7 @@ async def test_startup_alert_distinguishes_each_decline_pair(deployment, monkeyp
     fx.set_target(report=clean_report(fx.data, ok=False, findings=[finding]), rc=1)
     preflight_findings = []
     monkeypatch.setattr(fx.app.state.store_catalog, 'inspect_layout',
-                        lambda: SimpleNamespace(findings=list(preflight_findings), warnings=[]))
+                        lambda **kwargs: SimpleNamespace(findings=list(preflight_findings), warnings=[]))
     actual_ref = api._startup_full_ref
     attempt = {'outcome': None, 'children': 0}
 

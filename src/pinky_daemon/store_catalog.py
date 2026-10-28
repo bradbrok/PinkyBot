@@ -12,7 +12,7 @@ import sqlite3
 import stat
 import sys
 import threading
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -834,8 +834,10 @@ class StorageReconciliation:
     holds: list[dict[str, str | None]]
 
 
-def storage_hold_scope(expected_root, finding: Mapping) -> str | None:
-    """Attribute eligible findings to their lexical discovery entry."""
+def storage_hold_scope(
+    expected_root, finding: Mapping, registered_agents: Collection[str] = (),
+) -> str | None:
+    """Attribute eligible findings only to a non-retired registered subject."""
     if finding.get("kind") not in {"directory_outside_root", "database_outside_root"}:
         return None
     path = finding.get("path")
@@ -848,7 +850,7 @@ def storage_hold_scope(expected_root, finding: Mapping) -> str | None:
     except ValueError:
         return None
     parts = relative.split(os.sep)
-    if parts[0] in {"", ".", ".."}:
+    if parts[0] in {"", ".", ".."} or parts[0] not in registered_agents:
         return None
     return parts[0]
 
@@ -885,9 +887,12 @@ def inspect_filesystem_layout(
     *,
     silence_allowlist: Mapping[str, str] | None = None,
     scope: str | None = None,
+    registered_agents: Collection[str] = (),
 ) -> LayoutInspection:
     """Inspect metadata once without changing catalog state or opening files."""
-    inspector = _FilesystemLayoutInspector(expected_root, registered_identities, silence_allowlist)
+    inspector = _FilesystemLayoutInspector(
+        expected_root, registered_identities, silence_allowlist, registered_agents,
+    )
     if scope is not None and (not scope or scope in {".", ".."} or os.path.basename(scope) != scope):
         raise ValueError("invalid storage scope")
     inspector.scope = scope
@@ -895,7 +900,7 @@ def inspect_filesystem_layout(
 
 
 class _FilesystemLayoutInspector:
-    def __init__(self, expected_root, registered_identities, silence_allowlist):
+    def __init__(self, expected_root, registered_identities, silence_allowlist, registered_agents=()):
         self.root = os.path.realpath(os.fspath(expected_root))
         self.registered_realpaths = set(registered_identities)
         self.registered_paths_by_inode: dict[tuple[int, int], set[str]] = {}
@@ -913,6 +918,7 @@ class _FilesystemLayoutInspector:
         self._agent_child_identities: dict[str, dict[str, tuple[int, int] | None]] = {}
         self._registered_ancestor_identities: set[tuple[int, int]] | None = None
         self.scope: str | None = None
+        self.registered_agents = frozenset(registered_agents)
 
     def inspect(self) -> LayoutInspection:
         start = os.path.join(self.root, "agents", self.scope) if self.scope else self.root
@@ -950,6 +956,10 @@ class _FilesystemLayoutInspector:
                 self._outside_root("directory", directory, resolved_directory)
                 continue
             if self.scope and not self._in_selected_scope(resolved_directory):
+                self.warnings.append(
+                    "could not inspect directory outside selected storage scope; "
+                    f"skipping: path={directory!r} resolved_path={resolved_directory!r}"
+                )
                 continue
             directory_identity = (directory_stat.st_dev, directory_stat.st_ino)
             relative_directory = os.path.relpath(resolved_directory, self.root).replace(os.sep, "/")
@@ -1220,7 +1230,7 @@ class _FilesystemLayoutInspector:
         )
 
     def _record_finding(self, finding) -> None:
-        scope = storage_hold_scope(self.root, finding)
+        scope = storage_hold_scope(self.root, finding, self.registered_agents)
         if scope is not None:
             finding = {**finding, "scope": scope}
         self.findings.append(finding)
@@ -1715,7 +1725,9 @@ class StoreCatalog:
                     if observation is not entry.observation
                 ]
 
-    def validate(self, *, scoped_hold: bool = False) -> list[str] | StorageReconciliation:
+    def validate(
+        self, *, scoped_hold: bool = False, registered_agents: Collection[str] = (),
+    ) -> list[str] | StorageReconciliation:
         """Raise for an unsafe layout and return filesystem hygiene warnings."""
         with self._lock:
             self._require_observations_unchanged()
@@ -1795,7 +1807,9 @@ class StoreCatalog:
 
         for warning in warnings:
             logger.warning("STORE CATALOG WARNING: %s", warning)
-        result = self.reconcile_filesystem(scoped_hold=scoped_hold)
+        result = self.reconcile_filesystem(
+            scoped_hold=scoped_hold, registered_agents=registered_agents,
+        )
         if scoped_hold:
             return StorageReconciliation([*warnings, *result.warnings], result.holds)
         return [*warnings, *result]
@@ -2122,7 +2136,9 @@ class StoreCatalog:
             raise error from detail
         raise error
 
-    def inspect_layout(self, *, scope: str | None = None) -> LayoutInspection:
+    def inspect_layout(
+        self, *, scope: str | None = None, registered_agents: Collection[str] = (),
+    ) -> LayoutInspection:
         """Inspect current metadata without refreshing records or logging warnings."""
         with self._lock:
             paths = [
@@ -2134,11 +2150,15 @@ class StoreCatalog:
             self._expected_root,
             read_store_identities(paths),
             silence_allowlist=allowlist,
+            registered_agents=registered_agents,
             **({"scope": scope} if scope is not None else {}),
         )
 
-    def reconcile_filesystem(self, *, scoped_hold: bool = False) -> list[str] | StorageReconciliation:
+    def reconcile_filesystem(
+        self, *, scoped_hold: bool = False, registered_agents: Collection[str] = (),
+    ) -> list[str] | StorageReconciliation:
         """Raise legacy layout errors and log filesystem hygiene warnings."""
+        registered_agents = frozenset(registered_agents)
         with self._lock:
             self._require_observations_unchanged()
             self._refresh_identities()
@@ -2149,7 +2169,8 @@ class StoreCatalog:
             allowlist = dict(self._silence_allowlist)
 
         report = inspect_filesystem_layout(
-            self._expected_root, identities, silence_allowlist=allowlist
+            self._expected_root, identities, silence_allowlist=allowlist,
+            registered_agents=registered_agents,
         )
         self._skipped_unmanaged_subtrees = report.skipped_unmanaged_subtrees
         self._layout_log(
@@ -2157,7 +2178,7 @@ class StoreCatalog:
         )
         # Traversal failures preceded deferred inode-alias checks historically.
         holds = [finding for finding in report.findings
-                 if scoped_hold and storage_hold_scope(self._expected_root, finding) == finding.get("scope")
+                 if scoped_hold and storage_hold_scope(self._expected_root, finding, registered_agents) == finding.get("scope")
                  and finding.get("scope")]
         fatal = [finding for finding in report.findings if finding not in holds]
         for finding in fatal:
