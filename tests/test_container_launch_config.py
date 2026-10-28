@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import itertools
-import json
 import shlex
 import sys
 from types import SimpleNamespace
