@@ -1204,8 +1204,8 @@ def test_active_account_name_is_reserved_for_command_and_direct_writes(
     store, monkeypatch, capsys, name,
 ):
     _seed_account(store, token=_ACTIVE_NEW)
-    mirror = _active_file(store)
-    before = _active_state(mirror)
+    _active_file(store)
+    before = _active_snapshot(store)
     assert not ca.valid_name(name)
 
     def no_prompt(*args):
@@ -1214,9 +1214,32 @@ def test_active_account_name_is_reserved_for_command_and_direct_writes(
     monkeypatch.setattr(ca.getpass, "getpass", no_prompt)
     rc, _ = _active_run(capsys, "add", name)
     assert rc == 2
+    assert _active_snapshot(store) == before
     with pytest.raises(SystemExit):
         ca.write_token(name, _ACTIVE_NEW)
-    assert _active_state(mirror) == before
+    assert _active_snapshot(store) == before
+
+
+@pytest.mark.parametrize("name", ["AcTiVe", "../invalid"], ids=["reserved", "invalid"])
+@pytest.mark.parametrize("command", ["add", "switch", "remove"])
+@pytest.mark.parametrize("initial", ["missing", "permissive"])
+def test_invalid_named_command_preserves_whole_store_before_refusal(
+    store, monkeypatch, capsys, name, command, initial,
+):
+    write_env(store["env"], "OTHER=fixture\n")
+    if initial == "permissive":
+        store["accounts"].mkdir(mode=0o755)
+        store["accounts"].chmod(0o755)
+    before = _active_snapshot(store)
+
+    def no_prompt(*args):
+        raise AssertionError("An invalid account name must be rejected before prompting")
+
+    monkeypatch.setattr(ca.getpass, "getpass", no_prompt)
+    rc, output = _active_run(capsys, command, name)
+    assert rc == 2
+    assert "invalid name" in output.err
+    assert _active_snapshot(store) == before
 
 
 @pytest.mark.parametrize("name", ["active", "Active", "ACTIVE"])
