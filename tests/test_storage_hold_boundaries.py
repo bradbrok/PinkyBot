@@ -181,6 +181,46 @@ def test_retired_registered_name_does_not_make_its_outward_link_eligible(tmp_pat
         catalog.close()
 
 
+def test_active_scopes_remain_independent_during_full_and_scoped_inspection(tmp_path):
+    root = tmp_path / "root"
+    for name in ("first", "second"):
+        directory = root / "agents" / name / "data"
+        directory.mkdir(parents=True)
+        outside = tmp_path / (name + "-outside")
+        outside.mkdir()
+        (directory / "escape").symlink_to(outside, target_is_directory=True)
+    catalog = stores.StoreCatalog(expected_root=root, silence_allowlist={})
+    names = {"first", "second"}
+    try:
+        result = reconcile(catalog, names)
+        assert {row["scope"] for row in result.holds} == names
+        for name in sorted(names):
+            report = catalog.inspect_layout(
+                scope=name, **registered_kwargs(catalog.inspect_layout, names),
+            )
+            assert len(report.findings) == 1 and report.warnings == []
+            assert report.findings[0]["scope"] == name
+            assert report.findings[0]["path"] == str(root / "agents" / name / "data/escape")
+    finally:
+        catalog.close()
+
+
+def test_registered_hold_cannot_hide_an_unscoped_fatal_finding(tmp_path):
+    root = tmp_path / "root"
+    directory = root / "agents" / "first" / "data"
+    directory.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (directory / "escape").symlink_to(outside, target_is_directory=True)
+    (root / "unscoped").symlink_to(outside, target_is_directory=True)
+    catalog = stores.StoreCatalog(expected_root=root, silence_allowlist={})
+    try:
+        with pytest.raises(stores.StoreCatalogError, match="symlink escapes"):
+            reconcile(catalog, {"first"})
+    finally:
+        catalog.close()
+
+
 def relocated_layout(tmp_path):
     root = tmp_path / "root"
     directory = root / "agents" / "first" / "data"

@@ -960,3 +960,33 @@ async def test_relocated_in_root_directory_keeps_recheck_incomplete_and_hold_int
     assert any(warning.startswith("could not inspect") for warning in body["warnings"])
     assert h.app.state.storage_holds == before_hold
     assert full_report() == before_full
+
+
+async def test_retired_subject_outward_link_is_fatal_on_fresh_application(held_subject, monkeypatch):
+    from pinky_daemon import api
+    from pinky_daemon.store_catalog import StoreCatalogError
+
+    h = held_subject
+    assert h.app.state.agents.retire("sample")
+    root = Path(h.app.state.store_catalog.expected_root)
+    h.app.state.agents._fire_trace.close()
+    h.app.state.store_catalog.shutdown(deadline_seconds=10)
+    constructor = api.AgentRegistry
+    created = []
+
+    def record_registry(*args, **kwargs):
+        registry = constructor(*args, **kwargs)
+        created.append(registry)
+        return registry
+
+    monkeypatch.setattr(api, "AgentRegistry", record_registry)
+    rejected = False
+    try:
+        api.create_api(db_path=str(root / "api.db"), default_working_dir=str(root))
+    except StoreCatalogError:
+        rejected = True
+    finally:
+        for registry in created:
+            registry._fire_trace.close()
+            registry._catalog.shutdown(deadline_seconds=10)
+    assert rejected, "A hold on a retired subject cannot replace a fatal startup finding"
