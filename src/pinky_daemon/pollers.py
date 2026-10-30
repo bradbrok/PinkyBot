@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 from pinky_daemon import purchase_approval
 from pinky_daemon.message_handler import InboundMessage, MessageHandler
+from pinky_outreach.buttons import CALLBACK_DATA_PATTERN
 from pinky_outreach.discord import DiscordAdapter, DiscordError, DiscordRateLimited
 from pinky_outreach.slack import (
     BUTTON_ACTION_PREFIX,
@@ -1845,7 +1846,7 @@ class BrokerSlackPoller:
         action_id = action.get("action_id")
         if not isinstance(action_id, str) or not action_id.startswith(BUTTON_ACTION_PREFIX):
             raise ValueError("action_id")
-        data = token(action_id[len(BUTTON_ACTION_PREFIX):], r"[A-Za-z0-9_:-]{1,64}", "data")
+        data = token(action_id[len(BUTTON_ACTION_PREFIX):], CALLBACK_DATA_PATTERN, "data")
         if action.get("value") != data:
             raise ValueError("value")
         if action.get("block_id") != BUTTON_BLOCK_ID:

@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 
 import httpx
 
+from pinky_outreach.buttons import CALLBACK_DATA_PATTERN
 from pinky_outreach.types import Chat, Message, Platform
 
 CALLBACK_ANSWER_BUDGET = 10.0
@@ -703,7 +704,7 @@ class TelegramAdapter:
         if "data" not in cq:
             return None
         data = cq["data"]
-        if not isinstance(data, str) or re.fullmatch(r"[A-Za-z0-9_:-]{1,64}", data) is None:
+        if not isinstance(data, str) or re.fullmatch(CALLBACK_DATA_PATTERN, data) is None:
             return None
         callback_id = cq.get("id")
         if not isinstance(callback_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", callback_id) is None:

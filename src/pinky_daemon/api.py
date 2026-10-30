@@ -301,6 +301,7 @@ from pinky_daemon.tool_policy_store import ToolPolicyStore
 from pinky_daemon.transport_state import SessionState as TransportSessionState
 from pinky_daemon.trigger_store import TriggerStore
 from pinky_daemon.wake_prompt import WakeReason
+from pinky_outreach.buttons import CALLBACK_DATA_PATTERN
 from pinky_outreach.telegram import TelegramError
 
 # Feature flag: shared MCP mode uses a single HTTP/SSE server instead of per-agent stdio
@@ -2615,7 +2616,7 @@ def create_api(
             if any(unicodedata.category(char) in ("Cc", "Zl", "Zp") for char in text):
                 raise ValueError("text contains a control character")
             data = button.get("data")
-            if not isinstance(data, str) or re.fullmatch(r"[A-Za-z0-9_:-]{1,64}", data) is None:
+            if not isinstance(data, str) or re.fullmatch(CALLBACK_DATA_PATTERN, data) is None:
                 raise ValueError("invalid callback data")
             if data == CALLBACK_CHOSEN_MARKER:
                 raise ValueError("reserved callback data")
