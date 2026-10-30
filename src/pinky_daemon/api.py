@@ -2093,6 +2093,43 @@ def _derive_standalone_tenant_store_manifest(
     return derive_standalone_tenant_store_manifest_for_agent(agent_name)
 
 
+def _redact_token_settings(token_row: dict) -> dict:
+    """Copy a response token row without exposing secret settings values."""
+    result = dict(token_row)
+    if "settings" not in result:
+        return result
+    settings = result["settings"]
+    serialized = isinstance(settings, str)
+    if serialized:
+        try:
+            settings = json.loads(settings)
+        except (ValueError, RecursionError):
+            result["settings"] = "unreadable"
+            return result
+
+    def redact(value):
+        if isinstance(value, dict):
+            redacted = {}
+            for key, item in value.items():
+                name = key.lower()
+                secret = (
+                    "token" in name
+                    or "secret" in name
+                    or "password" in name
+                    or "credential" in name
+                    or name.endswith("key")
+                )
+                redacted[key] = ("set" if item else item) if secret else redact(item)
+            return redacted
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        return value
+
+    settings = redact(settings)
+    result["settings"] = json.dumps(settings) if serialized else settings
+    return result
+
+
 def create_api(
     *,
     max_sessions: int = 50,
@@ -6275,6 +6312,7 @@ def create_api(
         admin_action = path == "/admin" or path.startswith("/admin/")
         admin_action = admin_action or (request.method == "POST" and path.rstrip("/") == "/agents")
         admin_action = admin_action or path == "/models/roster" or path.startswith("/models/roster/")
+        admin_action = admin_action or path in ("/system/all-tokens", "/system/all-tokens/")
         if admin_action:
             try:
                 caller = agents.get(caller_name)
@@ -8300,7 +8338,7 @@ npm run build</pre>
     @app.get("/system/all-tokens")
     async def list_all_tokens():
         """List all agent bot tokens across all agents."""
-        return {"tokens": agents.list_all_tokens()}
+        return {"tokens": [_redact_token_settings(token) for token in agents.list_all_tokens()]}
 
     @app.get("/system/all-approved-users")
     async def list_all_approved_users():
@@ -10866,7 +10904,7 @@ npm run build</pre>
             except Exception as e:
                 _log(f"api: failed to start discord poller for {name}: {e}")
 
-        return token.to_dict()
+        return _redact_token_settings(token.to_dict())
 
     @app.get("/agents/{name}/tokens")
     async def list_agent_tokens(name: str):
@@ -10874,7 +10912,11 @@ npm run build</pre>
         if not agents.get(name):
             raise HTTPException(404, f"Agent '{name}' not found")
         result = agents.list_tokens(name)
-        return {"agent": name, "tokens": [t.to_dict() for t in result], "count": len(result)}
+        return {
+            "agent": name,
+            "tokens": [_redact_token_settings(t.to_dict()) for t in result],
+            "count": len(result),
+        }
 
     @app.delete("/agents/{name}/tokens/{platform}")
     async def remove_agent_token(name: str, platform: str):
