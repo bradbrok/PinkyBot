@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time as wall_time
 from collections import deque
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
 from urllib.parse import parse_qs
@@ -14,6 +15,7 @@ from urllib.parse import parse_qs
 import httpx
 import pytest
 
+from pinky_daemon import broker as broker_module
 from pinky_daemon.auth import build_internal_auth_headers
 from pinky_messaging.server import create_server
 from pinky_outreach import slack as slack_module
@@ -290,6 +292,218 @@ def test_reordered_completed_sends_are_deduped(group):
     first = responses[0].json()
     assert first["chat_id"] == GROUP and first.get("group_dm_users") == USERS
     assert all(response.json() == {**first, "deduped": True} for response in responses[1:])
+
+
+class _BrokerClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def __getattr__(self, name):
+        return getattr(wall_time, name)
+
+
+def _slow_post(group, monkeypatch, seconds, *, blocked=False, outcome="success"):
+    state = SimpleNamespace(clock=_BrokerClock(), entered=threading.Event(),
+                            release=threading.Event(), returned=threading.Event(), message_id=None)
+    monkeypatch.setattr(broker_module, "time", state.clock)
+    assert group.gateway.broker._dedupe_window == 45.0
+    group.before_open = lambda: state.clock.advance(25)
+    transport = group.adapter._client._transport
+    original = transport.handler
+    posts = 0
+
+    def response(request):
+        nonlocal posts
+        result = original(request)
+        if request.url.path.endswith("/chat.postMessage"):
+            posts += 1
+            if posts == 1:
+                state.message_id = result.json()["message"]["ts"]
+                state.clock.advance(seconds)
+                state.entered.set()
+                try:
+                    if blocked:
+                        assert state.release.wait(5), "fixture post must be released"
+                    if outcome == "error":
+                        return httpx.Response(200, json={"ok": False, "error": "fixture_error"})
+                    if outcome == "cancelled":
+                        raise asyncio.CancelledError()
+                finally:
+                    state.returned.set()
+        return result
+
+    monkeypatch.setattr(transport, "handler", response)
+    return state
+
+
+@asynccontextmanager
+async def _pending_post(group, monkeypatch, seconds, *, target=TARGET, outcome="success", extra=None):
+    state = _slow_post(group, monkeypatch, seconds, blocked=True, outcome=outcome)
+    state.extra = extra or {}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=group.gateway.app),
+                                base_url="http://fixture") as client:
+        state.client = client
+        state.first = asyncio.create_task(client.post(
+            "/broker/send", json=_body(target, **state.extra), headers=_headers(group)))
+        try:
+            assert await asyncio.to_thread(state.entered.wait, 2), "first post must start"
+            yield state
+        finally:
+            state.release.set()
+            await asyncio.gather(state.first, return_exceptions=True)
+            assert await asyncio.to_thread(state.returned.wait, 2), "fixture worker must finish"
+            await asyncio.sleep(0)
+
+
+async def _retry(group, state, target=CANONICAL):
+    response = await asyncio.wait_for(state.client.post(
+        "/broker/send", json=_body(target, **state.extra), headers=_headers(group)), 2)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _placeholder():
+    return {"sent": True, "deduped": True, "agent": "sample", "platform": "slack",
+            "chat_id": CANONICAL, "message_id": None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra", [{}, {"reply_to": "1700000000.000001", "buttons": BUTTONS}],
+                         ids=["plain", "threaded-card"])
+async def test_slow_group_inflight_retry_at_46_seconds_posts_once(group, monkeypatch, extra):
+    async with _pending_post(group, monkeypatch, 21, extra=extra) as state:
+        assert state.clock.now == 1046
+        assert await _retry(group, state) == _placeholder()
+        assert len(_calls(group, "conversations.open")) == 1
+        assert len(_calls(group, "chat.postMessage")) == 1
+        assert len(getattr(group.gateway.broker, "_outbound_delivery_tasks", ())) == 1
+        state.release.set()
+        original = await state.first
+        assert original.status_code == 200, original.text
+        assert len(getattr(group.gateway.broker, "_outbound_delivery_tasks", ())) == 0
+        assert await _retry(group, state) == {**original.json(), "deduped": True}
+
+
+def test_slow_group_retry_two_seconds_after_delivery_returns_original(group, monkeypatch):
+    state = _slow_post(group, monkeypatch, 19)
+    original = _post(group)
+    assert original.status_code == 200, original.text
+    state.clock.advance(2)
+    duplicate = _post(group, CANONICAL)
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json() == {**original.json(), "deduped": True}
+    assert duplicate.json().get("message_id") == state.message_id
+    assert duplicate.json().get("group_dm_users") == USERS
+    assert len(_calls(group, "chat.postMessage")) == 1
+
+
+def test_group_retry_window_ends_after_completion(group, monkeypatch):
+    state = _slow_post(group, monkeypatch, 19)
+    original = _post(group)
+    assert original.status_code == 200, original.text
+    state.clock.advance(46)
+    retry = _post(group, CANONICAL)
+    assert retry.status_code == 200, retry.text
+    assert retry.json().get("deduped") is None
+    assert retry.json().get("message_id") != original.json().get("message_id")
+    assert len(_calls(group, "chat.postMessage")) == 2
+    group.gateway.broker._dedupe_window = 0
+    assert _post(group, content="Unreserved message").status_code == 200
+    assert _post(group, content="Unreserved message").status_code == 200
+    assert len(_calls(group, "chat.postMessage")) == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "error", "cancelled"])
+@pytest.mark.parametrize("extra", [{}, {"reply_to": "1700000000.000001", "buttons": BUTTONS}],
+                         ids=["plain", "threaded-card"])
+async def test_cancelled_group_caller_settles_when_worker_finishes(group, monkeypatch, outcome, extra):
+    broker = group.gateway.broker
+    async with _pending_post(group, monkeypatch, 15 if outcome == "success" else 1,
+                             outcome=outcome, extra=extra) as state:
+        state.first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await state.first
+        assert await _retry(group, state) == _placeholder()
+        assert len(_calls(group, "chat.postMessage")) == 1
+        state.clock.advance(10 if outcome == "success" else 2)
+        state.release.set()
+        assert await asyncio.to_thread(state.returned.wait, 2)
+        for _ in range(200):
+            entries = list(broker._recent_sends.values())
+            entry = entries[0] if entries else None
+            settled = (entry is not None and entry.get("result") is not None) if outcome == "success" else entry is None
+            if settled:
+                break
+            await asyncio.sleep(0.005)
+        assert settled, "cancelled caller's reservation must settle with its worker"
+        assert len(getattr(broker, "_outbound_delivery_tasks", ())) == 0
+        state.clock.advance(2)
+        retry = await _retry(group, state)
+        if outcome == "success":
+            assert retry.get("deduped") is True
+            assert retry.get("message_id") == state.message_id
+            assert retry.get("group_dm_users") == USERS
+            assert retry.get("chat_id") == GROUP
+            assert len(_calls(group, "chat.postMessage")) == 1
+            record = group.gateway.app.state.conversation_store.get_history("sample-main")[-1]
+            assert record.chat_id == GROUP and record.metadata.get("group_dm_users") == USERS
+            assert record.metadata["delivery"] == retry
+        else:
+            assert retry.get("deduped") is None
+            assert retry.get("message_id") != state.message_id
+            assert len(_calls(group, "chat.postMessage")) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "error"])
+async def test_group_inflight_cap_expires_and_late_worker_keeps_new_result(group, monkeypatch, outcome):
+    async with _pending_post(group, monkeypatch, 21, outcome=outcome) as state:
+        state.clock.advance(599.5 - 46)
+        assert await _retry(group, state) == _placeholder()
+        state.clock.advance(1.5)
+        newer = await _retry(group, state)
+        assert newer.get("deduped") is None
+        assert newer.get("message_id") != state.message_id
+        assert len(_calls(group, "chat.postMessage")) == 2
+        state.release.set()
+        original = await state.first
+        assert original.status_code == (200 if outcome == "success" else 502), original.text
+        assert await _retry(group, state, TARGET) == {**newer, "deduped": True}
+        assert len(_calls(group, "chat.postMessage")) == 2
+
+
+@pytest.mark.asyncio
+async def test_single_id_slow_inflight_send_pins_existing_expiry_behavior(group, monkeypatch):
+    async with _pending_post(group, monkeypatch, 46, target="U0AAAA111") as state:
+        retry = await _retry(group, state, "U0AAAA111")
+        assert retry.get("deduped") is None
+        assert len(_calls(group, "conversations.open")) == 0
+        assert len(_calls(group, "chat.postMessage")) == 2
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.asyncio
+async def test_single_id_completion_pins_existing_start_based_expiry(group, monkeypatch, cancelled):
+    async with _pending_post(group, monkeypatch, 44, target="U0AAAA111") as state:
+        if cancelled:
+            state.first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await state.first
+        state.release.set()
+        assert await asyncio.to_thread(state.returned.wait, 2)
+        if not cancelled:
+            assert (await state.first).status_code == 200
+        state.clock.advance(2)
+        retry = await _retry(group, state, "U0AAAA111")
+        assert retry.get("deduped") is None
+        assert len(_calls(group, "chat.postMessage")) == 2
 
 
 @pytest.mark.asyncio

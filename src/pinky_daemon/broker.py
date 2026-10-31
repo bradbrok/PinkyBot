@@ -39,6 +39,9 @@ from pinky_daemon.transport_state import SessionState
 _INBOUND_RECONNECT_WAIT_SEC = 20.0
 _INBOUND_RECONNECT_POLL_SEC = 0.25
 
+# Bound reservations for deliveries that remain in flight beyond the retry window.
+_OUTBOUND_INFLIGHT_MAX_SEC = 600.0
+
 # #863 approval-notification policy. A delivered request is re-notified after
 # four hours OR ten newly held messages, whichever arrives first. Failures retry
 # exponentially (30s..30m) and become operator-visible terminal ``failed`` after
@@ -277,6 +280,7 @@ class MessageBroker:
         except (TypeError, ValueError):
             self._dedupe_window = 45.0
         self._recent_sends: dict[tuple, dict] = {}
+        self._outbound_delivery_tasks: set[asyncio.Task] = set()
 
         # Optional callback to ensure (start/resume) a streaming session on
         # demand. Wired by api.py after `_ensure_streaming_session` is
@@ -425,7 +429,13 @@ class MessageBroker:
         if now is None:
             now = time.monotonic()
         window = self._dedupe_window
-        expired = [k for k, v in self._recent_sends.items() if now - v["ts"] > window]
+        expired = [
+            k for k, v in self._recent_sends.items()
+            if now - v["ts"] > (
+                _OUTBOUND_INFLIGHT_MAX_SEC
+                if v.get("completion_window") and v["result"] is None else window
+            )
+        ]
         for k in expired:
             del self._recent_sends[k]
 
@@ -497,6 +507,8 @@ class MessageBroker:
         entry = self._recent_sends.get(key)
         if entry is not None:
             entry["result"] = result
+            if entry.get("completion_window"):
+                entry["ts"] = time.monotonic()
 
     def clear_outbound(
         self,
@@ -523,6 +535,7 @@ class MessageBroker:
         *,
         reply_to: str = "",
         key_extra: str = "",
+        completion_window: bool = False,
     ) -> dict:
         """Run ``deliver`` at most once per dedupe window.
 
@@ -531,7 +544,11 @@ class MessageBroker:
         within the window are suppressed and the original result is returned
         (carrying ``"deduped": True``).
 
-        Failure handling is deliberate (issue #113):
+        ``completion_window`` retains the reservation through delivery (up to
+        the safety cap), then measures the retry window from completion. Its
+        delivery task also settles the reservation after caller cancellation.
+
+        Default failure handling is deliberate (issue #113):
 
         * A delivery *failure* (``Exception``) releases the reservation so a
           genuine retry is not mistaken for a duplicate and silently dropped.
@@ -546,6 +563,33 @@ class MessageBroker:
         )
         if dup is not None:
             return dup
+        if completion_window:
+            key = self._dedupe_key(agent_name, platform, chat_id, content, reply_to, key_extra)
+            reservation = self._recent_sends.get(key)
+            if reservation is not None:
+                reservation["completion_window"] = True
+            task = asyncio.create_task(deliver())
+            self._outbound_delivery_tasks.add(task)
+
+            def settle(completed: asyncio.Task) -> None:
+                self._outbound_delivery_tasks.discard(completed)
+                try:
+                    result = completed.result()
+                except BaseException:
+                    if self._recent_sends.get(key) is reservation:
+                        self.clear_outbound(
+                            agent_name, platform, chat_id, content,
+                            reply_to=reply_to, key_extra=key_extra,
+                        )
+                else:
+                    if self._recent_sends.get(key) is reservation:
+                        self.finalize_outbound(
+                            agent_name, platform, chat_id, content, result,
+                            reply_to=reply_to, key_extra=key_extra,
+                        )
+
+            task.add_done_callback(settle)
+            return await asyncio.shield(task)
         try:
             result = await deliver()
         except Exception:

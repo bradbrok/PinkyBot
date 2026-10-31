@@ -3079,6 +3079,7 @@ def create_api(
         return await broker.deliver_deduped(
             agent_name, platform, dedupe_chat_id, content, _deliver,
             reply_to=reply_to, key_extra=key_extra,
+            **({"completion_window": True} if group_dm_users is not None else {}),
         )
 
     async def _broker_react(
