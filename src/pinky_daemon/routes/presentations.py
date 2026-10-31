@@ -471,7 +471,12 @@ async def render_pdf(req: dict):
     if not content:
         raise HTTPException(400, "content is required")
 
-    from pinky_daemon.research_export import _HTML_TEMPLATE, EXPORT_DIR, _markdown_to_html
+    from pinky_daemon.research_export import (
+        _HTML_TEMPLATE,
+        EXPORT_DIR,
+        _markdown_to_html,
+        _pdf_url_fetcher,
+    )
 
     html_body = _markdown_to_html(content)
     html_str = _HTML_TEMPLATE.format(title=title, body=html_body)
@@ -509,7 +514,7 @@ async def render_pdf(req: dict):
             if not same_directory:
                 raise HTTPException(400, "invalid filename")
         from weasyprint import HTML as WP_HTML
-        WP_HTML(string=html_str).write_pdf(path)
+        WP_HTML(string=html_str, url_fetcher=_pdf_url_fetcher()).write_pdf(path)
     except HTTPException:
         raise
     except ImportError:

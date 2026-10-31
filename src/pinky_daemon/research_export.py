@@ -11,6 +11,7 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
+from importlib import import_module
 
 EXPORT_DIR = "data/exports"
 
@@ -314,6 +315,31 @@ def export_brief_html(
     return path
 
 
+def _pdf_url_fetcher():
+    """Return a WeasyPrint resource fetcher that loads only inline ``data:`` URIs.
+
+    Markdown passes raw HTML through, so without this a document could point
+    the renderer at local files or internal URLs. Any other resource is
+    skipped: WeasyPrint logs a warning and renders the PDF without it.
+    Raises ImportError when WeasyPrint is not installed.
+    """
+    weasyprint_urls = import_module("weasyprint.urls")
+
+    fetcher_class = getattr(weasyprint_urls, "URLFetcher", None)
+    if fetcher_class is not None:
+        return fetcher_class(allowed_protocols={"data"}, allow_redirects=False)
+
+    # Older WeasyPrint releases take a plain function instead of a URLFetcher.
+    default_url_fetcher = weasyprint_urls.default_url_fetcher
+
+    def fetch(url, *args, **kwargs):
+        if not str(url).lower().startswith("data:"):
+            raise ValueError("PDF exports load inline data: resources only")
+        return default_url_fetcher(url, *args, **kwargs)
+
+    return fetch
+
+
 def export_brief_pdf(
     topic: dict,
     brief: dict,
@@ -337,7 +363,7 @@ def export_brief_pdf(
     path = os.path.join(EXPORT_DIR, filename)
 
     from weasyprint import HTML
-    HTML(string=html).write_pdf(path)
+    HTML(string=html, url_fetcher=_pdf_url_fetcher()).write_pdf(path)
 
     _log(f"research-export: wrote PDF to {path}")
     return path
