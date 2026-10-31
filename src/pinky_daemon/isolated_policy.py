@@ -43,15 +43,17 @@ ISOLATED_READ_PENDING = frozenset({
     ("GET", "/api/voice/sessions"),
 })
 
-# GET routes whose whole answer is already filtered to what the signed caller
-# may see (task reads are scoped server-side). The read diagnostics log nothing
-# for these, since a scoped read would not be refused.
+# GET routes whose handler already filters or authorizes the whole answer
+# against the signed caller (task reads are scoped to the caller; a skill's
+# refresh audit is refused unless the caller is assigned or the delegate). The
+# read diagnostics log nothing for these.
 ISOLATED_READ_SCOPED = frozenset({
     ("GET", "/tasks"),
     ("GET", "/tasks/stats"),
     ("GET", "/tasks/next"),
     ("GET", "/tasks/{task_id}"),
     ("GET", "/tasks/{task_id}/comments"),
+    ("GET", "/skills/{name}/refresh-audit"),
 })
 
 

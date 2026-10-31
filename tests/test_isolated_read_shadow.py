@@ -35,6 +35,7 @@ SCOPED_CASES = [
     ("/tasks/next", "/tasks/next"),
     ("/tasks/{task_id}", "/tasks/987654"),
     ("/tasks/{task_id}/comments", "/tasks/987654/comments"),
+    ("/skills/{name}/refresh-audit", "/skills/missing-skill/refresh-audit"),
 ]
 UNLISTED_CASES = [
     ("/system/primary-user", "/system/primary-user"),
@@ -593,13 +594,65 @@ def test_scoped_entries_are_existing_get_templates_and_not_pending(daemon):
 
 
 def test_scoped_routes_filter_by_the_signed_caller():
-    from pinky_daemon.routes import projects_tasks
+    from pinky_daemon.routes import projects_tasks, skills
 
+    marks = {
+        projects_tasks: "_task_read_scope(request)",
+        skills: 'getattr(request.state, "internal_caller", "")',
+    }
     handlers = {
-        route.path: route.endpoint
-        for route in projects_tasks.router.routes
+        route.path: (module, route.endpoint)
+        for module in marks
+        for route in module.router.routes
         if "GET" in (getattr(route, "methods", None) or ())
     }
     for _, template in policy.ISOLATED_READ_SCOPED:
-        source = inspect.getsource(handlers[template])
-        assert "_task_read_scope(request)" in source, template
+        module, handler = handlers[template]
+        assert marks[module] in inspect.getsource(handler), template
+
+
+AUDIT_SKILL = "review-audit-fixture"
+AUDIT_PATH = f"/skills/{AUDIT_SKILL}/refresh-audit"
+
+
+def _refresh_audit_reader(daemon, monkeypatch, flag_state, access):
+    d = daemon()
+    d.skills.register(AUDIT_SKILL, skill_type="skill", origin_agent="peer")
+    d.skills.record_refresh_audit(
+        AUDIT_SKILL, actor="peer", path="put", approval_ref="fixture-approval",
+        before_hash="a" * 64, after_hash="b" * 64, fields=["directive"],
+    )
+    if access == "assigned":
+        assert d.skills.assign_to_agent("tenant", AUDIT_SKILL)
+    elif access == "delegate":
+        d.skills.set_refresh_delegate(AUDIT_SKILL, "tenant")
+    original = d.agents.get
+
+    def lookup(name):
+        if name == "tenant" and flag_state == "missing":
+            return None
+        if name == "tenant" and flag_state == "error":
+            raise RuntimeError("private-registry-marker")
+        return original(name)
+
+    monkeypatch.setattr(d.agents, "get", lookup)
+    return d
+
+
+@pytest.mark.parametrize("access", ["assigned", "delegate"])
+@pytest.mark.parametrize("flag_state", ["isolated", "missing", "error"])
+def test_authorized_refresh_audit_reads_log_nothing(daemon, monkeypatch, logs, access, flag_state):
+    d = _refresh_audit_reader(daemon, monkeypatch, flag_state, access)
+    response = _unchanged_read(d, monkeypatch, logs, AUDIT_PATH, read_mode="shadow")
+    assert response.status_code == 200
+    assert [row["approval_ref"] for row in response.json()["audit"]] == ["fixture-approval"]
+    assert _read_lines(logs) == []
+
+
+@pytest.mark.parametrize("flag_state", ["isolated", "missing", "error"])
+def test_unauthorized_refresh_audit_reads_stay_refused(daemon, monkeypatch, logs, flag_state):
+    d = _refresh_audit_reader(daemon, monkeypatch, flag_state, "none")
+    response = _unchanged_read(d, monkeypatch, logs, AUDIT_PATH, read_mode="shadow")
+    assert response.status_code == 403
+    assert "fixture-approval" not in response.text
+    assert _read_lines(logs) == []
