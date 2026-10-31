@@ -35,7 +35,9 @@ def renderer(tmp_path, monkeypatch):
             writes.append(target)
 
     monkeypatch.setattr(research_export, 'EXPORT_DIR', str(export))
-    monkeypatch.setitem(sys.modules, 'weasyprint', SimpleNamespace(HTML=PDF))
+    monkeypatch.setitem(sys.modules, 'weasyprint', SimpleNamespace(HTML=PDF, __version__='70.0'))
+    monkeypatch.setitem(sys.modules, 'weasyprint.urls',
+                        SimpleNamespace(URLFetcher=lambda **kwargs: kwargs))
     app = FastAPI()
     app.include_router(router)
     client = TestClient(app)

@@ -11,6 +11,7 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
+from importlib import import_module
 
 EXPORT_DIR = "data/exports"
 
@@ -314,6 +315,51 @@ def export_brief_html(
     return path
 
 
+PDF_RENDERER_MIN_VERSION = (70, 0)
+
+
+class PdfRendererUnavailableError(ImportError):
+    """WeasyPrint is missing or too old to render with the restricted fetcher."""
+
+
+def _version_tuple(value: object) -> tuple[int, ...]:
+    parts = []
+    for piece in str(value).split("."):
+        digits = re.match(r"\d+", piece)
+        if not digits:
+            break
+        parts.append(int(digits.group()))
+    return tuple(parts)
+
+
+def _pdf_url_fetcher():
+    """Return a WeasyPrint resource fetcher that loads only inline ``data:`` URIs.
+
+    Markdown passes raw HTML through, so without this a document could point
+    the renderer at local files or internal URLs. Any other resource is
+    skipped: WeasyPrint logs a warning and renders the PDF without it.
+
+    Older WeasyPrint releases load some resources (attachments) without asking
+    the fetcher, so anything below PDF_RENDERER_MIN_VERSION is refused rather
+    than rendered unrestricted. Raises PdfRendererUnavailableError (an ImportError)
+    when WeasyPrint is missing or too old.
+    """
+    try:
+        weasyprint = import_module("weasyprint")
+        weasyprint_urls = import_module("weasyprint.urls")
+    except ImportError as exc:
+        raise PdfRendererUnavailableError("WeasyPrint not installed — cannot render PDFs") from exc
+    version = getattr(weasyprint, "__version__", "")
+    fetcher_class = getattr(weasyprint_urls, "URLFetcher", None)
+    if fetcher_class is None or _version_tuple(version)[:2] < PDF_RENDERER_MIN_VERSION:
+        wanted = ".".join(map(str, PDF_RENDERER_MIN_VERSION))
+        raise PdfRendererUnavailableError(
+            f"WeasyPrint {wanted} or newer is required to render PDFs safely "
+            f"(found {str(version)[:20] or 'unknown'})"
+        )
+    return fetcher_class(allowed_protocols={"data"}, allow_redirects=False)
+
+
 def export_brief_pdf(
     topic: dict,
     brief: dict,
@@ -336,8 +382,9 @@ def export_brief_pdf(
     filename = f"{topic['id']}_{slug}_{ts}.pdf"
     path = os.path.join(EXPORT_DIR, filename)
 
+    url_fetcher = _pdf_url_fetcher()
     from weasyprint import HTML
-    HTML(string=html).write_pdf(path)
+    HTML(string=html, url_fetcher=url_fetcher).write_pdf(path)
 
     _log(f"research-export: wrote PDF to {path}")
     return path
