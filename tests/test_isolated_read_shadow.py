@@ -22,14 +22,19 @@ PENDING_CASES = [
     ("/agents", "/agents"),
     ("/settings/owner-profile", "/settings/owner-profile"),
     ("/settings/main-agent", "/settings/main-agent"),
-    ("/tasks", "/tasks"),
-    ("/tasks/{task_id}", "/tasks/987654"),
     ("/skills/{name}", "/skills/missing-skill"),
     ("/kb/search", "/kb/search?q=fixture"),
     ("/kb/wiki/{slug:path}", "/kb/wiki/missing-page"),
     ("/kb/stats", "/kb/stats"),
     ("/api/voice/requests", "/api/voice/requests"),
     ("/api/voice/sessions", "/api/voice/sessions"),
+]
+SCOPED_CASES = [
+    ("/tasks", "/tasks"),
+    ("/tasks/stats", "/tasks/stats"),
+    ("/tasks/next", "/tasks/next"),
+    ("/tasks/{task_id}", "/tasks/987654"),
+    ("/tasks/{task_id}/comments", "/tasks/987654/comments"),
 ]
 UNLISTED_CASES = [
     ("/system/primary-user", "/system/primary-user"),
@@ -544,3 +549,57 @@ def test_pending_entries_are_the_exact_existing_get_templates(daemon):
         for method in (getattr(route, "methods", None) or ())
     }
     assert expected <= registered
+
+
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+@pytest.mark.parametrize("template,path", SCOPED_CASES)
+def test_caller_scoped_reads_log_nothing_and_keep_responses(
+    daemon, monkeypatch, logs, mode, template, path
+):
+    d = daemon(mode)
+    _unchanged_read(d, monkeypatch, logs, path)
+    assert _read_lines(logs) == []
+
+
+@pytest.mark.parametrize("template,path", SCOPED_CASES)
+def test_caller_scoped_reads_log_nothing_when_the_registry_fails(
+    daemon, monkeypatch, logs, template, path
+):
+    d = daemon()
+    original = d.agents.get
+
+    def unavailable(name):
+        if name == "tenant":
+            raise RuntimeError("private-registry-marker")
+        return original(name)
+
+    monkeypatch.setattr(d.agents, "get", unavailable)
+    _unchanged_read(d, monkeypatch, logs, path)
+    assert _read_lines(logs) == []
+
+
+def test_scoped_entries_are_existing_get_templates_and_not_pending(daemon):
+    d = daemon()
+    expected = frozenset(("GET", template) for template, _ in SCOPED_CASES)
+    assert isinstance(policy.ISOLATED_READ_SCOPED, frozenset)
+    assert policy.ISOLATED_READ_SCOPED == expected
+    assert not policy.ISOLATED_READ_SCOPED & policy.ISOLATED_READ_PENDING
+    registered = {
+        (method, route.path)
+        for route in d.app.routes
+        for method in (getattr(route, "methods", None) or ())
+    }
+    assert expected <= registered
+
+
+def test_scoped_routes_filter_by_the_signed_caller():
+    from pinky_daemon.routes import projects_tasks
+
+    handlers = {
+        route.path: route.endpoint
+        for route in projects_tasks.router.routes
+        if "GET" in (getattr(route, "methods", None) or ())
+    }
+    for _, template in policy.ISOLATED_READ_SCOPED:
+        source = inspect.getsource(handlers[template])
+        assert "_task_read_scope(request)" in source, template

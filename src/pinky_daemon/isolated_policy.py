@@ -35,14 +35,23 @@ ISOLATED_READ_PENDING = frozenset({
     ("GET", "/agents"),
     ("GET", "/settings/owner-profile"),
     ("GET", "/settings/main-agent"),
-    ("GET", "/tasks"),
-    ("GET", "/tasks/{task_id}"),
     ("GET", "/skills/{name}"),
     ("GET", "/kb/search"),
     ("GET", "/kb/wiki/{slug:path}"),
     ("GET", "/kb/stats"),
     ("GET", "/api/voice/requests"),
     ("GET", "/api/voice/sessions"),
+})
+
+# GET routes whose whole answer is already filtered to what the signed caller
+# may see (task reads are scoped server-side). The read diagnostics log nothing
+# for these, since a scoped read would not be refused.
+ISOLATED_READ_SCOPED = frozenset({
+    ("GET", "/tasks"),
+    ("GET", "/tasks/stats"),
+    ("GET", "/tasks/next"),
+    ("GET", "/tasks/{task_id}"),
+    ("GET", "/tasks/{task_id}/comments"),
 })
 
 

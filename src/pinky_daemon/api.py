@@ -201,6 +201,7 @@ from pinky_daemon.isolated_policy import (
     ISOLATED_GRANTS,
     ISOLATED_MUTATION_ALLOW,
     ISOLATED_READ_PENDING,
+    ISOLATED_READ_SCOPED,
     granted_mutation_allow,
     granted_tool_routes,
     isolation_flag,
@@ -6423,6 +6424,8 @@ def create_api(
                 return
             template, _ = resolve_mutation_route(app, request.scope)
             template = template or "<unknown>"
+            if ("GET", template) in ISOLATED_READ_SCOPED:
+                return
             if flag is None:
                 reason = "registry unavailable"
             elif (request.method, template) in ISOLATED_READ_PENDING:
