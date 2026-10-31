@@ -353,6 +353,59 @@ def test_repeat_map_resets_only_when_a_new_key_exceeds_the_limit(daemon, monkeyp
     )
 
 
+def test_a_repeat_599_seconds_later_stays_quiet(daemon, monkeypatch, logs):
+    d = daemon()
+    check = _shadow_check(d)
+    now = [100.0]
+    monkeypatch.setattr(api, "_isolated_read_now", lambda: now[0])
+    logs.clear()
+    check(_request(d), "tenant")
+    expected = [
+        "isolation: WOULD DENY READ GET /comms/messages for tenant reason=unlisted repeats=0"
+    ]
+    assert _read_lines(logs) == expected
+    now[0] = 699.0
+    check(_request(d), "tenant")
+    assert _read_lines(logs) == expected
+
+
+def test_the_window_ends_at_exactly_600_seconds(daemon, monkeypatch, logs):
+    d = daemon()
+    check = _shadow_check(d)
+    now = [100.0]
+    monkeypatch.setattr(api, "_isolated_read_now", lambda: now[0])
+    logs.clear()
+    check(_request(d), "tenant")
+    assert len(_read_lines(logs)) == 1
+    now[0] = 700.0
+    check(_request(d), "tenant")
+    lines = _read_lines(logs)
+    assert len(lines) == 2
+    assert lines[1] == (
+        "isolation: WOULD DENY READ GET /comms/messages for tenant reason=unlisted repeats=0"
+    )
+
+
+def test_an_expired_key_already_in_a_full_map_does_not_reset_it(daemon, monkeypatch, logs):
+    d = daemon()
+    check = _shadow_check(d)
+    now = [100.0]
+    monkeypatch.setattr(api, "resolve_mutation_route", lambda app, scope: (scope["path"], {}))
+    monkeypatch.setattr(api, "_isolated_read_now", lambda: now[0])
+    logs.clear()
+    for index in range(1024):
+        check(_request(d, f"/read-counter/{index}"), "tenant")
+    assert len(_read_lines(logs)) == 1024
+    now[0] = 700.0
+    check(_request(d, "/read-counter/0"), "tenant")
+    assert logs.count("isolation: read shadow log map reset (1024 keys)") == 0
+    lines = _read_lines(logs)
+    assert len(lines) == 1025
+    assert lines[-1] == (
+        "isolation: WOULD DENY READ GET /read-counter/0 for tenant reason=unlisted repeats=0"
+    )
+
+
 def test_registry_lookup_failure_is_diagnostic_only(daemon, monkeypatch, logs):
     d = daemon()
     original = d.agents.get
