@@ -2,7 +2,48 @@
 
 import logging
 import os
+import re
+import threading
 from contextlib import nullcontext
+
+_read_policy_warning_lock = threading.Lock()
+_read_policy_warning_emitted = False
+
+
+def read_policy_mode(log=None):
+    """Read diagnostics never enforce; the default follows write isolation."""
+    value = os.environ.get("PINKY_ISOLATED_READ_POLICY_MODE", "").strip().lower()
+    if not value:
+        return "shadow" if policy_mode() in {"shadow", "enforce"} else "off"
+    if value in {"off", "shadow"}:
+        return value
+    global _read_policy_warning_emitted
+    with _read_policy_warning_lock:
+        warn = not _read_policy_warning_emitted
+        _read_policy_warning_emitted = True
+    if warn:
+        safe_value = re.sub(r"[^a-zA-Z0-9_-]", "_", value)[:32]
+        message = f"isolation: read policy mode {safe_value} is not available; using shadow"
+        if log is None:
+            logging.getLogger(__name__).error(message)
+        else:
+            log(message)
+    return "shadow"
+
+
+ISOLATED_READ_PENDING = frozenset({
+    ("GET", "/agents"),
+    ("GET", "/settings/owner-profile"),
+    ("GET", "/settings/main-agent"),
+    ("GET", "/tasks"),
+    ("GET", "/tasks/{task_id}"),
+    ("GET", "/skills/{name}"),
+    ("GET", "/kb/search"),
+    ("GET", "/kb/wiki/{slug:path}"),
+    ("GET", "/kb/stats"),
+    ("GET", "/api/voice/requests"),
+    ("GET", "/api/voice/sessions"),
+})
 
 
 def policy_mode(log=None):

@@ -200,6 +200,7 @@ from pinky_daemon.isolated_policy import (
 from pinky_daemon.isolated_policy import (
     ISOLATED_GRANTS,
     ISOLATED_MUTATION_ALLOW,
+    ISOLATED_READ_PENDING,
     granted_mutation_allow,
     granted_tool_routes,
     isolation_flag,
@@ -217,6 +218,9 @@ from pinky_daemon.isolated_policy import (
 )
 from pinky_daemon.isolated_policy import (
     policy_mode as _isolation_policy_mode,
+)
+from pinky_daemon.isolated_policy import (
+    read_policy_mode as _isolation_read_policy_mode,
 )
 from pinky_daemon.kb_store import KBStore
 from pinky_daemon.librarian_runner import LibrarianRunner
@@ -1208,6 +1212,18 @@ def _isolation_path_target(path: str) -> str | None:
         if m:
             return m.group(1)
     return None
+
+
+def _isolation_request_path(request: Request) -> str:
+    return (
+        get_route_path(request.scope)
+        if _isolation_policy_mode() == "enforce"
+        else request.url.path
+    )
+
+
+def _isolated_read_now() -> float:
+    return time.monotonic()
 
 
 def _authorize_skill_assignment_mutation(request: Request, target_agent: str) -> str:
@@ -6321,11 +6337,7 @@ def create_api(
                 return True
             return caller is None or bool(getattr(caller, "isolated", True))
 
-        legacy_path = (
-            get_route_path(request.scope)
-            if _isolation_policy_mode() == "enforce"
-            else request.url.path
-        )
+        legacy_path = _isolation_request_path(request)
         fleet_write = _isolation_fleet_write(request.method, legacy_path)
         target = _isolation_path_target(legacy_path)
         if not fleet_write and target is None:
@@ -6393,6 +6405,52 @@ def create_api(
             )
             return True
         return False
+
+    read_shadow_events: dict[tuple[str, str, str, str], tuple[float, int]] = {}
+    read_shadow_lock = threading.Lock()
+
+    def _isolated_read_shadow(request: Request, caller_name: str) -> None:
+        """Observe reads without changing request handling or authority."""
+        try:
+            if request.method not in {"GET", "HEAD"}:
+                return
+            if _isolation_read_policy_mode(_log) != "shadow":
+                return
+            if _isolation_path_target(_isolation_request_path(request)) is not None:
+                return
+            flag = isolation_flag(agents, caller_name)
+            if flag is False:
+                return
+            template, _ = resolve_mutation_route(app, request.scope)
+            template = template or "<unknown>"
+            if flag is None:
+                reason = "registry unavailable"
+            elif (request.method, template) in ISOLATED_READ_PENDING:
+                reason = "pending-scope"
+            else:
+                reason = "unlisted"
+            key = (caller_name, request.method, template, reason)
+            now = _isolated_read_now()
+            safe_caller = re.sub(r"[^a-zA-Z0-9_-]", "_", caller_name)[:120]
+            with read_shadow_lock:
+                previous = read_shadow_events.get(key)
+                if previous is not None and now - previous[0] < 600:
+                    read_shadow_events[key] = (previous[0], previous[1] + 1)
+                    return
+                repeats = previous[1] if previous is not None else 0
+                if key not in read_shadow_events and len(read_shadow_events) >= 1024:
+                    read_shadow_events.clear()
+                    _log("isolation: read shadow log map reset (1024 keys)")
+                read_shadow_events[key] = (now, 0)
+                _log(
+                    f"isolation: WOULD DENY READ {request.method} {template} "
+                    f"for {safe_caller} reason={reason} repeats={repeats}"
+                )
+        except Exception as exc:
+            try:
+                _log(f"isolation: read shadow check failed: {type(exc).__name__}")
+            except Exception:
+                pass
 
     def _isolated_mutation_denied(request: Request, caller_name: str, mode: str) -> bool:
         if mode == "off" or request.method in _ISOLATION_SAFE_METHODS:
@@ -6717,6 +6775,7 @@ def create_api(
                     content=content,
                 )
             request.state.auth_gate = "internal_hmac"
+            _isolated_read_shadow(request, caller)
             return await call_next(request)
 
         # 3. Valid session cookie → through. Pulled up from the per-path
