@@ -180,6 +180,10 @@ def create_server(
     ) -> str:
         """Send a message to a chat/channel. Use chat IDs, not display names.
 
+        Slack group DM: chat_id may be 2-8 comma-separated Slack user IDs (e.g.
+        "U123,U456"); the message goes to the one group DM with exactly those people
+        (opened if needed); the result's chat_id is that conversation's id.
+
         Slack threading: reply_to is the thread root ts. When an inbound header
         includes thread_root_ts and is_thread_reply:true, default to replying in
         that thread (thread() already does this for an inbound message_id). Omit
@@ -244,6 +248,10 @@ def create_server(
     ) -> str:
         """Send an image file. Provide message_id to reply, or chat_id+platform for standalone.
 
+        Slack group DM: chat_id may be 2-8 comma-separated Slack user IDs (e.g.
+        "U123,U456"); the message goes to the one group DM with exactly those people
+        (opened if needed); the result's chat_id is that conversation's id.
+
         Telegram: spoiler blurs the image behind a tap-to-reveal mask;
         caption_above renders the caption above the image. The caption is
         formatted (MarkdownV2) like a normal message.
@@ -268,7 +276,12 @@ def create_server(
         chat_id: str = "",
         platform: str = "telegram",
     ) -> str:
-        """Send a file/document (PDF, code, etc.). Provide message_id to reply, or chat_id+platform for standalone."""
+        """Send a file/document (PDF, code, etc.). Provide message_id to reply, or chat_id+platform for standalone.
+
+        Slack group DM: chat_id may be 2-8 comma-separated Slack user IDs (e.g.
+        "U123,U456"); the message goes to the one group DM with exactly those people
+        (opened if needed); the result's chat_id is that conversation's id.
+        """
         result = _api("POST", "/broker/send-document", {
             "agent_name": agent_name,
             "message_id": message_id,
@@ -290,6 +303,10 @@ def create_server(
         caption_above: bool = False,
     ) -> str:
         """Send a video that plays inline (autoplay/streaming), not as a file download. Use for .mp4 clips/screen recordings. Provide message_id to reply, or chat_id+platform for standalone.
+
+        Slack group DM: chat_id may be 2-8 comma-separated Slack user IDs (e.g.
+        "U123,U456"); the message goes to the one group DM with exactly those people
+        (opened if needed); the result's chat_id is that conversation's id.
 
         Telegram: spoiler blurs the video behind a tap-to-reveal mask;
         caption_above renders the caption above the player. The caption is

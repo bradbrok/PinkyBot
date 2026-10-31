@@ -9,6 +9,7 @@ Requires a Slack Bot Token (xoxb-...) with appropriate scopes:
 - reactions:write
 - files:write (for uploads)
 - im:write (resolve U-prefixed user IDs to DM conversations for file uploads)
+- mpim:write (open group direct messages for several users)
 - channels:read (for channel info)
 - users:read (resolve user id -> display name)
 - users:read.email (resolve user id -> email; email lookup-by-email routing)
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 
 import httpx
@@ -29,6 +31,24 @@ BUTTON_BLOCK_ID = "pinky_btn"
 BUTTON_TEXT_BLOCK_ID = "pinky_btn_text"
 BUTTON_CHOSEN_BLOCK_ID = "pinky_btn_chosen"
 SLACK_BUTTON_STYLES = {"success": "primary", "danger": "danger", "primary": "primary"}
+
+
+def parse_group_dm_users(channel: str) -> list[str] | None:
+    """Validate a comma-separated user list; preserve every single-id path."""
+    if "," not in channel:
+        return None
+    users = [part.strip() for part in channel.split(",")]
+    if any(not user for user in users):
+        raise ValueError("Slack group DM user list must not contain empty IDs")
+    if len(users) < 2:
+        raise ValueError("Slack group DM requires at least 2 user IDs")
+    if len(users) > 8:
+        raise ValueError("Slack group DM allows at most 8 user IDs")
+    if len(set(users)) != len(users):
+        raise ValueError("Slack group DM user IDs must be unique")
+    if any(re.fullmatch(r"[UW][A-Z0-9]{2,}", user) is None for user in users):
+        raise ValueError("Slack group DM requires valid uppercase Slack user IDs")
+    return users
 
 
 def button_card_blocks(content: str, row: list[dict]) -> list[dict]:
@@ -174,7 +194,7 @@ class SlackAdapter:
         """Send a message to a Slack channel or thread.
 
         Args:
-            channel: Channel ID (C...), DM ID (D...), or group ID (G...).
+            channel: Conversation ID, single user ID, or a comma-separated user list.
             text: Message text (supports Slack mrkdwn formatting). When ``blocks``
                 are present this is the notification fallback text.
             thread_ts: Thread timestamp to reply in-thread.
@@ -186,9 +206,11 @@ class SlackAdapter:
                 (text-content unfurls / media unfurls). None leaves Slack's
                 defaults untouched; pass False to suppress preview cards.
         """
+        group_dm_users = parse_group_dm_users(channel)
+        conversation_id = self._ensure_conversation_id(channel) if group_dm_users is not None else channel
         result = self._request(
             "chat.postMessage",
-            channel=channel,
+            channel=conversation_id,
             text=text,
             thread_ts=thread_ts or None,
             reply_broadcast=reply_broadcast if thread_ts else None,
@@ -202,13 +224,16 @@ class SlackAdapter:
 
         return Message(
             platform=Platform.slack,
-            chat_id=channel,
+            chat_id=conversation_id,
             sender="bot",
             content=text,
             timestamp=datetime.fromtimestamp(float(ts), tz=timezone.utc) if ts else datetime.now(timezone.utc),
             message_id=ts,
             is_outbound=True,
-            metadata={"thread_ts": thread_ts} if thread_ts else {},
+            metadata={
+                **({"thread_ts": thread_ts} if thread_ts else {}),
+                **({"group_dm_users": group_dm_users} if group_dm_users is not None else {}),
+            },
         )
 
     def update_message(
@@ -244,7 +269,7 @@ class SlackAdapter:
             raise SlackError(f"response_url post failed: {resp.status_code}")
 
     def _ensure_conversation_id(self, channel: str) -> str:
-        """Resolve a U-prefixed user ID to the D-prefixed DM conversation ID.
+        """Resolve a user list or a single U-prefixed upload destination.
 
         ``chat.postMessage`` accepts a user ID and opens the DM implicitly, but
         ``files.completeUploadExternal(channel_id=...)`` requires a conversation
@@ -252,18 +277,26 @@ class SlackAdapter:
         scope fails without creating an upload ticket or transferring bytes.
         Successful U→D mappings are stable and cached for this adapter/token.
         Existing C/D/G conversation IDs pass through without an API call.
+        Group lists preserve input order on open and share a sorted-set cache key.
         """
-        if not channel.startswith("U"):
+        group_dm_users = parse_group_dm_users(channel)
+        if group_dm_users is None and not channel.startswith("U"):
             return channel
 
-        cached = self._dm_conversation_ids.get(channel)
+        cache_key = ",".join(sorted(group_dm_users)) if group_dm_users is not None else channel
+        cached = self._dm_conversation_ids.get(cache_key)
         if cached:
             return cached
 
         try:
-            result = self._request_form("conversations.open", users=channel)
+            users = ",".join(group_dm_users) if group_dm_users is not None else channel
+            result = self._request_form("conversations.open", users=users)
         except SlackError as exc:
             if exc.error == "missing_scope":
+                if group_dm_users is not None:
+                    raise SlackError(
+                        "missing_scope: the Slack app needs mpim:write; reinstall with that scope"
+                    ) from exc
                 raise SlackError(
                     "im:write is required to resolve U-prefixed user IDs "
                     "for Slack DM file uploads"
@@ -271,11 +304,11 @@ class SlackAdapter:
             raise
 
         conversation_id = str((result.get("channel") or {}).get("id") or "")
-        if not conversation_id.startswith("D"):
+        if not conversation_id or (group_dm_users is None and not conversation_id.startswith("D")):
             raise SlackError(
                 "conversations.open returned no valid DM conversation ID"
             )
-        self._dm_conversation_ids[channel] = conversation_id
+        self._dm_conversation_ids[cache_key] = conversation_id
         return conversation_id
 
     def upload_file(
@@ -297,6 +330,7 @@ class SlackAdapter:
         instead of spawning a new root message.
         """
         import os
+        group_dm_users = parse_group_dm_users(channel)
         filename = os.path.basename(file_path)
         file_size = os.path.getsize(file_path)
         conversation_id = self._ensure_conversation_id(channel)
@@ -337,13 +371,14 @@ class SlackAdapter:
 
         return Message(
             platform=Platform.slack,
-            chat_id=channel,
+            chat_id=conversation_id if group_dm_users is not None else channel,
             sender="bot",
             content=initial_comment or f"[file: {filename}]",
             timestamp=datetime.now(timezone.utc),
             message_id=file_id,
             is_outbound=True,
             metadata={"type": "file", "filename": filename,
+                      **({"group_dm_users": group_dm_users} if group_dm_users is not None else {}),
                       **({"thread_ts": thread_ts} if thread_ts else {})},
         )
 
