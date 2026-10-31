@@ -31,6 +31,7 @@ CANONICAL = ",".join(sorted(USERS))
 GROUP = "G0GROUP111"
 TEXT = "Choose an option"
 BUTTONS = [{"text": "Choose", "data": "request:1730312345.123456:count:3", "style": "primary"}]
+INVALID_REASONS = ["empty", "empty", "empty", "unique", "valid", "valid", "valid", "valid", "valid", "8"]
 INVALID_LISTS = [
     "U0AAAA111,", ",U0AAAA111", "U0AAAA111,,W0BBBB222",
     "U0AAAA111,U0AAAA111", "u0aaaa111,W0BBBB222", "C0CHANNEL,W0BBBB222",
@@ -119,8 +120,8 @@ def test_adapter_opens_given_order_and_caches_sorted_set(group):
                for method, _, content_type in group.calls if method == "conversations.open")
     assert [p["channel"] for p in _calls(group, "chat.postMessage")] == [GROUP, GROUP]
     assert first.chat_id == second.chat_id == GROUP
-    assert first.metadata["group_dm_users"] == USERS
-    assert second.metadata["group_dm_users"] == sorted(USERS)
+    assert first.metadata.get("group_dm_users") == USERS
+    assert second.metadata.get("group_dm_users") == sorted(USERS)
     assert first.metadata["thread_ts"] == "1700000000.000001"
 
 
@@ -133,9 +134,10 @@ def test_group_cache_is_per_adapter(group):
 
 
 def test_spaces_are_stripped(group):
-    result = group.adapter.send_message(" W0BBBB222 , U0AAAA111 ", TEXT)
+    response = _post(group, " W0BBBB222 , U0AAAA111 ")
+    assert response.status_code == 200, response.text
     assert _calls(group, "conversations.open") == [{"users": TARGET}]
-    assert result.chat_id == GROUP and result.metadata["group_dm_users"] == USERS
+    assert response.json()["chat_id"] == GROUP and response.json().get("group_dm_users") == USERS
 
 
 @pytest.mark.parametrize("code", ["missing_scope", "user_not_found", "user_disabled",
@@ -167,16 +169,17 @@ def test_empty_open_id_is_not_cached_or_posted(group):
 @pytest.mark.parametrize("conversation", ["G0GROUP111", "D0GROUP111", "X0GROUP111"])
 def test_group_open_accepts_nonempty_conversation_without_prefix_rule(group, conversation):
     group.outcomes.append({"ok": True, "channel": {"id": conversation}})
-    result = group.adapter.send_message(TARGET, TEXT)
+    response = _post(group)
+    assert response.status_code == 200, response.text
     assert _calls(group, "chat.postMessage")[0]["channel"] == conversation
-    assert result.chat_id == conversation
+    assert response.json()["chat_id"] == conversation
 
 
-@pytest.mark.parametrize("chat_id", INVALID_LISTS)
-def test_validation_refuses_before_http(group, chat_id):
+@pytest.mark.parametrize("chat_id,reason", list(zip(INVALID_LISTS, INVALID_REASONS)))
+def test_validation_refuses_before_http(group, chat_id, reason):
     response = _post(group, chat_id)
     assert response.status_code == 400, response.text
-    assert response.json()["detail"]
+    assert reason in response.json()["detail"].lower()
     assert group.calls == []
 
 
@@ -209,12 +212,12 @@ def test_broker_group_send_records_resolved_target_and_users(group):
     response = _post(group)
     assert response.status_code == 200, response.text
     result = response.json()
-    assert result["chat_id"] == GROUP and result["group_dm_users"] == USERS
+    assert result["chat_id"] == GROUP and result.get("group_dm_users") == USERS
     assert len(_calls(group, "chat.postMessage")) == 1
     records = group.gateway.app.state.conversation_store.get_history("sample-main")
     assert len(records) == 1
     assert records[0].chat_id == GROUP
-    assert records[0].metadata["group_dm_users"] == USERS
+    assert records[0].metadata.get("group_dm_users") == USERS
     assert records[0].metadata["delivery"] == result
     remembered = group.gateway.broker.get_message_context("sample", result["message_id"])
     assert remembered.chat_id == GROUP
@@ -239,7 +242,7 @@ def test_list_upload_completes_to_group(group):
     completed = _calls(group, "files.completeUploadExternal")
     assert len(completed) == 1 and completed[0]["channel_id"] == GROUP
     assert completed[0]["thread_ts"] == "1700000000.000001"
-    assert result.chat_id == GROUP and result.metadata["group_dm_users"] == USERS
+    assert result.chat_id == GROUP and result.metadata.get("group_dm_users") == USERS
     group.upload.assert_called_once()
 
 
@@ -260,9 +263,9 @@ def test_upload_routes_preserve_group_result(group, kind):
     })
     assert response.status_code == 200, response.text
     assert response.json()["chat_id"] == GROUP
-    assert response.json()["group_dm_users"] == USERS
+    assert response.json().get("group_dm_users") == USERS
     record = group.gateway.app.state.conversation_store.get_history("sample-main")[0]
-    assert record.chat_id == GROUP and record.metadata["group_dm_users"] == USERS
+    assert record.chat_id == GROUP and record.metadata.get("group_dm_users") == USERS
     assert record.metadata["delivery"] == response.json()
     assert _calls(group, "files.completeUploadExternal")[0]["channel_id"] == GROUP
 
@@ -285,7 +288,7 @@ def test_reordered_completed_sends_are_deduped(group):
     assert all(response.status_code == 200 for response in responses)
     assert len(_calls(group, "chat.postMessage")) == 1
     first = responses[0].json()
-    assert first["chat_id"] == GROUP and first["group_dm_users"] == USERS
+    assert first["chat_id"] == GROUP and first.get("group_dm_users") == USERS
     assert all(response.json() == {**first, "deduped": True} for response in responses[1:])
 
 
@@ -313,7 +316,7 @@ async def test_inflight_placeholder_uses_canonical_list(group):
             release.set()
             original = await first
     assert original.status_code == 200
-    assert original.json()["chat_id"] == GROUP and original.json()["group_dm_users"] == USERS
+    assert original.json()["chat_id"] == GROUP and original.json().get("group_dm_users") == USERS
     assert len(_calls(group, "chat.postMessage")) == 1
 
 
@@ -373,3 +376,15 @@ def test_tool_descriptions_explain_group_dm(name):
 
 def test_scope_documentation_names_mpim_write():
     assert "mpim:write" in slack_module.__doc__
+
+
+@pytest.mark.parametrize("kind", ["document", "photo", "video"])
+def test_validation_upload_routes_refuse_before_http(group, kind):
+    path = "/broker/send-" + kind
+    response = group.gateway.client.post(path, headers=_headers(group, path), json={
+        **_body("u0aaaa111,W0BBBB222"), "file_path": str(group.file),
+    })
+    assert response.status_code == 400, response.text
+    assert "valid" in response.json()["detail"].lower()
+    assert group.calls == []
+    group.upload.assert_not_called()
