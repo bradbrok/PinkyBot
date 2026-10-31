@@ -307,6 +307,7 @@ from pinky_daemon.transport_state import SessionState as TransportSessionState
 from pinky_daemon.trigger_store import TriggerStore
 from pinky_daemon.wake_prompt import WakeReason
 from pinky_outreach.buttons import CALLBACK_DATA_PATTERN
+from pinky_outreach.slack import parse_group_dm_users
 from pinky_outreach.telegram import TelegramError
 
 # Feature flag: shared MCP mode uses a single HTTP/SSE server instead of per-agent stdio
@@ -2530,6 +2531,10 @@ def create_api(
         metadata: dict | None = None,
     ) -> None:
         meta = metadata or {}
+        delivery = meta.get("delivery")
+        if platform == "slack" and isinstance(delivery, dict) and "group_dm_users" in delivery:
+            chat_id = delivery["chat_id"]
+            meta = {**meta, "group_dm_users": delivery["group_dm_users"]}
         message_id = _extract_message_id(meta.get("delivery"))
         if message_id:
             broker.remember_outbound_message_context(
@@ -2817,7 +2822,10 @@ def create_api(
                 unfurl_links=False if no_unfurl else None,
                 unfurl_media=False if no_unfurl else None,
             )
-            return SimpleNamespace(message_id=_extract_message_id(result))
+            return SimpleNamespace(
+                message_id=_extract_message_id(result),
+                **({"chat_id": result.chat_id} if "," in chat_id else {}),
+            )
 
         if platform == "buzz":
             result = adapter.send_message(
@@ -2906,10 +2914,18 @@ def create_api(
             # same as the text path passes reply_to as thread_ts. Without this
             # a send_photo/document/video reply spawned a new root instead of
             # threading (the file-upload path silently dropped reply_to).
+            try:
+                group_dm_users = parse_group_dm_users(chat_id)
+            except ValueError as error:
+                raise HTTPException(400, str(error)) from None
             result = adapter.upload_file(
                 chat_id, file_path, initial_comment=caption, thread_ts=reply_to,
             )
-            return SimpleNamespace(message_id=_extract_message_id(result))
+            return SimpleNamespace(
+                message_id=_extract_message_id(result),
+                **({"chat_id": result.chat_id, "group_dm_users": group_dm_users}
+                   if group_dm_users is not None else {}),
+            )
 
         raise HTTPException(400, f"Unsupported platform: {platform}")
 
@@ -2930,6 +2946,12 @@ def create_api(
         buttons: str = "",
     ) -> dict:
         """Send a message back to the platform on behalf of an agent."""
+        group_dm_users = None
+        if platform == "slack":
+            try:
+                group_dm_users = parse_group_dm_users(chat_id)
+            except ValueError as error:
+                raise HTTPException(400, str(error)) from None
         button_row = None
         delivery_blocks = blocks
         if buttons:
@@ -3014,7 +3036,7 @@ def create_api(
             # sendChatAction loop prevents the indicator from popping back up
             # after the message arrives.
             broker._stop_typing(agent_name, chat_id)
-            return {
+            result = {
                 "sent": True,
                 "agent": agent_name,
                 "platform": platform,
@@ -3022,6 +3044,9 @@ def create_api(
                 "chat_id": chat_id,
                 "message_id": msg.message_id,
             }
+            if group_dm_users is not None:
+                result.update(chat_id=msg.chat_id, group_dm_users=group_dm_users)
+            return result
 
         # Dedupe guard (issue #113): an identical send already in flight or just
         # delivered is suppressed and the original result returned, so a tool
@@ -3050,8 +3075,9 @@ def create_api(
             )
         else:
             key_extra = ""
+        dedupe_chat_id = ",".join(sorted(group_dm_users)) if group_dm_users is not None else chat_id
         return await broker.deliver_deduped(
-            agent_name, platform, chat_id, content, _deliver,
+            agent_name, platform, dedupe_chat_id, content, _deliver,
             reply_to=reply_to, key_extra=key_extra,
         )
 
@@ -12207,6 +12233,9 @@ npm run build</pre>
             broker._stop_typing(agent_name, chat_id)
 
         result = {"sent": True, "message_id": msg.message_id, "platform": platform, "chat_id": chat_id}
+        group_dm_users = getattr(msg, "group_dm_users", None)
+        if group_dm_users is not None:
+            result.update(chat_id=msg.chat_id, group_dm_users=group_dm_users)
         _outreach_attempt_log(
             agent_name=agent_name, platform=platform, method=method,
             chat_id=chat_id, file_path=file_path, caption_len=len(caption),
