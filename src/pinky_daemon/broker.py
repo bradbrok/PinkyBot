@@ -568,7 +568,11 @@ class MessageBroker:
             reservation = self._recent_sends.get(key)
             if reservation is not None:
                 reservation["completion_window"] = True
-            task = asyncio.create_task(deliver())
+
+            async def run_delivery():
+                return await deliver()
+
+            task = asyncio.create_task(run_delivery())
             self._outbound_delivery_tasks.add(task)
 
             def settle(completed: asyncio.Task) -> None:

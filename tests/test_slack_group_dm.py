@@ -462,6 +462,34 @@ async def test_cancelled_group_caller_settles_when_worker_finishes(group, monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("completion_window", [True, False], ids=["completion", "legacy"])
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
+async def test_factory_failure_releases_reservation_for_immediate_retry(gateway, completion_window,
+                                                                       error_type):
+    broker = gateway.broker
+    assert broker._dedupe_window == 45.0
+    args = ("sample", "slack", CANONICAL, TEXT)
+    kwargs = {"completion_window": True} if completion_window else {}
+    failure = error_type("factory failed before returning an awaitable")
+    failing_factory = Mock(side_effect=failure)
+    with pytest.raises(error_type) as observed:
+        await broker.deliver_deduped(*args, failing_factory, **kwargs)
+    assert observed.value is failure
+    failing_factory.assert_called_once_with()
+    assert broker._recent_sends == {}, "failed factory must release its reservation immediately"
+    assert not broker._outbound_delivery_tasks
+    result = {"sent": True, "chat_id": GROUP, "message_id": "1700000000.000001"}
+
+    async def delivered():
+        return result
+
+    retry_factory = Mock(side_effect=delivered)
+    assert await broker.deliver_deduped(*args, retry_factory, **kwargs) is result
+    retry_factory.assert_called_once_with()
+    assert not broker._outbound_delivery_tasks
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["success", "error"])
 async def test_group_inflight_cap_expires_and_late_worker_keeps_new_result(group, monkeypatch, outcome):
     async with _pending_post(group, monkeypatch, 21, outcome=outcome) as state:
