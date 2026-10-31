@@ -29,7 +29,7 @@ class _NewFetcher:
         self.kwargs = kwargs
 
 
-def _fake_weasyprint(monkeypatch, urls):
+def _fake_weasyprint(monkeypatch, urls, version="70.0"):
     built = []
 
     class PDF:
@@ -39,75 +39,79 @@ def _fake_weasyprint(monkeypatch, urls):
         def write_pdf(self, path):
             Path(path).write_bytes(b"%PDF synthetic")
 
-    monkeypatch.setitem(sys.modules, "weasyprint", SimpleNamespace(HTML=PDF))
+    module = SimpleNamespace(HTML=PDF)
+    if version is not None:
+        module.__version__ = version
+    monkeypatch.setitem(sys.modules, "weasyprint", module)
     monkeypatch.setitem(sys.modules, "weasyprint.urls", urls)
     return built
 
 
-def test_current_weasyprint_gets_a_data_only_fetcher_without_redirects(monkeypatch):
-    _fake_weasyprint(monkeypatch, SimpleNamespace(URLFetcher=_NewFetcher))
+@pytest.mark.parametrize("version", ["70.0", "70.1", "71.0", "70.0rc1", "100.2"])
+def test_supported_weasyprint_gets_a_data_only_fetcher_without_redirects(monkeypatch, version):
+    _fake_weasyprint(monkeypatch, SimpleNamespace(URLFetcher=_NewFetcher), version)
     fetcher = research_export._pdf_url_fetcher()
     assert isinstance(fetcher, _NewFetcher)
     assert fetcher.kwargs == {"allowed_protocols": {"data"}, "allow_redirects": False}
 
 
-@pytest.mark.parametrize("url", [
-    "file:///etc/hosts",
-    "FILE:///etc/hosts",
-    "http://127.0.0.1:8888/agents",
-    "https://example.com/logo.png",
-    "ftp://example.com/x",
-    "/relative/path.png",
-    "",
+@pytest.mark.parametrize("version,urls", [
+    ("61.1", SimpleNamespace(default_url_fetcher=lambda *a, **k: {})),  # function API only
+    ("69.9", SimpleNamespace(URLFetcher=_NewFetcher)),
+    ("9.0", SimpleNamespace(URLFetcher=_NewFetcher)),
+    ("", SimpleNamespace(URLFetcher=_NewFetcher)),
+    ("unknown", SimpleNamespace(URLFetcher=_NewFetcher)),
+    (None, SimpleNamespace(URLFetcher=_NewFetcher)),  # no __version__
+    ("70.0", SimpleNamespace(default_url_fetcher=lambda *a, **k: {})),  # no URLFetcher
 ])
-def test_older_weasyprint_refuses_everything_but_data(monkeypatch, url):
-    calls = []
-    _fake_weasyprint(monkeypatch, SimpleNamespace(
-        default_url_fetcher=lambda *a, **k: calls.append(a) or {"string": b""}))
-    fetch = research_export._pdf_url_fetcher()
-    with pytest.raises(ValueError):
-        fetch(url)
-    assert calls == []
-
-
-def test_older_weasyprint_passes_data_uris_through(monkeypatch):
-    calls = []
-    _fake_weasyprint(monkeypatch, SimpleNamespace(
-        default_url_fetcher=lambda url, *a, **k: calls.append(url) or {"string": PNG}))
-    fetch = research_export._pdf_url_fetcher()
-    assert fetch(DATA_PNG, timeout=5) == {"string": PNG}
-    assert calls == [DATA_PNG]
+def test_old_or_unknown_weasyprint_is_refused(monkeypatch, version, urls):
+    _fake_weasyprint(monkeypatch, urls, version)
+    with pytest.raises(research_export.PdfRendererUnavailableError, match="70.0 or newer"):
+        research_export._pdf_url_fetcher()
 
 
 def test_missing_weasyprint_raises_import_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "weasyprint", None)
     monkeypatch.setitem(sys.modules, "weasyprint.urls", None)
-    with pytest.raises(ImportError):
+    with pytest.raises(ImportError, match="not installed"):
         research_export._pdf_url_fetcher()
+
+
+def _render_client(tmp_path, monkeypatch):
+    export = tmp_path / "exports"
+    monkeypatch.setattr(research_export, "EXPORT_DIR", str(export))
+    app = FastAPI()
+    app.include_router(router)
+    return TestClient(app), export
 
 
 def test_render_pdf_route_uses_the_restricted_fetcher(tmp_path, monkeypatch):
     built = _fake_weasyprint(monkeypatch, SimpleNamespace(URLFetcher=_NewFetcher))
-    monkeypatch.setattr(research_export, "EXPORT_DIR", str(tmp_path))
-    app = FastAPI()
-    app.include_router(router)
-    with TestClient(app) as client:
+    client, _ = _render_client(tmp_path, monkeypatch)
+    with client:
         response = client.post("/render/pdf", json={"content": "# Report", "filename": "r"})
     assert response.status_code == 200, response.text
     assert len(built) == 1
     assert built[0]["url_fetcher"].kwargs["allowed_protocols"] == {"data"}
 
 
-def test_render_pdf_route_still_reports_missing_weasyprint(tmp_path, monkeypatch):
-    monkeypatch.setitem(sys.modules, "weasyprint", None)
-    monkeypatch.setitem(sys.modules, "weasyprint.urls", None)
-    export = tmp_path / "exports"
-    monkeypatch.setattr(research_export, "EXPORT_DIR", str(export))
-    app = FastAPI()
-    app.include_router(router)
-    with TestClient(app) as client:
+@pytest.mark.parametrize("version,urls,detail", [
+    (None, None, "WeasyPrint not installed"),
+    ("61.1", SimpleNamespace(default_url_fetcher=lambda *a, **k: {}), "70.0 or newer"),
+])
+def test_render_pdf_route_refuses_missing_or_old_weasyprint(tmp_path, monkeypatch, version, urls, detail):
+    if urls is None:
+        monkeypatch.setitem(sys.modules, "weasyprint", None)
+        monkeypatch.setitem(sys.modules, "weasyprint.urls", None)
+        built = []
+    else:
+        built = _fake_weasyprint(monkeypatch, urls, version)
+    client, export = _render_client(tmp_path, monkeypatch)
+    with client:
         response = client.post("/render/pdf", json={"content": "# Report", "filename": "r"})
     assert response.status_code == 503
+    assert detail in response.json()["detail"]
+    assert built == []
     assert not export.exists() or list(export.iterdir()) == []
 
 
@@ -120,6 +124,17 @@ def test_research_export_uses_the_restricted_fetcher(tmp_path, monkeypatch):
     assert Path(path).exists()
     assert len(built) == 1
     assert built[0]["url_fetcher"].kwargs["allowed_protocols"] == {"data"}
+
+
+def test_research_export_refuses_old_weasyprint_without_rendering(tmp_path, monkeypatch):
+    built = _fake_weasyprint(monkeypatch, SimpleNamespace(default_url_fetcher=lambda *a, **k: {}), "61.1")
+    monkeypatch.setattr(research_export, "EXPORT_DIR", str(tmp_path))
+    topic = {"id": 7, "title": "Topic", "status": "published"}
+    brief = {"content": "Body", "summary": "", "key_findings": "", "sources": ""}
+    with pytest.raises(research_export.PdfRendererUnavailableError):
+        research_export.export_brief_pdf(topic, brief)
+    assert built == []
+    assert list(tmp_path.glob("*.pdf")) == []
 
 
 # Real rendering, where WeasyPrint and its system libraries load (optional; skipped otherwise).
@@ -226,3 +241,27 @@ def test_real_render_control_default_fetcher_does_load_them(tmp_path, local_serv
     assert b"local file body" in objects
     # Twice the pictures: the remote PNG renders too (each PNG also writes its alpha mask).
     assert objects.count(b"/Subtype /Image") == 2 * restricted_images
+
+
+class _OneTopic:
+    def get_topic_detail(self, topic_id):
+        return {
+            "topic": {"id": topic_id, "title": "Topic", "status": "published"},
+            "briefs": [{"content": "Body", "summary": "", "key_findings": "", "sources": ""}],
+            "reviews": [],
+        }
+
+
+def test_research_export_route_answers_503_for_old_weasyprint(tmp_path, monkeypatch):
+    from pinky_daemon.routes import research as research_routes
+
+    built = _fake_weasyprint(monkeypatch, SimpleNamespace(default_url_fetcher=lambda *a, **k: {}), "61.1")
+    monkeypatch.setattr(research_export, "EXPORT_DIR", str(tmp_path))
+    monkeypatch.setattr(research_routes, "_research", _OneTopic())
+    app = FastAPI()
+    app.include_router(research_routes.router)
+    with TestClient(app) as client:
+        response = client.get("/research/7/export", params={"format": "pdf"})
+    assert response.status_code == 503
+    assert "70.0 or newer" in response.json()["detail"]
+    assert built == [] and list(tmp_path.glob("*.pdf")) == []

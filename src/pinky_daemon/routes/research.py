@@ -165,7 +165,10 @@ async def export_research(topic_id: int, format: str = "md"):
     topic_data = detail["topic"]
 
     if format == "pdf":
-        path = export_brief_pdf(topic_data, brief, reviews)
+        try:
+            path = export_brief_pdf(topic_data, brief, reviews)
+        except ImportError as e:
+            raise HTTPException(503, str(e) or "WeasyPrint not installed — cannot render PDFs") from None
         return FileResponse(
             path,
             media_type="application/pdf",
