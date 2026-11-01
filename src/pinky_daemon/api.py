@@ -9065,12 +9065,23 @@ npm run build</pre>
                 inspection = await asyncio.to_thread(
                     store_catalog.inspect_layout, scope=name, registered_agents=_storage_agent_names(),
                 )
+                reported_paths = {finding.get("path") for finding in inspection.findings}
+                retained_outward_link = bool(hold) and any(
+                    isinstance(path := finding.get("path"), str)
+                    and path not in reported_paths
+                    and os.path.lexists(path) and os.path.islink(path)
+                    and os.path.commonpath((store_catalog.expected_root, os.path.realpath(path)))
+                    != store_catalog.expected_root
+                    for finding in hold["findings"]
+                )
             except OSError as exc:
                 return {"cleared": False, "reason": "incomplete", "findings": [],
                         "error": type(exc).__name__, "storage_hold": hold}
-            incomplete = any(warning.startswith("could not inspect") for warning in inspection.warnings)
+            incomplete = retained_outward_link or any(
+                warning.startswith("could not inspect") for warning in inspection.warnings
+            )
             if inspection.findings or incomplete:
-                if hold and inspection.findings and all(
+                if hold and inspection.findings and not retained_outward_link and all(
                     storage_hold_scope(store_catalog.expected_root, finding, _storage_agent_names()) == name
                     for finding in inspection.findings
                 ):

@@ -914,6 +914,7 @@ class _FilesystemLayoutInspector:
         self.findings: list[dict[str, str | None]] = []
         self.warnings: list[str] = []
         self.unclaimed_databases: list[_FilesystemDatabase] = []
+        self._unclaimed_entries: set[tuple[tuple[int, int], str]] = set()
         self.skipped_unmanaged_subtrees = 0
         self._agent_child_identities: dict[str, dict[str, tuple[int, int] | None]] = {}
         self._registered_ancestor_identities: set[tuple[int, int]] | None = None
@@ -923,12 +924,37 @@ class _FilesystemLayoutInspector:
     def inspect(self) -> LayoutInspection:
         start = os.path.join(self.root, "agents", self.scope) if self.scope else self.root
         pending_directories: list[tuple[str, bool]] = [(start, False)]
-        # Scan each inode once, but propagate a later owned visit through cached
-        # child edges. This preserves alias context without duplicate findings.
-        visited_directories: dict[tuple[int, int], bool] = {}
-        directory_children: dict[tuple[int, int], list[str]] = {}
+        # Findings belong to each lexical scope, while ownership follows the
+        # physical directory and propagates through every cached scope's edges.
+        visited_directories: dict[tuple[tuple[int, int], str | None], bool] = {}
+        directory_children: dict[tuple[tuple[int, int], str | None], list[str]] = {}
+        directory_visits: dict[
+            tuple[int, int], list[tuple[tuple[int, int], str | None]]
+        ] = {}
+        deferred_visits: dict[
+            tuple[int, int], dict[tuple[tuple[int, int], str | None], str]
+        ] = {}
+        owned_directories: set[tuple[int, int]] = set()
         skipped_directories: set[tuple[int, int]] = set()
         reported_directory_errors: set[str] = set()
+
+        def propagate_owned(identity):
+            if identity in owned_directories:
+                return
+            owned_directories.add(identity)
+            for key in directory_visits.get(identity, ()):
+                if not visited_directories[key]:
+                    visited_directories[key] = True
+                    pending_directories.extend(
+                        (child, True) for child in reversed(directory_children[key])
+                    )
+            pending_directories.extend(
+                (path, True) for path in deferred_visits.pop(identity, {}).values()
+            )
+            if identity in skipped_directories:
+                skipped_directories.remove(identity)
+                self.skipped_unmanaged_subtrees -= 1
+
         while pending_directories:
             directory, owned_visit = pending_directories.pop()
             try:
@@ -938,6 +964,8 @@ class _FilesystemLayoutInspector:
                         and directory not in reported_directory_errors):
                     reported_directory_errors.add(directory)
                     self._inspection_error("directory", directory, None, exc)
+                continue
+            if self._record_outward_database_link(directory, resolved_directory):
                 continue
             try:
                 directory_stat = os.stat(resolved_directory)
@@ -962,6 +990,11 @@ class _FilesystemLayoutInspector:
                 )
                 continue
             directory_identity = (directory_stat.st_dev, directory_stat.st_ino)
+            ownership_scope = storage_hold_scope(
+                self.root, {"kind": "directory_outside_root", "path": directory},
+                self.registered_agents,
+            )
+            directory_key = (directory_identity, ownership_scope)
             relative_directory = os.path.relpath(resolved_directory, self.root).replace(os.sep, "/")
             relative_segments = relative_directory.split("/")
             discovered_segments = os.path.relpath(directory, self.root).split(os.sep)
@@ -977,7 +1010,7 @@ class _FilesystemLayoutInspector:
                 for segments in (discovered_segments, relative_segments)
             )
             owned_visit = not unmanaged_workspace and (
-                owned_visit or any(
+                owned_visit or directory_identity in owned_directories or any(
                     len(segments) >= 3 and segments[0] == "agents"
                     and segments[2] in _DAEMON_AGENT_SUBDIRECTORIES
                     for segments in (discovered_segments, relative_segments)
@@ -986,12 +1019,14 @@ class _FilesystemLayoutInspector:
                     for segments in (discovered_segments, relative_segments)
                 )
             )
-            if directory_identity in visited_directories:
-                if owned_visit and not visited_directories[directory_identity]:
-                    visited_directories[directory_identity] = True
+            if owned_visit:
+                propagate_owned(directory_identity)
+            if directory_key in visited_directories:
+                if owned_visit and not visited_directories[directory_key]:
+                    visited_directories[directory_key] = True
                     pending_directories.extend(
                         (child, True)
-                        for child in reversed(directory_children[directory_identity])
+                        for child in reversed(directory_children[directory_key])
                     )
                 continue
             unmanaged_agent_child = (
@@ -1002,20 +1037,25 @@ class _FilesystemLayoutInspector:
             )
             if unmanaged_agent_child or unmanaged_workspace:
                 if not self._contains_registered_store(resolved_directory, directory_identity):
+                    deferred_visits.setdefault(directory_identity, {}).setdefault(
+                        directory_key, directory,
+                    )
                     if directory_identity not in skipped_directories:
                         skipped_directories.add(directory_identity)
                         self.skipped_unmanaged_subtrees += 1
                     continue
                 # A registered store claims the containing agent subtree.
                 owned_visit = True
+                propagate_owned(directory_identity)
             # A later owned alias may require a previously pruned target. Only
             # scanned directories participate in the cycle guard; counts follow
             # the final set of directories whose contents were left uninspected.
             if directory_identity in skipped_directories:
                 skipped_directories.remove(directory_identity)
                 self.skipped_unmanaged_subtrees -= 1
-            visited_directories[directory_identity] = owned_visit
-            directory_children[directory_identity] = []
+            visited_directories[directory_key] = owned_visit
+            directory_visits.setdefault(directory_identity, []).append(directory_key)
+            directory_children[directory_key] = []
             try:
                 with os.scandir(resolved_directory) as iterator:
                     entries = sorted(iterator, key=lambda entry: entry.name)
@@ -1025,7 +1065,7 @@ class _FilesystemLayoutInspector:
 
             child_directories: list[str] = []
             for entry in entries:
-                discovered_path = entry.path
+                discovered_path = os.path.join(directory, entry.name)
                 resolved_path = os.path.join(resolved_directory, entry.name)
                 try:
                     is_symlink = entry.is_symlink()
@@ -1040,6 +1080,8 @@ class _FilesystemLayoutInspector:
                         resolved_path = os.path.realpath(discovered_path)
                     except OSError as exc:
                         self._inspection_error("file or directory", discovered_path, None, exc)
+                        continue
+                    if self._record_outward_database_link(discovered_path, resolved_path):
                         continue
                 if not is_symlink and not (
                     (entry.name.endswith(".db") and not entry.name.endswith(_SQLITE_SIDECAR_SUFFIXES))
@@ -1059,8 +1101,11 @@ class _FilesystemLayoutInspector:
                         continue
                     child_directories.append(discovered_path)
                     continue
-                self._record_database(discovered_path, resolved_path, entry_stat)
-            directory_children[directory_identity] = child_directories
+                self._record_database(
+                    discovered_path, resolved_path, entry_stat,
+                    entry_identity=(directory_identity, entry.name),
+                )
+            directory_children[directory_key] = child_directories
             pending_directories.extend(
                 (child, owned_visit) for child in reversed(child_directories)
             )
@@ -1151,7 +1196,17 @@ class _FilesystemLayoutInspector:
             self._registered_ancestor_identities = identities
         return directory_identity in self._registered_ancestor_identities
 
-    def _record_database(self, discovered_path, resolved_path, path_stat) -> None:
+    def _record_outward_database_link(self, path, resolved_path) -> bool:
+        name = os.path.basename(path)
+        if (name.endswith(".db") and not name.endswith(_SQLITE_SIDECAR_SUFFIXES)
+                and not self._under_root(resolved_path) and os.path.islink(path)):
+            self._outside_root("database", path, resolved_path)
+            return True
+        return False
+
+    def _record_database(
+        self, discovered_path, resolved_path, path_stat, *, entry_identity=None,
+    ) -> None:
         name = os.path.basename(discovered_path)
         if not name.endswith(".db") or name.endswith(_SQLITE_SIDECAR_SUFFIXES):
             return
@@ -1190,7 +1245,12 @@ class _FilesystemLayoutInspector:
         if (resolved_path in self.registered_realpaths
                 or self._ignored_path(resolved_path) or component_memory):
             return
-        self.unclaimed_databases.append(database)
+        # Distinct file aliases keep their warnings; revisiting the same entry
+        # through a different directory scope must not duplicate hygiene output.
+        if entry_identity is None or entry_identity not in self._unclaimed_entries:
+            if entry_identity is not None:
+                self._unclaimed_entries.add(entry_identity)
+            self.unclaimed_databases.append(database)
 
     def _outside_root(self, kind: str, path: str, resolved_path: str) -> None:
         self._record_finding({
