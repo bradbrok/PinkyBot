@@ -912,6 +912,7 @@ class _FilesystemLayoutInspector:
             if silence_allowlist is None else silence_allowlist
         )
         self.findings: list[dict[str, str | None]] = []
+        self._finding_keys: set[tuple[tuple[str, str | None], ...]] = set()
         self.warnings: list[str] = []
         self.unclaimed_databases: list[_FilesystemDatabase] = []
         self._unclaimed_entries: set[tuple[tuple[int, int], str]] = set()
@@ -924,15 +925,15 @@ class _FilesystemLayoutInspector:
     def inspect(self) -> LayoutInspection:
         start = os.path.join(self.root, "agents", self.scope) if self.scope else self.root
         pending_directories: list[tuple[str, bool]] = [(start, False)]
-        # Findings belong to each lexical scope, while ownership follows the
-        # physical directory and propagates through every cached scope's edges.
-        visited_directories: dict[tuple[tuple[int, int], str | None], bool] = {}
-        directory_children: dict[tuple[tuple[int, int], str | None], list[str]] = {}
+        # Scope and lexical role decide descendant scopes. Ownership follows
+        # the physical directory through every cached context's child edges.
+        visited_directories: dict[tuple[tuple[int, int], str | None, str], bool] = {}
+        directory_children: dict[tuple[tuple[int, int], str | None, str], list[str]] = {}
         directory_visits: dict[
-            tuple[int, int], list[tuple[tuple[int, int], str | None]]
+            tuple[int, int], list[tuple[tuple[int, int], str | None, str]]
         ] = {}
         deferred_visits: dict[
-            tuple[int, int], dict[tuple[tuple[int, int], str | None], str]
+            tuple[int, int], dict[tuple[tuple[int, int], str | None, str], str]
         ] = {}
         owned_directories: set[tuple[int, int]] = set()
         skipped_directories: set[tuple[int, int]] = set()
@@ -990,11 +991,8 @@ class _FilesystemLayoutInspector:
                 )
                 continue
             directory_identity = (directory_stat.st_dev, directory_stat.st_ino)
-            ownership_scope = storage_hold_scope(
-                self.root, {"kind": "directory_outside_root", "path": directory},
-                self.registered_agents,
-            )
-            directory_key = (directory_identity, ownership_scope)
+            ownership_scope, lexical_role = self._scope_context(directory)
+            directory_key = (directory_identity, ownership_scope, lexical_role)
             relative_directory = os.path.relpath(resolved_directory, self.root).replace(os.sep, "/")
             relative_segments = relative_directory.split("/")
             discovered_segments = os.path.relpath(directory, self.root).split(os.sep)
@@ -1068,15 +1066,7 @@ class _FilesystemLayoutInspector:
                 discovered_path = entry.path
                 lexical_path = os.path.join(directory, entry.name)
                 if self.registered_agents and lexical_path != entry.path:
-                    lexical_scope = storage_hold_scope(
-                        self.root, {"kind": "directory_outside_root", "path": lexical_path},
-                        self.registered_agents,
-                    )
-                    canonical_scope = storage_hold_scope(
-                        self.root, {"kind": "directory_outside_root", "path": entry.path},
-                        self.registered_agents,
-                    )
-                    if lexical_scope != canonical_scope:
+                    if self._scope_context(lexical_path) != self._scope_context(entry.path):
                         discovered_path = lexical_path
                 resolved_path = os.path.join(resolved_directory, entry.name)
                 try:
@@ -1305,7 +1295,24 @@ class _FilesystemLayoutInspector:
         scope = storage_hold_scope(self.root, finding, self.registered_agents)
         if scope is not None:
             finding = {**finding, "scope": scope}
-        self.findings.append(finding)
+        # Different roles can yield the same canonical entry. Preserve every
+        # distinct path/scope while emitting an identical diagnostic only once.
+        key = tuple(sorted(finding.items()))
+        if key not in self._finding_keys:
+            self._finding_keys.add(key)
+            self.findings.append(finding)
+
+    def _scope_context(self, path: str) -> tuple[str | None, str]:
+        path = os.path.normpath(path)
+        scope = storage_hold_scope(
+            self.root, {"kind": "directory_outside_root", "path": path},
+            self.registered_agents,
+        )
+        if path == self.root:
+            return scope, "ROOT"
+        if path == os.path.join(self.root, "agents"):
+            return scope, "AGENTS_CONTAINER"
+        return scope, "OTHER"
 
     def _in_selected_scope(self, path: str) -> bool:
         selected = os.path.join(self.root, "agents", self.scope)
