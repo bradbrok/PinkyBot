@@ -13,7 +13,7 @@ from pinky_daemon import api
 from pinky_daemon import store_catalog as stores
 from pinky_daemon.agent_registry import AgentRegistry
 
-_RELOCATED_FULL_SHA256 = "228f33b9fba63edf16473cb712a2da3daeee852eddf7825b19cf7f1dad5d1b93"
+_RELOCATED_FULL_SHA256 = "6118d255eb0f8542c5b1276456a5225f754c4044f157200641a5c0f4708ea7fc"
 
 
 def registered_kwargs(call, names):
