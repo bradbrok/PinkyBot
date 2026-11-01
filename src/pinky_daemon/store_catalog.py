@@ -1065,7 +1065,19 @@ class _FilesystemLayoutInspector:
 
             child_directories: list[str] = []
             for entry in entries:
-                discovered_path = os.path.join(directory, entry.name)
+                discovered_path = entry.path
+                lexical_path = os.path.join(directory, entry.name)
+                if self.registered_agents and lexical_path != entry.path:
+                    lexical_scope = storage_hold_scope(
+                        self.root, {"kind": "directory_outside_root", "path": lexical_path},
+                        self.registered_agents,
+                    )
+                    canonical_scope = storage_hold_scope(
+                        self.root, {"kind": "directory_outside_root", "path": entry.path},
+                        self.registered_agents,
+                    )
+                    if lexical_scope != canonical_scope:
+                        discovered_path = lexical_path
                 resolved_path = os.path.join(resolved_directory, entry.name)
                 try:
                     is_symlink = entry.is_symlink()
