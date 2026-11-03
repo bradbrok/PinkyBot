@@ -270,6 +270,7 @@ from pinky_daemon.store_catalog import (
     StoreCatalogError,
     StoreIntegrityTarget,
     StorePathAuthorityError,
+    lstat_with_resolved_parent,
     storage_hold_scope,
 )
 from pinky_daemon.store_manifest import (
@@ -9066,14 +9067,22 @@ npm run build</pre>
                     store_catalog.inspect_layout, scope=name, registered_agents=_storage_agent_names(),
                 )
                 reported_paths = {finding.get("path") for finding in inspection.findings}
-                retained_outward_link = bool(hold) and any(
-                    isinstance(path := finding.get("path"), str)
-                    and path not in reported_paths
-                    and os.path.lexists(path) and os.path.islink(path)
-                    and os.path.commonpath((store_catalog.expected_root, os.path.realpath(path)))
-                    != store_catalog.expected_root
-                    for finding in hold["findings"]
-                )
+
+                def retained_link(finding):
+                    path = finding.get("path")
+                    if not isinstance(path, str) or path in reported_paths:
+                        return False
+                    try:
+                        metadata = lstat_with_resolved_parent(path)
+                    except (FileNotFoundError, NotADirectoryError):
+                        return False
+                    return (
+                        stat.S_ISLNK(metadata.st_mode)
+                        and os.path.commonpath((store_catalog.expected_root, os.path.realpath(path)))
+                        != store_catalog.expected_root
+                    )
+
+                retained_outward_link = bool(hold) and any(map(retained_link, hold["findings"]))
             except OSError as exc:
                 return {"cleared": False, "reason": "incomplete", "findings": [],
                         "error": type(exc).__name__, "storage_hold": hold}

@@ -881,6 +881,13 @@ def read_store_identities(
     return identities
 
 
+def lstat_with_resolved_parent(path: str | os.PathLike[str]) -> os.stat_result:
+    """Inspect the entry without re-walking its lexical directory aliases."""
+    path = os.fspath(path)
+    parent = os.path.realpath(os.path.dirname(path))
+    return os.lstat(os.path.join(parent, os.path.basename(path)))
+
+
 def inspect_filesystem_layout(
     expected_root: str | os.PathLike[str],
     registered_identities: Mapping[str, tuple[int, int] | None],
@@ -915,7 +922,7 @@ class _FilesystemLayoutInspector:
         self._finding_keys: set[tuple[tuple[str, str | None], ...]] = set()
         self.warnings: list[str] = []
         self.unclaimed_databases: list[_FilesystemDatabase] = []
-        self._unclaimed_entries: set[tuple[tuple[int, int], str]] = set()
+        self._unclaimed_entries: set[tuple[tuple[int, int], str, tuple[int, int]]] = set()
         self.skipped_unmanaged_subtrees = 0
         self._agent_child_identities: dict[str, dict[str, tuple[int, int] | None]] = {}
         self._registered_ancestor_identities: set[tuple[int, int]] | None = None
@@ -966,7 +973,13 @@ class _FilesystemLayoutInspector:
                     reported_directory_errors.add(directory)
                     self._inspection_error("directory", directory, None, exc)
                 continue
-            if self._record_outward_database_link(directory, resolved_directory):
+            try:
+                if self._record_outward_database_link(directory, resolved_directory):
+                    continue
+            except OSError as exc:
+                if directory not in reported_directory_errors:
+                    reported_directory_errors.add(directory)
+                    self._inspection_error("directory", directory, resolved_directory, exc)
                 continue
             try:
                 directory_stat = os.stat(resolved_directory)
@@ -1083,7 +1096,9 @@ class _FilesystemLayoutInspector:
                     except OSError as exc:
                         self._inspection_error("file or directory", discovered_path, None, exc)
                         continue
-                    if self._record_outward_database_link(discovered_path, resolved_path):
+                    if self._record_outward_database_link(
+                        discovered_path, resolved_path, is_symlink=is_symlink,
+                    ):
                         continue
                 if not is_symlink and not (
                     (entry.name.endswith(".db") and not entry.name.endswith(_SQLITE_SIDECAR_SUFFIXES))
@@ -1198,12 +1213,15 @@ class _FilesystemLayoutInspector:
             self._registered_ancestor_identities = identities
         return directory_identity in self._registered_ancestor_identities
 
-    def _record_outward_database_link(self, path, resolved_path) -> bool:
+    def _record_outward_database_link(self, path, resolved_path, *, is_symlink=None) -> bool:
         name = os.path.basename(path)
         if (name.endswith(".db") and not name.endswith(_SQLITE_SIDECAR_SUFFIXES)
-                and not self._under_root(resolved_path) and os.path.islink(path)):
-            self._outside_root("database", path, resolved_path)
-            return True
+                and not self._under_root(resolved_path)):
+            if is_symlink is None:
+                is_symlink = stat.S_ISLNK(lstat_with_resolved_parent(path).st_mode)
+            if is_symlink:
+                self._outside_root("database", path, resolved_path)
+                return True
         return False
 
     def _record_database(
@@ -1248,7 +1266,9 @@ class _FilesystemLayoutInspector:
                 or self._ignored_path(resolved_path) or component_memory):
             return
         # Distinct file aliases keep their warnings; revisiting the same entry
-        # through a different directory scope must not duplicate hygiene output.
+        # and target through a different scope must not duplicate hygiene output.
+        if entry_identity is not None:
+            entry_identity = (*entry_identity, database.dev_ino)
         if entry_identity is None or entry_identity not in self._unclaimed_entries:
             if entry_identity is not None:
                 self._unclaimed_entries.add(entry_identity)
