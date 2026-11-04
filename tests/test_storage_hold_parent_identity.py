@@ -271,3 +271,79 @@ async def test_repaired_leaf_in_same_parent_clears_hold(parent_hold, replacement
 
     assert body["cleared"] is True
     assert "alice" not in h.app.state.storage_holds
+
+
+@pytest.fixture
+async def simple_parent_hold(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    app = create_api(db_path=str(root / "conversations.db"))
+    catalog = app.state.store_catalog
+    try:
+        for name in ("bob", "alice"):
+            app.state.agents.register(name, working_dir=str(root / "agents" / name))
+        app.state.agents.set_main_agent("bob")
+        parent = root / "agents" / "alice" / "data" / "sub"
+        parent.mkdir(parents=True, exist_ok=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        leaf = parent / "escape"
+        leaf.symlink_to(outside, target_is_directory=True)
+        identity = (leaf.lstat().st_dev, leaf.lstat().st_ino)
+        catalog.shutdown(deadline_seconds=5)
+        app = create_api(db_path=str(root / "conversations.db"))
+        catalog = app.state.store_catalog
+        findings = app.state.storage_holds["alice"]
+        assert len(findings) == 1
+        assert findings[0]["path"] == str(leaf)
+        assert findings[0]["parent_path"] == str(parent)
+        assert (findings[0]["parent_dev"], findings[0]["parent_ino"]) == (
+            parent.stat().st_dev, parent.stat().st_ino,
+        )
+        outside.rmdir()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            cookies={
+                SESSION_COOKIE_NAME: create_session_cookie(os.environ["PINKY_SESSION_SECRET"])
+            },
+        ) as client:
+            yield SimpleNamespace(app=app, catalog=catalog, client=client, leaf=leaf, identity=identity)
+    finally:
+        catalog.shutdown(deadline_seconds=5)
+
+
+async def test_parent_aba_needs_descriptor_absence_proof(simple_parent_hold, monkeypatch):
+    h = simple_parent_hold
+    before = copy.deepcopy(h.app.state.storage_holds)
+    original_scan = h.catalog.inspect_layout
+    original_lstat = os.lstat
+    moved = h.leaf.parent.with_name("temporarily-away")
+    armed, events = [], []
+
+    def scan(**kwargs):
+        result = original_scan(**kwargs)
+        assert result.findings == []
+        assert not any(warning.startswith("could not inspect") for warning in result.warnings)
+        armed.append(True)
+        return result
+
+    def lstat(path, *args, **kwargs):
+        if armed and not events and os.fspath(path) == str(h.leaf):
+            h.leaf.parent.rename(moved)
+            try:
+                return original_lstat(path, *args, **kwargs)
+            except FileNotFoundError:
+                events.append(True)
+                raise
+            finally:
+                moved.rename(h.leaf.parent)
+        return original_lstat(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(h.catalog, "inspect_layout", scan)
+        patch.setattr(os, "lstat", lstat)
+        body = await _recheck(h)
+
+    assert events == [True]
+    _retained(h, body, before)

@@ -9067,7 +9067,10 @@ npm run build</pre>
 
     @app.post("/agents/{name}/storage/recheck")
     async def recheck_storage_hold(name: str, request: Request):
-        """Clear a hold only after a complete, safe scan of its lexical scope."""
+        """Clear a hold only after a complete, safe scan of its lexical scope.
+
+        This checks the layout when run; it does not protect against concurrent tree changes.
+        """
         name = _agent_name_or_400(name)
         caller = getattr(request.state, "internal_caller", "")
         if caller:
