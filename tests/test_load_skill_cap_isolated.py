@@ -74,6 +74,8 @@ def test_isolated_agent_capped_load_skill_works_without_a_read_line(
     assert calls == [("GET", "/skills/long-fixture"), ("GET", "/agents/tenant")]
     assert out.startswith("# Skill: long-fixture\nLong fixture\n\n[Partial load: ")
     assert "(cap 2000)" in out
+    assert "\n## Rules [always]\n" in out
+    assert "\n## Setup\n" not in out
     # The skill read is already on the pending-scope list (and proves the read
     # diagnostics are on); the agent's read of its own record adds no line.
     assert [line for line in logs if line.startswith("isolation: WOULD DENY READ ")] == [

@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_self.server import create_server
-from tests.skill_sections_support import FIXTURES, LONG, today_output
+from tests.skill_sections_support import ALWAYS_LAST, FIXTURES, LONG, today_output
 
 AGENT = "cap-tester"
 TOOL_DESCRIPTION = (
@@ -119,6 +119,18 @@ def test_cap_set_returns_contents_and_first_part():
     assert "\n## Rules [always]\n" in out
     assert "\n## Reference\n" not in out
     assert calls == [("GET", "/skills/long"), ("GET", f"/agents/{AGENT}")]
+
+
+def test_cap_set_serves_always_sections_beyond_the_first_part():
+    always = "## Never Do [always]\n" + ALWAYS_LAST.split("## Never Do [always]\n", 1)[1]
+    first = ALWAYS_LAST.split("## Middle\n", 1)[0]
+    out, _ = _run("always-last", "", ALWAYS_LAST, {"skill_load_cap": 2000})
+    assert out.startswith(
+        f"# Skill: always-last\n\n[Partial load: {len(first) + len(always)} of "
+        f"{len(ALWAYS_LAST)} characters (cap 2000). Not shown: sections 2-3. "
+    )
+    assert "Section 1 is longer than the cap and is shown whole.]" in out
+    assert out.endswith("\n\n" + first + "[Not shown: sections 2-3]\n" + always)
 
 
 @pytest.mark.parametrize(
