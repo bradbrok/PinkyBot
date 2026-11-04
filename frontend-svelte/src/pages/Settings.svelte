@@ -1347,7 +1347,7 @@
                 <div class="empty">{$_('settings.hb_no_agents')}</div>
             {:else}
                 <table class="data-table">
-                    <thead><tr><th>{$_('settings.hb_agent_col')}</th><th>{$_('settings.hb_wake_col')}</th><th>{$_('settings.hb_clock_col')}</th><th>{$_('settings.hb_sleep_col')}</th><th>Skill load cap</th><th>{$_('settings.hb_heartbeat_col')}</th><th>{$_('settings.hb_schedules_col')}</th><th>{$_('settings.hb_actions_col')}</th></tr></thead>
+                    <thead><tr><th>{$_('settings.hb_agent_col')}</th><th>{$_('settings.hb_wake_col')}</th><th>{$_('settings.hb_clock_col')}</th><th>{$_('settings.hb_sleep_col')}</th><th>{$_('settings.hb_skill_cap_col')}</th><th>{$_('settings.hb_heartbeat_col')}</th><th>{$_('settings.hb_schedules_col')}</th><th>{$_('settings.hb_actions_col')}</th></tr></thead>
                     <tbody>
                         {#each heartbeatSettings as a}
                             <tr>
@@ -1369,7 +1369,7 @@
                                 </td>
                                 <td>
                                     <span class="badge badge-{a.skill_load_cap > 0 ? 'on' : 'off'}">
-                                        {a.skill_load_cap > 0 ? a.skill_load_cap + ' chars' : 'Whole skill'}
+                                        {a.skill_load_cap > 0 ? $_('settings.hb_skill_cap_chars', { values: { count: a.skill_load_cap } }) : $_('settings.hb_skill_cap_whole')}
                                     </span>
                                 </td>
                                 <td>
@@ -1435,7 +1435,7 @@
                         </select>
                     </div>
                     <div class="form-row">
-                        <span class="form-label">Skill load cap (characters, 0 = whole skill)</span>
+                        <span class="form-label">{$_('settings.skill_load_cap_label')}</span>
                         <input type="number" class="form-input" bind:value={editSkillLoadCap} min="0" max="200000" style="max-width:140px">
                     </div>
                 </div>
