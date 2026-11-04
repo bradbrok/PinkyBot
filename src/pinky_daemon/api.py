@@ -270,7 +270,8 @@ from pinky_daemon.store_catalog import (
     StoreCatalogError,
     StoreIntegrityTarget,
     StorePathAuthorityError,
-    lstat_with_resolved_parent,
+    record_storage_hold_parent,
+    storage_hold_parent,
     storage_hold_scope,
 )
 from pinky_daemon.store_manifest import (
@@ -3417,12 +3418,25 @@ def create_api(
 
     app.state.storage_holds = {}
     app.state.storage_hold_overrides = set()
+    storage_parent_fields = ("parent_path", "parent_dev", "parent_ino")
     delivered_main_storage_notices: set[str] = set()
 
-    def _storage_hold_for(name: str | None = None, *, registering: bool = False):
+    def _storage_findings_view(findings):
+        return [
+            {key: value for key, value in finding.items() if key not in storage_parent_fields}
+            for finding in findings
+        ]
+
+    def _storage_hold_for(
+        name: str | None = None, *, registering: bool = False,
+        include_parent_identity: bool = False,
+    ):
         """The sole state reader; registration projects a detached view without saving."""
         if name is None:
-            return [_storage_hold_for(subject) for subject in app.state.storage_holds]
+            return [
+                _storage_hold_for(subject, include_parent_identity=include_parent_identity)
+                for subject in app.state.storage_holds
+            ]
         findings = app.state.storage_holds.get(name)
         if not name or not findings:
             return None
@@ -3437,6 +3451,8 @@ def create_api(
             "main_exempt": main_exempt, "overridden": overridden,
             "registered": registered,
         }
+        if not include_parent_identity:
+            view["findings"] = _storage_findings_view(view["findings"])
         if registering and not registered:
             view["prospective_registration"] = True
         return view
@@ -9061,7 +9077,7 @@ npm run build</pre>
         if agents.get(name) is None:
             raise HTTPException(404, f"Agent '{name}' not found")
         async with _lifecycle(name):
-            hold = _storage_hold_for(name)
+            hold = _storage_hold_for(name, include_parent_identity=True)
             try:
                 inspection = await asyncio.to_thread(
                     store_catalog.inspect_layout, scope=name, registered_agents=_storage_agent_names(),
@@ -9070,22 +9086,48 @@ npm run build</pre>
 
                 def retained_link(finding):
                     path = finding.get("path")
-                    if not isinstance(path, str) or path in reported_paths:
+                    if not isinstance(path, str):
                         return False
-                    try:
-                        metadata = lstat_with_resolved_parent(path)
-                    except (FileNotFoundError, NotADirectoryError):
-                        return False
-                    return (
-                        stat.S_ISLNK(metadata.st_mode)
-                        and os.path.commonpath((store_catalog.expected_root, os.path.realpath(path)))
-                        != store_catalog.expected_root
-                    )
+                    with storage_hold_parent(path) as (parent, descriptor, parent_stat):
+                        if any(key in finding for key in storage_parent_fields):
+                            if (
+                                not isinstance(finding.get("parent_path"), str)
+                                or (finding.get("parent_dev"), finding.get("parent_ino"))
+                                != (parent_stat.st_dev, parent_stat.st_ino)
+                            ):
+                                raise OSError("storage hold parent identity is unverified")
+                        if path in reported_paths:
+                            return False
+                        name = os.path.basename(path)
+                        try:
+                            metadata = os.lstat(os.path.join(parent, name))
+                        except FileNotFoundError:
+                            try:
+                                os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                            except FileNotFoundError:
+                                return False
+                            raise OSError("storage hold entry still exists in its parent")
+                        anchored = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                        if (metadata.st_dev, metadata.st_ino) != (anchored.st_dev, anchored.st_ino):
+                            raise OSError("storage hold entry changed during lookup")
+                        if not stat.S_ISLNK(metadata.st_mode):
+                            return False
+                        target = os.readlink(name, dir_fd=descriptor)
+                        if not os.path.isabs(target):
+                            target = os.path.join(parent, target)
+                        resolved = os.path.realpath(target, strict=True)
+                        return (
+                            os.path.commonpath((store_catalog.expected_root, resolved))
+                            != store_catalog.expected_root
+                        )
 
                 retained_outward_link = bool(hold) and any(map(retained_link, hold["findings"]))
             except OSError as exc:
+                public_hold = (
+                    {**hold, "findings": _storage_findings_view(hold["findings"])} if hold else None
+                )
                 return {"cleared": False, "reason": "incomplete", "findings": [],
-                        "error": type(exc).__name__, "storage_hold": hold}
+                        "error": type(exc).__name__, "storage_hold": public_hold}
             incomplete = retained_outward_link or any(
                 warning.startswith("could not inspect") for warning in inspection.warnings
             )
@@ -9094,7 +9136,17 @@ npm run build</pre>
                     storage_hold_scope(store_catalog.expected_root, finding, _storage_agent_names()) == name
                     for finding in inspection.findings
                 ):
-                    app.state.storage_holds[name] = copy.deepcopy(inspection.findings)
+                    def accepted_finding(finding):
+                        for previous in hold["findings"]:
+                            plain = {key: value for key, value in previous.items()
+                                     if key not in storage_parent_fields}
+                            if plain == finding:
+                                return copy.deepcopy(previous)
+                        return record_storage_hold_parent(finding)
+
+                    app.state.storage_holds[name] = [
+                        accepted_finding(finding) for finding in inspection.findings
+                    ]
                 return {"cleared": False, "reason": "incomplete" if incomplete else "findings",
                         "findings": inspection.findings, "warnings": inspection.warnings,
                         "storage_hold": _storage_hold_for(name)}
@@ -17334,7 +17386,7 @@ npm run build</pre>
         warnings = reconciliation.warnings if reconciliation else []
         holds = {}
         for finding in reconciliation.holds if reconciliation else []:
-            holds.setdefault(finding["scope"], []).append(finding)
+            holds.setdefault(finding["scope"], []).append(record_storage_hold_parent(finding))
         app.state.storage_holds = holds
     except StoreCatalogError as exc:
         storage_observability.record_boot_failure()

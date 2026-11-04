@@ -12,7 +12,8 @@ import sqlite3
 import stat
 import sys
 import threading
-from collections.abc import Callable, Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -879,6 +880,39 @@ def read_store_identities(
             raise
         identities[path] = (metadata.st_dev, metadata.st_ino)
     return identities
+
+
+@contextmanager
+def storage_hold_parent(
+    path: str | os.PathLike[str],
+) -> Iterator[tuple[str, int, os.stat_result]]:
+    """Keep leaf operations anchored to one strictly resolved parent directory."""
+    parent = os.path.realpath(os.path.dirname(os.fspath(path)), strict=True)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(parent, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), parent)
+        yield parent, descriptor, metadata
+        current = os.stat(parent, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise OSError("storage hold parent changed during lookup")
+    finally:
+        os.close(descriptor)
+
+
+def record_storage_hold_parent(finding: Mapping[str, Any]) -> dict[str, Any]:
+    """Capture identity for a new hold without changing its inspection finding."""
+    hold = dict(finding)
+    hold.update(parent_path=None, parent_dev=None, parent_ino=None)
+    try:
+        with storage_hold_parent(hold["path"]) as (parent, _, metadata):
+            hold.update(parent_path=parent, parent_dev=metadata.st_dev, parent_ino=metadata.st_ino)
+    except OSError:
+        # An unknown parent identity cannot later prove leaf removal.
+        pass
+    return hold
 
 
 def lstat_with_resolved_parent(path: str | os.PathLike[str]) -> os.stat_result:
