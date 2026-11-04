@@ -82,6 +82,24 @@ DEFAULT_STREAMING_ALLOWED_TOOLS = [
 ]
 
 
+# SDK stdout frame cap. The SDK default (1 MiB) is smaller than a single
+# tool result carrying a full-size screenshot (base64 image), so one Read of
+# a large PNG killed the reader loop. Override with PINKY_SDK_MAX_BUFFER_BYTES.
+_DEFAULT_SDK_MAX_BUFFER_BYTES = 32 * 1024 * 1024
+
+
+def _sdk_max_buffer_size() -> int:
+    raw = os.environ.get("PINKY_SDK_MAX_BUFFER_BYTES", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+    return _DEFAULT_SDK_MAX_BUFFER_BYTES
+
+
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
@@ -319,6 +337,8 @@ class StreamingSession(TransportReplacementMixin):
         self._auth_success_callback = auth_success_callback
         self._client = None
         self._reader_task: asyncio.Task | None = None
+        # Strong ref for a reconnect spawned by the reader loop on transport loss.
+        self._reader_reconnect_task: asyncio.Task | None = None
         # Strong refs to background tasks (e.g. the post-handshake wake
         # prompt detached from connect()). Python's asyncio docs warn:
         # tasks created via asyncio.create_task() must have a strong
@@ -499,6 +519,7 @@ class StreamingSession(TransportReplacementMixin):
             allowed_tools=self._config.allowed_tools or DEFAULT_STREAMING_ALLOWED_TOOLS,
             permission_mode=self._config.permission_mode,
             mcp_servers=mcp_servers or None,
+            max_buffer_size=_sdk_max_buffer_size(),
         )
 
         if self._config.disallowed_tools:
@@ -1492,7 +1513,14 @@ class StreamingSession(TransportReplacementMixin):
             # pattern from PR #484). attempt_reconnect drives the retry loop and
             # settles to CONNECTED or DEAD.
             self._state_machine._state = SessionState.RECONNECTING
-            await self.attempt_reconnect()
+            # Do NOT await the reconnect from inside the reader task: the
+            # reconnect cycle calls disconnect(), which cancels and awaits
+            # this very task. Awaiting here deadlocked the two tasks (the
+            # cancel propagated into the reconnect task, RecursionError,
+            # both destroyed while pending) and left the session stuck in
+            # RECONNECTING until the watchdog's ~6 min transition recovery.
+            # Hand the reconnect to its own task and let the reader exit.
+            self._reader_reconnect_task = asyncio.create_task(self.attempt_reconnect())
 
     def _context_window(self, *, reported_max: int | None = None) -> int:
         """Use the same effective window for the gauge and restart ceiling."""
