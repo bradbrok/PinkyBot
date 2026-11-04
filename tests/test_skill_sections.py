@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 
 from pinky_daemon.skill_sections import (
@@ -12,7 +14,7 @@ from pinky_daemon.skill_sections import (
     split_sections,
     validate_skill_load_cap,
 )
-from tests.skill_sections_support import FIXTURES, LONG, today_output
+from tests.skill_sections_support import FIXTURES, LONG, assert_partial, today_output
 
 INTRO = "Intro.\n"
 
@@ -122,107 +124,120 @@ def test_section_zero_listed_only_with_text():
 
 
 # ── Default (capped) output ────────────────────────────────────────────────
+# Partial-load fixtures use sections of about 1000 characters, so the hidden
+# part is larger than the notice and contents list a partial load adds.
 
 
 def test_partial_exact_format():
-    s1, s2, s3, s4 = sec("One", 100), sec("Two", 100), sec("Three", 100), sec("Four [always]", 100)
+    s1, s2, s3 = sec("One", 1000), sec("Two", 1000), sec("Three", 1000)
+    s4 = sec("Four [always]", 1000)
     text = INTRO + s1 + s2 + s3 + s4
-    assert len(text) == 407
+    assert len(text) == 4007
     expected = (
         "# Skill: demo\nDemo description\n\n"
-        + notice("demo", 307, 407, 210, "3")
+        + notice("demo", 3007, 4007, 2010, "3")
         + "\n\nContents:\n"
         "0. (intro) - 7 characters - shown\n"
-        "1. One - 100 characters - shown\n"
-        "2. Two - 100 characters - shown\n"
-        "3. Three - 100 characters\n"
-        "4. Four [always] - 100 characters - shown\n\n"
+        "1. One - 1000 characters - shown\n"
+        "2. Two - 1000 characters - shown\n"
+        "3. Three - 1000 characters\n"
+        "4. Four [always] - 1000 characters - shown\n\n"
         + INTRO + s1 + s2 + "[Not shown: sections 3]\n" + s4
     )
-    assert render_default("demo", "Demo description", text, 210) == expected
+    out = render_default("demo", "Demo description", text, 2010)
+    assert out == expected
+    assert_partial(out, "demo", "Demo description", text)
 
 
 def test_partial_without_description_follows_todays_header_rule():
-    text = INTRO + sec("One", 100) + sec("Two", 100) + sec("Three", 100)
-    out = render_default("demo", "", text, 150)
+    text = INTRO + sec("One", 1000) + sec("Two", 1000) + sec("Three", 1000)
+    out = render_default("demo", "", text, 2000)
     assert out.startswith("# Skill: demo\n\n[Partial load: ")
     assert out.isascii()
+    assert_partial(out, "demo", "", text)
 
 
 def test_contiguous_fill_up_to_the_cap():
-    s = [sec(f"S{k}", 100) for k in range(1, 5)]
+    s = [sec(f"S{k}", 1000) for k in range(1, 5)]
     text = INTRO + "".join(s)
-    out = render_default("demo", "", text, 310)
-    assert notice("demo", 307, 407, 310, "4") in out
+    out = render_default("demo", "", text, 3010)
+    assert notice("demo", 3007, 4007, 3010, "4") in out
     assert out.endswith(INTRO + s[0] + s[1] + s[2] + "[Not shown: sections 4]\n")
+    assert_partial(out, "demo", "", text)
 
 
 def test_fill_stops_at_first_section_that_does_not_fit():
-    s1, s2, s3 = sec("One", 100), sec("Big", 300), sec("Small", 50)
+    s1, s2, s3 = sec("One", 1000), sec("Big", 3000), sec("Small", 500)
     text = INTRO + s1 + s2 + s3
-    out = render_default("demo", "", text, 200)
+    out = render_default("demo", "", text, 2000)
     # Section 3 alone would fit, but the first part stays contiguous.
     assert s3 not in out
-    assert notice("demo", 107, 457, 200, "2-3") in out
+    assert notice("demo", 1007, 4507, 2000, "2-3") in out
     assert out.endswith(INTRO + s1 + "[Not shown: sections 2-3]\n")
+    assert_partial(out, "demo", "", text)
 
 
 def test_section_one_over_the_cap_is_shown_whole():
-    s1, s2 = sec("Big", 500), sec("Small", 50)
+    s1, s2 = sec("Big", 5000), sec("Small", 1000)
     text = INTRO + s1 + s2
-    out = render_default("demo", "", text, 300)
+    out = render_default("demo", "", text, 2000)
     assert s1 in out
     assert notice(
-        "demo", 507, 557, 300, "2",
+        "demo", 5007, 6007, 2000, "2",
         " Section 1 is longer than the cap and is shown whole.",
     ) in out
     assert out.endswith(INTRO + s1 + "[Not shown: sections 2]\n")
+    assert_partial(out, "demo", "", text)
 
 
 def test_always_section_at_the_end_is_served_with_gap_lines():
-    s = [sec("One", 100), sec("Two", 100), sec("Three", 100), sec("Four", 100)]
-    rules = sec("Rules [always]", 100)
+    s = [sec("One", 1000), sec("Two", 1000), sec("Three", 1000), sec("Four", 1000)]
+    rules = sec("Rules [always]", 1000)
     text = INTRO + "".join(s) + rules
-    out = render_default("demo", "", text, 210)
+    out = render_default("demo", "", text, 2010)
     assert rules in out
     assert out.endswith(
         INTRO + s[0] + s[1] + "[Not shown: sections 3-4]\n" + rules
     )
-    assert "5. Rules [always] - 100 characters - shown" in out
+    assert "5. Rules [always] - 1000 characters - shown" in out
+    assert_partial(out, "demo", "", text)
 
 
 def test_always_sections_do_not_use_up_the_cap():
-    s1, rules = sec("One", 100), sec("Rules [always]", 150)
-    s3, s4 = sec("Three", 100), sec("Four", 100)
+    s1, rules = sec("One", 1000), sec("Rules [always]", 1500)
+    s3, s4 = sec("Three", 1000), sec("Four", 1000)
     text = INTRO + s1 + rules + s3 + s4
-    out = render_default("demo", "", text, 220)
-    # 7 + 100 + 100 = 207 <= 220 once the always section is not counted.
+    out = render_default("demo", "", text, 2200)
+    # 7 + 1000 + 1000 = 2007 <= 2200 once the always section is not counted.
     assert out.endswith(INTRO + s1 + rules + s3 + "[Not shown: sections 4]\n")
-    assert notice("demo", 357, 457, 220, "4") in out
+    assert notice("demo", 3507, 4507, 2200, "4") in out
+    assert_partial(out, "demo", "", text)
 
 
 def test_several_gaps_and_ranges():
-    s = [sec(f"S{k}", 100) for k in range(1, 8)]
-    s[3] = sec("S4 [always]", 100)
+    s = [sec(f"S{k}", 1000) for k in range(1, 8)]
+    s[3] = sec("S4 [always]", 1000)
     text = INTRO + "".join(s)
-    out = render_default("demo", "", text, 150)
-    assert notice("demo", 207, 707, 150, "2-3, 5-7") in out
+    out = render_default("demo", "", text, 2000)
+    assert notice("demo", 2007, 7007, 2000, "2-3, 5-7") in out
     assert out.endswith(
         INTRO + s[0] + "[Not shown: sections 2-3]\n" + s[3] + "[Not shown: sections 5-7]\n"
     )
+    assert_partial(out, "demo", "", text)
 
 
 def test_unlisted_intro_is_not_in_contents():
-    s = [sec("A", 100), sec("B", 100), sec("C", 100)]
+    s = [sec("A", 1000), sec("B", 1000), sec("C", 1000)]
     text = "\n" + "".join(s)
-    out = render_default("demo", "", text, 150)
+    out = render_default("demo", "", text, 2000)
     contents = out.split("Contents:\n", 1)[1].split("\n\n", 1)[0]
     assert contents.splitlines() == [
-        "1. A - 100 characters - shown",
-        "2. B - 100 characters",
-        "3. C - 100 characters",
+        "1. A - 1000 characters - shown",
+        "2. B - 1000 characters",
+        "3. C - 1000 characters",
     ]
     assert out.endswith("\n\n" + "\n" + s[0] + "[Not shown: sections 2-3]\n")
+    assert_partial(out, "demo", "", text)
 
 
 @pytest.mark.parametrize("cap", [0, -5])
@@ -231,9 +246,10 @@ def test_cap_zero_or_below_is_todays_output(cap):
 
 
 def test_total_within_cap_is_todays_output():
-    text = INTRO + sec("One", 100) + sec("Two", 100)
+    text = INTRO + sec("One", 1000) + sec("Two", 1000)
     assert render_default("demo", "d", text, len(text)) == today_output("demo", "d", text)
-    assert render_default("demo", "d", text, len(text) - 1) != today_output("demo", "d", text)
+    # One character over the cap is a partial load (shorter than the whole skill).
+    assert_partial(render_default("demo", "d", text, len(text) - 1), "demo", "d", text)
 
 
 @pytest.mark.parametrize(
@@ -248,6 +264,82 @@ def test_fewer_than_two_headings_is_todays_output(text):
 def test_served_set_of_every_section_is_todays_output():
     text = INTRO + sec("One", 100) + sec("Rules [always]", 300)
     assert render_default("demo", "d", text, 200) == today_output("demo", "d", text)
+
+
+def test_just_over_the_cap_with_a_small_hidden_part_is_todays_output():
+    # 7 + 10000 + 9900 = 19907 fits the cap; only the 200-character tail would
+    # be hidden, which is less than the notice and contents list would add.
+    text = INTRO + sec("Main", 10_000) + sec("More", 9_900) + sec("Tail", 200)
+    assert len(text) == 20_107
+    assert render_default("demo", "d", text, 20_000) == today_output("demo", "d", text)
+    # With a larger hidden tail the partial load is shorter, so it is used.
+    text = INTRO + sec("Main", 10_000) + sec("More", 9_900) + sec("Tail", 2_000)
+    assert_partial(render_default("demo", "d", text, 20_000), "demo", "d", text)
+
+
+def test_partial_as_long_as_the_whole_skill_is_todays_output():
+    s1 = sec("One", 2000)
+
+    def skill(hidden):
+        """The skill with a hidden section 2 of ``hidden`` characters, and its partial load."""
+        text = INTRO + s1 + sec("Two", hidden)
+        partial = (
+            "# Skill: demo\n\n"
+            + notice("demo", 2007, len(text), 2050, "2")
+            + "\n\nContents:\n"
+            "0. (intro) - 7 characters - shown\n"
+            "1. One - 2000 characters - shown\n"
+            f"2. Two - {hidden} characters\n\n"
+            + INTRO + s1 + "[Not shown: sections 2]\n"
+        )
+        return text, partial
+
+    # From 100 to 999 hidden characters the partial load keeps one length, so
+    # exactly one size makes it as long as the whole skill.
+    equal = [
+        hidden for hidden in range(100, 1000)
+        if len(skill(hidden)[1]) == len(today_output("demo", "", skill(hidden)[0]))
+    ]
+    assert len(equal) == 1 and 100 < equal[0] < 999
+    for hidden in (equal[0] - 1, equal[0]):  # Longer than, then as long as the whole skill.
+        text, _ = skill(hidden)
+        assert render_default("demo", "", text, 2050) == today_output("demo", "", text)
+    text, partial = skill(equal[0] + 1)  # One character shorter: the partial load.
+    assert render_default("demo", "", text, 2050) == partial
+    assert_partial(partial, "demo", "", text)
+
+
+def _generated_skills():
+    """(name, description, directive) over small and large sections and [always] marks."""
+    sizes = (40, 150, 600, 2500)
+    for intro in ("", INTRO):
+        for count in (2, 3, 4):
+            for combo in itertools.product(sizes, repeat=count):
+                for always in sorted({0, 2, count}):  # 0 = no section marked.
+                    parts = [
+                        sec(f"S{k}" + (" [always]" if k == always else ""), size)
+                        for k, size in enumerate(combo, 1)
+                    ]
+                    yield "demo", "d", intro + "".join(parts)
+    for name, (description, directive) in FIXTURES.items():
+        yield name, description, directive
+
+
+def test_default_load_is_todays_output_or_shorter():
+    partial = 0
+    longer = []
+    for name, description, directive in _generated_skills():
+        whole = today_output(name, description, directive)
+        for cap in (1, 100, 300, 1000, 2000, 5000, 20_000, len(directive) - 1):
+            out = render_default(name, description, directive, cap)
+            if out == whole:
+                continue
+            if len(out) < len(whole):
+                partial += 1
+            else:
+                longer.append((name, len(directive), cap, len(out) - len(whole)))
+    assert not longer, f"{len(longer)} loads longer than the whole skill, e.g. {longer[:3]}"
+    assert partial  # The grid also has real partial loads.
 
 
 def test_full_text_is_todays_output():

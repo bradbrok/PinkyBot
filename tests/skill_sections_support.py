@@ -17,6 +17,14 @@ def today_output(name: str, description, directive) -> str:
     return f"{header}\n\n{directive}"
 
 
+def assert_partial(out: str, name: str, description, directive) -> None:
+    """``out`` is a partial load, and strictly shorter than today's output."""
+    whole = today_output(name, description, directive)
+    header = whole[: len(whole) - len(directive)]
+    assert out.startswith(f"{header}[Partial load: ")
+    assert len(out) < len(whole), (len(out), len(whole))
+
+
 # Over 20000 characters, several headings, a fence with heading-like lines,
 # an always-served section and a long tail.
 LONG = (

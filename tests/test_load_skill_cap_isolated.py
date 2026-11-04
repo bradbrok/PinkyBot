@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from pinky_daemon import api
 from pinky_self.server import create_server
 from tests.isolated_policy_support import daemon as daemon
-from tests.skill_sections_support import LONG, today_output
+from tests.skill_sections_support import LONG, assert_partial, today_output
 
 pytestmark = pytest.mark.real_auth
 
@@ -73,6 +73,7 @@ def test_isolated_agent_capped_load_skill_works_without_a_read_line(
 
     assert calls == [("GET", "/skills/long-fixture"), ("GET", "/agents/tenant")]
     assert out.startswith("# Skill: long-fixture\nLong fixture\n\n[Partial load: ")
+    assert_partial(out, "long-fixture", "Long fixture", LONG)
     assert "(cap 2000)" in out
     assert "\n## Rules [always]\n" in out
     assert "\n## Setup\n" not in out
