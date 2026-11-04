@@ -204,7 +204,12 @@ def render_default(name: str, description, directive, cap: int) -> str:
         body.append(_gap_line(body[-1] if body else "", gap))
 
     header = _header(name, description)
-    return f"{header}\n\n{notice}\n\n{_contents(sections, served)}\n\n{''.join(body)}"
+    partial = f"{header}\n\n{notice}\n\n{_contents(sections, served)}\n\n{''.join(body)}"
+    # The notice and contents list can cost more than a small hidden part, and
+    # a partial load must never be longer than the whole skill.
+    if len(partial) >= len(whole):
+        return whole
+    return partial
 
 
 def render_section(name: str, description, directive, section: str) -> str:
