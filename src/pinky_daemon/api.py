@@ -16771,6 +16771,7 @@ npm run build</pre>
                 "wake_interval": a.wake_interval,
                 "clock_aligned": a.clock_aligned,
                 "auto_sleep_hours": a.auto_sleep_hours,
+                "skill_load_cap": a.skill_load_cap,
                 "latest_heartbeat": hb_map.get(a.name),
                 "schedules": agent_schedules,
             })

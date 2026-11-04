@@ -151,6 +151,28 @@ def test_cap_read_failure_gives_full_text(agent):
     assert calls == [("GET", "/skills/long"), ("GET", f"/agents/{AGENT}")]
 
 
+def test_cap_read_that_raises_gives_full_text():
+    import pinky_self.server as server_module
+
+    original = server_module.build_internal_auth_headers
+
+    def signing(secret, **kwargs):
+        if kwargs["path"].startswith("/agents/"):
+            raise RuntimeError("fixture signing failure")
+        return original(secret, **kwargs)
+
+    api = FakeApi(
+        {"name": "long", "description": "A long skill", "directive": LONG},
+        {"skill_load_cap": 20000},
+    )
+    with patch("urllib.request.urlopen", side_effect=api), patch.object(
+        server_module, "build_internal_auth_headers", side_effect=signing
+    ):
+        out = _tool().fn(skill_name="long")
+    assert out == today_output("long", "A long skill", LONG)
+    assert api.calls == [("GET", "/skills/long")]
+
+
 @pytest.mark.parametrize("section", ["all", "1", "Setup", "Nope", " "])
 def test_cap_is_read_only_for_the_default_load(section):
     out, calls = _run(

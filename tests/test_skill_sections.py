@@ -52,7 +52,9 @@ ROUND_TRIP = {
     "crlf": ("Intro\r\n# A\r\nbody\r\n## B\r\nmore\r\n", ["A", "B"]),
     "lone cr": ("# A\rbody\r## B\r", ["A", "B"]),
     "mixed endings": ("# A\r\nx\n## B\ry\r\n", ["A", "B"]),
-    "0-3 spaces and 4 spaces": ("   # Three\n    # Four\n  ## Two\n# One\n", ["Three", "Two", "One"]),
+    "0-3 spaces and 4 spaces": (
+        "   # Three\n    # Four\n  ## Two\n# One\n", ["Three", "Two", "One"],
+    ),
     "hash tag is not a heading": ("#tag\n# Real\n#another\n##also\n", ["Real"]),
     "tab after hash is not a heading": ("#\tTab\n# Real\n", ["Real"]),
     "empty heading line is not a heading": ("# \n#\n# Real\n", ["Real"]),
@@ -190,7 +192,8 @@ def test_always_section_at_the_end_is_served_with_gap_lines():
 
 
 def test_always_sections_do_not_use_up_the_cap():
-    s1, rules, s3, s4 = sec("One", 100), sec("Rules [always]", 150), sec("Three", 100), sec("Four", 100)
+    s1, rules = sec("One", 100), sec("Rules [always]", 150)
+    s3, s4 = sec("Three", 100), sec("Four", 100)
     text = INTRO + s1 + rules + s3 + s4
     out = render_default("demo", "", text, 220)
     # 7 + 100 + 100 = 207 <= 220 once the always section is not counted.

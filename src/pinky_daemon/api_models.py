@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from pinky_daemon.agent_registry import validate_restart_tokens_cap
 from pinky_daemon.model_roster_state import MANAGED_FIELDS
+from pinky_daemon.skill_sections import validate_skill_load_cap
 
 
 class ModelRosterSyncRequest(BaseModel):
@@ -490,6 +491,15 @@ class UpdateAgentRequest(BaseModel):
     wake_interval: int | None = None  # Seconds (0=disabled, 1800=30m, 3600=1h)
     clock_aligned: bool | None = None  # Align to wall clock boundaries
     auto_sleep_hours: int | None = None  # Auto-sleep after N hours idle (0=disabled)
+    skill_load_cap: int | None = None  # load_skill cap in characters (0=whole skill)
+
+    @field_validator("skill_load_cap", mode="before")
+    @classmethod
+    def _skill_load_cap_valid(cls, value: object) -> int | None:
+        if value is None:
+            return None
+        return validate_skill_load_cap(value)
+
     voice_config: dict | None = None  # Per-agent voice settings
     dream_enabled: bool | None = None  # Enable nightly memory consolidation
     dream_schedule: str | None = None  # Cron for dream runs (default "0 3 * * *")
