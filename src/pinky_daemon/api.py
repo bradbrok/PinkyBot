@@ -10939,9 +10939,13 @@ npm run build</pre>
         """Set a bot token for an agent on a platform."""
         if not agents.get(name):
             raise HTTPException(404, f"Agent '{name}' not found")
+        settings = req.settings
+        if "settings" not in req.model_fields_set:
+            stored = agents.get_token(name, platform)
+            settings = stored.settings if stored is not None else {}
         token = agents.set_token(
             name, platform, req.token,
-            enabled=req.enabled, settings=req.settings, token_ref=req.token_ref,
+            enabled=req.enabled, settings=settings, token_ref=req.token_ref,
         )
 
         # Evict the cached outbound adapter so sends pick up the new token
@@ -10991,7 +10995,7 @@ npm run build</pre>
                         break
 
                 # Optional per-token overrides come through token settings.
-                settings = req.settings or {}
+                settings = token.settings or {}
                 poller = _new_discord_broker_poller(name, raw_token, settings)
                 poll_interval = poller._poll_interval
                 watched = poller._configured_channels
