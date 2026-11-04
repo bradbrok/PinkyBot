@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from mcp.server.fastmcp import FastMCP
 
 from pinky_daemon.auth import build_internal_auth_headers, resolve_request_signing_secret
+from pinky_daemon.isolated_policy import isolated_read_refusal
 from pinky_daemon.shared_mcp import (
     LazyAgentName,
     record_mcp_success,
@@ -89,6 +90,14 @@ def create_server(
 
     mcp = FastMCP("pinky-self", host=host, port=port)
 
+    def _read_refusal(status: int, error_body: str, caller: str) -> bool:
+        if status != 403:
+            return False
+        try:
+            return json.loads(error_body) == isolated_read_refusal(caller)
+        except (ValueError, TypeError):
+            return False
+
     def _api(
         method: str, path: str, body: dict | None = None, *, timeout: float = 30,
     ) -> dict:
@@ -112,6 +121,9 @@ def create_server(
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8", errors="replace")
+            if method in {"GET", "HEAD"} and _read_refusal(e.code, error_body, agent):
+                return {"error": "This read is not available to this caller.", "status": 403,
+                        "_isolated_read_refused": True}
             return {"error": error_body, "status": e.code}
         except Exception as e:
             return {"error": str(e)}
@@ -1607,7 +1619,10 @@ def create_server(
                         f.write(resp.read())
                     return json.dumps({"success": True, "path": str(path), "filename": filename})
             except _ue.HTTPError as e:
-                return json.dumps({"error": e.read().decode("utf-8", errors="replace"), "status": e.code})
+                error_body = e.read().decode("utf-8", errors="replace")
+                if _read_refusal(e.code, error_body, agent):
+                    return "This read is not available to this caller."
+                return json.dumps({"error": error_body, "status": e.code})
             except Exception as e:
                 return json.dumps({"error": str(e)})
 
@@ -2636,6 +2651,8 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
             topic_path = urllib.parse.quote(topic, safe="/")
             result = _api("GET", f"/kb/wiki/{topic_path}?include_content=true")
             if "error" in result:
+                if result.get("_isolated_read_refused"):
+                    return result["error"]
                 return f"No wiki page found for: {topic}"
 
             content = result.get("content", "")

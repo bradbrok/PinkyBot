@@ -18,16 +18,16 @@ from tests.isolated_policy_support import signed
 
 pytestmark = pytest.mark.real_auth
 
-PENDING_CASES = [
+ALLOWED_CASES = [
     ("/agents", "/agents"),
     ("/settings/owner-profile", "/settings/owner-profile"),
     ("/settings/main-agent", "/settings/main-agent"),
     ("/skills/{name}", "/skills/missing-skill"),
-    ("/kb/search", "/kb/search?q=fixture"),
-    ("/kb/wiki/{slug:path}", "/kb/wiki/missing-page"),
-    ("/kb/stats", "/kb/stats"),
     ("/api/voice/requests", "/api/voice/requests"),
     ("/api/voice/sessions", "/api/voice/sessions"),
+    ("/scheduler/wake-ledger", "/scheduler/wake-ledger"),
+    ("/schedules", "/schedules"),
+    ("/system/health", "/system/health"),
 ]
 SCOPED_CASES = [
     ("/tasks", "/tasks"),
@@ -38,6 +38,9 @@ SCOPED_CASES = [
     ("/skills/{name}/refresh-audit", "/skills/missing-skill/refresh-audit"),
 ]
 UNLISTED_CASES = [
+    ("/kb/search", "/kb/search?q=fixture"),
+    ("/kb/wiki/{slug:path}", "/kb/wiki/missing-page"),
+    ("/kb/stats", "/kb/stats"),
     ("/system/primary-user", "/system/primary-user"),
     ("/comms/messages", "/comms/messages"),
     ("/conversations", "/conversations"),
@@ -105,15 +108,15 @@ def _unchanged_read(d, monkeypatch, logs, path, *, name="tenant", method="GET", 
 
 
 @pytest.mark.parametrize("mode", ["shadow", "enforce"])
-@pytest.mark.parametrize("template,path", PENDING_CASES)
-def test_pending_reads_log_templates_without_changing_responses(
+@pytest.mark.parametrize("template,path", ALLOWED_CASES)
+def test_allowed_reads_log_only_unassigned_skills(
     daemon, monkeypatch, logs, mode, template, path
 ):
     d = daemon(mode)
     _unchanged_read(d, monkeypatch, logs, path)
-    assert _read_lines(logs) == [
-        f"isolation: WOULD DENY READ GET {template} for tenant reason=pending-scope repeats=0"
-    ]
+    assert _read_lines(logs) == ([
+        f"isolation: WOULD DENY READ GET {template} for tenant reason=unassigned-skill repeats=0"
+    ] if template == "/skills/{name}" else [])
 
 
 @pytest.mark.parametrize("mode", ["shadow", "enforce"])
@@ -162,7 +165,7 @@ def _request(d, path="/comms/messages", method="GET"):
     )
 
 
-@pytest.mark.parametrize("template,path", PENDING_CASES + UNLISTED_CASES)
+@pytest.mark.parametrize("template,path", ALLOWED_CASES + UNLISTED_CASES)
 def test_normal_signed_reads_have_no_read_line(daemon, monkeypatch, logs, template, path):
     d = daemon()
     _unchanged_read(d, monkeypatch, logs, path, name="normal")
@@ -248,7 +251,7 @@ def test_read_mode_defaults_and_overrides_never_change_responses(
     assert bool(_read_lines(logs)) is expected
 
 
-@pytest.mark.parametrize("value", ["enforce", "bogus"])
+@pytest.mark.parametrize("value", ["invalid", "bogus"])
 def test_invalid_read_modes_use_shadow_and_warn_once(daemon, monkeypatch, logs, value):
     d = daemon()
     monkeypatch.setenv("PINKY_ISOLATED_READ_POLICY_MODE", value)
@@ -272,7 +275,7 @@ def test_invalid_mode_warning_is_process_wide_and_safe(monkeypatch, logs):
     raw = "bad\n" + "x" * 80 + "\x1b"
     monkeypatch.setenv("PINKY_ISOLATED_READ_POLICY_MODE", raw)
     assert policy.read_policy_mode(logs.append) == "shadow"
-    monkeypatch.setenv("PINKY_ISOLATED_READ_POLICY_MODE", "enforce")
+    monkeypatch.setenv("PINKY_ISOLATED_READ_POLICY_MODE", "bogus")
     assert policy.read_policy_mode(logs.append) == "shadow"
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", raw.strip().lower())[:32]
     assert logs == [f"isolation: read policy mode {safe} is not available; using shadow"]
@@ -280,7 +283,7 @@ def test_invalid_mode_warning_is_process_wide_and_safe(monkeypatch, logs):
 
 
 def test_invalid_mode_without_a_callback_uses_one_error_record(monkeypatch, caplog):
-    monkeypatch.setenv("PINKY_ISOLATED_READ_POLICY_MODE", "enforce")
+    monkeypatch.setenv("PINKY_ISOLATED_READ_POLICY_MODE", "bogus")
     assert policy.read_policy_mode() == "shadow"
     assert policy.read_policy_mode() == "shadow"
     records = [record for record in caplog.records if "read policy mode" in record.message]
@@ -444,7 +447,7 @@ def test_unknown_paths_use_a_shared_unknown_template(daemon, monkeypatch, logs):
     "explicit_head,template,status",
     [
         (True, "/read-head/{key}", 200),
-        (False, "<unknown>", 405),
+        (False, "/read-head/{key}", 405),
     ],
 )
 def test_head_logs_the_resolved_template_or_unknown(
@@ -539,11 +542,11 @@ def test_log_sink_failure_cannot_refuse_the_read(daemon, monkeypatch, logs):
     assert attempts[1] == "isolation: read shadow check failed: RuntimeError"
 
 
-def test_pending_entries_are_the_exact_existing_get_templates(daemon):
+def test_allowed_entries_are_the_exact_existing_get_templates(daemon):
     d = daemon()
-    expected = frozenset(("GET", template) for template, _ in PENDING_CASES)
-    assert isinstance(policy.ISOLATED_READ_PENDING, frozenset)
-    assert policy.ISOLATED_READ_PENDING == expected
+    expected = frozenset(("GET", template) for template, _ in ALLOWED_CASES)
+    assert isinstance(policy.ISOLATED_READ_ALLOW, frozenset)
+    assert policy.ISOLATED_READ_ALLOW == expected
     registered = {
         (method, route.path)
         for route in d.app.routes
@@ -584,7 +587,7 @@ def test_scoped_entries_are_existing_get_templates_and_not_pending(daemon):
     expected = frozenset(("GET", template) for template, _ in SCOPED_CASES)
     assert isinstance(policy.ISOLATED_READ_SCOPED, frozenset)
     assert policy.ISOLATED_READ_SCOPED == expected
-    assert not policy.ISOLATED_READ_SCOPED & policy.ISOLATED_READ_PENDING
+    assert not policy.ISOLATED_READ_SCOPED & policy.ISOLATED_READ_ALLOW
     registered = {
         (method, route.path)
         for route in d.app.routes

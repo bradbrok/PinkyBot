@@ -11,11 +11,11 @@ _read_policy_warning_emitted = False
 
 
 def read_policy_mode(log=None):
-    """Read diagnostics never enforce; the default follows write isolation."""
+    """Read enforcement is explicit; the default follows write isolation in shadow."""
     value = os.environ.get("PINKY_ISOLATED_READ_POLICY_MODE", "").strip().lower()
     if not value:
         return "shadow" if policy_mode() in {"shadow", "enforce"} else "off"
-    if value in {"off", "shadow"}:
+    if value in {"off", "shadow", "enforce"}:
         return value
     global _read_policy_warning_emitted
     with _read_policy_warning_lock:
@@ -31,16 +31,16 @@ def read_policy_mode(log=None):
     return "shadow"
 
 
-ISOLATED_READ_PENDING = frozenset({
+ISOLATED_READ_ALLOW = frozenset({
     ("GET", "/agents"),
     ("GET", "/settings/owner-profile"),
     ("GET", "/settings/main-agent"),
     ("GET", "/skills/{name}"),
-    ("GET", "/kb/search"),
-    ("GET", "/kb/wiki/{slug:path}"),
-    ("GET", "/kb/stats"),
     ("GET", "/api/voice/requests"),
     ("GET", "/api/voice/sessions"),
+    ("GET", "/scheduler/wake-ledger"),
+    ("GET", "/schedules"),
+    ("GET", "/system/health"),
 })
 
 # GET routes whose handler already filters or authorizes the whole answer
@@ -86,6 +86,12 @@ def isolation_flag(registry, name):
 
 ISOLATED_GRANTS = {
     "kb_writer": {("self", "kb_save_wiki"): (("PUT", "/kb/wiki/{slug:path}"),)},
+    "kb_reader": {
+        ("self", "kb_search"): (("GET", "/kb/search"),),
+        ("self", "kb_get_wiki"): (("GET", "/kb/wiki/{slug:path}"),),
+        ("self", "kb_stats"): (("GET", "/kb/stats"),),
+    },
+    "fleet_roster": {("self", "list_agents"): (("GET", "/agents"),)},
 }
 
 
@@ -113,6 +119,27 @@ def granted_tool_routes(grants) -> dict:
 
 def granted_mutation_allow(grants) -> frozenset[tuple[str, str]]:
     return frozenset(route for routes in granted_tool_routes(grants).values() for route in routes)
+
+
+def granted_read_allow(grants) -> frozenset[tuple[str, str]]:
+    return frozenset(route for route in granted_mutation_allow(grants) if route[0] == "GET")
+
+
+def isolated_read_caller(request) -> str:
+    """Scope only enforced reads, using the verified identity and cached flag."""
+    caller = getattr(request.state, "internal_caller", "")
+    if not caller or read_policy_mode() != "enforce":
+        return ""
+    if hasattr(request.state, "isolated_read_flag"):
+        flag = request.state.isolated_read_flag
+    else:
+        flag = isolation_flag(getattr(request.app.state, "agents", None), caller)
+    return caller if flag is not False else ""
+
+
+def isolated_read_refusal(caller: str) -> dict[str, str]:
+    """Identify the read gate's refusal without changing older denial messages."""
+    return {"error": f"isolated agent '{caller}' cannot read this route", "agent": caller}
 
 
 def isolated_caller_policy(request):
