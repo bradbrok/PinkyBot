@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +31,12 @@ from tests.test_slack_readback import (
 from tests.test_slack_readback import (
     gateway as gateway,
 )
+from tests.test_slack_readback_admission import (
+    _BlockedCalls,
+    _count,
+    _outcome,
+)
+from tests.test_slack_readback_admission import admission_pool as admission_pool
 
 pytestmark = pytest.mark.real_auth
 
@@ -85,6 +90,7 @@ async def test_retry_wait_uses_loop_without_worker(monkeypatch, history):
     monkeypatch.setattr(slack_readback, "asyncio", SimpleNamespace(
         to_thread=asyncio.to_thread, wait_for=asyncio.wait_for,
         get_running_loop=asyncio.get_running_loop, sleep=async_sleep,
+        shield=asyncio.shield, wrap_future=asyncio.wrap_future,
     ))
 
     class Adapter:
@@ -109,116 +115,43 @@ async def test_retry_wait_uses_loop_without_worker(monkeypatch, history):
     assert waits == [(1, loop_thread, "async")]
 
 
-async def _until(predicate):
-    async def wait():
-        while not predicate():
-            await asyncio.sleep(0.001)
-    await asyncio.wait_for(wait(), 3)
-
-
 @pytest.mark.parametrize("expire", [False, True])
-async def test_four_readback_workers_isolate_default_and_bound_fifth(monkeypatch, expire):
-    loop = asyncio.get_running_loop()
-    default = ThreadPoolExecutor(max_workers=4, thread_name_prefix="unrelated")
-    loop.set_default_executor(default)
-    releases = [threading.Event() for _ in range(4)]
-    entered = [threading.Event() for _ in range(4)]
-    fifth_started = threading.Event()
-    submitted = asyncio.Event()
-    calls = []
-    tasks = []
-    original_submit = loop.run_in_executor
-    submissions = []
-
-    def observe_submit(executor, call, *args):
-        submissions.append(executor)
-        if len(submissions) == 5:
-            submitted.set()
-        return original_submit(executor, call, *args)
-
-    monkeypatch.setattr(loop, "run_in_executor", observe_submit)
-
-    def block(index, **kwargs):
-        calls.append((index, threading.current_thread().name))
-        entered[index].set()
-        assert releases[index].wait(8), "test must release every blocked worker"
-        return index
-
-    def fifth(**kwargs):
-        fifth_started.set()
-        return 5
-
+async def test_four_readback_workers_isolate_default_and_bound_fifth(admission_pool, expire):
+    blocked = _BlockedCalls(admission_pool)
+    started = []
     try:
-        for index in range(4):
-            tasks.append(asyncio.create_task(slack_readback._Reader().call(block, index)))
-        await _until(lambda: all(event.is_set() for event in entered))
+        await blocked.start()
         reader = slack_readback._Reader()
         if expire:
             reader.deadline = slack_readback.monotonic() + 0.15
-        pending = asyncio.create_task(reader.call(fifth))
-        tasks.append(pending)
-        await asyncio.wait_for(submitted.wait(), 3)
-        # A default-executor marker must finish while ALL read workers remain blocked.
-        marker = original_submit(None, lambda: threading.current_thread().name)
-        done, _ = await asyncio.wait({marker}, timeout=1)
-        assert marker in done, "blocked readbacks must not occupy default-executor workers"
-        assert marker.result().startswith("unrelated")
-        assert not fifth_started.is_set()
-        assert all(executor is not None for executor in submissions)
-        assert len({id(executor) for executor in submissions}) == 1
-        assert all(name.startswith("slack-readback") for _, name in calls)
-        if expire:
-            with pytest.raises(slack_readback._DeadlineError):
-                await asyncio.wait_for(pending, 1)
-        else:
-            releases[0].set()
-            assert await asyncio.wait_for(pending, 3) == 5
-            assert fifth_started.is_set()
+        result = await _outcome(reader.call(lambda **kw: started.append(True)))
+        assert type(result).__name__ == "_BusyError"
+        assert len(admission_pool.futures) == 4 and started == []
+        assert admission_pool._work_queue.empty()
+        assert await asyncio.wait_for(asyncio.to_thread(lambda: "available"), 1) == "available"
     finally:
-        for event in releases:
-            event.set()
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 5)
-        # Flush every executor that received work, after all blocked functions finish.
-        executors = {id(executor): executor for executor in submissions}
-        for executor in executors.values():
-            await asyncio.wait_for(original_submit(executor, lambda: None), 3)
-        default.shutdown(wait=True, cancel_futures=True)
-    assert fifth_started.is_set() is (not expire)
+        await blocked.close()
 
 
-async def test_running_timeout_keeps_worker_occupied_until_function_finishes():
-    releases = [threading.Event() for _ in range(4)]
-    entered = [threading.Event() for _ in range(4)]
-    fifth_started = threading.Event()
-    tasks = []
-
-    def block(index, **kwargs):
-        entered[index].set()
-        assert releases[index].wait(8)
-
-    def fifth(**kwargs):
-        fifth_started.set()
-
+async def test_running_timeout_keeps_worker_occupied_until_function_finishes(admission_pool):
+    blocked = _BlockedCalls(admission_pool)
     try:
-        for index in range(4):
-            reader = slack_readback._Reader()
-            if index == 0:
-                reader.deadline = slack_readback.monotonic() + 0.15
-            tasks.append(asyncio.create_task(reader.call(block, index)))
-        await _until(lambda: all(event.is_set() for event in entered))
+        await blocked.start(timeout_first=True)
         with pytest.raises(slack_readback._DeadlineError):
-            await asyncio.wait_for(tasks[0], 1)
-        waiting = asyncio.create_task(slack_readback._Reader().call(fifth))
-        tasks.append(waiting)
-        await asyncio.sleep(0.05)
-        assert not fifth_started.is_set()
-        releases[0].set()
-        await asyncio.wait_for(waiting, 3)
-        assert fifth_started.is_set()
+            await asyncio.wait_for(blocked.tasks[0], 1)
+        result = await _outcome(slack_readback._Reader().call(lambda **kw: "fifth"))
+        assert type(result).__name__ == "_BusyError"
+        assert len(admission_pool.futures) == 4 and _count() == 4
+        assert not admission_pool.futures[0].done()
+        signal = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        admission_pool.futures[0].add_done_callback(lambda _: loop.call_soon_threadsafe(signal.set))
+        blocked.releases[0].set()
+        await asyncio.wait_for(signal.wait(), 2)
+        assert await slack_readback._Reader().call(lambda **kw: "fifth") == "fifth"
+        assert len(admission_pool.futures) == 5 and _count() == 3
     finally:
-        for release in releases:
-            release.set()
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 5)
+        await blocked.close()
 
 
 @pytest.mark.parametrize("history", [False, True])
@@ -315,48 +248,30 @@ def test_each_http_timeout_tracks_remaining_budget(gateway, monkeypatch, history
         assert set(options.values()) == {seconds}
 
 
-async def test_queued_http_timeout_is_recomputed_when_worker_starts(monkeypatch):
+async def test_queued_http_timeout_is_recomputed_when_worker_starts(monkeypatch, admission_pool):
     clock = SimpleNamespace(now=100.0)
     monkeypatch.setattr(slack_readback, "monotonic", lambda: clock.now)
     loop = asyncio.get_running_loop()
-    submit = loop.run_in_executor
-    submitted = asyncio.Event()
-    count = 0
-
-    def observe(executor, call, *args):
-        nonlocal count
-        count += 1
-        future = submit(executor, call, *args)
-        if count == 5:
-            submitted.set()
-        return future
-
-    monkeypatch.setattr(loop, "run_in_executor", observe)
-    release = threading.Event()
-    entered = [threading.Event() for _ in range(4)]
+    entered, release = asyncio.Event(), threading.Event()
+    admission_pool.releases.append(release)
     observed = []
-    tasks = []
 
-    def block(index, **kwargs):
-        entered[index].set()
-        assert release.wait(8)
+    def before(index):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10)
 
-    def record_timeout(*, timeout):
-        observed.append(timeout)
-
+    admission_pool.before = before
+    task = asyncio.create_task(slack_readback._Reader().call(
+        lambda *, timeout: observed.append(timeout)))
     try:
-        for index in range(4):
-            tasks.append(asyncio.create_task(slack_readback._Reader().call(block, index)))
-        await _until(lambda: all(event.is_set() for event in entered))
-        tasks.append(asyncio.create_task(slack_readback._Reader().call(record_timeout)))
-        await asyncio.wait_for(submitted.wait(), 3)
+        await asyncio.wait_for(entered.wait(), 2)
         clock.now = 145.0
         release.set()
-        await asyncio.wait_for(asyncio.gather(*tasks), 3)
+        await asyncio.wait_for(task, 2)
         assert observed == [15.0]
     finally:
         release.set()
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 5)
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 3)
 
 
 @pytest.mark.parametrize("remaining", [1.0, 0.5])
@@ -376,6 +291,7 @@ async def test_retry_at_or_beyond_remaining_budget_never_sleeps(monkeypatch, rem
     monkeypatch.setattr(slack_readback, "asyncio", SimpleNamespace(
         to_thread=asyncio.to_thread, wait_for=asyncio.wait_for,
         get_running_loop=asyncio.get_running_loop, sleep=async_sleep,
+        shield=asyncio.shield, wrap_future=asyncio.wrap_future,
     ))
 
     def limited(**kwargs):

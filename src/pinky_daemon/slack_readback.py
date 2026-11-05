@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from time import monotonic
 
 import httpx
@@ -15,11 +16,24 @@ from fastapi import HTTPException
 from pinky_outreach.slack import SlackError, SlackRateLimitError
 
 REQUEST_SECONDS = 60.0
-_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="slack-readback")
+_WORKERS = 4
+_EXECUTOR = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="slack-readback")
+_LOCK = Lock()
+_OUTSTANDING = 0
+
+
+class _BusyError(Exception):
+    pass
 
 
 class _DeadlineError(Exception):
     pass
+
+
+def _release_slot(future):
+    global _OUTSTANDING
+    with _LOCK:
+        _OUTSTANDING -= 1
 
 
 class _Reader:
@@ -33,16 +47,27 @@ class _Reader:
         return remaining
 
     async def offload(self, call, *args, **kwargs):
+        global _OUTSTANDING
         remaining = self.remaining()
 
         def invoke():
             # Queue time consumes the same budget as HTTP calls and retry waits.
             return call(*args, timeout=min(30.0, self.remaining()), **kwargs)
 
+        # Submitted calls retain capacity until completion, even if their caller stops waiting.
+        with _LOCK:
+            if _OUTSTANDING >= _WORKERS:
+                raise _BusyError
+            _OUTSTANDING += 1
         try:
-            future = asyncio.get_running_loop().run_in_executor(_EXECUTOR, invoke)
-            # Queued calls can be cancelled; running calls retain their worker until done.
-            return await asyncio.wait_for(future, remaining)
+            future = _EXECUTOR.submit(invoke)
+        except BaseException:
+            with _LOCK:
+                _OUTSTANDING -= 1
+            raise
+        future.add_done_callback(_release_slot)
+        try:
+            return await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(future)), remaining)
         except TimeoutError:
             raise _DeadlineError from None
 
@@ -144,6 +169,8 @@ async def read_message(select_adapter, channel, ts, thread_ts):
         message = next((message for message in messages if message["ts"] == ts), None)
         return {"found": message is not None, "channel": channel, "ts": ts,
                 "message": message, "bot": bot}
+    except _BusyError:
+        raise HTTPException(503, {"code": "slack_busy"}) from None
     except SlackError as exc:
         raise _slack_error(exc) from None
     except (httpx.HTTPError, _DeadlineError):
@@ -163,6 +190,11 @@ async def read_history(select_adapter, channel, oldest, latest, max_pages):
                 page = await reader.call(adapter._request_form, "conversations.history",
                                          channel=channel, oldest=oldest, latest=latest,
                                          inclusive="true", limit=200, cursor=cursor)
+            except _BusyError:
+                if not result["pages"]:
+                    raise
+                result["stopped_reason"] = "busy"
+                return result
             except SlackRateLimitError:
                 result["stopped_reason"] = "rate_limited"
                 return result
@@ -189,6 +221,8 @@ async def read_history(select_adapter, channel, oldest, latest, max_pages):
             seen.add(cursor)
         result["stopped_reason"] = "page_cap"
         return result
+    except _BusyError:
+        raise HTTPException(503, {"code": "slack_busy"}) from None
     except SlackError as exc:
         raise _slack_error(exc) from None
     except (httpx.HTTPError, _DeadlineError):
