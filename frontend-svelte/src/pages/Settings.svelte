@@ -84,6 +84,7 @@
     let editWakeInterval = 1800;
     let editClockAligned = true;
     let editAutoSleepHours = 8;
+    let editSkillLoadCap = 0;
 
     // Account info & costs
     let accountInfo = {};
@@ -379,17 +380,24 @@
         editWakeInterval = agent.wake_interval || 0;
         editClockAligned = agent.clock_aligned !== false;
         editAutoSleepHours = agent.auto_sleep_hours ?? 8;
+        editSkillLoadCap = agent.skill_load_cap ?? 0;
     }
 
     let savingWakeSettings = false;
     async function saveWakeSettings() {
         const name = editingAgent;
+        if (!Number.isInteger(editSkillLoadCap)
+            || (editSkillLoadCap !== 0 && (editSkillLoadCap < 2000 || editSkillLoadCap > 200000))) {
+            toast('Skill load cap must be 0 (whole skill) or a whole number from 2000 to 200000', 'error');
+            return;
+        }
         savingWakeSettings = true;
         try {
             await api('PUT', `/agents/${editingAgent}`, {
                 wake_interval: editWakeInterval,
                 clock_aligned: editClockAligned,
                 auto_sleep_hours: editAutoSleepHours,
+                skill_load_cap: editSkillLoadCap,
             });
             editingAgent = null;
             toast(`Wake settings saved for ${name}`);
@@ -1339,7 +1347,7 @@
                 <div class="empty">{$_('settings.hb_no_agents')}</div>
             {:else}
                 <table class="data-table">
-                    <thead><tr><th>{$_('settings.hb_agent_col')}</th><th>{$_('settings.hb_wake_col')}</th><th>{$_('settings.hb_clock_col')}</th><th>{$_('settings.hb_sleep_col')}</th><th>{$_('settings.hb_heartbeat_col')}</th><th>{$_('settings.hb_schedules_col')}</th><th>{$_('settings.hb_actions_col')}</th></tr></thead>
+                    <thead><tr><th>{$_('settings.hb_agent_col')}</th><th>{$_('settings.hb_wake_col')}</th><th>{$_('settings.hb_clock_col')}</th><th>{$_('settings.hb_sleep_col')}</th><th>{$_('settings.hb_skill_cap_col')}</th><th>{$_('settings.hb_heartbeat_col')}</th><th>{$_('settings.hb_schedules_col')}</th><th>{$_('settings.hb_actions_col')}</th></tr></thead>
                     <tbody>
                         {#each heartbeatSettings as a}
                             <tr>
@@ -1357,6 +1365,11 @@
                                 <td>
                                     <span class="badge badge-{a.auto_sleep_hours > 0 ? 'on' : 'off'}">
                                         {a.auto_sleep_hours > 0 ? a.auto_sleep_hours + 'h' : $_('settings.hb_disabled')}
+                                    </span>
+                                </td>
+                                <td>
+                                    <span class="badge badge-{a.skill_load_cap > 0 ? 'on' : 'off'}">
+                                        {a.skill_load_cap > 0 ? $_('settings.hb_skill_cap_chars', { values: { count: a.skill_load_cap } }) : $_('settings.hb_skill_cap_whole')}
                                     </span>
                                 </td>
                                 <td>
@@ -1420,6 +1433,10 @@
                             <option value={12}>12 hours</option>
                             <option value={24}>24 hours</option>
                         </select>
+                    </div>
+                    <div class="form-row">
+                        <span class="form-label">{$_('settings.skill_load_cap_label')}</span>
+                        <input type="number" class="form-input" bind:value={editSkillLoadCap} min="0" max="200000" style="max-width:140px">
                     </div>
                 </div>
                 <p style="margin:0 0 1rem 0;font-size:0.8rem;color:var(--gray-mid)">

@@ -44,6 +44,11 @@ from pinky_daemon.shared_mcp import (
     record_probe_success,
     resolve_lazy,
 )
+from pinky_daemon.skill_sections import (
+    effective_skill_load_cap,
+    render_default,
+    render_section,
+)
 
 
 def _log(msg: str) -> None:
@@ -1824,9 +1829,24 @@ def create_server(
             parts.append(line)
         return "\n".join(parts)
 
+    def _skill_load_cap() -> int:
+        """This agent's skill load cap; any failure means 0 (the whole skill)."""
+        try:
+            agent_info = _api("GET", f"/agents/{agent_name}")
+            if not isinstance(agent_info, dict) or "error" in agent_info:
+                return 0
+            return effective_skill_load_cap(agent_info.get("skill_load_cap"))
+        except Exception:
+            return 0
+
     @mcp.tool()
-    def load_skill(skill_name: str) -> str:
-        """Load a skill's full instructions into context. Call before using a skill for the first time."""
+    def load_skill(skill_name: str, section: str = "") -> str:
+        (
+            "Load a skill's instructions. Usually returns the whole skill. If your agent has a "
+            "skill load cap and the skill is longer, you get its contents list, the first part "
+            "and every section marked [always]; pass section=\"<number or heading>\" for another "
+            "part, or section=\"all\" for everything."
+        )
         result = _api("GET", f"/skills/{skill_name}")
         if "error" in result:
             status = result.get("status", 500)
@@ -1839,10 +1859,9 @@ def create_server(
             return f"Skill '{skill_name}' has no instructions body."
 
         desc = result.get("description", "")
-        header = f"# Skill: {skill_name}"
-        if desc:
-            header += f"\n{desc}"
-        return f"{header}\n\n{directive}"
+        if section == "":
+            return render_default(skill_name, desc, directive, _skill_load_cap())
+        return render_section(skill_name, desc, directive, section)
 
     def _register_skill_admin_tools():
         @mcp.tool()

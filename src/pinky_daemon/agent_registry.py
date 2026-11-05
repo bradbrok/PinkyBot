@@ -59,6 +59,7 @@ from pinky_daemon.model_roster_state import (
     plan_fields,
 )
 from pinky_daemon.schedule_fire_trace import ScheduleFireTrace, trace_event
+from pinky_daemon.skill_sections import effective_skill_load_cap, validate_skill_load_cap
 from pinky_daemon.store_catalog import (
     StoreCatalog,
     StoreConnectionPolicy,
@@ -584,6 +585,9 @@ class Agent:
     wake_interval: int = 0  # Seconds between wake checks (0 = disabled, 1800 = 30m, 3600 = 1h)
     clock_aligned: bool = True  # Align wakes to wall clock (:00, :30 for 30m; :00 for 1h)
     auto_sleep_hours: int = 0  # Auto-sleep after N hours inactive (0 = disabled)
+    # load_skill cap in characters: 0 = whole skill; 2000..200000 = a longer skill
+    # loads as its contents list, first part and [always] sections.
+    skill_load_cap: int = 0
     plain_text_fallback: bool = False  # Auto-send assistant text when no outreach tool was used
     voice_config: dict = field(default_factory=dict)  # Per-agent voice settings (JSON blob)
     # voice_config schema: {
@@ -695,6 +699,7 @@ class Agent:
             "wake_interval": self.wake_interval,
             "clock_aligned": self.clock_aligned,
             "auto_sleep_hours": self.auto_sleep_hours,
+            "skill_load_cap": self.skill_load_cap,
             "plain_text_fallback": self.plain_text_fallback,
             "voice_config": self.voice_config,
             "role": self.role,
@@ -2170,6 +2175,8 @@ class AgentRegistry:
             ("container_image", "TEXT NOT NULL DEFAULT ''"),
             # Explicit per-agent CODEX_HOME. Inert unless the isolation flag is on.
             ("codex_home", "TEXT NOT NULL DEFAULT ''"),
+            # load_skill cap in characters; 0 = the whole skill (unchanged).
+            ("skill_load_cap", "INTEGER NOT NULL DEFAULT 0"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -3321,6 +3328,8 @@ except Exception as exc:
         name = _validate_agent_name(name)
         if "restart_tokens_cap" in kwargs:
             validate_restart_tokens_cap(kwargs["restart_tokens_cap"])
+        if "skill_load_cap" in kwargs:
+            validate_skill_load_cap(kwargs["skill_load_cap"])
         force_soul = bool(kwargs.pop("force_soul", False))
         soul_source = str(kwargs.pop("soul_source", "registry-update") or "registry-update")
         with self._rmw_lock:
@@ -3339,7 +3348,8 @@ except Exception as exc:
                         "context_nudge_threshold_pct", "restart_tokens_cap",
                         "auto_restart", "parent", "max_sessions", "enabled",
                         "auto_start", "heartbeat_interval", "wake_interval",
-                        "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
+                        "clock_aligned", "auto_sleep_hours", "skill_load_cap",
+                        "plain_text_fallback", "voice_config", "role",
                         "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
                         "librarian_enabled", "librarian_schedule",
                         "runtime", "transport", "provider_url", "provider_model", "provider_ref",
@@ -3563,6 +3573,8 @@ except Exception as exc:
         name = _validate_agent_name(name)
         if "restart_tokens_cap" in kwargs:
             validate_restart_tokens_cap(kwargs["restart_tokens_cap"])
+        if "skill_load_cap" in kwargs:
+            validate_skill_load_cap(kwargs["skill_load_cap"])
         with self._rmw_lock:
             return self._register_locked(name, create_only=create_only, **kwargs)
 
@@ -3638,6 +3650,7 @@ except Exception as exc:
                 wake_interval=kwargs.get("wake_interval", 0),
                 clock_aligned=kwargs.get("clock_aligned", True),
                 auto_sleep_hours=kwargs.get("auto_sleep_hours", 8),
+                skill_load_cap=kwargs.get("skill_load_cap", 0),
                 plain_text_fallback=kwargs.get("plain_text_fallback", False),
                 voice_config=kwargs.get("voice_config", {}),
                 role=kwargs.get("role", ""),
@@ -3675,7 +3688,8 @@ except Exception as exc:
                     restart_threshold_pct, context_nudge_threshold_pct, restart_tokens_cap, auto_restart, parent, groups,
                     max_sessions, enabled, registration_finalized, auto_start,
                     heartbeat_interval, plain_text_fallback,
-                    wake_interval, clock_aligned, auto_sleep_hours, voice_config, role, isolated,
+                    wake_interval, clock_aligned, auto_sleep_hours, skill_load_cap,
+                    voice_config, role, isolated,
                     isolation_mode, container_image,
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
                     librarian_enabled, librarian_schedule,
@@ -3684,7 +3698,7 @@ except Exception as exc:
                     thinking_effort, strict_effort_enforcement, dedicated_config_dir,
                     watchdog_config,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -3697,6 +3711,7 @@ except Exception as exc:
                  int(agent.enabled), int(not create_only), int(agent.auto_start),
                  agent.heartbeat_interval, int(agent.plain_text_fallback),
                  agent.wake_interval, int(agent.clock_aligned), agent.auto_sleep_hours,
+                 agent.skill_load_cap,
                  json.dumps(agent.voice_config), agent.role, int(agent.isolated),
                  agent.isolation_mode, agent.container_image,
                  int(agent.dream_enabled), agent.dream_schedule, agent.dream_timezone, agent.dream_model, int(agent.dream_notify),
@@ -3761,7 +3776,7 @@ except Exception as exc:
         "disallowed_tools, thinking_effort, watchdog_config, last_seen_at, "
         "strict_effort_enforcement, context_nudge_threshold_pct, isolated, "
         "isolation_mode, container_image, dedicated_config_dir, codex_home, restart_tokens_cap, "
-        "tool_policy_enabled, isolated_grants"
+        "tool_policy_enabled, isolated_grants, skill_load_cap"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -4925,11 +4940,18 @@ except Exception as exc:
                 catalog = materialized.get("catalog", [])
                 if catalog:
                     names = [e["name"] for e in catalog]
+                    if effective_skill_load_cap(getattr(agent, "skill_load_cap", 0)):
+                        load_hint = (
+                            "`load_skill(\"name\")` for instructions (a long skill comes back "
+                            "as a contents list plus its first part; ask for more with section=)."
+                        )
+                    else:
+                        load_hint = "`load_skill(\"name\")` for full instructions."
                     parts.append(
                         f"## Skills\n"
                         f"You have {len(catalog)} skills equipped. "
                         f"Call `list_my_skills()` for descriptions, "
-                        f"`load_skill(\"name\")` for full instructions.\n\n"
+                        f"{load_hint}\n\n"
                         f"Equipped: {', '.join(names)}"
                     )
             except Exception:
@@ -9132,6 +9154,7 @@ except Exception as exc:
             restart_tokens_cap=row[56] if len(row) > 56 else 0,
             tool_policy_enabled=bool(row[57]) if len(row) > 57 else False,
             isolated_grants=self._decode_isolated_grants(row[58]) if len(row) > 58 else [],
+            skill_load_cap=row[59] if len(row) > 59 else 0,
         )
 
     @staticmethod
