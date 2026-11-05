@@ -290,19 +290,99 @@ async def test_completed_function_releases_capacity(admission_pool, failure):
     assert _count() == 0
 
 
-async def test_submit_failure_rolls_back_reservation(admission_pool):
-    admission_pool.fail_submit = True
-    with pytest.raises(RuntimeError, match="submit refused"):
-        await slack_readback._Reader().call(lambda **kw: None)
+async def test_submit_refusal_keeps_reservation(gateway, monkeypatch):
     assert _count() == 0
-    admission_pool.fail_submit = False
-    blocked = _BlockedCalls(admission_pool)
+    pool = _Pool()
+    monkeypatch.setattr(slack_readback, "_EXECUTOR", pool)
+    pool.fail_submit = True
+    dispatched = []
     try:
-        await blocked.start()
-        assert _count() == 4 and len(admission_pool.futures) == 4
+        for _ in range(4):
+            with pytest.raises(RuntimeError, match="submit refused"):
+                await slack_readback._Reader().call(lambda **kw: dispatched.append(True))
+        assert _count() == 4
+        assert pool.futures == [] and pool._work_queue.empty() and dispatched == []
+        pool.fail_submit = False
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app),
+                                    base_url="http://test") as client:
+            response = await client.get(MESSAGE_PATH, headers=_headers(gateway, MESSAGE_PATH))
+        assert response.status_code == 503
+        assert response.json() == {"detail": {"code": "slack_busy"}}
+        assert gateway.calls == [] and pool.futures == [] and _count() == 4
     finally:
-        await blocked.close()
+        pool.shutdown(wait=True, cancel_futures=True)
+        with slack_readback._LOCK:
+            slack_readback._OUTSTANDING = 0
+
+
+async def test_failed_worker_start_bounds_real_submit_queue(gateway, monkeypatch):
     assert _count() == 0
+    pool = ThreadPoolExecutor(max_workers=4)
+    monkeypatch.setattr(slack_readback, "_EXECUTOR", pool)
+    dispatched, attempts, outcomes = [], [], []
+    failure = RuntimeError("worker start failed")
+
+    def cannot_start_worker():
+        attempts.append(True)
+        raise failure
+
+    monkeypatch.setattr(pool, "_adjust_thread_count", cannot_start_worker)
+    try:
+        for _ in range(8):
+            outcomes.append(await _outcome(slack_readback._Reader().call(
+                lambda **kw: dispatched.append(True))))
+        assert pool._work_queue.qsize() <= 4
+        assert pool._work_queue.qsize() == 4 and _count() == 4
+        assert len(attempts) == 4 and dispatched == []
+        assert all(result is failure for result in outcomes[:4])
+        assert all(isinstance(result, slack_readback._BusyError) for result in outcomes[4:])
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app),
+                                    base_url="http://test") as client:
+            response = await client.get(MESSAGE_PATH, headers=_headers(gateway, MESSAGE_PATH))
+        assert response.status_code == 503
+        assert response.json() == {"detail": {"code": "slack_busy"}}
+        assert gateway.calls == [] and len(attempts) == 4 and pool._work_queue.qsize() == 4
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+        with slack_readback._LOCK:
+            slack_readback._OUTSTANDING = 0
+
+
+async def test_failed_fourth_worker_start_keeps_only_one_queued_call(monkeypatch):
+    assert _count() == 0
+    pool = _Pool()
+    monkeypatch.setattr(slack_readback, "_EXECUTOR", pool)
+    blocked = _BlockedCalls(pool)
+    dispatched, attempts, outcomes = [], [], []
+    failure = RuntimeError("worker start failed")
+
+    def cannot_start_worker():
+        attempts.append(True)
+        raise failure
+
+    try:
+        await blocked.start(3)
+        assert _count() == 3 and len(pool.futures) == 3 and pool._work_queue.empty()
+        monkeypatch.setattr(pool, "_adjust_thread_count", cannot_start_worker)
+        for _ in range(8):
+            outcomes.append(await _outcome(slack_readback._Reader().call(
+                lambda **kw: dispatched.append(True))))
+        assert pool._work_queue.qsize() <= 1
+        assert pool._work_queue.qsize() == 1 and _count() == 4
+        assert len(attempts) == 1 and dispatched == [] and len(pool.futures) == 3
+        assert outcomes[0] is failure
+        assert all(isinstance(result, slack_readback._BusyError) for result in outcomes[1:])
+        # Cancel queued work before unblocking the three existing workers.
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+        for release in blocked.releases:
+            release.set()
+        try:
+            await asyncio.wait_for(asyncio.gather(*blocked.tasks, return_exceptions=True), 3)
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+            with slack_readback._LOCK:
+                slack_readback._OUTSTANDING = 0
 
 
 @pytest.mark.parametrize("failure", [False, True])
@@ -369,7 +449,7 @@ def test_completion_after_originating_loop_closes(admission_pool, caplog):
         assert _count() == 0
         assert asyncio.run(slack_readback._Reader().call(lambda **kw: "new loop")) == "new loop"
         assert _count() == 0
-        assert "Exception calling callback" not in caplog.text
+        assert "exception calling callback" not in caplog.text.lower()
     finally:
         release.set()
         if not loop.is_closed():

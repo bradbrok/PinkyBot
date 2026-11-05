@@ -59,12 +59,8 @@ class _Reader:
             if _OUTSTANDING >= _WORKERS:
                 raise _BusyError
             _OUTSTANDING += 1
-        try:
-            future = _EXECUTOR.submit(invoke)
-        except BaseException:
-            with _LOCK:
-                _OUTSTANDING -= 1
-            raise
+        # A failed submit may already have queued work, so keep its reservation.
+        future = _EXECUTOR.submit(invoke)
         future.add_done_callback(_release_slot)
         try:
             return await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(future)), remaining)
