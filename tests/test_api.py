@@ -21,6 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from pinky_daemon.agent_registry import DEFAULT_HEARTBEAT_PROMPT
+from pinky_daemon.auth import SESSION_COOKIE_NAME, create_session_cookie
 from pinky_daemon.broker import BrokerMessage
 from pinky_daemon.claude_runner import RunResult
 from pinky_daemon.message_context_store import MessageContextStore
@@ -34,6 +35,14 @@ from pinky_daemon.sessions import (
 )
 
 # ── SessionMessage ───────────────────────────────────────────
+
+
+def _as_owner(client):
+    """Send the owner's browser session, for owner-only routes."""
+    client.cookies.set(
+        SESSION_COOKIE_NAME, create_session_cookie(os.environ["PINKY_SESSION_SECRET"])
+    )
+    return client
 
 
 class TestRedactEnvSecrets:
@@ -5318,7 +5327,7 @@ class TestOwnerProfileAPI:
         assert "timezone" in data
 
     def test_set_and_get(self):
-        client = self._make_client()
+        client = _as_owner(self._make_client())
         resp = client.put("/settings/owner-profile", json={
             "name": "Brad",
             "role": "dev",
@@ -5335,7 +5344,7 @@ class TestOwnerProfileAPI:
         assert resp2.json()["name"] == "Brad"
 
     def test_partial_update(self):
-        client = self._make_client()
+        client = _as_owner(self._make_client())
         client.put("/settings/owner-profile", json={"name": "Brad"})
         client.put("/settings/owner-profile", json={"pronouns": "he/him"})
         data = client.get("/settings/owner-profile").json()
@@ -8242,13 +8251,13 @@ class TestSettingsEndpoints:
         assert "name" in data
 
     def test_set_owner_profile(self):
-        client = self._make_client()
+        client = _as_owner(self._make_client())
         resp = client.put("/settings/owner-profile", json={"name": "Alice", "timezone": "America/New_York"})
         assert resp.status_code == 200
         assert resp.json()["name"] == "Alice"
 
     def test_empty_owner_profile_update_returns_current(self):
-        client = self._make_client()
+        client = _as_owner(self._make_client())
         client.put("/settings/owner-profile", json={"name": "Alice"})
         resp = client.put("/settings/owner-profile", json={})
         assert resp.status_code == 200

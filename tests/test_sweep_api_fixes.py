@@ -13,6 +13,8 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from pinky_daemon.auth import SESSION_COOKIE_NAME, create_session_cookie
+
 
 def _make_app(db_path: str):
     from pinky_daemon.api import create_api
@@ -358,6 +360,11 @@ class TestProviderNullFields:
             db_path = os.path.join(tmpdir, "test.db")
             app = _make_app(db_path)
             with TestClient(app) as client:
+                # The API-key routes are owner-session only.
+                client.cookies.set(
+                    SESSION_COOKIE_NAME,
+                    create_session_cookie(os.environ["PINKY_SESSION_SECRET"]),
+                )
                 r = client.put(
                     "/system/api-keys/OPENAI_API_KEY", json={"value": None}
                 )
