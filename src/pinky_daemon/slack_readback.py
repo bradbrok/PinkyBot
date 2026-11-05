@@ -81,7 +81,7 @@ def _message(message, bot, token):
     fields = {key: message.get(key) for key in
               ("ts", "thread_ts", "user", "bot_id", "app_id", "subtype")}
     if (not isinstance(text, str) or not isinstance(fields["ts"], str)
-            or not re.fullmatch(r"\d{9,10}\.\d{6}", fields["ts"])
+            or not re.fullmatch(r"[0-9]{9,10}\.[0-9]{6}", fields["ts"])
             or any(value is not None and not isinstance(value, str) for value in fields.values())):
         raise SlackError("invalid_response")
     edited = message.get("edited")
@@ -125,6 +125,7 @@ async def read_message(select_adapter, channel, ts, thread_ts):
         if thread_ts and thread_ts != ts:
             method = "conversations.replies"
             params["ts"] = thread_ts
+            params["limit"] = 2
         page = await reader.call(adapter._request_form, method, **params)
         messages = _messages(page, bot, adapter.bot_token)
         message = next((message for message in messages if message["ts"] == ts), None)

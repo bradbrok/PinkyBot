@@ -9,7 +9,7 @@ import threading
 import time
 from collections import deque
 from types import SimpleNamespace
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, quote, urlencode
 
 import httpx
 import pytest
@@ -66,6 +66,8 @@ def gateway(tmp_path, monkeypatch):
         else:
             assert method in ("conversations.history", "conversations.replies")
             result = state.outcomes.popleft() if state.outcomes else _page()
+        if callable(result):
+            result = result(request)
         if isinstance(result, Exception):
             raise result
         return result if isinstance(result, httpx.Response) else httpx.Response(200, json=result)
@@ -172,7 +174,23 @@ def test_thread_lookup_matches_exact_timestamp_and_keeps_parent_out(gateway, thr
     form = {"channel": CHANNEL, "oldest": TS, "latest": TS, "inclusive": "true", "limit": "1"}
     if method == "conversations.replies":
         form["ts"] = PARENT
+        form["limit"] = "2"
     assert _forms(gateway)[1] == (method, form)
+
+
+def test_thread_lookup_finds_reply_when_parent_counts_toward_limit(gateway):
+    def parent_first(request):
+        assert request.url.path.endswith("/conversations.replies")
+        limit = int(parse_qs(request.content.decode())["limit"][0])
+        return _page([_message(ts=PARENT), _message(thread_ts=PARENT)][:limit])
+
+    gateway.outcomes.append(parent_first)
+    response = _get(gateway, thread_ts=PARENT)
+    assert response.status_code == 200
+    assert response.json()["found"] is True
+    assert response.json()["message"]["ts"] == TS
+    assert response.json()["message"]["thread_ts"] == PARENT
+    assert [method for method, _, _ in gateway.calls] == ["auth.test", "conversations.replies"]
 
 
 @pytest.mark.parametrize("messages", [[], [_message(ts=PARENT)]])
@@ -212,6 +230,14 @@ def test_other_signed_and_owner_session_callers_cannot_read(gateway, history):
 def test_bad_inputs_are_400_before_any_slack_call(gateway, path, params):
     response = _get(gateway, path, **params)
     assert response.status_code == 400
+    assert not gateway.calls and not gateway.selected
+
+
+@pytest.mark.parametrize("ts", ["١٧٣٠٣١٢٣٤٥.123456", "1730312345.١٢٣٤٥٦"])
+def test_non_ascii_timestamp_is_400_before_any_slack_call(gateway, ts):
+    response = _get(gateway, MESSAGE_PATH.replace(TS, quote(ts, safe="")))
+    assert response.status_code == 400
+    assert response.json() == {"detail": {"code": "invalid_timestamp"}}
     assert not gateway.calls and not gateway.selected
 
 
@@ -261,6 +287,7 @@ def test_transport_failure_is_504_without_exception_text(gateway, caplog, histor
     httpx.Response(200, content=TOKEN), {}, [], {"ok": "true", "messages": []},
     {"ok": True}, {"ok": True, "messages": {}},
     {"ok": True, "messages": ["bad"]}, {"ok": True, "messages": [{"ts": TS, "text": None}]},
+    {"ok": True, "messages": [_message(ts="١٧٣٠٣١٢٣٤٥.١٢٣٤٥٦")]},
 ])
 def test_malformed_upstream_is_an_explicit_failure(gateway, caplog, body):
     gateway.outcomes.append(body)

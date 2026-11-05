@@ -9863,7 +9863,7 @@ npm run build</pre>
             raise HTTPException(403, "verified caller must match the target agent")
         if not re.fullmatch(r"[CDG][A-Z0-9]{2,}", channel):
             raise HTTPException(400, {"code": "invalid_channel"})
-        if any(not re.fullmatch(r"\d{9,10}\.\d{6}", value) for value in timestamps):
+        if any(not re.fullmatch(r"[0-9]{9,10}\.[0-9]{6}", value) for value in timestamps):
             raise HTTPException(400, {"code": "invalid_timestamp"})
         return name
 
