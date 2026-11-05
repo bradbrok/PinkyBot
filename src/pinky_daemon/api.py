@@ -8363,12 +8363,18 @@ npm run build</pre>
 
     @app.put("/system/primary-user")
     async def set_primary_user(
+        request: Request,
         chat_id: str,
         display_name: str = "",
         notification_platform: str = "",
         notification_account_id: str = "",
     ):
-        """Set the primary user — auto-approved for all agents."""
+        """Set the primary user — auto-approved for all agents.
+
+        Owner session only: the primary user is the owner's identity, so an
+        agent's signed request must not be able to change it.
+        """
+        _owner_control_actor(request)
         if not chat_id.strip():
             raise HTTPException(400, "chat_id is required")
         if bool(notification_platform.strip()) != bool(notification_account_id.strip()):
@@ -8394,8 +8400,13 @@ npm run build</pre>
         return {"destinations": destinations, "count": len(destinations)}
 
     @app.put("/system/owner-notification-destinations")
-    async def set_owner_notification_destinations(req: dict):
-        """Replace the canonical owner destination and ordered fallbacks."""
+    async def set_owner_notification_destinations(req: dict, request: Request):
+        """Replace the canonical owner destination and ordered fallbacks.
+
+        Owner session only: these are where owner alerts go, so an agent's
+        signed request must not be able to redirect them.
+        """
+        _owner_control_actor(request)
         try:
             destinations = agents.set_owner_notification_destinations(
                 req.get("destinations", []),

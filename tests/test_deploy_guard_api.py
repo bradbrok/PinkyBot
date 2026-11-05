@@ -5,12 +5,14 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
 
+from pinky_daemon.auth import SESSION_COOKIE_NAME, create_session_cookie
 from tests.test_deploy_guard import TOKEN, guard_module, load, record, save
 from tests.test_deploy_guard import harness as _harness
 from tests.test_startup_preflight import clean_report
@@ -134,6 +136,10 @@ def test_route_refresh_tracks_shared_token_and_destination_changes(deployment):
         "sender", "telegram", "", token_ref=token["id"], settings={"account_id": "fixture-account"}
     )
     client = TestClient(fx.app)
+    # The destinations route is owner-session only.
+    client.cookies.set(
+        SESSION_COOKIE_NAME, create_session_cookie(os.environ["PINKY_SESSION_SECRET"])
+    )
     destination = dict(
         platform="telegram",
         account_id="fixture-account",
