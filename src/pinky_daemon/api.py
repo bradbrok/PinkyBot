@@ -8431,16 +8431,26 @@ npm run build</pre>
             }
         return {"keys": keys}
 
+    # The only system settings the API-key routes may write. Everything else in
+    # system_settings (owner identity, the UI password hash, ...) has its own route.
+    _api_key_names = frozenset({
+        "ANTHROPIC_API_KEY",
+        "ELEVENLABS_API_KEY", "OPENAI_API_KEY", "DEEPGRAM_API_KEY", "GIPHY_API_KEY",
+        "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER", "PINKY_BASE_URL",
+    })
+
+    def _api_key_name_or_400(key_name: str) -> str:
+        if key_name not in _api_key_names:
+            raise HTTPException(
+                400, f"Unknown key: {key_name}. Allowed: {', '.join(sorted(_api_key_names))}"
+            )
+        return key_name
+
     @app.put("/system/api-keys/{key_name}")
-    async def set_api_key(key_name: str, req: dict):
-        """Set an API key in system settings."""
-        allowed = {
-            "ANTHROPIC_API_KEY",
-            "ELEVENLABS_API_KEY", "OPENAI_API_KEY", "DEEPGRAM_API_KEY", "GIPHY_API_KEY",
-            "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER", "PINKY_BASE_URL",
-        }
-        if key_name not in allowed:
-            raise HTTPException(400, f"Unknown key: {key_name}. Allowed: {', '.join(sorted(allowed))}")
+    async def set_api_key(key_name: str, req: dict, request: Request):
+        """Set an API key in system settings. Owner session only."""
+        _owner_control_actor(request)
+        _api_key_name_or_400(key_name)
         value = (req.get("value") or "").strip()
         if not value:
             raise HTTPException(400, "value is required")
@@ -8448,8 +8458,15 @@ npm run build</pre>
         return {"saved": True, "key": key_name}
 
     @app.delete("/system/api-keys/{key_name}")
-    async def delete_api_key(key_name: str):
-        """Remove an API key from system settings."""
+    async def delete_api_key(key_name: str, request: Request):
+        """Remove an API key from system settings. Owner session only.
+
+        Only the API-key names can be cleared here: this route must never
+        blank another system setting such as the owner identity or the UI
+        password hash.
+        """
+        _owner_control_actor(request)
+        _api_key_name_or_400(key_name)
         agents.set_setting(key_name, "")
         return {"deleted": True, "key": key_name}
 

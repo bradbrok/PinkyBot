@@ -147,3 +147,64 @@ async def test_the_owner_session_still_sets_the_profile_and_agents_can_read_it(d
         path = "/settings/owner-profile"
         response = await c.get(path, headers=signed(d, "GET", path, "normal"))
         assert response.status_code == 200, response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "key",
+    ["ui_password_hash", "primary_user_chat_id", "owner_notification_destinations", "OPENAI_API_KEY"],
+)
+@pytest.mark.parametrize("actor", ["normal", "dreamer"])
+async def test_a_signed_agent_cannot_clear_any_setting_through_the_api_key_routes(daemon, actor, key):
+    d = daemon()
+    d.agents.set_setting(key, "kept")
+    path = f"/system/api-keys/{key}"
+    async with client(d) as c:
+        response = await c.delete(path, headers=signed(d, "DELETE", path, actor))
+        assert response.status_code == 403, response.text
+        response = await c.put(path, json={"value": "x"}, headers=signed(d, "PUT", path, actor))
+        assert response.status_code == 403, response.text
+    assert d.agents.get_setting(key) == "kept"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", ["ui_password_hash", "primary_user_chat_id", "owner_notification_destinations"])
+async def test_the_owner_cannot_clear_non_api_key_settings_through_delete(daemon, key):
+    d = daemon()
+    d.agents.set_setting(key, "kept")
+    async with client(d, owner_headers()) as c:
+        response = await c.delete(f"/system/api-keys/{key}")
+    assert response.status_code == 400, response.text
+    assert d.agents.get_setting(key) == "kept"
+
+
+@pytest.mark.asyncio
+async def test_the_owner_still_sets_and_clears_an_api_key(daemon):
+    d = daemon()
+    async with client(d, owner_headers()) as c:
+        assert (await c.put("/system/api-keys/OPENAI_API_KEY", json={"value": "sk-test"})).status_code == 200
+        assert d.agents.get_setting("OPENAI_API_KEY") == "sk-test"
+        assert (await c.delete("/system/api-keys/OPENAI_API_KEY")).status_code == 200
+    assert d.agents.get_setting("OPENAI_API_KEY") == ""
+
+
+@pytest.mark.asyncio
+async def test_a_refused_agent_delete_keeps_ui_setup_closed(daemon, monkeypatch):
+    monkeypatch.delenv("PINKY_UI_PASSWORD", raising=False)
+    setup = {"password": "a-long-fixture-password"}
+    first = daemon()
+    async with client(first) as c:  # control: a first-ever setup still opens a session
+        response = await c.post("/auth/setup", json=setup)
+        assert response.status_code == 200, response.text
+        assert SESSION_COOKIE_NAME in response.headers.get("set-cookie", "")
+
+    d = daemon()
+    d.agents.set_setting("ui_password_hash", "stored-hash")
+    path = "/system/api-keys/ui_password_hash"
+    async with client(d) as c:
+        response = await c.delete(path, headers=signed(d, "DELETE", path, "normal"))
+        assert response.status_code == 403, response.text
+        response = await c.post("/auth/setup", json=setup)
+        assert response.status_code == 409, response.text
+        assert SESSION_COOKIE_NAME not in response.headers.get("set-cookie", "")
+    assert d.agents.get_setting("ui_password_hash") == "stored-hash"
