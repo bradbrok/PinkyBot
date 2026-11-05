@@ -6,7 +6,8 @@ import asyncio
 import hashlib
 import json
 import re
-from time import monotonic, sleep
+from concurrent.futures import ThreadPoolExecutor
+from time import monotonic
 
 import httpx
 from fastapi import HTTPException
@@ -14,6 +15,7 @@ from fastapi import HTTPException
 from pinky_outreach.slack import SlackError, SlackRateLimitError
 
 REQUEST_SECONDS = 60.0
+_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="slack-readback")
 
 
 class _DeadlineError(Exception):
@@ -32,24 +34,35 @@ class _Reader:
 
     async def offload(self, call, *args, **kwargs):
         remaining = self.remaining()
+
+        def invoke():
+            # Queue time consumes the same budget as HTTP calls and retry waits.
+            return call(*args, timeout=min(30.0, self.remaining()), **kwargs)
+
         try:
-            return await asyncio.wait_for(asyncio.to_thread(call, *args, **kwargs), remaining)
+            future = asyncio.get_running_loop().run_in_executor(_EXECUTOR, invoke)
+            # Queued calls can be cancelled; running calls retain their worker until done.
+            return await asyncio.wait_for(future, remaining)
         except TimeoutError:
             raise _DeadlineError from None
 
     async def call(self, call, *args, **kwargs):
         for attempt in range(4):
             try:
-                return await self.offload(call, *args, timeout=min(30.0, self.remaining()), **kwargs)
+                return await self.offload(call, *args, **kwargs)
             except SlackRateLimitError as exc:
                 if attempt == 3:
                     raise
-                if exc.retry_after >= self.remaining():
+                remaining = self.remaining()
+                if exc.retry_after >= remaining:
                     raise _DeadlineError from None
-                await self.offload(sleep, exc.retry_after)
+                try:
+                    await asyncio.wait_for(asyncio.sleep(exc.retry_after), remaining)
+                except TimeoutError:
+                    raise _DeadlineError from None
 
     async def start(self, select_adapter):
-        adapter = await self.offload(select_adapter)
+        adapter = select_adapter()
         if adapter is None or not adapter.bot_token:
             raise HTTPException(409, {"code": "slack_not_configured"})
         info = await self.call(adapter.get_bot_info)

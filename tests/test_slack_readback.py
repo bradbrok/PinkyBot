@@ -115,7 +115,7 @@ def _history(state, **params):
 def _timing(monkeypatch):
     clock = SimpleNamespace(now=100.0, waits=[], threads=[])
 
-    def sleep(seconds):
+    async def sleep(seconds):
         clock.waits.append(seconds)
         clock.threads.append(threading.get_ident())
         clock.now += seconds
@@ -123,7 +123,7 @@ def _timing(monkeypatch):
     module = sys.modules.get("pinky_daemon.slack_readback")
     if module is not None:
         monkeypatch.setattr(module, "monotonic", lambda: clock.now)
-        monkeypatch.setattr(module, "sleep", sleep)
+        monkeypatch.setattr(module.asyncio, "sleep", sleep)
     return clock
 
 
@@ -498,18 +498,19 @@ async def test_total_deadline_bounds_an_inflight_call(gateway, monkeypatch, hist
         assert response.json() == {"detail": {"code": "slack_unreachable"}}
 
 
-async def test_retry_sleep_runs_off_the_event_loop(gateway, monkeypatch):
+async def test_retry_sleep_yields_on_the_event_loop(gateway, monkeypatch):
     module = sys.modules["pinky_daemon.slack_readback"]
-    entered, release = threading.Event(), threading.Event()
+    entered, release = asyncio.Event(), asyncio.Event()
     loop_thread, sleep_threads = threading.get_ident(), []
+    real_sleep = asyncio.sleep
 
-    def slow_sleep(seconds):
+    async def slow_sleep(seconds):
         assert seconds == 1
         sleep_threads.append(threading.get_ident())
         entered.set()
-        release.wait(2)
+        await asyncio.wait_for(release.wait(), 2)
 
-    monkeypatch.setattr(module, "sleep", slow_sleep)
+    monkeypatch.setattr(module.asyncio, "sleep", slow_sleep)
     gateway.outcomes.extend([httpx.Response(429, headers={"Retry-After": "1"}), _page()])
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://test") as client:
         pending = asyncio.create_task(client.get(MESSAGE_PATH, headers=_headers(gateway, MESSAGE_PATH)))
@@ -517,9 +518,9 @@ async def test_retry_sleep_runs_off_the_event_loop(gateway, monkeypatch):
             for _ in range(100):
                 if entered.is_set() or pending.done():
                     break
-                await asyncio.sleep(0.005)
+                await real_sleep(0.005)
             assert entered.is_set() and not pending.done()
-            assert sleep_threads and all(thread != loop_thread for thread in sleep_threads)
+            assert sleep_threads and all(thread == loop_thread for thread in sleep_threads)
         finally:
             release.set()
             response = await asyncio.wait_for(pending, 3)
