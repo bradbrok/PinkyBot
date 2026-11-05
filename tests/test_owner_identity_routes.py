@@ -1,8 +1,9 @@
 """The owner's identity settings change only from an owner session.
 
 The primary user and the owner notification destinations say who the owner
-is and where owner alerts go. An agent's signed request passes the auth
-middleware, so these two write routes check for an owner session themselves.
+is and where owner alerts go, and the owner profile holds the code word
+agents use to verify the owner. An agent's signed request passes the auth
+middleware, so these write routes check for an owner session themselves.
 """
 
 import os
@@ -111,3 +112,38 @@ async def test_reads_stay_open_to_signed_agents(daemon):
         for path in ("/system/primary-user", "/system/owner-notification-destinations"):
             response = await c.get(path, headers=signed(d, "GET", path, "normal"))
             assert response.status_code == 200, response.text
+
+
+async def put_profile(c, headers=None):
+    return await c.put(
+        "/settings/owner-profile",
+        json={"name": "Not the owner", "code_word": "agent-chosen-word"},
+        headers=headers or {},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("actor", ["normal", "dreamer", "tenant"])
+async def test_a_signed_agent_cannot_change_the_owner_profile_or_code_word(daemon, actor):
+    d = daemon()
+    path = "/settings/owner-profile"
+    before = d.agents.get_owner_profile()
+    async with client(d) as c:
+        response = await put_profile(c, signed(d, "PUT", path, actor))
+    assert response.status_code == 403, response.text
+    if actor != "tenant":
+        assert response.json() == {"detail": "authenticated owner session required"}
+    assert d.agents.get_owner_profile() == before
+
+
+@pytest.mark.asyncio
+async def test_the_owner_session_still_sets_the_profile_and_agents_can_read_it(daemon):
+    d = daemon()
+    async with client(d, owner_headers()) as c:
+        response = await put_profile(c)
+        assert response.status_code == 200, response.text
+    assert d.agents.get_owner_profile()["code_word"] == "agent-chosen-word"
+    async with client(d) as c:
+        path = "/settings/owner-profile"
+        response = await c.get(path, headers=signed(d, "GET", path, "normal"))
+        assert response.status_code == 200, response.text

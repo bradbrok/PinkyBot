@@ -16807,8 +16807,14 @@ npm run build</pre>
         return agents.get_owner_profile()
 
     @app.put("/settings/owner-profile")
-    async def set_owner_profile(req: OwnerProfileRequest):
-        """Update owner profile. Only non-empty fields are written."""
+    async def set_owner_profile(req: OwnerProfileRequest, request: Request):
+        """Update owner profile. Only non-empty fields are written.
+
+        Owner session only: the profile holds the owner's code word, which
+        agents use to verify the owner, so an agent's signed request must not
+        be able to change it.
+        """
+        _owner_control_actor(request)
         updates = {k: v for k, v in req.model_dump().items() if v}
         if not updates:
             return agents.get_owner_profile()
