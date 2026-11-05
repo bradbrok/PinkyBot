@@ -161,8 +161,10 @@ def test_slack_file_upload_uses_thread_root(media, monkeypatch, kind, include_ch
     upload_url = "https://files.slack.com/upload/fixture"
     post = Mock(
         side_effect=[
-            SimpleNamespace(json=lambda: {"ok": True, "upload_url": upload_url, "file_id": "F123"}),
-            SimpleNamespace(json=lambda: {"ok": True, "files": [{"id": "F123"}]}),
+            SimpleNamespace(status_code=200, raise_for_status=lambda: None,
+                            json=lambda: {"ok": True, "upload_url": upload_url, "file_id": "F123"}),
+            SimpleNamespace(status_code=200, raise_for_status=lambda: None,
+                            json=lambda: {"ok": True, "files": [{"id": "F123"}]}),
         ]
     )
     monkeypatch.setattr(adapter._client, "post", post)

@@ -63,7 +63,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from starlette._utils import get_route_path
 
-from pinky_daemon import deploy_guard, runtime_model_catalog
+from pinky_daemon import deploy_guard, runtime_model_catalog, slack_readback
 from pinky_daemon import schedule_fire_trace as _schedule_fire_trace
 from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
@@ -9856,6 +9856,46 @@ npm run build</pre>
             "capabilities": [d.directive for d in directives],
             "groups": agent.groups,
         }
+
+    def _slack_read_target(name, request, channel, *timestamps):
+        name = _agent_name_or_400(name)
+        if getattr(request.state, "internal_caller", None) != name:
+            raise HTTPException(403, "verified caller must match the target agent")
+        if not re.fullmatch(r"[CDG][A-Z0-9]{2,}", channel):
+            raise HTTPException(400, {"code": "invalid_channel"})
+        if any(not re.fullmatch(r"[0-9]{9,10}\.[0-9]{6}", value) for value in timestamps):
+            raise HTTPException(400, {"code": "invalid_timestamp"})
+        return name
+
+    @app.get("/agents/{name}/slack/message/{channel}/{ts}")
+    async def get_agent_slack_message(
+        name: str, channel: str, ts: str, request: Request,
+        thread_ts: str | None = None, account_id: str = "",
+    ):
+        """Read one exact Slack message using only the signed caller's account."""
+        name = _slack_read_target(name, request, channel, ts,
+                                 *([thread_ts] if thread_ts is not None else []))
+        select = functools.partial(_get_platform_adapter, name, "slack", account_id=account_id)
+        return await slack_readback.read_message(select, channel, ts, thread_ts)
+
+    @app.get("/agents/{name}/slack/history/{channel}")
+    async def get_agent_slack_history(
+        name: str, channel: str, request: Request, oldest: str = "", latest: str = "",
+        max_pages: str = "10", account_id: str = "",
+    ):
+        """Read a bounded channel window and report whether pagination finished."""
+        name = _slack_read_target(name, request, channel, oldest, latest)
+        bounds = [tuple(map(int, value.split("."))) for value in (oldest, latest)]
+        if bounds[0] > bounds[1]:
+            raise HTTPException(400, {"code": "invalid_window"})
+        try:
+            pages = int(max_pages) if re.fullmatch(r"[0-9]+", max_pages) else 0
+        except ValueError:
+            pages = 0
+        if not 1 <= pages <= 50:
+            raise HTTPException(400, {"code": "invalid_max_pages"})
+        select = functools.partial(_get_platform_adapter, name, "slack", account_id=account_id)
+        return await slack_readback.read_history(select, channel, oldest, latest, pages)
 
     @app.get("/agents/{name}/message-context/{platform}/{chat_id}/{message_id}")
     async def get_agent_message_context(

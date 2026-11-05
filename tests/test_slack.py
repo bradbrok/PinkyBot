@@ -556,12 +556,16 @@ class TestSlackAdapter:
         mock_response.json.return_value = {"ok": True, "messages": []}
         adapter._client.post = MagicMock(return_value=mock_response)
 
-        adapter.get_history("C12345", oldest="1711584000.000100", limit=10)
+        adapter.get_history("C12345", oldest="1711584000.000100",
+                            latest="1711584060.000200", limit=10)
 
         call_kwargs = adapter._client.post.call_args
-        payload = call_kwargs.kwargs.get("json", call_kwargs[1].get("json", {}))
-        assert payload["oldest"] == "1711584000.000100"
-        assert payload["limit"] == 10
+        assert "json" not in call_kwargs.kwargs
+        assert call_kwargs.kwargs["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
+        assert call_kwargs.kwargs["data"] == {
+            "channel": "C12345", "oldest": "1711584000.000100",
+            "latest": "1711584060.000200", "limit": 10,
+        }
         adapter.close()
 
     def test_get_bot_info(self):
