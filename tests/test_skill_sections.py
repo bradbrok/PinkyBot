@@ -214,6 +214,19 @@ def test_always_sections_do_not_use_up_the_cap():
     assert_partial(out, "demo", "", text)
 
 
+def test_always_section_one_does_not_use_up_the_cap():
+    rules, s2, s3 = sec("Rules [always]", 5000), sec("Two", 1900), sec("Three", 1000)
+    text = INTRO + rules + s2 + s3
+    out = render_default("demo", "", text, 2000)
+    # 7 + 1900 = 1907 <= 2000 once the always section 1 is not counted.
+    assert out.endswith(INTRO + rules + s2 + "[Not shown: sections 3]\n")
+    assert notice(
+        "demo", 6907, 7907, 2000, "3",
+        " Section 1 is longer than the cap and is shown whole.",
+    ) in out
+    assert_partial(out, "demo", "", text)
+
+
 def test_several_gaps_and_ranges():
     s = [sec(f"S{k}", 1000) for k in range(1, 8)]
     s[3] = sec("S4 [always]", 1000)

@@ -3,10 +3,12 @@
 Long skills fill the context window when loaded whole. An agent can opt in to a
 cap: a skill longer than the cap then loads as its contents list, the first part
 (whole sections from the top that fit the cap) and every section whose heading
-ends with `` [always]``. Any other section is one ``section=`` call away.
+ends with `` [always]``, unless that would not be shorter than the whole skill,
+in which case it loads whole. Any other section is one ``section=`` call away.
 
-Pure functions only (no I/O). With no cap, every output here is exactly the
-whole-skill text ``load_skill`` has always returned.
+Pure functions only (no I/O). With no cap, a load without a section, and any
+load with ``section="all"``, is exactly the whole-skill text ``load_skill`` has
+always returned.
 """
 
 from __future__ import annotations
