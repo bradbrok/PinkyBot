@@ -103,6 +103,14 @@ class SlackError(Exception):
         super().__init__(f"Slack API error: {error}")
 
 
+class SlackRateLimitError(SlackError):
+    """A retryable Slack read with a bounded server-provided delay."""
+
+    def __init__(self, retry_after: int):
+        self.retry_after = retry_after
+        super().__init__("ratelimited")
+
+
 class SlackAdapter:
     """Slack Web API adapter using httpx."""
 
@@ -145,7 +153,7 @@ class SlackAdapter:
 
         return data
 
-    def _request_form(self, method: str, **params) -> dict:
+    def _request_form(self, method: str, *, timeout: float | None = None, **params) -> dict:
         """Make a Slack Web API request with form-encoded args.
 
         Required for Slack's read/info methods (users.info, conversations.info,
@@ -156,15 +164,37 @@ class SlackAdapter:
         The client's default Content-Type is JSON, so override it per-request.
         """
         params = {k: v for k, v in params.items() if v is not None}
-        resp = self._client.post(
-            f"/{method}",
-            data=params,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        data = resp.json()
-
-        if not data.get("ok"):
-            raise SlackError(data.get("error", "unknown_error"))
+        options = {} if timeout is None else {"timeout": timeout}
+        try:
+            resp = self._client.post(
+                f"/{method}",
+                data=params,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                **options,
+            )
+        except httpx.TimeoutException:
+            raise httpx.TimeoutException("Slack request timed out") from None
+        except httpx.HTTPError:
+            raise httpx.RequestError("Slack request failed") from None
+        if resp.status_code == 429:
+            try:
+                retry_after = max(1, min(30, int(resp.headers.get("Retry-After", "1"))))
+            except (ValueError, TypeError):
+                retry_after = 1
+            raise SlackRateLimitError(retry_after)
+        try:
+            resp.raise_for_status()
+            data = resp.json()
+        except (httpx.HTTPStatusError, ValueError):
+            raise SlackError("invalid_response") from None
+        if not isinstance(data, dict) or type(data.get("ok")) is not bool:
+            raise SlackError("invalid_response")
+        if not data["ok"]:
+            error = data.get("error")
+            if (not isinstance(error, str) or not re.fullmatch(r"[a-z_]{1,64}", error)
+                    or self._token and self._token in error):
+                error = "invalid_response"
+            raise SlackError(error)
 
         return data
 
@@ -423,7 +453,7 @@ class SlackAdapter:
             oldest: Only messages after this timestamp.
             latest: Only messages before this timestamp.
         """
-        result = self._request(
+        result = self._request_form(
             "conversations.history",
             channel=channel,
             limit=min(limit, 200),
@@ -474,10 +504,10 @@ class SlackAdapter:
 
     # ── Info ─────────────────────────────────────────────────
 
-    def get_bot_info(self) -> dict:
+    def get_bot_info(self, *, timeout: float | None = None) -> dict:
         """Get the bot's identity."""
         if not self._bot_info:
-            result = self._request("auth.test")
+            result = self._request_form("auth.test", timeout=timeout)
             self._bot_info = {
                 "user_id": result.get("user_id"),
                 "bot_id": result.get("bot_id"),

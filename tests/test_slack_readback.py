@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import sys
 import threading
+import time
 from collections import deque
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlencode
@@ -201,6 +202,7 @@ def test_other_signed_and_owner_session_callers_cannot_read(gateway, history):
     (MESSAGE_PATH.replace(TS, "1730312345.12345"), {}),
     (MESSAGE_PATH.replace(TS, "1730312345.123456%0A"), {}),
     (MESSAGE_PATH, {"thread_ts": "broken"}),
+    (MESSAGE_PATH, {"thread_ts": ""}),
     (HISTORY_PATH, {}),
     (HISTORY_PATH, {"oldest": LATEST, "latest": PARENT}),
     (HISTORY_PATH, {"oldest": PARENT, "latest": "bad"}),
@@ -402,3 +404,110 @@ def test_rate_limit_exception_preserves_slack_error_contract(gateway):
     assert captured.value.error == "ratelimited"
     assert getattr(captured.value, "retry_after", None) == 4
     assert TOKEN not in str(captured.value)
+
+
+@pytest.mark.parametrize("failure,status", [
+    ({"ok": False, "error": "channel_not_found"}, 502),
+    (httpx.ReadTimeout(TOKEN), 504), (httpx.Response(200, content=TOKEN), 502),
+])
+def test_failed_page_after_success_is_still_an_error(gateway, failure, status):
+    gateway.outcomes.extend([_page([_message()], more=True, cursor="next"), failure])
+    response = _history(gateway)
+    assert response.status_code == status
+    assert "detail" in response.json() and "complete" not in response.json()
+    assert TOKEN not in response.text
+
+
+@pytest.mark.parametrize("body", [{"ok": True, "messages": []},
+                                   {"ok": True, "messages": [], "has_more": "false"}])
+def test_missing_or_nonboolean_completion_is_not_complete(gateway, body):
+    gateway.outcomes.append(body)
+    response = _history(gateway)
+    assert response.status_code == 502
+    assert response.json() == {"detail": {"code": "slack_error", "error": "invalid_response"}}
+
+
+@pytest.mark.parametrize("body,status", [
+    ({"ok": True}, 502), ({"ok": False, "error": "invalid_auth"}, 502),
+    (httpx.ConnectError(TOKEN), 504),
+])
+def test_identity_failure_never_returns_success(gateway, body, status):
+    gateway.auth.append(body)
+    response = _history(gateway)
+    assert response.status_code == status
+    assert TOKEN not in response.text
+    assert [method for method, _, _ in gateway.calls] == ["auth.test"]
+
+
+@pytest.mark.parametrize("history", [False, True])
+async def test_total_deadline_bounds_an_inflight_call(gateway, monkeypatch, history):
+    module = sys.modules["pinky_daemon.slack_readback"]
+    monkeypatch.setattr(module, "REQUEST_SECONDS", 0.1)
+    release = threading.Event()
+    if history:
+        gateway.outcomes.extend([_page([_message()], more=True, cursor="one"), _page()])
+
+    def slow(method):
+        if method == "conversations.history" and (not history or len(gateway.calls) == 3):
+            release.wait(2)
+
+    gateway.before = slow
+    path = HISTORY_PATH + "?" + urlencode({"oldest": PARENT, "latest": LATEST}) if history else MESSAGE_PATH
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://test") as client:
+        start = time.monotonic()
+        try:
+            response = await asyncio.wait_for(client.get(path, headers=_headers(gateway, path)), 1)
+            elapsed = time.monotonic() - start
+        finally:
+            release.set()
+        assert elapsed < 0.75
+    if history:
+        assert response.status_code == 200
+        body = response.json()
+        assert (body["complete"], body["stopped_reason"], body["pages"]) == (False, "deadline", 1)
+        assert len(body["messages"]) == 1
+    else:
+        assert response.status_code == 504
+        assert response.json() == {"detail": {"code": "slack_unreachable"}}
+
+
+async def test_retry_sleep_runs_off_the_event_loop(gateway, monkeypatch):
+    module = sys.modules["pinky_daemon.slack_readback"]
+    entered, release = threading.Event(), threading.Event()
+    loop_thread, sleep_threads = threading.get_ident(), []
+
+    def slow_sleep(seconds):
+        assert seconds == 1
+        sleep_threads.append(threading.get_ident())
+        entered.set()
+        release.wait(2)
+
+    monkeypatch.setattr(module, "sleep", slow_sleep)
+    gateway.outcomes.extend([httpx.Response(429, headers={"Retry-After": "1"}), _page()])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gateway.app), base_url="http://test") as client:
+        pending = asyncio.create_task(client.get(MESSAGE_PATH, headers=_headers(gateway, MESSAGE_PATH)))
+        try:
+            for _ in range(100):
+                if entered.is_set() or pending.done():
+                    break
+                await asyncio.sleep(0.005)
+            assert entered.is_set() and not pending.done()
+            assert sleep_threads and all(thread != loop_thread for thread in sleep_threads)
+        finally:
+            release.set()
+            response = await asyncio.wait_for(pending, 3)
+        assert response.status_code == 200
+
+
+def test_token_test_caller_handles_rate_limit_without_leaking(gateway, tmp_path):
+    from pinky_daemon.outreach_config import OutreachConfigStore
+
+    gateway.auth.append(httpx.Response(429, content=TOKEN))
+    store = OutreachConfigStore(str(tmp_path / "outreach.db"))
+    try:
+        result = store._test_slack(TOKEN)
+    finally:
+        store.close()
+    assert result == {"platform": "slack", "success": False,
+                      "error": "Slack API error: ratelimited"}
+    assert TOKEN not in str(result)
