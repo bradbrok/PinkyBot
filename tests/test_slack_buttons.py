@@ -90,6 +90,7 @@ def _state(*, store=None, registry=None, broker=None, event_callback=None):
         registry.get_user_status.side_effect = lambda agent, key: statuses.get(key)
         registry.get_primary_user.return_value = {"chat_id": "UOWNER"}
         registry.get_setting.return_value = ""
+        registry.get_slack_mention_only.return_value = set()
     if broker is None:
         broker = MessageBroker(registry, Mock(), message_context_store=store)
         broker.handle_inbound = AsyncMock()
@@ -378,7 +379,7 @@ async def test_button_click_is_acked_before_any_slack_call(monkeypatch):
     listener = await _socket(state, monkeypatch, events)
     state.adapter.update_message.side_effect = lambda *a, **k: events.append("update")
     state.poller._resolve_user_name.side_effect = lambda uid: events.append("resolve") or uid
-    state.broker.handle_inbound.side_effect = lambda msg: events.append("inbound")
+    state.broker.handle_inbound.side_effect = lambda msg, **kwargs: events.append("inbound")
     await listener(state.poller._client, SimpleNamespace(
         type="interactive", envelope_id="opaque-envelope", payload=_payload(),
     ))
@@ -405,7 +406,7 @@ async def test_button_click_becomes_one_inbound_message_with_tap_fields():
         "user_id": "UCLICKER", "bot_id": None, "was_bot": False, "forwarded": None,
         "via_bot_id": None, "sender_business_bot_id": None, "reply_to": CARD,
         "reply_to_sender_id": "UBOT", "platform_ts": None, "channel_type": "", "thread_ts": CARD,
-        "button_data": DATA, "button_message_id": CARD,
+        "button_data": DATA, "button_message_id": CARD, "mention_only_exempt": "button_tap",
     }
     callback.assert_awaited_once_with(platform="slack", chat_id="CCHANNEL", sender="Display",
                                      content="Button tapped: " + DATA)
@@ -444,7 +445,8 @@ async def test_tap_reaches_signed_text_and_threads_under_its_card(gateway, outbo
     response = _text(gateway, platform="slack", chat_id="CCHANNEL", message_id="act-" + ACTION)
     assert response.status_code == 200, response.text
     body = response.json()
-    assert set(body) == TEXT_KEYS | set(FIELDS) | {"button_data", "button_message_id"}
+    assert set(body) == TEXT_KEYS | set(FIELDS) | {"button_data", "button_message_id", "thread_ts"}
+    assert body["thread_ts"] == CARD
     assert body["button_data"] == DATA and body["button_message_id"] == CARD
     assert body["sender_id"] == "UCLICKER" and body["text"] == "Button tapped: " + DATA
     assert body["reply_to"] == CARD and body["reply_to_sender_id"] == "UBOT"

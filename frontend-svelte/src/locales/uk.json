@@ -685,7 +685,12 @@
     "import_soul_field": "Душа",
     "import_warnings_title": "{count} елемент{plural} потребує{singular_s} уваги перед міграцією",
     "import_workspace_hint": "Вкажіть вашого агента OpenClaw — використайте локальний шлях або завантажте zip-архів.",
-    "import_workspace_label": "Робочий простір"
+    "import_workspace_label": "Робочий простір",
+    "mention_only_channels": "Канали лише за згадкою",
+    "mention_only_help": "У цих каналах агент читає й пише лише в гілках, де його згадали.",
+    "mention_only_channel_id": "ID каналу",
+    "mention_only_remove": "Видалити",
+    "mention_only_saved": "Канали лише за згадкою збережено"
   },
   "settings": {
     "tab_general": "Загальне",

@@ -685,7 +685,12 @@
     "import_soul_field": "Soul",
     "import_warnings_title": "{count} item{plural} need{singular_s} attention before migrating",
     "import_workspace_hint": "Point to your OpenClaw agent — use a local directory path or upload a zip.",
-    "import_workspace_label": "Workspace"
+    "import_workspace_label": "Workspace",
+    "mention_only_channels": "Mention-only channels",
+    "mention_only_help": "In these channels the agent only reads and posts in threads where it was tagged.",
+    "mention_only_channel_id": "Channel ID",
+    "mention_only_remove": "Remove",
+    "mention_only_saved": "Mention-only channels saved"
   },
   "settings": {
     "tab_general": "General",

@@ -1908,7 +1908,7 @@ class BrokerSlackPoller:
     async def _deliver_button_message(self, message) -> None:
         """Keep background delivery failures from logging private tap values."""
         try:
-            await self._broker.handle_inbound(message)
+            await self._broker.handle_inbound(message, trusted_button_tap=True)
         except Exception as error:
             _log("button tap delivery failed: " + type(error).__name__)
 
@@ -1936,6 +1936,7 @@ class BrokerSlackPoller:
                 "reply_to": card_ts, "reply_to_sender_id": card.get("user") or None,
                 "platform_ts": None, "channel_type": "im" if is_dm else "", "thread_ts": root,
                 "button_data": fields["data"], "button_message_id": card_ts,
+                "mention_only_exempt": "button_tap",
             },
         )
         already_chosen = fields["chosen"]
@@ -2125,6 +2126,15 @@ class BrokerSlackPoller:
         text = event.get("text", "") or ""
         ts = event.get("ts", "") or ""
         thread_ts = event.get("thread_ts", "") or ""
+        mentions_self = bool(self._bot_user_id and re.search(
+            r"<@" + re.escape(self._bot_user_id) + r"(?:\|[^>]*|)>", text,
+        ))
+        thread_key = thread_ts or ts
+        if not self._broker.mention_only_admit(
+            self._agent_name, "slack", channel, thread_key, ts, mentions_self,
+        ):
+            self._broker.log_mention_only_drop(self._agent_name, channel, ts, thread_key)
+            return
         channel_type = event.get("channel_type", "")  # im | channel | group | mpim
         is_group = channel_type != "im"
         # Identity: humans carry `user`; bot-authored messages carry `bot_id`
@@ -2171,6 +2181,7 @@ class BrokerSlackPoller:
             "platform_ts": None,
             "channel_type": channel_type,
             "thread_ts": thread_ts,
+            "mentions_self": mentions_self,
         }
 
         broker_msg = self._BrokerMessage(

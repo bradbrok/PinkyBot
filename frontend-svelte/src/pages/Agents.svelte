@@ -77,6 +77,12 @@
     let tokenValue = '';
     let tokenRefId = '';
     let globalBotTokens = [];
+    let mentionChannels = [];
+    let mentionChannelInput = '';
+    let mentionError = '';
+    let mentionLoading = false;
+    let mentionSaving = false;
+    let mentionLoaded = false;
     $: platformBotTokens = globalBotTokens.filter(bt => bt.platform === tokenPlatform);
 
     // Voice config state
@@ -682,6 +688,12 @@
     async function openDetail(name) {
         const req = ++openDetailSeq;
         currentAgent = name;
+        mentionChannels = [];
+        mentionChannelInput = '';
+        mentionError = '';
+        mentionLoaded = false;
+        mentionLoading = false;
+        mentionSaving = false;
         activeTab = 'identity';
         try {
             const agent = await api('GET', `/agents/${name}`);
@@ -753,6 +765,7 @@
             detailOpen = true;
             loadDirectives();
             loadTokens();
+            loadMentionChannels();
             loadFiles();
             loadSchedules();
             loadSessions();
@@ -849,6 +862,46 @@
         loadTokens();
     }
     async function removeToken(platform) { if (!confirm(`Remove ${platform} token?`)) return; await api('DELETE', `/agents/${currentAgent}/tokens/${platform}`); toast(`${platform} token removed`); loadTokens(); }
+
+    async function loadMentionChannels() {
+        const req = openDetailSeq;
+        const name = currentAgent;
+        mentionLoading = true;
+        mentionError = '';
+        try {
+            const result = await api('GET', `/agents/${encodeURIComponent(name)}/slack/mention-only`);
+            if (req !== openDetailSeq) return;
+            mentionChannels = result.channels.map(row => row.channel_id);
+            mentionLoaded = true;
+        } catch (error) {
+            if (req === openDetailSeq) mentionError = error.message;
+        } finally {
+            if (req === openDetailSeq) mentionLoading = false;
+        }
+    }
+
+    function addMentionChannel() {
+        const channel = mentionChannelInput.trim();
+        if (channel && !mentionChannels.includes(channel)) mentionChannels = [...mentionChannels, channel];
+        mentionChannelInput = '';
+    }
+
+    async function saveMentionChannels() {
+        const req = openDetailSeq;
+        const name = currentAgent;
+        mentionSaving = true;
+        mentionError = '';
+        try {
+            const result = await api('PUT', `/agents/${encodeURIComponent(name)}/slack/mention-only`, { channels: mentionChannels });
+            if (req !== openDetailSeq) return;
+            mentionChannels = result.channels.map(row => row.channel_id);
+            toast($_('agents.mention_only_saved'));
+        } catch (error) {
+            if (req === openDetailSeq) mentionError = error.message;
+        } finally {
+            if (req === openDetailSeq) mentionSaving = false;
+        }
+    }
 
     // MCP Servers
     async function loadMcpServers() { const req = openDetailSeq; try { const data = await api('GET', `/agents/${currentAgent}/mcp-servers`); if (req !== openDetailSeq) return; mcpServers = data.servers || []; } catch { if (req === openDetailSeq) mcpServers = []; } }
@@ -1895,6 +1948,24 @@
                         </div>
                     {/each}
                 {/if}
+            </div>
+
+            <SectionHeader title={'Slack · ' + $_('agents.mention_only_channels')} variant="detail" />
+            <div style="padding:0.75rem 1.5rem;background:var(--surface-2);border-radius:var(--radius-lg)">
+                <p style="font-size:0.85rem;color:var(--text-secondary)">{$_('agents.mention_only_help')}</p>
+                {#if mentionLoading}<p>{$_('common.loading')}</p>{/if}
+                {#if mentionError}<p role="alert" style="color:var(--tone-danger-text)">{mentionError}</p>{/if}
+                {#each mentionChannels as channel}
+                    <div style="display:flex;gap:0.5rem;align-items:center;margin-bottom:0.4rem">
+                        <code style="flex:1">{channel}</code>
+                        <button class="btn btn-sm btn-danger" disabled={mentionSaving} on:click={() => mentionChannels = mentionChannels.filter(value => value !== channel)}>{$_('agents.mention_only_remove')}</button>
+                    </div>
+                {/each}
+                <div style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center">
+                    <input class="form-input" type="text" bind:value={mentionChannelInput} aria-label={$_('agents.mention_only_channel_id')} placeholder={$_('agents.mention_only_channel_id')} disabled={!mentionLoaded || mentionLoading || mentionSaving} style="flex:1;min-width:160px">
+                    <button class="btn" on:click={addMentionChannel} disabled={!mentionLoaded || mentionLoading || mentionSaving || !mentionChannelInput.trim()}>{$_('common.add')}</button>
+                    <button class="btn btn-primary" on:click={saveMentionChannels} disabled={!mentionLoaded || mentionLoading || mentionSaving}>{$_('common.save')}</button>
+                </div>
             </div>
 
             <!-- Users (approved + pending merged) -->

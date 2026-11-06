@@ -104,6 +104,12 @@ class MessageContextStore:
                 PRIMARY KEY (agent_name, platform, chat_id, message_id)
             );
             CREATE INDEX IF NOT EXISTS idx_button_choices_chosen ON button_choices(chosen_at);
+            CREATE TABLE IF NOT EXISTS slack_tagged_threads (
+                agent_name TEXT NOT NULL, chat_id TEXT NOT NULL, thread_ts TEXT NOT NULL,
+                first_tag_ts TEXT NOT NULL, tagged_at REAL NOT NULL,
+                PRIMARY KEY(agent_name, chat_id, thread_ts)
+            );
+            CREATE INDEX IF NOT EXISTS idx_slack_tagged_threads_age ON slack_tagged_threads(tagged_at);
             """
         )
         self._db.commit()
@@ -387,6 +393,32 @@ class MessageContextStore:
             ).fetchone()
             return tuple(row) if row is not None else None
 
+    def mark_tagged(self, agent: str, chat_id: str, thread_ts: str, tag_ts: str) -> None:
+        """Record the first tag; after 30-day expiry a thread needs a fresh tag."""
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT OR IGNORE INTO slack_tagged_threads VALUES (?, ?, ?, ?, ?)",
+                (agent, chat_id, thread_ts, tag_ts, time.time()),
+            )
+
+    def is_tagged(self, agent: str, chat_id: str, thread_ts: str) -> bool:
+        with self._lock:
+            return self._db.execute(
+                "SELECT 1 FROM slack_tagged_threads WHERE agent_name=? AND chat_id=? AND thread_ts=?",
+                (agent, chat_id, thread_ts),
+            ).fetchone() is not None
+
+    def purge_slack_tagged_threads(self, agent: str, channels: list[str] | None = None) -> None:
+        """Remove all agent marks, or only marks for the supplied channel ids."""
+        with self._lock, self._db:
+            if channels is None:
+                self._db.execute("DELETE FROM slack_tagged_threads WHERE agent_name=?", (agent,))
+            else:
+                self._db.executemany(
+                    "DELETE FROM slack_tagged_threads WHERE agent_name=? AND chat_id=?",
+                    [(agent, channel) for channel in channels],
+                )
+
     def _sweep_retention_locked(self, now: float) -> int:
         """Prune expired rows while the caller owns ``_lock`` and the transaction."""
         cutoff = now - self.retention_seconds
@@ -394,6 +426,9 @@ class MessageContextStore:
         self._db.execute(
             "DELETE FROM message_contexts WHERE stored_at < ?",
             (cutoff,),
+        )
+        self._db.execute(
+            "DELETE FROM slack_tagged_threads WHERE tagged_at < ?", (now - 30 * 86400,),
         )
         return self._db.total_changes - before
 
