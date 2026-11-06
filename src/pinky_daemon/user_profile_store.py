@@ -26,6 +26,32 @@ from pinky_daemon.store_catalog import (
 )
 
 
+# #1521: cap on one user's "Known about" section in a system prompt (bytes).
+PROFILE_PROMPT_MAX_BYTES = 16_000
+
+
+def _entry_line_bytes(e) -> int:
+    return len(f"- {e.key}: {e.value} (high confidence)".encode("utf-8")) + 1
+
+
+def _within_budget(entries: list, budget: int) -> tuple[list, int]:
+    """The entries that fit in ``budget`` bytes, most confident then most recent
+    first (returned in their original order), and how many were left out."""
+    total = sum(_entry_line_bytes(e) for e in entries)
+    if total <= budget:
+        return entries, 0
+    keep: set[int] = set()
+    used = 0
+    for k, e in sorted(enumerate(entries),
+                       key=lambda kv: (-kv[1].confidence, -kv[1].updated_at, kv[0])):
+        n = _entry_line_bytes(e)
+        if used + n > budget:
+            continue
+        keep.add(k)
+        used += n
+    return [e for k, e in enumerate(entries) if k in keep], len(entries) - len(keep)
+
+
 @dataclass
 class ProfileEntry:
     """A single learned trait about a user."""
@@ -374,11 +400,21 @@ class UserProfileStore:
         chat_id: str,
         display_name: str = "",
         min_confidence: float = 0.3,
+        max_bytes: int | None = None,
     ) -> str:
-        """Format a user's visible profile as markdown for system prompt injection."""
+        """Format a user's visible profile as markdown for system prompt injection.
+
+        #1521: the section is capped at ``max_bytes`` (default
+        ``PROFILE_PROMPT_MAX_BYTES``). Past the cap the most confident, then most
+        recently updated, entries are kept and a final line says how many were
+        left out (they stay in the store). An uncapped profile grew one agent's
+        prompt past the kernel's 128 KiB argv limit and kept it from starting.
+        """
         entries = self.get_visible_profile(agent_name, chat_id, min_confidence)
         if not entries:
             return ""
+        budget = PROFILE_PROMPT_MAX_BYTES if max_bytes is None else max_bytes
+        entries, omitted = _within_budget(entries, budget)
 
         label = display_name or chat_id
         lines = [f"### Known about {label}"]
@@ -404,6 +440,11 @@ class UserProfileStore:
             for r in rels:
                 lines.append(f"- {r.to_display_name}: {r.relation}")
 
+        if omitted:
+            lines.append(
+                f"- ({omitted} more entries about {label} not shown here to keep the "
+                "prompt small; they stay in the profile store)"
+            )
         return "\n".join(lines)
 
     # ── Stats ────────────────────────────────────────────
