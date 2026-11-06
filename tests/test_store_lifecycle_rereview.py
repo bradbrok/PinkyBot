@@ -26,6 +26,10 @@ async def test_slack_listener_cannot_publish_after_delivery_quiescence(
 
     class Broker:
         @staticmethod
+        def mention_only_admit(*_args) -> bool:
+            return True
+
+        @staticmethod
         async def handle_inbound(_message) -> None:
             delivered.set()
 
