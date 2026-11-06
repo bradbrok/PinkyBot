@@ -5185,14 +5185,19 @@ except Exception as exc:
         with self._rmw_lock:
             try:
                 self._db.execute("BEGIN IMMEDIATE")
-                changed = self.get_slack_mention_only(agent) ^ selected
+                current = self.get_slack_mention_only(agent)
+                removed, added = current - selected, selected - current
+                changed = removed | added
                 if changed:
                     self._purge_slack_tagged_threads(agent, sorted(changed))
-                self._db.execute("DELETE FROM agent_slack_mention_only WHERE agent_name=?", (agent,))
+                self._db.executemany(
+                    "DELETE FROM agent_slack_mention_only WHERE agent_name=? AND channel_id=?",
+                    [(agent, channel) for channel in sorted(removed)],
+                )
                 now = time.time()
                 self._db.executemany(
                     "INSERT INTO agent_slack_mention_only VALUES (?, ?, ?, ?)",
-                    [(agent, channel, now, actor) for channel in sorted(selected)],
+                    [(agent, channel, now, actor) for channel in sorted(added)],
                 )
                 self._db.commit()
             except Exception:

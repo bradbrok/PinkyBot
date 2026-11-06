@@ -157,3 +157,33 @@ def test_broadcast_counts_refusal_as_failure(gateway):
     assert len(blocked) == 1 and blocked[0].get("sent") is False
     assert any("mention-only" in error for error in result["errors"])
     assert all(call.args[0] != CHANNEL for call in g.adapter.send_message.call_args_list)
+
+
+@pytest.mark.parametrize("kind", ["send", "react", "file"])
+def test_r3_expired_outbound_without_sweep(gateway, monkeypatch, kind):
+    from tests.slack_mention_only_r3_support import LIFETIME, Clock, policy
+    from tests.slack_mention_only_support import tagged
+
+    g = gateway
+    clock = Clock(monkeypatch)
+    policy(g)
+    # Context retention is configurable; keep the pre-advance file context
+    # usable beyond the independent, fixed 30-day tagged-thread lifetime.
+    g.store.retention_days = 31
+    g.store.mark_tagged(AGENT, CHANNEL, ROOT, ROOT)
+    if kind == "file":
+        g.broker.remember_message_context(message(message_id=CHILD, reply_to=ROOT))
+    before = tuple(tagged(g))
+    clock.at(LIFETIME + 1)
+    assert tuple(tagged(g)) == before
+    if kind == "send":
+        response = post(g, "/broker/send", chat_id=CHANNEL, reply_to=ROOT, content="stale")
+    elif kind == "react":
+        response = post(g, "/broker/react", chat_id=CHANNEL, message_id=ROOT, emoji="eyes")
+    else:
+        response = post(g, "/broker/send-document", message_id=CHILD, file_path=str(g.file))
+    assert response.status_code == 403, response.text
+    g.select.assert_not_called()
+    for fn in (g.adapter.send_message, g.adapter.add_reaction, g.adapter.upload_file):
+        fn.assert_not_called()
+    assert tuple(tagged(g)) == before, "refusal must work without deleting the stale row"

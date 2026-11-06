@@ -20,6 +20,7 @@ DEFAULT_RETENTION_DAYS = 30
 DEFAULT_MAX_PER_AGENT = 5000
 DEFAULT_MIN_AGE_DAYS = 7
 DEFAULT_HARD_CAP_PER_AGENT = 20000
+SLACK_TAG_RETENTION_SECONDS = 30 * 86400
 
 
 class MessageContextStore:
@@ -394,18 +395,24 @@ class MessageContextStore:
             return tuple(row) if row is not None else None
 
     def mark_tagged(self, agent: str, chat_id: str, thread_ts: str, tag_ts: str) -> None:
-        """Record the first tag; after 30-day expiry a thread needs a fresh tag."""
+        """Keep a live first tag; renew expired rows only on a fresh qualifying tag."""
         with self._lock, self._db:
+            now = time.time()
             self._db.execute(
-                "INSERT OR IGNORE INTO slack_tagged_threads VALUES (?, ?, ?, ?, ?)",
-                (agent, chat_id, thread_ts, tag_ts, time.time()),
+                "INSERT INTO slack_tagged_threads VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(agent_name, chat_id, thread_ts) DO UPDATE SET "
+                "first_tag_ts=excluded.first_tag_ts, tagged_at=excluded.tagged_at "
+                "WHERE slack_tagged_threads.tagged_at < ?",
+                (agent, chat_id, thread_ts, tag_ts, now, now - SLACK_TAG_RETENTION_SECONDS),
             )
 
     def is_tagged(self, agent: str, chat_id: str, thread_ts: str) -> bool:
+        """Enforce the 30-day lifetime even when no cleanup sweep has run."""
         with self._lock:
             return self._db.execute(
-                "SELECT 1 FROM slack_tagged_threads WHERE agent_name=? AND chat_id=? AND thread_ts=?",
-                (agent, chat_id, thread_ts),
+                "SELECT 1 FROM slack_tagged_threads WHERE agent_name=? AND chat_id=? "
+                "AND thread_ts=? AND tagged_at>=?",
+                (agent, chat_id, thread_ts, time.time() - SLACK_TAG_RETENTION_SECONDS),
             ).fetchone() is not None
 
     def purge_slack_tagged_threads(self, agent: str, channels: list[str] | None = None) -> None:
@@ -428,7 +435,7 @@ class MessageContextStore:
             (cutoff,),
         )
         self._db.execute(
-            "DELETE FROM slack_tagged_threads WHERE tagged_at < ?", (now - 30 * 86400,),
+            "DELETE FROM slack_tagged_threads WHERE tagged_at < ?", (now - SLACK_TAG_RETENTION_SECONDS,),
         )
         return self._db.total_changes - before
 

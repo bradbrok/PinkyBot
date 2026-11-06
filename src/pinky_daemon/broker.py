@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -1450,14 +1451,23 @@ class MessageBroker:
         self, agent: str, platform: str, chat_id: str, thread_key: str,
         message_id: str, mentions_self: bool,
     ) -> bool:
-        """Share admission across live and replay ingress; marking is idempotent."""
+        """A new tag must date from this channel's current policy activation."""
         if platform != "slack" or chat_id not in self._registry.get_slack_mention_only(agent):
+            return True
+        policy = next((row for row in self._registry.list_slack_mention_only(agent)
+                       if row["channel_id"] == chat_id), None)
+        if policy is None:
             return True
         if self._message_context_store is None or not thread_key:
             return False
         if mentions_self is True:
-            self._message_context_store.mark_tagged(agent, chat_id, thread_key, message_id)
-            return True
+            try:
+                tag_time = float(message_id)
+            except (TypeError, ValueError, OverflowError):
+                tag_time = math.nan
+            if math.isfinite(tag_time) and tag_time >= policy["created_at"]:
+                self._message_context_store.mark_tagged(agent, chat_id, thread_key, message_id)
+                return True
         return self._message_context_store.is_tagged(agent, chat_id, thread_key)
 
     @staticmethod
@@ -1827,7 +1837,10 @@ class MessageBroker:
         delivered = 0
         for msg in pending:
             envelope = msg.get("slack_envelope") or {}
-            if msg["platform"] != "slack" or not envelope.get("message_id"):
+            if msg["platform"] != "slack" or (
+                not envelope.get("message_id")
+                and not (envelope.get("metadata") or {}).get("thread_ts")
+            ):
                 envelope = {}
             broker_msg = BrokerMessage(
                 platform=msg["platform"],
@@ -1838,7 +1851,7 @@ class MessageBroker:
                 agent_name=agent_name,
                 timestamp=envelope.get("timestamp", msg["created_at"]),
                 is_group=bool(msg.get("is_group")),
-                message_id=envelope.get("message_id", ""),
+                message_id=envelope.get("message_id") or "",
                 reply_to=envelope.get("reply_to", ""),
                 chat_title=envelope.get("chat_title", ""),
                 metadata=envelope.get("metadata", {}),

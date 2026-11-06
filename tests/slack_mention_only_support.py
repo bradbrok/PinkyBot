@@ -37,6 +37,8 @@ def required(owner, name):
 
 @pytest.fixture
 def gateway(tmp_path, monkeypatch):
+    # Keep policy activation and the existing synthetic Slack ids on one epoch.
+    monkeypatch.setattr(time, "time", lambda: float(ROOT) - 1)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PINKY_SESSION_SECRET", SECRET)
     monkeypatch.setenv("PINKY_TOOL_POLICY", "off")

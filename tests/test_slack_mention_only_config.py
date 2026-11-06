@@ -292,3 +292,27 @@ def test_hard_delete_purge_failure_does_not_notify_listener(gateway, monkeypatch
     assert g.agents.get(AGENT) is not None
     assert (rows(g), tuple(tagged(g)), tuple(tagged(g, channel=OTHER))) == before
     assert not g.agents._db.in_transaction
+
+
+def test_r3_live_first_tag_and_exact_expiry_boundary(gateway, monkeypatch):
+    from tests.slack_mention_only_r3_support import LIFETIME, Clock, policy
+
+    g = gateway
+    clock = Clock(monkeypatch)
+    policy(g)
+    marker = required(g.store, "mark_tagged")
+    query = required(g.store, "is_tagged")
+    marker(AGENT, CHANNEL, ROOT, ROOT)
+    first = tuple(tagged(g))
+    marker(AGENT, CHANNEL, ROOT, clock.at(10))
+    assert tuple(tagged(g)) == first
+    clock.at(LIFETIME)
+    assert query(AGENT, CHANNEL, ROOT), "exactly 30 days is still eligible"
+    marker(AGENT, CHANNEL, ROOT, clock.ts(LIFETIME))
+    assert tuple(tagged(g)) == first
+    fresh = clock.at(LIFETIME + 1)
+    assert not query(AGENT, CHANNEL, ROOT), "expiry must not wait for a sweep"
+    assert tuple(tagged(g)) == first, "physical row remains until renewed or swept"
+    marker(AGENT, CHANNEL, ROOT, fresh)
+    assert tuple(tagged(g)) == (fresh, clock.now)
+    assert query(AGENT, CHANNEL, ROOT)

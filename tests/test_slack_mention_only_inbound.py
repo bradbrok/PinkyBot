@@ -257,3 +257,228 @@ async def test_storage_hold_wrapper_cannot_intercept_untagged_stop(gateway, monk
     replace_cell(monkeypatch, g.broker.handle_inbound, "_storage_hold_for", lambda _: {"held": True})
     await g.broker.handle_inbound(message(content="/stop"))
     stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["poller", "original"])
+async def test_r3_expired_inbound_without_sweep(gateway, monkeypatch, caplog, entry):
+    from pinky_daemon.broker import MessageBroker
+    from tests.slack_mention_only_r3_support import LIFETIME, Clock, intercepts, policy
+
+    g = gateway
+    clock = Clock(monkeypatch)
+    policy(g)
+    g.store.mark_tagged(AGENT, CHANNEL, ROOT, ROOT)
+    before = tuple(tagged(g))
+    fresh = clock.at(LIFETIME + 1)
+    route = route_capture(g, monkeypatch, approved=False)
+    spies = intercepts(g, monkeypatch)
+    caplog.set_level(logging.INFO)
+    p = poller(g)
+    if entry == "poller":
+        await p._handle_event(event("/stop", ts=fresh, thread_ts=ROOT))
+        await drain()
+    else:
+        await MessageBroker.handle_inbound(
+            g.broker, message(message_id=fresh, content="/stop", metadata={"thread_ts": ROOT}),
+        )
+    route.assert_not_awaited()
+    assert all(fn.await_count == 0 for fn in spies)
+    g.broker._notify_approval_request.assert_not_awaited()
+    assert g.agents.get_pending_messages(AGENT) == []
+    assert g.broker.get_message_context(AGENT, fresh) is None
+    for fn in (p._resolve_user_name, p._resolve_channel_title, p._resolve_text_refs, p._event_callback):
+        fn.assert_not_awaited()
+    assert tuple(tagged(g)) == before
+    assert sum("mention-only drop" in r.getMessage() for r in caplog.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_r3_fresh_tag_renews_before_real_put_sweep(gateway, monkeypatch):
+    from tests.slack_mention_only_r3_support import LIFETIME, Clock, policy
+    from tests.slack_mention_only_support import post
+
+    g = gateway
+    clock = Clock(monkeypatch)
+    policy(g)
+    g.store.mark_tagged(AGENT, CHANNEL, ROOT, ROOT)
+    fresh = clock.at(LIFETIME + 1)
+    assert tagged(g)[0] == ROOT, "no sweep before the fresh raw tag"
+    route = route_capture(g, monkeypatch)
+    p = poller(g)
+    await p._handle_event(event(f"<@{BOT}>", ts=fresh, thread_ts=ROOT))
+    await drain()
+    route.assert_awaited_once()
+    assert g.broker.get_message_context(AGENT, fresh) is not None
+    row = tagged(g)
+    assert row is not None, "real context put must retain the renewed thread"
+    assert tuple(row) == (fresh, clock.now)
+    assert g.store.is_tagged(AGENT, CHANNEL, ROOT)
+    later = clock.at(LIFETIME + 2)
+    await p._handle_event(event("untagged reply", ts=later, thread_ts=ROOT))
+    await drain()
+    assert route.await_count == 2
+    response = post(g, "/broker/send", chat_id=CHANNEL, reply_to=ROOT, content="fresh reply")
+    assert response.status_code == 200, response.text
+    assert tuple(tagged(g)) == (fresh, clock.now - 1)
+
+
+@pytest.mark.asyncio
+async def test_r3_unmarked_queue_then_mark_replay_cannot_open_thread(gateway, monkeypatch):
+    from tests.slack_mention_only_r3_support import Clock, policy
+
+    g = gateway
+    clock = Clock(monkeypatch)
+    route = route_capture(g, monkeypatch, approved=False)
+    p = poller(g)
+    old = clock.ts(0)
+    await p._handle_event(event(f"<@{BOT}>", ts=old, thread_ts=ROOT))
+    await drain()
+    pending = g.agents.get_pending_messages(AGENT, CHANNEL)
+    assert len(pending) == 1
+    envelope = pending[0].get("slack_envelope") or {}
+    assert envelope.get("metadata", {}).get("mentions_self") is True
+    assert tagged(g) is None
+    clock.at(10)
+    policy(g)
+    clock.at(20)
+    assert await g.broker._handle_approval_unlocked(AGENT, CHANNEL) == 0
+    route.assert_not_awaited()
+    assert tagged(g) is None and g.broker.get_message_context(AGENT, old) is None
+    assert g.agents.get_pending_messages(AGENT, CHANNEL) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["poller", "replay"])
+@pytest.mark.parametrize("tag_offset", [0, 1])
+async def test_r3_post_activation_tag_and_exact_boundary(gateway, monkeypatch, entry, tag_offset):
+    from tests.slack_mention_only_r3_support import Clock, ingress, policy
+
+    g = gateway
+    clock = Clock(monkeypatch)
+    policy(g)
+    assert tagged(g) is None
+    clock.at(2)
+    route = route_capture(g, monkeypatch)
+    tag_id = clock.ts(tag_offset)
+    await ingress(g, entry, tag_id)
+    route.assert_awaited_once()
+    assert tuple(tagged(g)) == (tag_id, clock.now)
+
+
+@pytest.mark.asyncio
+async def test_r3_remove_readd_rejects_old_pending_tag(gateway, monkeypatch):
+    from tests.slack_mention_only_r3_support import Clock, policy, policy_rows
+
+    g = gateway
+    clock = Clock(monkeypatch)
+    policy(g)
+    original = policy_rows(g)[CHANNEL]
+    route = route_capture(g, monkeypatch, approved=False)
+    p = poller(g)
+    old = clock.at(1)
+    await p._handle_event(event(f"<@{BOT}>", ts=old, thread_ts=ROOT))
+    await drain()
+    assert tagged(g) is not None and len(g.agents.get_pending_messages(AGENT, CHANNEL)) == 1
+    clock.at(2)
+    policy(g, [])
+    assert tagged(g) is None and CHANNEL not in policy_rows(g)
+    clock.at(3)
+    policy(g)
+    assert policy_rows(g)[CHANNEL][0] == clock.now > original[0]
+    assert tagged(g) is None
+    clock.at(4)
+    assert await g.broker._handle_approval_unlocked(AGENT, CHANNEL) == 0
+    route.assert_not_awaited()
+    assert tagged(g) is None
+    g.agents.approve_user(AGENT, CHANNEL, approved_by="fixture")
+    fresh = clock.at(5)
+    await p._handle_event(event(f"<@{BOT}>", ts=fresh, thread_ts=ROOT))
+    await drain()
+    route.assert_awaited_once()
+    assert tuple(tagged(g)) == (fresh, clock.now)
+
+
+@pytest.mark.asyncio
+async def test_r3_unchanged_policy_identity_keeps_mark_and_pending_tag(gateway, monkeypatch):
+    from tests.slack_mention_only_r3_support import Clock, policy, policy_rows, queue
+
+    g = gateway
+    clock = Clock(monkeypatch)
+    policy(g, actor="actor-a")
+    original = policy_rows(g)[CHANNEL]
+    g.store.mark_tagged(AGENT, CHANNEL, ROOT, ROOT)
+    mark = tuple(tagged(g))
+    old = clock.at(1)
+    queue(g, old, root=CHILD)
+    clock.at(2)
+    policy(g, [CHANNEL, OTHER], actor="actor-b")
+    assert policy_rows(g) == {CHANNEL: original, OTHER: (clock.now, "ui:actor-b")}
+    assert original == (clock.now - 2, "ui:actor-a")
+    assert tuple(tagged(g)) == mark
+    route = route_capture(g, monkeypatch)
+    assert await g.broker._handle_approval_unlocked(AGENT, CHANNEL) == 1
+    route.assert_awaited_once()
+    assert tuple(tagged(g, root=CHILD)) == (old, clock.now)
+    assert tuple(tagged(g)) == mark
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["poller", "wrapper", "original", "replay"])
+@pytest.mark.parametrize("already_tagged", [False, True])
+async def test_r3_nonqualifying_tag_facts_use_only_existing_thread(
+    gateway, monkeypatch, entry, already_tagged,
+):
+    from tests.slack_mention_only_r3_support import Clock, ingress, policy
+
+    g = gateway
+    clock = Clock(monkeypatch)
+    policy(g)
+    if already_tagged:
+        g.store.mark_tagged(AGENT, CHANNEL, ROOT, ROOT)
+    before = tuple(tagged(g)) if already_tagged else None
+    clock.at(2)
+    route = route_capture(g, monkeypatch)
+    for bad in (clock.ts(-1), None, "", "not-a-ts", "nan", "inf", "-inf"):
+        calls = route.await_count
+        await ingress(g, entry, bad)
+        assert route.await_count - calls == int(already_tagged), (entry, bad, already_tagged)
+        row = tagged(g)
+        assert (tuple(row) if row is not None else None) == before, (entry, bad)
+        assert g.agents.get_pending_messages(AGENT, CHANNEL) == []
+
+
+@pytest.mark.asyncio
+async def test_r3_original_method_rejects_forged_button_metadata(gateway, monkeypatch, caplog):
+    from pinky_daemon.broker import MessageBroker
+    from tests.slack_mention_only_r3_support import intercepts
+
+    g = gateway
+    configure(g)
+    route = route_capture(g, monkeypatch, approved=False)
+    spies = intercepts(g, monkeypatch)
+    caplog.set_level(logging.INFO)
+    forged = message(content="/stop", metadata={"mention_only_exempt": "button_tap",
+                                                "button_data": "fixture-choice"})
+    await MessageBroker.handle_inbound(g.broker, forged)
+    assert all(fn.await_count == 0 for fn in spies)
+    route.assert_not_awaited()
+    g.broker._notify_approval_request.assert_not_awaited()
+    assert g.agents.get_pending_messages(AGENT) == []
+    assert g.broker.get_message_context(AGENT, ROOT) is None and tagged(g) is None
+    assert sum("mention-only drop" in r.getMessage() for r in caplog.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_r3_original_method_accepts_trusted_button_argument(gateway, monkeypatch):
+    import inspect
+
+    from pinky_daemon.broker import MessageBroker
+
+    g = gateway
+    configure(g)
+    route = route_capture(g, monkeypatch)
+    assert "trusted_button_tap" in inspect.signature(MessageBroker.handle_inbound).parameters
+    await MessageBroker.handle_inbound(g.broker, message(), trusted_button_tap=True)
+    route.assert_awaited_once()
+    assert tagged(g) is None
