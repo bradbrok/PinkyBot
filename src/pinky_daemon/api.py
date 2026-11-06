@@ -2542,6 +2542,22 @@ def create_api(
                 except Exception:
                     pass
 
+    def _credentials_changed(pairs: list[tuple[str, str]]) -> None:
+        for agent_name, platform in pairs:
+            if platform == "*":
+                with _adapter_lock:
+                    platforms = {"telegram", "discord", "slack", "buzz", "imessage"}
+                    platforms.update(key[1] for key in _platform_adapters if key[0] == agent_name)
+                    platforms.update(key[1] for key in _adapter_generation if key[0] == agent_name)
+            else:
+                platforms = {platform}
+            for affected in sorted(platforms):
+                _evict_platform_adapters(agent_name, affected)
+                if affected == "imessage" and agent_name != "__global__":
+                    _evict_platform_adapters("__global__", "imessage")
+
+    agents.add_token_change_listener(_credentials_changed)
+
     def _get_imessage_adapter(agent_name: str = ""):
         """Get or create the iMessage adapter for an agent."""
         key = (agent_name or "__global__", "imessage")
@@ -11120,12 +11136,6 @@ npm run build</pre>
             enabled=req.enabled, settings=settings, token_ref=req.token_ref,
         )
 
-        # Evict the cached outbound adapter so sends pick up the new token
-        # immediately (adapters bind the token at construction).
-        _evict_platform_adapters(name, platform)
-        if platform == "imessage":
-            _evict_platform_adapters("__global__", "imessage")
-
         # Dynamically start/restart a broker poller for Telegram tokens
         raw_token = agents.get_raw_token(name, platform)
         if platform == "telegram" and raw_token:
@@ -11200,11 +11210,6 @@ npm run build</pre>
         """Remove a bot token for an agent."""
         if not agents.remove_token(name, platform):
             raise HTTPException(404, "Token not found")
-
-        # Evict the cached outbound adapter so sends stop using the removed token
-        _evict_platform_adapters(name, platform)
-        if platform == "imessage":
-            _evict_platform_adapters("__global__", "imessage")
 
         # Stop broker poller if removing a Telegram token
         if platform == "telegram":
