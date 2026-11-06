@@ -482,3 +482,161 @@ async def test_r3_original_method_accepts_trusted_button_argument(gateway, monke
     await MessageBroker.handle_inbound(g.broker, message(), trusted_button_tap=True)
     route.assert_awaited_once()
     assert tagged(g) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sweep", [False, True])
+async def test_r4_stale_pending_tag_cannot_renew_after_thirty_days(gateway, monkeypatch, sweep):
+    from tests.slack_mention_only_r3_support import LIFETIME, Clock, policy
+
+    g = gateway
+    clock = Clock(monkeypatch)
+    policy(g)
+    route = route_capture(g, monkeypatch, approved=False)
+    p = poller(g)
+    old = clock.at(1)
+    await p._handle_event(event(f"<@{BOT}>", ts=old, thread_ts=ROOT))
+    await drain()
+    pending = g.agents.get_pending_messages(AGENT, CHANNEL)
+    assert len(pending) == 1
+    assert pending[0]["slack_envelope"]["message_id"] == old
+    assert pending[0]["slack_envelope"]["metadata"]["mentions_self"] is True
+    first = (old, clock.now)
+    assert tuple(tagged(g)) == first
+    assert g.broker.get_message_context(AGENT, old) is None
+    route.assert_not_awaited()
+
+    clock.at(LIFETIME + 2)
+    if sweep:
+        g.store.sweep_retention()
+    assert g.agents.get_pending_messages(AGENT, CHANNEL) == pending
+    assert not g.store.is_tagged(AGENT, CHANNEL, ROOT)
+    assert (None if tagged(g) is None else tuple(tagged(g))) == (None if sweep else first)
+    g.agents.approve_user(AGENT, CHANNEL, approved_by="fixture-r4")
+    assert g.agents.get_user_status(AGENT, CHANNEL) == "approved"
+    assert await g.broker.handle_approval(AGENT, CHANNEL) == 0
+    route.assert_not_awaited()
+    assert g.broker.get_message_context(AGENT, old) is None
+    assert (None if tagged(g) is None else tuple(tagged(g))) == (None if sweep else first)
+    assert not g.store.is_tagged(AGENT, CHANNEL, ROOT)
+    assert g.agents.get_pending_messages(AGENT, CHANNEL) == []
+    assert g.agents._db.execute(
+        "SELECT delivered FROM pending_messages WHERE id=?", (pending[0]["id"],),
+    ).fetchone()[0] == 1
+
+    fresh = clock.at(LIFETIME + 3)
+    await p._handle_event(event(f"<@{BOT}>", ts=fresh, thread_ts=ROOT))
+    await drain()
+    route.assert_awaited_once()
+    assert g.broker.get_message_context(AGENT, fresh) is not None
+    assert tuple(tagged(g)) == (fresh, clock.now)
+    assert g.store.is_tagged(AGENT, CHANNEL, ROOT)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["poller", "wrapper", "original", "replay"])
+@pytest.mark.parametrize("tag_offset,qualifies", [(1, True), (0.999999, False)],
+                         ids=["exact-cutoff", "just-older"])
+async def test_r4_original_tag_age_boundary(gateway, monkeypatch, entry, tag_offset, qualifies):
+    from tests.slack_mention_only_r3_support import LIFETIME, Clock, ingress, policy
+
+    g = gateway
+    clock = Clock(monkeypatch)
+    policy(g)
+    clock.at(LIFETIME + 1)
+    route = route_capture(g, monkeypatch)
+    tag_id = clock.ts(tag_offset)
+    delivered = await ingress(g, entry, tag_id)
+    assert route.await_count == int(qualifies)
+    if entry == "replay":
+        assert delivered == int(qualifies)
+    row = tagged(g)
+    assert (tuple(row) if row is not None else None) == ((tag_id, clock.now) if qualifies else None)
+    assert (g.broker.get_message_context(AGENT, tag_id) is not None) == qualifies
+    assert g.agents.get_pending_messages(AGENT, CHANNEL) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["poller", "wrapper", "original", "replay"])
+async def test_r4_stale_tag_uses_different_live_mark_control(gateway, monkeypatch, entry):
+    from tests.slack_mention_only_r3_support import LIFETIME, Clock, ingress, policy
+
+    g = gateway
+    clock = Clock(monkeypatch)
+    policy(g)
+    route = route_capture(g, monkeypatch)
+    fresh = clock.at(LIFETIME + 1)
+    await ingress(g, "poller", fresh)
+    route.assert_awaited_once()
+    first = (fresh, clock.now)
+    assert tuple(tagged(g)) == first
+    clock.at(LIFETIME + 2)
+    stale = clock.ts(1)
+    assert stale != fresh
+    delivered = await ingress(g, entry, stale)
+    assert route.await_count == 2
+    if entry == "replay":
+        assert delivered == 1
+    assert tuple(tagged(g)) == first
+    assert g.store.is_tagged(AGENT, CHANNEL, ROOT)
+    assert g.broker.get_message_context(AGENT, stale) is not None
+    assert g.agents.get_pending_messages(AGENT, CHANNEL) == []
+
+
+def test_r4_policy_removed_between_admission_reads_is_unmarked(gateway, monkeypatch):
+    from tests.slack_mention_only_r3_support import Clock, policy
+
+    g = gateway
+    clock = Clock(monkeypatch)
+    policy(g)
+    original_get = g.agents.get_slack_mention_only
+    reads = []
+
+    def remove_before_returning_membership(agent):
+        membership = original_get(agent)
+        reads.append(membership)
+        monkeypatch.setattr(g.agents, "get_slack_mention_only", original_get)
+        clock.at(2)
+        g.agents.set_slack_mention_only(agent, [], "fixture-r4")
+        return membership
+
+    monkeypatch.setattr(g.agents, "get_slack_mention_only", remove_before_returning_membership)
+    assert g.broker.mention_only_admit(AGENT, "slack", CHANNEL, ROOT, clock.ts(1), False)
+    assert reads == [{CHANNEL}]
+    assert g.agents.list_slack_mention_only(AGENT) == []
+    assert tagged(g) is None
+
+
+def test_r4_policy_removed_and_readded_between_admission_reads_uses_new_activation(
+    gateway, monkeypatch,
+):
+    from tests.slack_mention_only_r3_support import Clock, policy, policy_rows
+
+    g = gateway
+    clock = Clock(monkeypatch)
+    policy(g)
+    old = clock.at(1)
+    g.store.mark_tagged(AGENT, CHANNEL, ROOT, old)
+    assert tuple(tagged(g)) == (old, clock.now)
+    original_get = g.agents.get_slack_mention_only
+    reads = []
+
+    def replace_before_returning_membership(agent):
+        membership = original_get(agent)
+        reads.append(membership)
+        monkeypatch.setattr(g.agents, "get_slack_mention_only", original_get)
+        clock.at(2)
+        g.agents.set_slack_mention_only(agent, [], "fixture-r4")
+        clock.at(3)
+        g.agents.set_slack_mention_only(agent, [CHANNEL], "fixture-r4")
+        return membership
+
+    monkeypatch.setattr(g.agents, "get_slack_mention_only", replace_before_returning_membership)
+    assert not g.broker.mention_only_admit(AGENT, "slack", CHANNEL, ROOT, old, True)
+    assert reads == [{CHANNEL}]
+    assert policy_rows(g)[CHANNEL] == (clock.now, "fixture-r4")
+    assert clock.now == float(clock.ts(3))
+    assert tagged(g) is None
+    fresh = clock.at(4)
+    assert g.broker.mention_only_admit(AGENT, "slack", CHANNEL, ROOT, fresh, True)
+    assert tuple(tagged(g)) == (fresh, clock.now)

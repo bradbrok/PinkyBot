@@ -1451,7 +1451,9 @@ class MessageBroker:
         self, agent: str, platform: str, chat_id: str, thread_key: str,
         message_id: str, mentions_self: bool,
     ) -> bool:
-        """A new tag must date from this channel's current policy activation."""
+        """A new tag must be fresh and date from the current policy activation."""
+        from pinky_daemon.message_context_store import SLACK_TAG_RETENTION_SECONDS
+
         if platform != "slack" or chat_id not in self._registry.get_slack_mention_only(agent):
             return True
         policy = next((row for row in self._registry.list_slack_mention_only(agent)
@@ -1465,7 +1467,8 @@ class MessageBroker:
                 tag_time = float(message_id)
             except (TypeError, ValueError, OverflowError):
                 tag_time = math.nan
-            if math.isfinite(tag_time) and tag_time >= policy["created_at"]:
+            if (math.isfinite(tag_time) and tag_time >= policy["created_at"]
+                    and tag_time >= time.time() - SLACK_TAG_RETENTION_SECONDS):
                 self._message_context_store.mark_tagged(agent, chat_id, thread_key, message_id)
                 return True
         return self._message_context_store.is_tagged(agent, chat_id, thread_key)
