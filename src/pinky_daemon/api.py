@@ -2438,15 +2438,53 @@ def create_api(
 
     # Message broker — routes platform messages through approval checks to agent sessions
     _platform_adapters: dict[tuple[str, ...], object] = {}
+    _adapter_lock = threading.Lock()
+    _adapter_generation: dict[tuple[str, str], int] = {}
+
+    def _cached_platform_adapter(key: tuple[str, ...], build):
+        generation_key = (key[0], key[1])
+        for _ in range(2):
+            with _adapter_lock:
+                if key in _platform_adapters:
+                    return _platform_adapters[key]
+                generation = _adapter_generation.get(generation_key, 0)
+
+            # Registry reads and adapter construction can block; keep them unlocked.
+            adapter = build()
+            with _adapter_lock:
+                changed = _adapter_generation.get(generation_key, 0) != generation
+                if not changed:
+                    if key in _platform_adapters:
+                        cached = _platform_adapters[key]
+                    else:
+                        if adapter is not None:
+                            _platform_adapters[key] = adapter
+                        return adapter
+
+            # Only dispose of our unpublished adapter, outside the cache lock.
+            if adapter is not None:
+                try:
+                    close = getattr(adapter, "close", None)
+                    if close is not None:
+                        close()
+                except Exception:
+                    pass
+            if not changed:
+                return cached
+        return None
 
     def _get_platform_adapter(
         agent_name: str, platform: str, *, account_id: str = "",
     ):
         """Get or create a platform adapter for an agent."""
-        key = (agent_name, platform, account_id)
-        if key in _platform_adapters:
-            return _platform_adapters[key]
+        return _cached_platform_adapter(
+            (agent_name, platform, account_id),
+            lambda: _build_platform_adapter(agent_name, platform, account_id=account_id),
+        )
 
+    def _build_platform_adapter(
+        agent_name: str, platform: str, *, account_id: str = "",
+    ):
         if platform == "buzz":
             from pinky_outreach.buzz_dependency import missing_buzz_dependencies
 
@@ -2465,7 +2503,6 @@ def create_api(
                 relay_url=material.relay_url,
                 community_id=material.community_id,
             )
-            _platform_adapters[key] = adapter
             return adapter
 
         token = (
@@ -2487,34 +2524,53 @@ def create_api(
             from pinky_outreach.slack import SlackAdapter
             adapter = SlackAdapter(token)
 
-        if adapter:
-            _platform_adapters[key] = adapter
         return adapter
 
     def _evict_platform_adapters(agent_name: str, platform: str) -> None:
         """Drop generic and account-bound adapters after token mutation."""
-        for key in list(_platform_adapters):
-            if len(key) >= 2 and key[0] == agent_name and key[1] == platform:
-                adapter = _platform_adapters.pop(key, None)
-                if platform == "buzz" and adapter is not None:
-                    try:
-                        adapter.close()
-                    except Exception:
-                        pass
+        generation_key = (agent_name, platform)
+        removed = []
+        with _adapter_lock:
+            _adapter_generation[generation_key] = _adapter_generation.get(generation_key, 0) + 1
+            for key in list(_platform_adapters):
+                if len(key) >= 2 and key[0] == agent_name and key[1] == platform:
+                    removed.append(_platform_adapters.pop(key))
+        if platform == "buzz":
+            for adapter in removed:
+                try:
+                    adapter.close()
+                except Exception:
+                    pass
+
+    def _credentials_changed(pairs: list[tuple[str, str]]) -> None:
+        for agent_name, platform in pairs:
+            if platform == "*":
+                with _adapter_lock:
+                    platforms = {"telegram", "discord", "slack", "buzz", "imessage"}
+                    platforms.update(key[1] for key in _platform_adapters if key[0] == agent_name)
+                    platforms.update(key[1] for key in _adapter_generation if key[0] == agent_name)
+            else:
+                platforms = {platform}
+            for affected in sorted(platforms):
+                _evict_platform_adapters(agent_name, affected)
+                if affected == "imessage" and agent_name != "__global__":
+                    _evict_platform_adapters("__global__", "imessage")
+
+    agents.add_token_change_listener(_credentials_changed)
 
     def _get_imessage_adapter(agent_name: str = ""):
         """Get or create the iMessage adapter for an agent."""
         key = (agent_name or "__global__", "imessage")
-        if key in _platform_adapters:
-            return _platform_adapters[key]
-        # Check if any agent has iMessage enabled in DB
-        check_name = agent_name or agents.get_main_agent() or ""
-        if check_name and agents.get_raw_token(check_name, "imessage"):
-            from pinky_outreach.imessage import iMessageAdapter
-            adapter = iMessageAdapter()
-            _platform_adapters[key] = adapter
-            return adapter
-        return None
+
+        def build():
+            # Check if any agent has iMessage enabled in DB
+            check_name = agent_name or agents.get_main_agent() or ""
+            if check_name and agents.get_raw_token(check_name, "imessage"):
+                from pinky_outreach.imessage import iMessageAdapter
+                return iMessageAdapter()
+            return None
+
+        return _cached_platform_adapter(key, build)
 
     def _get_tg_adapter(agent_name: str):
         return _get_platform_adapter(agent_name, "telegram")
@@ -11080,12 +11136,6 @@ npm run build</pre>
             enabled=req.enabled, settings=settings, token_ref=req.token_ref,
         )
 
-        # Evict the cached outbound adapter so sends pick up the new token
-        # immediately (adapters bind the token at construction).
-        _evict_platform_adapters(name, platform)
-        if platform == "imessage":
-            _platform_adapters.pop(("__global__", "imessage"), None)
-
         # Dynamically start/restart a broker poller for Telegram tokens
         raw_token = agents.get_raw_token(name, platform)
         if platform == "telegram" and raw_token:
@@ -11160,11 +11210,6 @@ npm run build</pre>
         """Remove a bot token for an agent."""
         if not agents.remove_token(name, platform):
             raise HTTPException(404, "Token not found")
-
-        # Evict the cached outbound adapter so sends stop using the removed token
-        _evict_platform_adapters(name, platform)
-        if platform == "imessage":
-            _platform_adapters.pop(("__global__", "imessage"), None)
 
         # Stop broker poller if removing a Telegram token
         if platform == "telegram":

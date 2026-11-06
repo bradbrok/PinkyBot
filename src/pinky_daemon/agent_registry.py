@@ -34,6 +34,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import resources
@@ -1602,6 +1603,7 @@ class AgentRegistry:
         # admin requests can both read the same baseline ACL, append
         # different entries, and one write loses.
         self._rmw_lock = threading.RLock()
+        self._token_change_listeners: list[Callable[[list[tuple[str, str]]], None]] = []
         self._init_tables()
         self._classify_model_roster()
         self._model_roster_errors = 0
@@ -4096,32 +4098,45 @@ except Exception as exc:
             relay_signing_pubkey=row[7],
         )
 
+    def _update_buzz_state(self, agent_name: str, sql: str, params: tuple) -> None:
+        """Notify only when enabled/status changes, not diagnostic timestamps."""
+        with self._token_change_transaction() as changes:
+            before = self._db.execute(
+                "SELECT enabled, status FROM buzz_identities WHERE agent=?", (agent_name,),
+            ).fetchone()
+            self._db.execute(sql, params)
+            after = self._db.execute(
+                "SELECT enabled, status FROM buzz_identities WHERE agent=?", (agent_name,),
+            ).fetchone()
+            if before != after:
+                changes.append((agent_name, "buzz"))
+
     def mark_buzz_identity_unhealthy(self, agent_name: str, reason: str) -> None:
         """Disable an identity after AEAD/KEK/public-key integrity failure."""
-        self._db.execute(
+        self._update_buzz_state(
+            agent_name,
             "UPDATE buzz_identities SET enabled=0, status='unhealthy', "
             "last_error=?, updated_at=? WHERE agent=?",
             (str(reason or "integrity_failure")[:160], time.time(), agent_name),
         )
-        self._db.commit()
 
     def mark_buzz_dependency_refused(self, agent_name: str, reason: str) -> None:
         """Refuse registration without destroying an otherwise valid identity."""
-        self._db.execute(
+        self._update_buzz_state(
+            agent_name,
             "UPDATE buzz_identities SET status='dependency_refused', "
             "last_error=?, updated_at=? WHERE agent=? AND enabled=1",
             (str(reason or "missing_runtime_dependency")[:160], time.time(), agent_name),
         )
-        self._db.commit()
 
     def mark_buzz_dependency_ready(self, agent_name: str) -> None:
         """Restore an enabled dependency-refused identity after venv healing."""
-        self._db.execute(
+        self._update_buzz_state(
+            agent_name,
             "UPDATE buzz_identities SET status='active', last_error='', updated_at=? "
             "WHERE agent=? AND enabled=1 AND status='dependency_refused'",
             (time.time(), agent_name),
         )
-        self._db.commit()
 
     def disable_buzz_identity(self, agent_name: str) -> bool:
         """Owner-control lifecycle operation; encrypted material remains recoverable."""
@@ -4772,15 +4787,12 @@ except Exception as exc:
 
     def delete(self, name: str) -> bool:
         """Permanently delete an agent and all its directives/tokens (cascade)."""
-        cursor = self._db.execute("DELETE FROM agents WHERE name=?", (name,))
-        # #623: purge the per-agent signing key too. Without this, a hard-
-        # deleted name keeps its key in agent_signing_keys, so re-registering
-        # that name inherits a STALE signing credential. Harmless under dual-
-        # accept, but once the per-agent key is the sole credential (increment
-        # 4) a recreated agent must mint a fresh identity, not resurrect the
-        # old one. No FK/cascade on the table, so delete explicitly.
-        self._signing_keys.delete_signing_key(name)
-        self._db.commit()
+        with self._token_change_transaction() as changes:
+            cursor = self._db.execute("DELETE FROM agents WHERE name=?", (name,))
+            # Signing keys have no cascade: name reuse must mint a fresh identity.
+            self._signing_keys.delete_signing_key(name)
+            if cursor.rowcount > 0:
+                changes.append((name, "*"))
         if cursor.rowcount > 0:
             _log(f"agents: deleted {name}")
             return True
@@ -5129,6 +5141,35 @@ except Exception as exc:
 
     # ── Tokens ──────────────────────────────────────────────
 
+    def add_token_change_listener(
+        self, fn: Callable[[list[tuple[str, str]]], None],
+    ) -> None:
+        """Subscribe to committed credential changes in the writing thread."""
+        with self._rmw_lock:
+            self._token_change_listeners.append(fn)
+
+    @contextmanager
+    def _token_change_transaction(self):
+        """Keep dependency reads with their write; notify only after commit."""
+        with self._rmw_lock:
+            changes: list[tuple[str, str]] = []
+            try:
+                if not self._db.in_transaction:
+                    self._db.execute("BEGIN IMMEDIATE")
+                yield changes
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+            listeners = tuple(self._token_change_listeners)
+        if changes:
+            for listener in listeners:
+                try:
+                    listener(list(changes))
+                except Exception:
+                    # Exception messages may contain credential values.
+                    _log("agents: token change listener failed after commit")
+
     def set_token(self, agent_name: str, platform: str, token: str, **kwargs) -> AgentToken:
         """Set a platform bot token for an agent."""
         now = time.time()
@@ -5136,16 +5177,17 @@ except Exception as exc:
         settings = kwargs.get("settings", {})
         token_ref = kwargs.get("token_ref", "")
 
-        self._db.execute(
-            """INSERT INTO agent_tokens (agent_name, platform, token, enabled, settings, token_ref, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT (agent_name, platform)
-               DO UPDATE SET token=excluded.token, enabled=excluded.enabled,
-                            settings=excluded.settings, token_ref=excluded.token_ref,
-                            updated_at=excluded.updated_at""",
-            (agent_name, platform, token, int(enabled), json.dumps(settings), token_ref, now),
-        )
-        self._db.commit()
+        with self._token_change_transaction() as changes:
+            self._db.execute(
+                """INSERT INTO agent_tokens (agent_name, platform, token, enabled, settings, token_ref, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (agent_name, platform)
+                   DO UPDATE SET token=excluded.token, enabled=excluded.enabled,
+                                settings=excluded.settings, token_ref=excluded.token_ref,
+                                updated_at=excluded.updated_at""",
+                (agent_name, platform, token, int(enabled), json.dumps(settings), token_ref, now),
+            )
+            changes.append((agent_name, platform))
         return self.get_token(agent_name, platform)  # type: ignore
 
     def get_token(self, agent_name: str, platform: str) -> AgentToken | None:
@@ -5236,11 +5278,12 @@ except Exception as exc:
 
     def remove_token(self, agent_name: str, platform: str) -> bool:
         """Remove a token."""
-        cursor = self._db.execute(
-            "DELETE FROM agent_tokens WHERE agent_name=? AND platform=?",
-            (agent_name, platform),
-        )
-        self._db.commit()
+        with self._token_change_transaction() as changes:
+            cursor = self._db.execute(
+                "DELETE FROM agent_tokens WHERE agent_name=? AND platform=?",
+                (agent_name, platform),
+            )
+            changes.append((agent_name, platform))
         return cursor.rowcount > 0
 
     # ── Schedules ───────────────────────────────────────────
@@ -8111,6 +8154,9 @@ except Exception as exc:
 
     def set_setting(self, key: str, value: str) -> None:
         """Set a system setting value."""
+        if key == "main_agent":
+            self._write_main_agent(value)
+            return
         self._db.execute(
             "INSERT INTO system_settings (key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=?",
@@ -8120,6 +8166,8 @@ except Exception as exc:
 
     def delete_setting(self, key: str) -> bool:
         """Delete a system setting. Returns True if it existed."""
+        if key == "main_agent":
+            return self._write_main_agent(None)
         cur = self._db.execute("DELETE FROM system_settings WHERE key=?", (key,))
         self._db.commit()
         return cur.rowcount > 0
@@ -8163,6 +8211,21 @@ except Exception as exc:
         self.set_setting("heartbeat_prompt", prompt.strip() or DEFAULT_HEARTBEAT_PROMPT)
 
     # ── Main Agent ──────────────────────────────────────────
+
+    def _write_main_agent(self, value: str | None) -> bool:
+        """Use one commit boundary for assignment, auto-selection and clearing."""
+        with self._token_change_transaction() as changes:
+            before = self.get_main_agent()
+            if value is None:
+                cursor = self._db.execute("DELETE FROM system_settings WHERE key='main_agent'")
+            else:
+                cursor = self._db.execute(
+                    "INSERT INTO system_settings (key, value) VALUES ('main_agent', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (value,),
+                )
+            if before != (value or ""):
+                changes.append(("__global__", "imessage"))
+        return cursor.rowcount > 0
 
     def get_main_agent(self) -> str:
         """Get the designated main agent name."""
@@ -8431,19 +8494,25 @@ except Exception as exc:
         updates.append("updated_at=?")
         params.append(time.time())
         params.append(token_id)
-        self._db.execute(
-            f"UPDATE bot_tokens SET {', '.join(updates)} WHERE id=?", params
-        )
-        self._db.commit()
+        with self._token_change_transaction() as changes:
+            changes.extend(self._db.execute(
+                "SELECT agent_name, platform FROM agent_tokens WHERE token_ref=?", (token_id,),
+            ).fetchall())
+            self._db.execute(
+                f"UPDATE bot_tokens SET {', '.join(updates)} WHERE id=?", params
+            )
         return self.get_bot_token(token_id)
 
     def delete_bot_token(self, token_id: str) -> bool:
         """Delete a global bot token. Clears refs in agent_tokens."""
-        self._db.execute(
-            "UPDATE agent_tokens SET token_ref='' WHERE token_ref=?", (token_id,)
-        )
-        cursor = self._db.execute("DELETE FROM bot_tokens WHERE id=?", (token_id,))
-        self._db.commit()
+        with self._token_change_transaction() as changes:
+            changes.extend(self._db.execute(
+                "SELECT agent_name, platform FROM agent_tokens WHERE token_ref=?", (token_id,),
+            ).fetchall())
+            self._db.execute(
+                "UPDATE agent_tokens SET token_ref='' WHERE token_ref=?", (token_id,)
+            )
+            cursor = self._db.execute("DELETE FROM bot_tokens WHERE id=?", (token_id,))
         return cursor.rowcount > 0
 
     # ── Model Registry ──────────────────────────────────────
