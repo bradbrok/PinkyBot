@@ -1604,6 +1604,7 @@ class AgentRegistry:
         # different entries, and one write loses.
         self._rmw_lock = threading.RLock()
         self._token_change_listeners: list[Callable[[list[tuple[str, str]]], None]] = []
+        self._slack_tagged_threads_purger: Callable | None = None
         self._init_tables()
         self._classify_model_roster()
         self._model_roster_errors = 0
@@ -2097,6 +2098,12 @@ class AgentRegistry:
 
     def _migrate(self) -> None:
         """Add new columns to existing databases."""
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS agent_slack_mention_only ("
+            "agent_name TEXT NOT NULL, channel_id TEXT NOT NULL, "
+            "created_at REAL NOT NULL, created_by TEXT NOT NULL, "
+            "PRIMARY KEY(agent_name, channel_id))"
+        )
         existing = {
             row[1] for row in self._db.execute("PRAGMA table_info(agents)").fetchall()
         }
@@ -4787,7 +4794,11 @@ except Exception as exc:
 
     def delete(self, name: str) -> bool:
         """Permanently delete an agent and all its directives/tokens (cascade)."""
+        # Purge the separate context store before starting the registry transaction.
+        # Failure leaves the agent and its policy intact without notifying listeners.
+        self._purge_slack_tagged_threads(name)
         with self._token_change_transaction() as changes:
+            self._db.execute("DELETE FROM agent_slack_mention_only WHERE agent_name=?", (name,))
             cursor = self._db.execute("DELETE FROM agents WHERE name=?", (name,))
             # Signing keys have no cascade: name reuse must mint a fresh identity.
             self._signing_keys.delete_signing_key(name)
@@ -5138,6 +5149,60 @@ except Exception as exc:
         if not row:
             return None
         return {"id": row[0], "agent_name": row[1], "content": row[2], "source": row[3], "created_at": row[4]}
+
+    # ── Slack mention-only policy ───────────────────────────
+
+    def set_slack_tagged_threads_purger(self, purge: Callable) -> None:
+        """Wire the context store owned by this registry's API instance."""
+        self._slack_tagged_threads_purger = purge
+
+    def _purge_slack_tagged_threads(self, agent: str, channels=None) -> None:
+        if self._slack_tagged_threads_purger is not None:
+            self._slack_tagged_threads_purger(agent, channels)
+        elif channels or self.get_slack_mention_only(agent):
+            raise RuntimeError("Slack tagged-thread storage is unavailable")
+
+    def get_slack_mention_only(self, agent: str) -> set[str]:
+        """Read the current owner-controlled channel restriction."""
+        return {row[0] for row in self._db.execute(
+            "SELECT channel_id FROM agent_slack_mention_only WHERE agent_name=?", (agent,),
+        ).fetchall()}
+
+    def list_slack_mention_only(self, agent: str) -> list[dict]:
+        return [{"channel_id": row[0], "created_at": row[1]} for row in self._db.execute(
+            "SELECT channel_id, created_at FROM agent_slack_mention_only "
+            "WHERE agent_name=? ORDER BY channel_id", (agent,),
+        ).fetchall()]
+
+    def set_slack_mention_only(self, agent: str, channel_ids: list[str], actor: str) -> None:
+        """Replace policy atomically, purging removed and newly added thread marks first."""
+        if not isinstance(channel_ids, list) or len(channel_ids) > 50:
+            raise ValueError("channels must be a list of at most 50 channel ids")
+        if any(not isinstance(channel, str) or not re.fullmatch(r"[CG][A-Z0-9]{8,20}", channel)
+               for channel in channel_ids):
+            raise ValueError("invalid Slack channel id")
+        selected = set(channel_ids)
+        with self._rmw_lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                current = self.get_slack_mention_only(agent)
+                removed, added = current - selected, selected - current
+                changed = removed | added
+                if changed:
+                    self._purge_slack_tagged_threads(agent, sorted(changed))
+                self._db.executemany(
+                    "DELETE FROM agent_slack_mention_only WHERE agent_name=? AND channel_id=?",
+                    [(agent, channel) for channel in sorted(removed)],
+                )
+                now = time.time()
+                self._db.executemany(
+                    "INSERT INTO agent_slack_mention_only VALUES (?, ?, ?, ?)",
+                    [(agent, channel, now, actor) for channel in sorted(added)],
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
 
     # ── Tokens ──────────────────────────────────────────────
 

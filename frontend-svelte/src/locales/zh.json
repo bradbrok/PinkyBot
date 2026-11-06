@@ -685,7 +685,12 @@
     "import_soul_field": "灵魂",
     "import_warnings_title": "{count} 项需要在迁移前处理",
     "import_workspace_hint": "指向您的 OpenClaw 智能体 — 使用本地目录路径或上传 zip 文件。",
-    "import_workspace_label": "工作区"
+    "import_workspace_label": "工作区",
+    "mention_only_channels": "仅限提及的频道",
+    "mention_only_help": "在这些频道中，智能体只读取和回复曾提及它的会话串。",
+    "mention_only_channel_id": "频道 ID",
+    "mention_only_remove": "移除",
+    "mention_only_saved": "已保存仅限提及的频道"
   },
   "settings": {
     "tab_general": "通用",

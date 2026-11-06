@@ -685,7 +685,12 @@
     "import_soul_field": "소울",
     "import_warnings_title": "마이그레이션 전 {count}개 항목{plural}에 주의가 필요합니다{singular_s}",
     "import_workspace_hint": "OpenClaw 에이전트를 가리키세요 — 로컬 디렉토리 경로를 사용하거나 zip을 업로드하세요.",
-    "import_workspace_label": "워크스페이스"
+    "import_workspace_label": "워크스페이스",
+    "mention_only_channels": "멘션 전용 채널",
+    "mention_only_help": "이 채널에서 에이전트는 자신이 멘션된 스레드에서만 읽고 게시합니다.",
+    "mention_only_channel_id": "채널 ID",
+    "mention_only_remove": "삭제",
+    "mention_only_saved": "멘션 전용 채널을 저장했습니다"
   },
   "settings": {
     "tab_general": "일반",

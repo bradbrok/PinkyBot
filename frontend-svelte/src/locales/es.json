@@ -685,7 +685,12 @@
     "import_soul_field": "Alma",
     "import_warnings_title": "{count} elemento{plural} requiere{singular_s} atención antes de migrar",
     "import_workspace_hint": "Apunta a tu agente de OpenClaw — usa una ruta de directorio local o sube un zip.",
-    "import_workspace_label": "Espacio de trabajo"
+    "import_workspace_label": "Espacio de trabajo",
+    "mention_only_channels": "Canales solo con menciones",
+    "mention_only_help": "En estos canales, el agente solo lee y publica en hilos donde se le ha mencionado.",
+    "mention_only_channel_id": "ID del canal",
+    "mention_only_remove": "Eliminar",
+    "mention_only_saved": "Canales solo con menciones guardados"
   },
   "settings": {
     "tab_general": "General",

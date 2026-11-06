@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import math
 import os
 import re
 import sys
@@ -56,7 +58,7 @@ _APPROVAL_NOTIFY_POLL_SEC = 5
 
 INBOUND_MESSAGE_FIELDS = (
     "user_id", "was_bot", "bot_id", "forwarded", "via_bot_id", "sender_business_bot_id",
-    "reply_to", "reply_to_sender_id", "platform_ts",
+    "reply_to", "reply_to_sender_id", "platform_ts", "mentions_self", "thread_ts",
 )
 BUTTON_TAP_FIELDS = ("button_data", "button_message_id")
 
@@ -1445,8 +1447,55 @@ class MessageBroker:
             _log("button-claim persistence failed: " + type(error).__name__)
             return True
 
-    async def handle_inbound(self, message: BrokerMessage) -> None:
+    def mention_only_admit(
+        self, agent: str, platform: str, chat_id: str, thread_key: str,
+        message_id: str, mentions_self: bool,
+    ) -> bool:
+        """A new tag must be fresh and date from the current policy activation."""
+        from pinky_daemon.message_context_store import SLACK_TAG_RETENTION_SECONDS
+
+        if platform != "slack" or chat_id not in self._registry.get_slack_mention_only(agent):
+            return True
+        policy = next((row for row in self._registry.list_slack_mention_only(agent)
+                       if row["channel_id"] == chat_id), None)
+        if policy is None:
+            return True
+        if self._message_context_store is None or not thread_key:
+            return False
+        if mentions_self is True:
+            try:
+                tag_time = float(message_id)
+            except (TypeError, ValueError, OverflowError):
+                tag_time = math.nan
+            if (math.isfinite(tag_time) and tag_time >= policy["created_at"]
+                    and tag_time >= time.time() - SLACK_TAG_RETENTION_SECONDS):
+                self._message_context_store.mark_tagged(agent, chat_id, thread_key, message_id)
+                return True
+        return self._message_context_store.is_tagged(agent, chat_id, thread_key)
+
+    @staticmethod
+    def log_mention_only_drop(agent: str, chat_id: str, message_id: str, thread_key: str) -> None:
+        logging.getLogger(__name__).info(
+            "mention-only drop agent=%s channel=%s ts=%s thread=%s",
+            agent, chat_id, message_id, thread_key,
+        )
+
+    def _mention_only_message_admit(self, message: BrokerMessage) -> bool:
+        key = message.metadata.get("thread_ts") or message.message_id
+        admitted = self.mention_only_admit(
+            message.agent_name, message.platform, message.chat_id, key,
+            message.message_id, message.metadata.get("mentions_self") is True,
+        )
+        if not admitted:
+            self.log_mention_only_drop(message.agent_name, message.chat_id, message.message_id, key)
+        return admitted
+
+    async def handle_inbound(self, message: BrokerMessage, *, trusted_button_tap: bool = False) -> None:
         """Handle an incoming platform message. Non-blocking."""
+        # Only the validated managed-card entry can supply this trusted argument.
+        # Serialized metadata, including legacy pending envelopes, cannot exempt itself.
+        if not trusted_button_tap and not self._mention_only_message_admit(message):
+            return
         agent_name = message.agent_name
 
         # 0. Intercept /stop command from owner
@@ -1754,6 +1803,9 @@ class MessageBroker:
             if has_images:
                 body += "\n(Use Read to view the image)"
 
+        if (message.platform == "slack"
+                and message.chat_id in self._registry.get_slack_mention_only(agent_name)):
+            body += "\nThis channel is mention-only for you: reply only in this thread, with thread(message_id=...)."
         return f"{header}\n{body}"
 
     async def handle_approval(self, agent_name: str, chat_id: str) -> int:
@@ -1785,9 +1837,13 @@ class MessageBroker:
         # Using chat_id here would re-route a held channel reply to the sender's
         # DM. sender_id is restored from the approval key so group context (and
         # the reply hint) reflect the right surface.
+        delivered = 0
         for msg in pending:
             envelope = msg.get("slack_envelope") or {}
-            if msg["platform"] != "slack" or not envelope.get("message_id"):
+            if msg["platform"] != "slack" or (
+                not envelope.get("message_id")
+                and not (envelope.get("metadata") or {}).get("thread_ts")
+            ):
                 envelope = {}
             broker_msg = BrokerMessage(
                 platform=msg["platform"],
@@ -1798,11 +1854,14 @@ class MessageBroker:
                 agent_name=agent_name,
                 timestamp=envelope.get("timestamp", msg["created_at"]),
                 is_group=bool(msg.get("is_group")),
-                message_id=envelope.get("message_id", ""),
+                message_id=envelope.get("message_id") or "",
                 reply_to=envelope.get("reply_to", ""),
                 chat_title=envelope.get("chat_title", ""),
                 metadata=envelope.get("metadata", {}),
             )
+            if not self._mention_only_message_admit(broker_msg):
+                self._registry.mark_pending_message_delivered(msg["id"])
+                continue
             handoff = await self._route_streaming(agent_name, broker_msg)
             if handoff is False:
                 raise RuntimeError(
@@ -1815,9 +1874,10 @@ class MessageBroker:
             # route and this write remains intentionally at-least-once; closing
             # that final window requires an end-to-end idempotency key/claim.
             self._registry.mark_pending_message_delivered(msg["id"])
+            delivered += 1
 
-        _log(f"broker: queued {len(pending)} pending messages for delivery to {agent_name}")
-        return len(pending)
+        _log(f"broker: queued {delivered} pending messages for delivery to {agent_name}")
+        return delivered
 
     # ── Streaming Session Support ─────────────────────────
 

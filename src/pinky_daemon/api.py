@@ -2896,6 +2896,34 @@ def create_api(
 
         raise HTTPException(400, f"Unsupported platform: {platform}")
 
+    def _mention_only_refusal(
+        agent: str, platform: str, chat_id: str, thread_ts: str,
+    ) -> str | None:
+        if platform != "slack":
+            return None
+        channels = agents.get_slack_mention_only(agent)
+        if not channels:
+            return None
+        if not re.fullmatch(r"[CGDU][A-Z0-9]{8,}", chat_id):
+            try:
+                user_list = parse_group_dm_users(chat_id)
+            except ValueError:
+                user_list = None
+            if user_list is None:
+                return "mention-only channels are configured: use the channel id"
+        if chat_id not in channels:
+            return None
+        if thread_ts and message_context_store.is_tagged(agent, chat_id, thread_ts):
+            return None
+        return (f"mention-only channel {chat_id}: post only in a thread where you were tagged "
+                "(use thread(message_id=...))")
+
+    def _log_mention_only_refusal(agent: str, chat_id: str, kind: str, thread: str) -> None:
+        logging.getLogger(__name__).warning(
+            "mention-only refuse agent=%s channel=%s kind=%s thread=%s",
+            agent, chat_id, kind, thread,
+        )
+
     def _send_file_message(
         agent_name: str,
         platform: str,
@@ -2916,6 +2944,10 @@ def create_api(
         ``has_spoiler`` / ``show_caption_above_media`` apply to visual media only
         (photo/animation/video); they are not forwarded for documents.
         """
+        refusal = _mention_only_refusal(agent_name, platform, chat_id, reply_to)
+        if refusal:
+            _log_mention_only_refusal(agent_name, chat_id, "file", reply_to)
+            raise HTTPException(403, refusal)
         adapter = _get_platform_adapter(agent_name, platform)
         if not adapter:
             raise HTTPException(503, f"No {platform} adapter for {agent_name}")
@@ -3004,6 +3036,10 @@ def create_api(
         buttons: str = "",
     ) -> dict:
         """Send a message back to the platform on behalf of an agent."""
+        refusal = _mention_only_refusal(agent_name, platform, chat_id, reply_to)
+        if refusal:
+            _log_mention_only_refusal(agent_name, chat_id, "send", reply_to)
+            return {"sent": False, "error": refusal, "platform": platform, "chat_id": chat_id}
         group_dm_users = None
         if platform == "slack":
             try:
@@ -3148,6 +3184,16 @@ def create_api(
         emoji: str,
     ):
         """Add a reaction on behalf of an agent."""
+        thread_key = message_id
+        if platform == "slack":
+            stored = broker.get_message_context_by_identity(agent_name, platform, chat_id, message_id)
+            if stored is not None:
+                context, _ = stored
+                thread_key = context.reply_to or context.message_id
+        refusal = _mention_only_refusal(agent_name, platform, chat_id, thread_key)
+        if refusal:
+            _log_mention_only_refusal(agent_name, chat_id, "react", thread_key)
+            return {"reacted": False, "error": refusal}
         loop = asyncio.get_running_loop()
         if platform != "telegram":
             adapter = _get_platform_adapter(agent_name, platform)
@@ -3385,6 +3431,9 @@ def create_api(
     )
     app.state.activity = activity
     app.state.message_context_store = message_context_store
+    agents.set_slack_tagged_threads_purger(
+        lambda agent, channels=None: message_context_store.purge_slack_tagged_threads(agent, channels),
+    )
     # Exposed for unit-test reach-in (#591 P1#1 — verifying commit=False
     # preserves inbox state). Not part of the public API.
     app.state.comms = comms
@@ -3571,12 +3620,17 @@ def create_api(
         bind = getattr(descriptor, "__get__", None)
         return bind(broker, type(broker)) if bind is not None else descriptor
 
-    async def _guarded_handle_inbound(message):
+    async def _guarded_handle_inbound(message, *, trusted_button_tap: bool = False):
+        if not trusted_button_tap and not broker._mention_only_message_admit(message):
+            return None
         if (hold := _storage_hold_for(message.agent_name)) and hold["held"]:
             if message.content.strip().startswith("/stop"):
                 await broker._handle_stop_command(message)
             return None
-        return await _current_broker_delegate("handle_inbound", original_handle_inbound)(message)
+        delegate = _current_broker_delegate("handle_inbound", original_handle_inbound)
+        if trusted_button_tap:
+            return await delegate(message, trusted_button_tap=True)
+        return await delegate(message)
 
     async def _guarded_inject_agent_message(from_agent, to_agent, message):
         if (hold := _storage_hold_for(to_agent)) and hold["held"]:
@@ -11120,6 +11174,32 @@ npm run build</pre>
         )
         return agents.get_buzz_identity(name)
 
+    @app.get("/agents/{name}/slack/mention-only")
+    async def get_slack_mention_only(name: str, request: Request):
+        if not _has_valid_session(request) and getattr(request.state, "internal_caller", "") != name:
+            raise HTTPException(403, "owner session or matching agent required")
+        if not agents.get(name):
+            raise HTTPException(404, "Agent not found")
+        return {"channels": agents.list_slack_mention_only(name)}
+
+    @app.put("/agents/{name}/slack/mention-only")
+    async def set_slack_mention_only(name: str, req: dict, request: Request):
+        """Owner policy applies even to control commands; use a DM or tag the bot."""
+        actor = _owner_control_actor(request)
+        if not agents.get(name):
+            raise HTTPException(404, "Agent not found")
+        try:
+            agents.set_slack_mention_only(name, req.get("channels"), actor)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from None
+        audit.log(
+            "slack_mention_only_updated", agent_name=name, tool_name="owner_control",
+            tool_input_summary=json.dumps({
+                "agent": name, "actor": actor, "count": len(agents.get_slack_mention_only(name)),
+            }),
+        )
+        return {"channels": agents.list_slack_mention_only(name)}
+
     # ── Agent Tokens ────────────────────────────────────────
 
     @app.put("/agents/{name}/tokens/{platform}")
@@ -12080,6 +12160,8 @@ npm run build</pre>
         except Exception as e:
             _log(f"broker-send: failed for {agent_name} -> {platform}:{chat_id}: {e}")
             raise HTTPException(502, f"Failed to send message: {e}")
+        if result.get("sent") is False:
+            raise HTTPException(403, result["error"])
         metadata = {"tool": "send", "reply_to": reply_to, "delivery": result}
         if buttons:
             metadata["buttons"] = _parse_telegram_buttons(buttons)
@@ -12159,6 +12241,8 @@ npm run build</pre>
             quote=quote,
             reply_metadata=_buzz_reply_metadata(ctx),
         )
+        if result.get("sent") is False:
+            raise HTTPException(403, result["error"])
         _record_outbound_message(
             agent_name,
             platform=ctx.platform,
@@ -12217,6 +12301,9 @@ npm run build</pre>
             try:
                 result = await _broker_send(agent_name, group["platform"], group["chat_id"], content)
                 deliveries.append(result)
+                if result.get("sent") is False:
+                    errors.append(f"{group['platform']}:{group['chat_id']}: {result['error']}")
+                    continue
                 _record_outbound_message(
                     agent_name,
                     platform=group["platform"],
@@ -12710,7 +12797,9 @@ npm run build</pre>
             chat_id = ctx.chat_id
         if not agent_name or not chat_id or not message_id or not emoji:
             raise HTTPException(400, "agent_name, message_id, and emoji are required")
-        await _broker_react(agent_name, platform, chat_id, message_id, emoji)
+        result = await _broker_react(agent_name, platform, chat_id, message_id, emoji)
+        if isinstance(result, dict) and result.get("reacted") is False:
+            raise HTTPException(403, result["error"])
         # Log reaction in conversation history so the UI can display it
         session_id = _session_id_for_agent(agent_name)
         store.append(

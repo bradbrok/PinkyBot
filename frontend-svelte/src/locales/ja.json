@@ -685,7 +685,12 @@
     "import_soul_field": "ソウル",
     "import_warnings_title": "移行前に{count}件の項目{plural}を確認が必要です",
     "import_workspace_hint": "OpenClawエージェントのパスを指定します。ローカルディレクトリパスまたはzipファイルをアップロードしてください。",
-    "import_workspace_label": "ワークスペース"
+    "import_workspace_label": "ワークスペース",
+    "mention_only_channels": "メンション必須のチャンネル",
+    "mention_only_help": "これらのチャンネルでは、エージェントは自分がメンションされたスレッドだけを読み、投稿します。",
+    "mention_only_channel_id": "チャンネルID",
+    "mention_only_remove": "削除",
+    "mention_only_saved": "メンション必須のチャンネルを保存しました"
   },
   "settings": {
     "tab_general": "一般",

@@ -334,7 +334,7 @@ def test_single_skipped_update_advances_cursor(capsys):
 
 
 async def _slack(monkeypatch, event):
-    current = SimpleNamespace(handle_inbound=AsyncMock())
+    current = SimpleNamespace(handle_inbound=AsyncMock(), mention_only_admit=lambda *args: True)
     adapter = MagicMock()
     poller = pollers.BrokerSlackPoller(adapter, "sample", current, registry=None, app_token="fixture")
     poller._bot_user_id, poller._bot_id = "USELF", "BSELF"
