@@ -1,8 +1,46 @@
 {
   "schema": "pinky-model-roster/1",
-  "revision": 8,
-  "updated": "2026-10-26",
+  "revision": 9,
+  "updated": "2026-11-09",
   "models": [
+    {
+      "provider": "anthropic",
+      "model_id": "claude-fable-5-2",
+      "display_name": "Claude Fable 5.2",
+      "description": "Anthropic's most capable model (2026-11-09). Succeeds Fable 5.1 at a lower $8/$40 price for demanding reasoning and long-horizon agentic work; cache reads at 0.025x input. 1M context; adaptive thinking always on (use effort to control depth).",
+      "tier": "fable",
+      "context_window": 1000000,
+      "is_1m": true,
+      "pricing": {
+        "input": 8.0,
+        "output": 40.0,
+        "cached_input": 0.2,
+        "cache_write_5m": 10.0,
+        "cache_write_1h": 16.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 1
+    },
+    {
+      "provider": "anthropic",
+      "model_id": "claude-mythos-5-2",
+      "display_name": "Claude Mythos 5.2",
+      "description": "Claude Fable 5.2 capabilities without the safety classifiers. Limited availability via Project Glasswing (approved customers only).",
+      "tier": "fable",
+      "context_window": 1000000,
+      "is_1m": true,
+      "pricing": {
+        "input": 8.0,
+        "output": 40.0,
+        "cached_input": 0.2,
+        "cache_write_5m": 10.0,
+        "cache_write_1h": 16.0
+      },
+      "supports_thinking": true,
+      "active": true,
+      "sort_order": 2
+    },
     {
       "provider": "anthropic",
       "model_id": "claude-fable-5-1",
