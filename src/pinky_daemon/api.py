@@ -8480,14 +8480,14 @@ npm run build</pre>
     # ── System Settings ────────────────────────────────────
 
     @app.get("/system/health")
-    async def system_health(request: Request):
+    async def system_health(request: Request = None):
         """Authenticated scheduler liveness, access-log and storage health."""
         result = {
             "scheduler": app.state.scheduler.health_snapshot(),
             "access_log": app.state.access_log.status(),
             "sqlite_locks": getattr(app.state, "sqlite_lock_health", {"healthy": None}),
         }
-        if isolated_read_caller(request):
+        if request is not None and isolated_read_caller(request):
             result["access_log"] = {
                 key: value for key, value in result["access_log"].items() if key != "path"
             }

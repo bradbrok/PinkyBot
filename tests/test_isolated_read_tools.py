@@ -12,10 +12,13 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from starlette.responses import Response
 
+from pinky_daemon import api, isolated_policy
 from pinky_daemon.routes import projects_tasks
 from pinky_self import server as self_server
 from tests.isolated_policy_support import daemon as daemon
+from tests.skill_sections_support import LONG, assert_partial
 from tests.test_isolated_read_scopes import layout as layout
+from tests.test_load_skill_cap_isolated import _load_skill_through_daemon
 
 pytestmark = pytest.mark.real_auth
 
@@ -187,3 +190,30 @@ def test_export_still_signs_an_allowed_request_and_saves_in_private_tmp(
     method, path, headers = transport.requests[-1]
     assert (method, path) == ("GET", "/research/1/export?format=pdf")
     assert any(key.lower() == "x-pinky-signature" for key in headers)
+
+
+@pytest.mark.parametrize("write_mode", ["shadow", "enforce"])
+@pytest.mark.parametrize("read_mode", [None, "enforce"])
+def test_assigned_capped_skill_load_has_no_read_diagnostic(
+    daemon, monkeypatch, write_mode, read_mode,
+):
+    monkeypatch.delenv("PINKY_ISOLATED_READ_POLICY_MODE", raising=False)
+    instance = daemon(write_mode)
+    if read_mode is not None:
+        monkeypatch.setenv("PINKY_ISOLATED_READ_POLICY_MODE", read_mode)
+    assert isolated_policy.read_policy_mode() == (read_mode or "shadow")
+    instance.skills.register("long-fixture", description="Long fixture", directive=LONG)
+    instance.skills.assign_to_agent("tenant", "long-fixture")
+    instance.agents.update("tenant", skill_load_cap=2000)
+    logs = []
+    monkeypatch.setattr(api, "_log", lambda text, **kwargs: logs.append(str(text)))
+
+    result, calls = _load_skill_through_daemon(instance, monkeypatch)
+
+    assert calls == [("GET", "/skills/long-fixture"), ("GET", "/agents/tenant")]
+    assert_partial(result, "long-fixture", "Long fixture", LONG)
+    assert "(cap 2000)" in result
+    assert "\n## Rules [always]\n" in result
+    assert "\n## Setup\n" not in result
+    assert not [line for line in logs if line.startswith("isolation: WOULD DENY READ ")]
+    assert not [line for line in logs if line.startswith("isolation: DENY READ ")]

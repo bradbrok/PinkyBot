@@ -6,7 +6,7 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 
-from pinky_daemon import voice_routes
+from pinky_daemon import api, voice_routes
 from pinky_daemon.api_models import OwnerProfileRequest
 from pinky_daemon.auth import SESSION_COOKIE_NAME, create_session_cookie
 from tests.isolated_policy_support import daemon as daemon
@@ -287,3 +287,113 @@ def test_shadow_own_schedule_queries_log_nothing(layout, monkeypatch, read_logs,
     read_logs.clear()
     assert _read(layout, path + query).status_code == 200
     assert not any(" READ " in line for line in read_logs)
+
+
+@pytest.fixture
+def targeted_reads(daemon, monkeypatch):
+    instance = daemon()
+    instance.agents.update("tenant", groups=["shared"])
+    instance.agents.update("peer", groups=["shared"])
+    for name in ("tenant", "peer", "normal"):
+        instance.agents.set_slack_mention_only(name, ["C12345678"], "fixture-owner")
+    instance.readback_calls = []
+
+    async def message(select, channel, timestamp, thread_timestamp):
+        instance.readback_calls.append(("message", select.args, select.keywords))
+        return {"agent": select.args[0], "channel": channel, "timestamp": timestamp}
+
+    async def history(select, channel, oldest, latest, pages):
+        instance.readback_calls.append(("history", select.args, select.keywords))
+        return {"agent": select.args[0], "channel": channel, "messages": []}
+
+    monkeypatch.setattr(api.slack_readback, "read_message", message)
+    monkeypatch.setattr(api.slack_readback, "read_history", history)
+    return instance
+
+
+def _targeted_read(instance, monkeypatch, read_logs, mode, caller, target, kind):
+    monkeypatch.setenv("PINKY_ISOLATED_READ_POLICY_MODE", mode)
+    prefix = f"/agents/{target}/slack"
+    if kind == "message":
+        path = prefix + "/message/C12345678/1730312345.123456?account_id=fixture-account"
+    elif kind == "history":
+        path = prefix + "/history/C12345678?oldest=1730312300.000001&latest=1730312400.000000"
+        path += "&account_id=fixture-account"
+    else:
+        path = prefix + "/mention-only"
+    read_logs.clear()
+    response = _read(instance, path, name=caller)
+    assert not any(" READ " in line for line in read_logs)
+    if caller == target:
+        assert response.status_code == 200
+        if kind == "mention-only":
+            assert response.json()["channels"][0]["channel_id"] == "C12345678"
+        else:
+            assert response.json()["agent"] == caller
+            assert instance.readback_calls == [
+                (kind, (caller, "slack"), {"account_id": "fixture-account"}),
+            ]
+    else:
+        assert response.status_code == 403
+        assert instance.readback_calls == []
+        if caller == "normal":
+            expected = ("owner session or matching agent required" if kind == "mention-only"
+                        else "verified caller must match the target agent")
+            assert response.json() == {"detail": expected}
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("caller,target", [
+    ("tenant", "tenant"), ("tenant", "peer"), ("normal", "normal"), ("normal", "peer"),
+])
+def test_slack_message_reads_keep_the_existing_self_boundary(
+    targeted_reads, monkeypatch, read_logs, mode, caller, target,
+):
+    _targeted_read(targeted_reads, monkeypatch, read_logs, mode, caller, target, "message")
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("caller,target", [
+    ("tenant", "tenant"), ("tenant", "peer"), ("normal", "normal"), ("normal", "peer"),
+])
+def test_slack_history_reads_keep_the_existing_self_boundary(
+    targeted_reads, monkeypatch, read_logs, mode, caller, target,
+):
+    _targeted_read(targeted_reads, monkeypatch, read_logs, mode, caller, target, "history")
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("caller,target", [
+    ("tenant", "tenant"), ("tenant", "peer"), ("normal", "normal"), ("normal", "peer"),
+])
+def test_slack_mention_policy_reads_keep_the_existing_self_boundary(
+    targeted_reads, monkeypatch, read_logs, mode, caller, target,
+):
+    _targeted_read(targeted_reads, monkeypatch, read_logs, mode, caller, target, "mention-only")
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("caller", ["tenant", "normal"])
+def test_profile_read_permission_does_not_grant_owner_writes(layout, monkeypatch, mode, caller):
+    from tests.isolated_policy_support import signed
+
+    monkeypatch.setenv("PINKY_ISOLATED_READ_POLICY_MODE", mode)
+    path = "/settings/owner-profile"
+    before = layout.agents.get_owner_profile()
+    response = _read(layout, path, name=caller)
+    assert response.status_code == 200
+    assert ("code_word" in response.json()) is (caller == "normal" or mode != "enforce")
+    client = TestClient(layout.app)
+    try:
+        response = client.put(
+            path, headers=signed(layout, "PUT", path, caller), json={"role": "changed fixture"},
+        )
+        assert response.status_code == 403
+        assert layout.agents.get_owner_profile() == before
+        client.cookies.set(
+            SESSION_COOKIE_NAME, create_session_cookie(os.environ["PINKY_SESSION_SECRET"]),
+        )
+        assert client.put(path, json={"role": "owner fixture update"}).status_code == 200
+        assert layout.agents.get_owner_profile()["role"] == "owner fixture update"
+    finally:
+        client.close()
