@@ -17,7 +17,7 @@ from tests.skill_sections_support import LONG, assert_partial, today_output
 pytestmark = pytest.mark.real_auth
 
 SKILLS_READ_LINE = (
-    "isolation: WOULD DENY READ GET /skills/{name} for tenant reason=pending-scope repeats=0"
+    "isolation: WOULD DENY READ GET /skills/{name} for tenant reason=unassigned-skill repeats=0"
 )
 
 
@@ -77,8 +77,8 @@ def test_isolated_agent_capped_load_skill_works_without_a_read_line(
     assert "(cap 2000)" in out
     assert "\n## Rules [always]\n" in out
     assert "\n## Setup\n" not in out
-    # The skill read is already on the pending-scope list (and proves the read
-    # diagnostics are on); the agent's read of its own record adds no line.
+    # An unassigned skill read produces the scoped read diagnostic; the
+    # agent's read of its own record adds no line.
     assert [line for line in logs if line.startswith("isolation: WOULD DENY READ ")] == [
         SKILLS_READ_LINE
     ]

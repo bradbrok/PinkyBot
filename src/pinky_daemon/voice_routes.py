@@ -19,6 +19,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
 from pydantic import BaseModel
 
 from pinky_daemon.auth import OWNER_SESSION_USER
+from pinky_daemon.isolated_policy import isolated_read_caller
 
 
 def _log(msg: str) -> None:
@@ -311,11 +312,15 @@ async def propose_call_endpoint(body: ProposeCallRequest, request: Request) -> d
 
 @router.get("/requests")
 async def list_call_requests(
-    agent: str = "", state: str = "", limit: int = 50
+    request: Request, agent: str = "", state: str = "", limit: int = 50
 ) -> dict:
     """List call requests with optional filters."""
     if not _voice_store:
         raise HTTPException(status_code=503, detail="Voice module not initialized")
+    if caller := isolated_read_caller(request):
+        if agent and agent != caller:
+            return {"requests": []}
+        agent = caller
     requests = _voice_store.list_call_requests(
         agent_name=agent, state=state, limit=limit
     )
@@ -1103,13 +1108,17 @@ async def send_dtmf_endpoint(
 
 @router.get("/sessions")
 async def list_sessions(
-    agent: str = "", direction: str = "", status: str = "", limit: int = 50
+    request: Request, agent: str = "", direction: str = "", status: str = "", limit: int = 50
 ) -> dict:
     """List voice call sessions with optional filters."""
     if not _voice_store:
         raise HTTPException(
             status_code=503, detail="Voice module not initialized"
         )
+    if caller := isolated_read_caller(request):
+        if agent and agent != caller:
+            return {"sessions": []}
+        agent = caller
     sessions = _voice_store.list_sessions(
         agent_name=agent, direction=direction, status=status, limit=limit
     )

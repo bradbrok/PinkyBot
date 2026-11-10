@@ -200,12 +200,17 @@ from pinky_daemon.isolated_policy import (
 from pinky_daemon.isolated_policy import (
     ISOLATED_GRANTS,
     ISOLATED_MUTATION_ALLOW,
-    ISOLATED_READ_PENDING,
+    ISOLATED_READ_ALLOW,
     ISOLATED_READ_SCOPED,
+    can_read_skill,
     granted_mutation_allow,
+    granted_read_allow,
     granted_tool_routes,
+    isolated_read_caller,
+    isolated_read_refusal,
     isolation_flag,
     isolation_grants,
+    read_route_names_caller,
     resolve_mutation_route,
 )
 from pinky_daemon.isolated_policy import (
@@ -6564,28 +6569,55 @@ def create_api(
     read_shadow_events: dict[tuple[str, str, str, str], tuple[float, int]] = {}
     read_shadow_lock = threading.Lock()
 
-    def _isolated_read_shadow(request: Request, caller_name: str) -> None:
-        """Observe reads without changing request handling or authority."""
+    def _isolated_read_shadow(request: Request, caller_name: str) -> bool:
+        """Log read refusals, or enforce them when explicitly enabled."""
+        mode = "shadow"
         try:
             if request.method not in {"GET", "HEAD"}:
-                return
-            if _isolation_read_policy_mode(_log) != "shadow":
-                return
-            if _isolation_path_target(_isolation_request_path(request)) is not None:
-                return
-            flag = isolation_flag(agents, caller_name)
-            if flag is False:
-                return
-            template, _ = resolve_mutation_route(app, request.scope)
+                return False
+            mode = _isolation_read_policy_mode(_log)
+            if mode == "off":
+                return False
+            scope = dict(request.scope)
+            if request.method == "HEAD":
+                scope["method"] = "GET"
+            template, params = resolve_mutation_route(app, scope)
+            if template is None:
+                scope["path"] = re.sub(r"/+", "/", get_route_path(scope)).rstrip("/") or "/"
+                scope["root_path"] = ""
+                template, params = resolve_mutation_route(app, scope)
             template = template or "<unknown>"
+            if read_route_names_caller(template, params, caller_name):
+                return False
+            flag = isolation_flag(agents, caller_name)
+            request.state.isolated_read_flag = flag
+            if flag is False:
+                return False
             if ("GET", template) in ISOLATED_READ_SCOPED:
-                return
-            if flag is None:
-                reason = "registry unavailable"
-            elif (request.method, template) in ISOLATED_READ_PENDING:
-                reason = "pending-scope"
-            else:
-                reason = "unlisted"
+                return False
+            allowed = ("GET", template) in ISOLATED_READ_ALLOW
+            if flag is True and not allowed:
+                allowed = ("GET", template) in granted_read_allow(
+                    isolation_grants(agents, caller_name)
+                )
+            reason = "registry unavailable" if flag is None else "unlisted"
+            if allowed:
+                if mode == "shadow" and template == "/skills/{name}":
+                    skill = skills.get(params.get("name", ""))
+                    if not can_read_skill(skills, caller_name, skill):
+                        reason = "unassigned-skill"
+                    else:
+                        return False
+                elif mode == "shadow" and template in {"/schedules", "/scheduler/wake-ledger"}:
+                    if any(
+                        name and name != caller_name
+                        for name in request.query_params.getlist("agent_name")
+                    ):
+                        reason = "other-agent"
+                    else:
+                        return False
+                else:
+                    return False
             key = (caller_name, request.method, template, reason)
             now = _isolated_read_now()
             safe_caller = re.sub(r"[^a-zA-Z0-9_-]", "_", caller_name)[:120]
@@ -6593,14 +6625,15 @@ def create_api(
                 previous = read_shadow_events.get(key)
                 if previous is not None and now - previous[0] < 600:
                     read_shadow_events[key] = (previous[0], previous[1] + 1)
-                    return
+                    return mode == "enforce"
                 repeats = previous[1] if previous is not None else 0
                 if key not in read_shadow_events and len(read_shadow_events) >= 1024:
                     read_shadow_events.clear()
                     _log("isolation: read shadow log map reset (1024 keys)")
                 read_shadow_events[key] = (now, 0)
                 _log(
-                    f"isolation: WOULD DENY READ {request.method} {template} "
+                    f"isolation: {'DENY' if mode == 'enforce' else 'WOULD DENY'} "
+                    f"READ {request.method} {template} "
                     f"for {safe_caller} reason={reason} repeats={repeats}"
                 )
         except Exception as exc:
@@ -6608,6 +6641,7 @@ def create_api(
                 _log(f"isolation: read shadow check failed: {type(exc).__name__}")
             except Exception:
                 pass
+        return mode == "enforce"
 
     def _isolated_mutation_denied(request: Request, caller_name: str, mode: str) -> bool:
         if mode == "off" or request.method in _ISOLATION_SAFE_METHODS:
@@ -6932,7 +6966,9 @@ def create_api(
                     content=content,
                 )
             request.state.auth_gate = "internal_hmac"
-            _isolated_read_shadow(request, caller)
+            if _isolated_read_shadow(request, caller):
+                request.state.auth_gate = "deny_isolation"
+                return JSONResponse(status_code=403, content=isolated_read_refusal(caller))
             return await call_next(request)
 
         # 3. Valid session cookie → through. Pulled up from the per-path
@@ -8268,10 +8304,23 @@ npm run build</pre>
     @app.get("/agents/{name}/skills/available")
     async def get_available_agent_skills(
         name: str,
+        request: Request,
         self_assignable: bool = False,
         category: str = "",
     ):
         """List skills from the catalog not yet assigned to this agent."""
+        if caller := isolated_read_caller(request):
+            try:
+                if agents.get(caller) is None:
+                    raise ValueError("caller unavailable")
+                result = skills.get_available_skills(
+                    caller, self_assignable_only=True, category=category,
+                )
+                fields = ("name", "description", "category", "self_assignable")
+                rows = [{key: getattr(skill, key) for key in fields} for skill in result]
+                return {"agent": caller, "skills": rows, "count": len(rows)}
+            except Exception:
+                return {"agent": caller, "skills": [], "count": 0}
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -8441,14 +8490,24 @@ npm run build</pre>
     # ── System Settings ────────────────────────────────────
 
     @app.get("/system/health")
-    async def system_health():
+    async def system_health(request: Request = None):
         """Authenticated scheduler liveness, access-log and storage health."""
-        return {
+        result = {
             "scheduler": app.state.scheduler.health_snapshot(),
             "access_log": app.state.access_log.status(),
             "sqlite_locks": getattr(app.state, "sqlite_lock_health", {"healthy": None}),
-            "storage_holds": _storage_hold_for(),
         }
+        if request is not None and isolated_read_caller(request):
+            result["access_log"] = {
+                key: value for key, value in result["access_log"].items() if key != "path"
+            }
+            result["sqlite_locks"] = {
+                key: value for key, value in result["sqlite_locks"].items()
+                if key in {"healthy", "checked"}
+            }
+        else:
+            result["storage_holds"] = _storage_hold_for()
+        return result
 
     @app.get("/system/timezone")
     async def get_default_timezone():
@@ -9119,8 +9178,33 @@ npm run build</pre>
         return result
 
     @app.get("/agents")
-    async def list_agents(group: str = "", enabled_only: bool = False):
+    async def list_agents(request: Request, group: str = "", enabled_only: bool = False):
         """List all registered agents, including live working status."""
+        if caller := isolated_read_caller(request):
+            try:
+                subject = agents.get(caller)
+                if subject is None:
+                    raise ValueError("caller unavailable")
+                result = agents.list(group=group, enabled_only=enabled_only)
+                roster = (
+                    request.state.isolated_read_flag is True
+                    and "fleet_roster" in isolation_grants(agents, caller)
+                )
+                if roster:
+                    fields = ("name", "model", "groups", "enabled")
+                else:
+                    groups = set(subject.groups)
+                    result = [a for a in result if a.name == caller or groups.intersection(a.groups)]
+                    fields = ("name", "display_name", "role", "groups", "enabled")
+                online = broker.get_live_agents() if not roster else set()
+                rows = [
+                    {**{key: getattr(a, key) for key in fields},
+                     **({"online": a.name in online} if not roster else {})}
+                    for a in result
+                ]
+                return {"agents": rows, "count": len(rows), "main_agent": agents.get_main_agent()}
+            except Exception:
+                return {"agents": [], "count": 0, "main_agent": ""}
         result = agents.list(group=group, enabled_only=enabled_only)
         live_agents = broker.get_live_agents()
         agents_out = []
@@ -14073,9 +14157,16 @@ npm run build</pre>
         return {"toggled": True, "enabled": enabled}
 
     @app.get("/schedules")
-    async def list_all_schedules(enabled_only: bool = True):
+    async def list_all_schedules(
+        request: Request, enabled_only: bool = True, agent_name: str | None = None,
+    ):
         """List all schedules across all agents."""
-        schedules = agents.get_all_schedules(enabled_only=enabled_only)
+        if caller := isolated_read_caller(request):
+            if agent_name and agent_name != caller:
+                raise HTTPException(403, "schedule reads require the signed caller")
+            schedules = agents.get_schedules(caller, enabled_only=enabled_only)
+        else:
+            schedules = agents.get_all_schedules(enabled_only=enabled_only)
         return {
             "schedules": [s.to_dict() for s in schedules],
             "count": len(schedules),
@@ -14083,12 +14174,17 @@ npm run build</pre>
 
     @app.get("/scheduler/wake-ledger")
     async def list_scheduler_wake_ledger(
+        request: Request,
         agent_name: str | None = None,
         state: str | None = None,
         fired_after: float = 0.0,
         limit: int = 200,
     ):
         """Query exact-fire scheduler outcomes without interpreting logs."""
+        if caller := isolated_read_caller(request):
+            if agent_name and agent_name != caller:
+                raise HTTPException(403, "wake ledger reads require the signed caller")
+            agent_name = caller
         try:
             rows = agents.list_schedule_wake_ledger(
                 agent_name,
@@ -16993,9 +17089,14 @@ npm run build</pre>
         return {"updated": True, "heartbeat_prompt": agents.get_heartbeat_prompt()}
 
     @app.get("/settings/owner-profile")
-    async def get_owner_profile():
+    async def get_owner_profile(request: Request):
         """Get the owner/operator profile."""
-        return agents.get_owner_profile()
+        profile = agents.get_owner_profile()
+        if isolated_read_caller(request):
+            return {key: value for key, value in profile.items() if key in {
+                "name", "pronouns", "timezone", "role", "comm_style", "languages", "locale",
+            }}
+        return profile
 
     @app.put("/settings/owner-profile")
     async def set_owner_profile(req: OwnerProfileRequest, request: Request):

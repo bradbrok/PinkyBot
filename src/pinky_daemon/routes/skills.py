@@ -27,6 +27,7 @@ from pinky_daemon.api_models import (
     UpdateSkillRequest,
 )
 from pinky_daemon.auth import derive_skill_assignment_actor
+from pinky_daemon.isolated_policy import can_read_skill, isolated_read_caller
 from pinky_daemon.skill_loader import (
     _CONSECUTIVE_HYPHENS,
     _NAME_RE,
@@ -280,9 +281,18 @@ async def get_skill_categories():
 
 
 @router.get("/skills/{name}")
-async def get_skill(name: str):
+async def get_skill(name: str, request: Request):
     """Get a skill by name."""
-    skill = _skills.get(name)
+    if caller := isolated_read_caller(request):
+        try:
+            skill = _skills.get(name)
+            allowed = can_read_skill(_skills, caller, skill)
+        except Exception:
+            allowed = False
+        if not allowed:
+            raise HTTPException(404, f"Skill '{name}' not found")
+    else:
+        skill = _skills.get(name)
     if not skill:
         raise HTTPException(404, f"Skill '{name}' not found")
     return {**skill.to_dict(), "disk_drift": _disk_drift(skill)}
