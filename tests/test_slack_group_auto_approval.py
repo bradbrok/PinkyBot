@@ -600,7 +600,7 @@ async def test_former_sender_is_kept_while_later_rows_replay_in_order(case, caps
     case.grant(FORMER)
     assert await case.broker.reconcile_approved_pending_messages() == 1
     assert await case.broker.reconcile_approved_pending_messages() == 0
-    assert case.delivered() == ["eligible one", "eligible two", "trigger", "former"]
+    assert case.delivered() == ["eligible one", "eligible two", "trigger", "fixture former payload"]
     assert case.held() == []
 
 

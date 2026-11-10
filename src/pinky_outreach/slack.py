@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -517,6 +518,56 @@ class SlackAdapter:
                 "url": result.get("url"),
             }
         return self._bot_info
+
+    def resolve_group_dm_members(
+        self, channel: str, deadline: float,
+    ) -> tuple[str, tuple[str, ...], str] | str:
+        """Read one verified group DM membership page or return a fixed refusal reason."""
+        def remaining() -> float:
+            seconds = deadline - time.monotonic()
+            if seconds <= 0:
+                raise TimeoutError
+            return seconds
+
+        try:
+            result = self._request_form("conversations.info", channel=channel, timeout=remaining())
+            conversation = result.get("channel")
+            if not isinstance(conversation, dict) or conversation.get("id") != channel:
+                return "invalid_response"
+            is_mpim = conversation.get("is_mpim", False)
+            if type(is_mpim) is not bool:
+                return "invalid_response"
+            if not is_mpim:
+                return "not_group_dm"
+
+            own_user_id = self.get_bot_info(timeout=remaining()).get("user_id")
+            if not isinstance(own_user_id, str) or not re.fullmatch(r"[UW][A-Z0-9]{2,}", own_user_id):
+                return "invalid_response"
+            result = self._request_form(
+                "conversations.members", channel=channel, limit=10, timeout=remaining(),
+            )
+        except (TimeoutError, httpx.TimeoutException):
+            return "timeout"
+        except SlackError as exc:
+            if exc.error in ("missing_scope", "invalid_response"):
+                return exc.error
+            return "lookup_error"
+        except httpx.RequestError:
+            return "lookup_error"
+
+        members = result.get("members")
+        metadata = result.get("response_metadata", {})
+        if not isinstance(members, list) or not isinstance(metadata, dict):
+            return "invalid_response"
+        if any(
+            not isinstance(member, str) or not re.fullmatch(r"[UW][A-Z0-9]{2,}", member)
+            for member in members
+        ) or len(set(members)) != len(members):
+            return "invalid_response"
+        cursor = metadata.get("next_cursor", "")
+        if not isinstance(cursor, str):
+            return "invalid_response"
+        return own_user_id, tuple(members), cursor
 
     def get_channel_info(self, channel: str) -> Chat:
         """Get channel information."""

@@ -3494,6 +3494,29 @@ def create_api(
         message_context_store=message_context_store,
         api_readiness=app.state.api_readiness,
     )
+
+    def _refresh_slack_group_resolver(agent_name: str) -> None:
+        from pinky_daemon.pollers import BrokerSlackPoller
+
+        try:
+            token = agents.get_token(agent_name, "slack")
+        except ValueError:
+            token = None
+        if not token or not token.enabled or not token.token_set:
+            broker.set_slack_group_resolver(agent_name, None)
+            return
+        BrokerSlackPoller.register_group_dm_resolver(
+            broker, agent_name, lambda: _get_platform_adapter(agent_name, "slack"),
+        )
+
+    def _slack_group_credentials_changed(pairs: list[tuple[str, str]]) -> None:
+        for name in {name for name, platform in pairs if platform in ("slack", "*")}:
+            _refresh_slack_group_resolver(name)
+
+    agents.add_token_change_listener(_slack_group_credentials_changed)
+    for agent in agents.list():
+        _refresh_slack_group_resolver(agent.name)
+
     _broker_pollers: list[PollerStatus] = []  # Track active broker pollers
     _pending_transcript_reports: dict[
         tuple[str, str], tuple[Path, str, set[Path] | None, float]
@@ -14932,6 +14955,7 @@ npm run build</pre>
         return False
 
     dream_runner.set_owner_notify_callback(_notify_owner_alert)
+    broker.set_slack_group_owner_notify(_notify_owner_alert)
 
     scheduler = AgentScheduler(
         agents,

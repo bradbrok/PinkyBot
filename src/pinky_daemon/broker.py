@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -55,6 +56,15 @@ _APPROVAL_NOTIFY_RETRY_BASE_SEC = 30
 _APPROVAL_NOTIFY_RETRY_MAX_SEC = 30 * 60
 _APPROVAL_NOTIFY_MAX_ATTEMPTS = 5
 _APPROVAL_NOTIFY_POLL_SEC = 5
+_SLACK_GROUP_CHECK_TIMEOUT_SEC = 5.0
+_SLACK_GROUP_CHECK_INTERVAL_SEC = 60.0
+_SLACK_GROUP_NOTICE_TIMEOUT_SEC = 5.0
+_SLACK_LOOKUP_REFUSALS = frozenset({
+    "timeout", "not_group_dm", "missing_scope", "invalid_response", "lookup_error", "no_resolver",
+})
+_SlackGroupResolver = Callable[[str, float], Awaitable[tuple[str, tuple[str, ...], str] | str]]
+_kept_slack_rows: set[tuple[str, int, int, int]] = set()
+_kept_slack_rows_lock = threading.Lock()
 
 INBOUND_MESSAGE_FIELDS = (
     "user_id", "was_bot", "bot_id", "forwarded", "via_bot_id", "sender_business_bot_id",
@@ -319,6 +329,25 @@ class MessageBroker:
         self._approval_notification_task: asyncio.Task | None = None
         self._approval_notification_locks: dict[int, asyncio.Lock] = {}
         self._approval_flush_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._slack_group_resolvers: dict[str, _SlackGroupResolver] = {}
+        self._slack_group_resolver_lock = threading.Lock()
+        self._slack_group_checks: dict[tuple[str, str], asyncio.Task] = {}
+        self._slack_group_owner_notify: Callable[[str, str], Awaitable[bool]] | None = None
+
+    def set_slack_group_resolver(
+        self, agent_name: str, resolver: _SlackGroupResolver | None,
+    ) -> None:
+        """Install the agent's adapter resolver after credential configuration changes."""
+        with self._slack_group_resolver_lock:
+            if resolver is None:
+                self._slack_group_resolvers.pop(agent_name, None)
+            else:
+                self._slack_group_resolvers[agent_name] = resolver
+
+    def set_slack_group_owner_notify(
+        self, callback: Callable[[str, str], Awaitable[bool]],
+    ) -> None:
+        self._slack_group_owner_notify = callback
 
     @property
     def send_callback(self):
@@ -1246,6 +1275,8 @@ class MessageBroker:
         request_id = request["id"]
         lock = self._approval_notification_locks.setdefault(request_id, asyncio.Lock())
         async with lock:
+            if (request["agent_name"], request["chat_id"]) in self._slack_group_checks:
+                return
             current = self._registry.get_approval_request(
                 request["agent_name"], request["chat_id"],
             )
@@ -1365,8 +1396,14 @@ class MessageBroker:
             agent_name = backlog["agent_name"]
             chat_id = backlog["chat_id"]
             try:
+                gate = self._registry.get_slack_group_approval(agent_name, chat_id)
+                if gate.status != "approved":
+                    continue
                 self._registry.settle_approval_request(agent_name, chat_id, "approved")
-                delivered += await self.handle_approval(agent_name, chat_id)
+                if gate.automatic:
+                    delivered += await self.handle_approval(agent_name, chat_id, _automatic=True)
+                else:
+                    delivered += await self.handle_approval(agent_name, chat_id)
             except Exception as exc:
                 _log(
                     "ERROR broker: approved pending-message reconcile failed "
@@ -1490,6 +1527,131 @@ class MessageBroker:
             self.log_mention_only_drop(message.agent_name, message.chat_id, message.message_id, key)
         return admitted
 
+    @staticmethod
+    def _pending_slack_envelope(
+        message: BrokerMessage, *, own_sender: bool = False,
+    ) -> dict | None:
+        if message.platform != "slack" or not (message.message_id or own_sender):
+            return None
+        envelope = {
+            "metadata": {key: message.metadata[key] for key in INBOUND_MESSAGE_FIELDS
+                         if key in message.metadata},
+            "message_id": message.message_id,
+            "reply_to": message.reply_to,
+            "timestamp": message.timestamp,
+            "chat_title": message.chat_title,
+        }
+        if own_sender:
+            envelope["own_sender"] = True
+        return envelope
+
+    async def _slack_group_members(
+        self, resolver: _SlackGroupResolver, chat_id: str,
+    ) -> tuple[str, tuple[str, ...] | None]:
+        deadline = time.monotonic() + _SLACK_GROUP_CHECK_TIMEOUT_SEC
+        lookup = asyncio.create_task(resolver(chat_id, deadline))
+
+        def consume_error(task: asyncio.Task) -> None:
+            if not task.cancelled():
+                task.exception()
+
+        lookup.add_done_callback(consume_error)
+        try:
+            done, _ = await asyncio.wait((lookup,), timeout=_SLACK_GROUP_CHECK_TIMEOUT_SEC)
+            if not done or time.monotonic() >= deadline:
+                return "timeout", None
+            result = lookup.result()
+            if isinstance(result, str):
+                return result if result in _SLACK_LOOKUP_REFUSALS else "lookup_error", None
+            own_user_id, members, cursor = result
+            if cursor or len(members) > 9:
+                return "incomplete_members", None
+            if own_user_id not in members:
+                return "own_id_missing", None
+            participants = tuple(member for member in members if member != own_user_id)
+            if not participants:
+                return "no_other_members", None
+            return "eligible_members", (own_user_id, *participants)
+        except Exception:
+            return "lookup_error", None
+        finally:
+            if not lookup.done():
+                # Cancellation need not stop a blocking adapter call. Only
+                # the deadline-bounded caller can publish an approval.
+                lookup.cancel()
+
+    async def _send_slack_group_notice(self, agent_name: str, chat_id: str, members: str) -> None:
+        callback = self._slack_group_owner_notify
+        if callback is None:
+            return
+        try:
+            async with asyncio.timeout(_SLACK_GROUP_NOTICE_TIMEOUT_SEC):
+                await callback(
+                    agent_name,
+                    f"Slack group {chat_id} was automatically approved. Members: {members}",
+                )
+        except Exception:
+            _log(f"slack group notice failed: agent={agent_name} chat={chat_id}")
+
+    async def _complete_slack_group_check(
+        self, key: tuple[str, str], resolver: _SlackGroupResolver,
+        claim: tuple[int, float], request: dict,
+    ) -> bool:
+        agent_name, chat_id = key
+        display_name = ""
+        try:
+            reason, members = await self._slack_group_members(resolver, chat_id)
+            with self._slack_group_resolver_lock:
+                if self._slack_group_resolvers.get(agent_name) is not resolver:
+                    reason, members = "resolver_changed", None
+                decision, display_name = self._registry.finish_slack_group_check(
+                    agent_name, chat_id, claim, members,
+                )
+            if members is not None:
+                reason = decision
+        except Exception:
+            reason = "store_error"
+        finally:
+            self._slack_group_checks.pop(key, None)
+
+        _log(f"slack group approval: agent={agent_name} chat={chat_id} reason={reason}")
+        if reason != "approved":
+            await self._notify_approval_request(request)
+            return False
+
+        if self._slack_group_owner_notify is not None:
+            notice = asyncio.create_task(self._send_slack_group_notice(agent_name, chat_id, display_name))
+            self._background_tasks.add(notice)
+            notice.add_done_callback(self._background_tasks.discard)
+        try:
+            await self.handle_approval(agent_name, chat_id)
+        except Exception:
+            _log(f"slack group replay deferred: agent={agent_name} chat={chat_id}")
+        return True
+
+    async def _check_pending_slack_group(self, agent_name: str, chat_id: str, request: dict) -> bool:
+        key = (agent_name, chat_id)
+        task = self._slack_group_checks.get(key)
+        if task is None:
+            resolver = self._slack_group_resolvers.get(agent_name)
+            if resolver is None:
+                _log(f"slack group approval: agent={agent_name} chat={chat_id} reason=no_resolver")
+            else:
+                claim = self._registry.claim_slack_group_check(
+                    agent_name, chat_id, _SLACK_GROUP_CHECK_INTERVAL_SEC,
+                )
+                if claim is not None:
+                    task = asyncio.create_task(
+                        self._complete_slack_group_check(key, resolver, claim, request)
+                    )
+                    self._slack_group_checks[key] = task
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+        if task is None:
+            await self._notify_approval_request(request)
+            return False
+        return await asyncio.shield(task)
+
     async def handle_inbound(self, message: BrokerMessage, *, trusted_button_tap: bool = False) -> None:
         """Handle an incoming platform message. Non-blocking."""
         # Only the validated managed-card entry can supply this trusted argument.
@@ -1531,6 +1693,29 @@ class MessageBroker:
         #    (defense against strangers DMing the bot directly).
         approval_key, is_channel = self._approval_key(message)
         status = self._registry.get_user_status(agent_name, approval_key)
+        slack_group = message.platform == "slack" and is_channel
+        if slack_group and status in ("approved", "pending"):
+            gate = self._registry.get_slack_group_approval(agent_name, approval_key, message.sender_id)
+            if gate.status in (None, "pending", "approved", "denied"):
+                status = gate.status
+            if gate.automatic is True:
+                own_sender = trusted_button_tap and message.metadata.get("_slack_own_sender") is True
+                if status in ("approved", "pending") and (
+                    own_sender
+                    or gate.lacks_person(message.sender_id, approval_key)
+                    or (status == "approved" and not gate.sender_approved)
+                ):
+                    held, status, request = self._registry.hold_automatic_slack_group_message(
+                        agent_name=agent_name, chat_id=approval_key, sender_id=message.sender_id,
+                        sender_name=message.sender_name, content=message.content,
+                        held_at=message.timestamp,
+                        slack_envelope=self._pending_slack_envelope(message, own_sender=own_sender),
+                    )
+                    if held:
+                        self._stats["pending"] += 1
+                        if request is not None:
+                            await self._notify_approval_request(request)
+                        return
 
         if status == "denied":
             self._stats["denied"] += 1
@@ -1590,16 +1775,6 @@ class MessageBroker:
                 username = message.metadata.get("username", "")
                 if username and not is_channel:
                     target_name = f"{target_name or 'Unknown'} (@{username})"
-                slack_envelope = None
-                if message.platform == "slack" and message.message_id:
-                    slack_envelope = {
-                        "metadata": {key: message.metadata[key] for key in INBOUND_MESSAGE_FIELDS
-                                     if key in message.metadata},
-                        "message_id": message.message_id,
-                        "reply_to": message.reply_to,
-                        "timestamp": message.timestamp,
-                        "chat_title": message.chat_title,
-                    }
                 _, approval_request = self._registry.queue_pending_message_with_approval_request(
                     agent_name=agent_name,
                     platform=message.platform,
@@ -1611,9 +1786,13 @@ class MessageBroker:
                     sender_id=message.sender_id,
                     target_name=target_name,
                     held_at=message.timestamp,
-                    slack_envelope=slack_envelope,
+                    slack_envelope=self._pending_slack_envelope(message),
                 )
-                await self._notify_approval_request(approval_request)
+                if slack_group:
+                    if await self._check_pending_slack_group(agent_name, approval_key, approval_request):
+                        return
+                else:
+                    await self._notify_approval_request(approval_request)
                 self._stats["pending"] += 1
                 _log(f"broker: queued pending message for {agent_name} (key={approval_key}, sender={message.sender_name})")
                 return
@@ -1808,15 +1987,31 @@ class MessageBroker:
             body += "\nThis channel is mention-only for you: reply only in this thread, with thread(message_id=...)."
         return f"{header}\n{body}"
 
-    async def handle_approval(self, agent_name: str, chat_id: str) -> int:
+    async def handle_approval(self, agent_name: str, chat_id: str, *, _automatic: bool = False) -> int:
         """Serialize and flush one approved chat's held messages."""
+        automatic = _automatic or self._registry.get_slack_group_approval(agent_name, chat_id).automatic
         lock = self._approval_flush_locks.setdefault(
             (agent_name, chat_id), asyncio.Lock(),
         )
         async with lock:
-            return await self._handle_approval_unlocked(agent_name, chat_id)
+            return await self._handle_approval_unlocked(agent_name, chat_id, automatic=automatic)
 
-    async def _handle_approval_unlocked(self, agent_name: str, chat_id: str) -> int:
+    def _log_kept_slack_row(self, agent_name: str, chat_id: str, row_id: int) -> None:
+        path = self._registry._db_path
+        try:
+            stat = os.stat(path)
+            key = (path, stat.st_dev, stat.st_ino, row_id)
+        except OSError:
+            key = (path, 0, 0, row_id)
+        with _kept_slack_rows_lock:
+            if key in _kept_slack_rows:
+                return
+            _kept_slack_rows.add(key)
+        _log(f"slack group replay kept: agent={agent_name} chat={chat_id} row={row_id}")
+
+    async def _handle_approval_unlocked(
+        self, agent_name: str, chat_id: str, *, automatic: bool = False,
+    ) -> int:
         """When a pending user is approved, deliver their held messages.
 
         Successful rows are checkpointed individually so a later-row failure
@@ -1826,7 +2021,10 @@ class MessageBroker:
 
         Returns the number of messages delivered.
         """
-        pending = self._registry.get_pending_messages(agent_name, chat_id)
+        automatic = automatic or self._registry.get_slack_group_approval(agent_name, chat_id).automatic
+        pending = self._registry.get_pending_messages(
+            agent_name, chat_id, include_slack_provenance=automatic,
+        )
         if not pending:
             _log(f"broker: delivered 0/0 pending messages for {chat_id} to {agent_name}")
             return 0
@@ -1840,6 +2038,18 @@ class MessageBroker:
         delivered = 0
         for msg in pending:
             envelope = msg.get("slack_envelope") or {}
+            if automatic:
+                sender_id = msg.get("sender_id") or ""
+                gate = self._registry.get_slack_group_approval(agent_name, chat_id, sender_id)
+                if gate.status != "approved":
+                    break
+                if gate.automatic and (
+                    not gate.sender_approved
+                    or gate.lacks_person(sender_id, chat_id)
+                    or envelope.get("own_sender") is True
+                ):
+                    self._log_kept_slack_row(agent_name, chat_id, msg["id"])
+                    continue
             if msg["platform"] != "slack" or (
                 not envelope.get("message_id")
                 and not (envelope.get("metadata") or {}).get("thread_ts")
@@ -1876,7 +2086,8 @@ class MessageBroker:
             self._registry.mark_pending_message_delivered(msg["id"])
             delivered += 1
 
-        _log(f"broker: queued {delivered} pending messages for delivery to {agent_name}")
+        if delivered or not automatic:
+            _log(f"broker: queued {delivered} pending messages for delivery to {agent_name}")
         return delivered
 
     # ── Streaming Session Support ─────────────────────────
