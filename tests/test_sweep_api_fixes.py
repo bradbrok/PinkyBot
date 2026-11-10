@@ -9,7 +9,7 @@ import os
 import tempfile
 import time
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -406,7 +406,8 @@ class TestCodexSharedMcpBearer:
 
         with tempfile.TemporaryDirectory() as tmpdir, \
                 patch.object(api_mod, "SHARED_MCP_ENABLED", True), \
-                patch.object(codex_mod, "CodexSession", FakeCodexSession):
+                patch.object(codex_mod, "CodexSession", FakeCodexSession), \
+                patch("pinky_daemon.shared_mcp.SharedMcpManager.start", new_callable=AsyncMock):
             db_path = os.path.join(tmpdir, "test.db")
             app = _make_app(db_path)
             with TestClient(app) as client:
@@ -424,3 +425,34 @@ class TestCodexSharedMcpBearer:
                     assert headers["X-Agent-Name"] == "codex-agent"
                     key = agents.get_signing_key("codex-agent")
                     assert headers["Authorization"] == f"Bearer {derive_mcp_bearer(key)}"
+
+    def test_header_config_does_not_start_a_shared_listener(self, monkeypatch):
+        import socket
+        import threading
+
+        from pinky_daemon.shared_mcp import SHARED_MCP_PORT
+
+        starts, binds = [], []
+        real_start, real_bind = threading.Thread.start, socket.socket.bind
+
+        def start(thread):
+            if thread.name == "shared-mcp-server":
+                starts.append(thread.name)
+                return None
+            return real_start(thread)
+
+        def bind(sock, address):
+            if isinstance(address, tuple) and address[1] == SHARED_MCP_PORT:
+                binds.append(address)
+                raise AssertionError("Fixed shared-server port bind attempted")
+            return real_bind(sock, address)
+
+        monkeypatch.setattr(threading.Thread, "start", start)
+        monkeypatch.setattr(socket.socket, "bind", bind)
+        self.test_codex_mcp_headers_include_derived_bearer()
+        assert not starts, starts
+        assert not binds, binds
+        assert not any(
+            thread.name == "shared-mcp-server" and thread.is_alive()
+            for thread in threading.enumerate()
+        )
