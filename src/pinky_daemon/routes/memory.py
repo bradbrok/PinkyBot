@@ -204,6 +204,7 @@ def search_agent_chat_history(
             exclusions = {} if ownership is None else {
                 "exclude_prefixes": ownership.exclude_prefixes,
                 "exclude_session_ids": ownership.exclude_session_ids,
+                "retain_session_ids": ownership.retain_session_ids,
             }
             results = _store.search(
                 q, session_ids=agent_session_ids,

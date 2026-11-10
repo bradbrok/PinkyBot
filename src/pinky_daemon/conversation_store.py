@@ -292,6 +292,7 @@ class ConversationStore:
         session_prefix: str = "",
         exclude_prefixes: Collection[str] = (),
         exclude_session_ids: Collection[str] = (),
+        retain_session_ids: Collection[str] = (),
         platform: str = "",
         chat_id: str = "",
         limit: int = 50,
@@ -332,9 +333,11 @@ class ConversationStore:
                 scope.append("m.session_id LIKE ? ESCAPE '\\'")
                 params.append(f"{escaped}%")
             conditions.append(f"({' OR '.join(scope)})")
+        retained_ids = () if session_ids is None else session_ids
+        if retain_session_ids:
+            retained_ids = (*retained_ids, *retain_session_ids)
         exclusions, excluded_params = _session_exclusions(
-            "m.session_id", exclude_prefixes, exclude_session_ids,
-            () if session_ids is None else session_ids,
+            "m.session_id", exclude_prefixes, exclude_session_ids, retained_ids,
         )
         conditions.extend(exclusions)
         params.extend(excluded_params)
