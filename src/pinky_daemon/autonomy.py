@@ -31,6 +31,7 @@ from enum import Enum
 
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.conversation_store import ConversationStore
+from pinky_daemon.session_identity import session_ownership
 from pinky_daemon.task_store import TaskStore
 
 
@@ -281,12 +282,14 @@ class AutonomyEngine:
         conversation_store: ConversationStore,
         *,
         session_sender=None,  # async fn(agent_name, session_id, prompt) -> response
+        session_ownership_provider=None,
         idle_check_interval: int = 300,  # Check for work every 5 min even without events
     ) -> None:
         self._registry = registry
         self._tasks = task_store
         self._convos = conversation_store
         self._session_sender = session_sender
+        self._session_ownership_provider = session_ownership_provider
         self._idle_check_interval = idle_check_interval
         self._event_queue = EventQueue()
         self._running_loops: dict[str, asyncio.Task] = {}
@@ -295,6 +298,17 @@ class AutonomyEngine:
     @property
     def event_queue(self) -> EventQueue:
         return self._event_queue
+
+    def _last_message_time(self, agent_name: str) -> float | None:
+        ownership = (
+            self._session_ownership_provider(agent_name)
+            if self._session_ownership_provider else session_ownership(self._registry, agent_name)
+        )
+        return self._convos.last_message_time(
+            f"{agent_name}-", exclude_prefixes=ownership.exclude_prefixes,
+            exclude_session_ids=ownership.exclude_session_ids,
+            retain_session_ids=ownership.retain_session_ids,
+        )
 
     async def start(self) -> None:
         """Start autonomy engine."""
@@ -403,7 +417,7 @@ class AutonomyEngine:
                 # failure means "can't tell" — keep today's behavior.
                 if ctx_dict:
                     try:
-                        last_msg = self._convos.last_message_time(f"{agent_name}-")
+                        last_msg = self._last_message_time(agent_name)
                     except Exception:
                         last_msg = None
                     ctx_dict = mark_stale_context(ctx_dict, last_msg)

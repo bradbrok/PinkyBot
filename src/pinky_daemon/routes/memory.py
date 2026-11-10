@@ -200,10 +200,16 @@ def search_agent_chat_history(
     results = []
     if q:
         try:
+            ownership = getattr(agent_session_ids, "ownership", None)
+            exclusions = {} if ownership is None else {
+                "exclude_prefixes": ownership.exclude_prefixes,
+                "exclude_session_ids": ownership.exclude_session_ids,
+            }
             results = _store.search(
                 q, session_ids=agent_session_ids,
                 session_prefix=f"{agent_name}-", limit=limit,
                 after_ts=after_ts, before_ts=before_ts, role=role,
+                **exclusions,
             )
         except Exception:
             pass

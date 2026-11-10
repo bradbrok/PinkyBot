@@ -48,7 +48,7 @@ def history_app(tmp_path, monkeypatch):
 
 
 def legacy_session_ids(app, name):
-    """Reference the previous union on a small, complete synthetic fixture."""
+    """Reference candidate discovery and independent owner-evidence exclusions."""
     result = {
         session.id for session in app.state.manager.list()
         if session.agent_name == name or session.id.startswith(name + "-")
@@ -63,6 +63,15 @@ def legacy_session_ids(app, name):
         for summary in app.state.conversation_store.list_conversations(limit=5000)
         if summary.session_id.startswith(name + "-")
     )
+    sessions = app.state.manager.list()
+    foreign = {s.id for s in sessions if s.agent_name and s.agent_name != name}
+    explicit = {s.id for s in sessions if s.agent_name == name}
+    explicit.update(entry["session_id"] for entry in app.state.agents.list_streaming_session_ids(name)
+                    if entry.get("session_id"))
+    longer = [agent.name + "-" for agent in app.state.agents.list(include_retired=True)
+              if agent.name.startswith(name + "-")]
+    result.difference_update(foreign)
+    result = {sid for sid in result if sid in explicit or not any(sid.startswith(p) for p in longer)}
     return result
 
 
@@ -120,8 +129,14 @@ def test_session_collection_preserves_active_streaming_and_prefix_aliases(histor
     actual = memory._collect_agent_session_ids(name)
     assert actual == expected
     if name == "unit":
-        assert {"opaque-active", "opaque-stream", "unit-notes", "unit-x-main"} <= actual
+        assert {"opaque-active", "opaque-stream", "unit-notes"} <= actual
+        assert "unit-x-main" not in actual
+        assert "unit-active" not in actual
         assert "unitary-main" not in actual
+    elif name == "unit-x":
+        assert "unit-x-main" in actual
+    elif name == "unitary":
+        assert "unit-active" in actual
 
 
 def test_session_collection_does_not_list_all_conversations(history_app, monkeypatch):
@@ -138,7 +153,7 @@ def test_failed_prefix_read_keeps_active_and_streaming_aliases(history_app, monk
     failing = Mock(side_effect=OSError("synthetic read failure"))
     monkeypatch.setattr(store, "list_session_ids_with_prefix", failing, raising=False)
     result = memory._collect_agent_session_ids("unit")
-    assert result == {"opaque-active", "unit-active", "opaque-stream", "unit-notes"}
+    assert result == {"opaque-active", "opaque-stream", "unit-notes"}
     assert failing.call_count == 1
 
 
