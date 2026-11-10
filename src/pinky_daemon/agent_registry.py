@@ -34,7 +34,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import resources
@@ -7105,6 +7105,18 @@ except Exception as exc:
                 results.insert(0, {"label": "main", "session_id": main_id, "updated_at": 0.0})
 
         return results
+
+    def list_streaming_session_labels(self, agent_names: Collection[str]) -> list[dict]:
+        """Read label ownership evidence for exactly the requested registered names."""
+        if not agent_names:
+            return []
+        rows = self._db.execute(
+            """SELECT agent_name, label FROM streaming_session_labels
+               WHERE agent_name IN (SELECT value FROM json_each(?))
+               ORDER BY agent_name, label""",
+            (json.dumps(list(agent_names)),),
+        ).fetchall()
+        return [{"agent_name": row[0], "label": row[1]} for row in rows]
 
     # ── Custom MCP Servers ──────────────────────────────────
 

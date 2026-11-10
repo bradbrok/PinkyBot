@@ -3713,6 +3713,7 @@ def create_api(
             agents, agent_name,
             live_sessions=manager.list() if sessions is None else sessions,
             recorded_sessions=entries,
+            broker_sessions=broker._streaming,
         )
 
     def _collect_agent_session_ids(agent_name: str) -> set[str]:
