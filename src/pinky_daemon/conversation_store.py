@@ -32,6 +32,29 @@ def _fts5_phrase(query: str) -> str:
     return " ".join('"' + token.replace('"', '""') + '"' for token in query.split())
 
 
+def _session_exclusions(
+    column: str,
+    exclude_prefixes: Collection[str],
+    exclude_session_ids: Collection[str],
+    retain_session_ids: Collection[str] = (),
+) -> tuple[list[str], list]:
+    """Apply ownership exclusions in SQL, preserving stronger explicit evidence."""
+    conditions, params = [], []
+    if exclude_prefixes:
+        patterns = [prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+                    for prefix in exclude_prefixes]
+        exclusion = f"NOT EXISTS (SELECT 1 FROM json_each(?) p WHERE {column} LIKE p.value ESCAPE '\\')"
+        if retain_session_ids:
+            exclusion = f"({column} IN (SELECT value FROM json_each(?)) OR {exclusion})"
+            params.append(json.dumps(list(retain_session_ids)))
+        params.append(json.dumps(patterns))
+        conditions.append(exclusion)
+    if exclude_session_ids:
+        conditions.append(f"{column} NOT IN (SELECT value FROM json_each(?))")
+        params.append(json.dumps(list(exclude_session_ids)))
+    return conditions, params
+
+
 @dataclass
 class StoredMessage:
     """A message persisted in the conversation store."""
@@ -267,6 +290,9 @@ class ConversationStore:
         session_id: str = "",
         session_ids: Collection[str] | None = None,
         session_prefix: str = "",
+        exclude_prefixes: Collection[str] = (),
+        exclude_session_ids: Collection[str] = (),
+        retain_session_ids: Collection[str] = (),
         platform: str = "",
         chat_id: str = "",
         limit: int = 50,
@@ -307,6 +333,14 @@ class ConversationStore:
                 scope.append("m.session_id LIKE ? ESCAPE '\\'")
                 params.append(f"{escaped}%")
             conditions.append(f"({' OR '.join(scope)})")
+        retained_ids = () if session_ids is None else session_ids
+        if retain_session_ids:
+            retained_ids = (*retained_ids, *retain_session_ids)
+        exclusions, excluded_params = _session_exclusions(
+            "m.session_id", exclude_prefixes, exclude_session_ids, retained_ids,
+        )
+        conditions.extend(exclusions)
+        params.extend(excluded_params)
         if platform:
             conditions.append("m.platform = ?")
             params.append(platform)
@@ -407,30 +441,31 @@ class ConversationStore:
             for r in rows
         ]
 
-    def last_message_time(self, session_prefix: str) -> float | None:
-        """Most recent message timestamp for sessions of one agent.
+    def last_message_time(
+        self,
+        session_prefix: str,
+        *,
+        exclude_prefixes: Collection[str] = (),
+        exclude_session_ids: Collection[str] = (),
+        retain_session_ids: Collection[str] = (),
+    ) -> float | None:
+        """Most recent timestamp within an existing literal-prefix scope.
 
-        ``session_prefix`` is matched as ``{prefix}%`` so it covers the
-        agent's main session and any labeled siblings (``barsik-main``,
-        ``barsik-research``, …). Used by the autonomy engine's
-        continuation-staleness guard (#732): a saved-context snapshot
-        older than the agent's last conversation activity is history the
-        live thread already supersedes. Returns ``None`` when the agent
-        has no recorded messages.
-
-        LIKE wildcards in the prefix (``_``/``%`` are legal in agent
-        names) are escaped so ``foo_bar-`` can't match ``fooXbar-main``.
-        Known residual ambiguity (Murzik, PR #733): the ``agent-label``
-        session-id encoding can't distinguish prefix-FAMILY agent names —
-        ``foo-`` also matches ``foo-bar-main``. Worst case is a false
-        STALE verdict (a collapsed continuation, never a wrong replay),
-        and the fleet has no prefix-family names today; the real fix is
-        an ``agent_name`` column on conversation rows.
+        Production callers pass ownership exclusions. Empty defaults preserve
+        the raw prefix primitive. Retained explicit IDs can override a family
+        exclusion but never widen the original prefix. Wildcard characters in
+        prefixes and exclusions are escaped. No matching rows returns None.
         """
         escaped = session_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        exclusions, excluded_params = _session_exclusions(
+            "session_id", exclude_prefixes, exclude_session_ids, retain_session_ids,
+        )
+        sql = "SELECT MAX(timestamp) FROM messages WHERE session_id LIKE ? ESCAPE '\\'"
+        if exclusions:
+            sql += " AND " + " AND ".join(exclusions)
         row = self._conn.execute(
-            "SELECT MAX(timestamp) FROM messages WHERE session_id LIKE ? ESCAPE '\\'",
-            (f"{escaped}%",),
+            sql,
+            (f"{escaped}%", *excluded_params),
         ).fetchone()
         return float(row[0]) if row and row[0] is not None else None
 

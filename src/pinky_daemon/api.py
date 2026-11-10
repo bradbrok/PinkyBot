@@ -239,6 +239,13 @@ from pinky_daemon.presentation_store import PresentationStore
 from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.scheduler import AgentScheduler, read_rate_limit_status
 from pinky_daemon.scheduler import _log as _scheduler_log
+from pinky_daemon.session_identity import (
+    SessionIdScope,
+    resolve_session_owner,
+    session_id_for_agent,
+    session_key_for_agent,
+    session_ownership,
+)
 from pinky_daemon.session_store import SessionEventStore, SessionStore
 from pinky_daemon.session_watchdog import (
     MCP_ATTACH_FAILURE_PROTOCOL,
@@ -2583,7 +2590,7 @@ def create_api(
     from pinky_daemon.telegram_markdown import md_to_tg_mdv2 as _md_to_tg_mdv2
 
     def _session_id_for_agent(agent_name: str) -> str:
-        return f"{agent_name}-main"
+        return session_id_for_agent(agent_name)
 
     def _record_outbound_message(
         agent_name: str,
@@ -3701,15 +3708,25 @@ def create_api(
                     )
         return _record_cost
 
+    def _agent_session_ownership(agent_name: str, sessions=None, entries=None):
+        return session_ownership(
+            agents, agent_name,
+            live_sessions=manager.list() if sessions is None else sessions,
+            recorded_sessions=entries,
+            broker_sessions=broker._streaming,
+        )
+
     def _collect_agent_session_ids(agent_name: str) -> set[str]:
         """Return all known session IDs and aliases attributable to an agent."""
         session_ids: set[str] = set()
 
-        for session in manager.list():
+        sessions = manager.list()
+        for session in sessions:
             if getattr(session, "agent_name", "") == agent_name or session.id.startswith(f"{agent_name}-"):
                 session_ids.add(session.id)
 
-        for entry in agents.list_streaming_session_ids(agent_name):
+        entries = agents.list_streaming_session_ids(agent_name)
+        for entry in entries:
             session_id = entry.get("session_id", "") or ""
             label = entry.get("label", "") or ""
             if session_id:
@@ -3722,7 +3739,7 @@ def create_api(
         except Exception:
             pass
 
-        return session_ids
+        return SessionIdScope(session_ids, _agent_session_ownership(agent_name, sessions, entries))
 
     def _resolve_agent_history(
         agent_name: str,
@@ -4405,11 +4422,11 @@ def create_api(
     # advances the cycle-gate boundary). Not part of the public API.
     app.state._log_agent_wake_event = _log_agent_wake_event
 
-    _stream_event_subscribers: dict[str, set[asyncio.Queue]] = {}
+    _stream_event_subscribers: dict[tuple[str, str], set[asyncio.Queue]] = {}
 
-    async def _publish_stream_event(session_stream_id: str, event: dict) -> None:
+    async def _publish_stream_event(session_key: tuple[str, str], event: dict) -> None:
         """Broadcast an incremental stream event to active SSE subscribers."""
-        subscribers = list(_stream_event_subscribers.get(session_stream_id, set()))
+        subscribers = list(_stream_event_subscribers.get(session_key, set()))
         if not subscribers:
             return
         for queue in subscribers:
@@ -4441,10 +4458,11 @@ def create_api(
 
     async def _make_streaming_event_callback(agent_name: str, label: str):
         """Create a callback for incremental codex event streaming to the web UI."""
-        session_stream_id = f"{agent_name}-{label}"
+        session_stream_id = session_id_for_agent(agent_name, label)
+        session_key = session_key_for_agent(agent_name, label)
 
         async def _on_stream_event(event: dict):
-            await _publish_stream_event(session_stream_id, {
+            await _publish_stream_event(session_key, {
                 "session_id": session_stream_id,
                 **(event or {}),
             })
@@ -8058,7 +8076,10 @@ npm run build</pre>
         if not agent_name:
             # Derive from session_id if possible
             session = manager.get(session_id)
-            agent_name = session.agent_name if session else session_id.split("-")[0]
+            agent_name = session.agent_name if session else resolve_session_owner(
+                session_id, (agent.name for agent in agents.list(include_retired=True)),
+                allow_exact=True,
+            )
         metadata = req.get("metadata", {})
         analytics.log_activity(
             session_id=session_id,
@@ -8106,9 +8127,10 @@ npm run build</pre>
 
         # Refresh all sessions for this agent
         all_sessions = manager.list()
+        ownership = _agent_session_ownership(name, all_sessions)
         refreshed = []
         for s in all_sessions:
-            if s.agent_name == name or s.id.startswith(f"{name}-"):
+            if (s.agent_name == name or s.id.startswith(f"{name}-")) and ownership.keeps(s.id):
                 session = manager.refresh(s.id)
                 if session:
                     refreshed.append(s.id)
@@ -13490,9 +13512,10 @@ npm run build</pre>
     @app.get("/agents/{agent_name}/streaming/events")
     async def stream_agent_events(agent_name: str, label: str = "main"):
         """SSE stream for incremental agent events (Codex CLI partials/tool calls)."""
-        session_stream_id = f"{agent_name}-{label}"
+        session_stream_id = session_id_for_agent(agent_name, label)
+        session_key = session_key_for_agent(agent_name, label)
         queue: asyncio.Queue = asyncio.Queue(maxsize=200)
-        _stream_event_subscribers.setdefault(session_stream_id, set()).add(queue)
+        _stream_event_subscribers.setdefault(session_key, set()).add(queue)
 
         async def event_generator():
             try:
@@ -13503,11 +13526,11 @@ npm run build</pre>
                     except asyncio.TimeoutError:
                         yield f"data: {json.dumps({'type': 'ping', 'session_id': session_stream_id, 'timestamp': time.time()})}\n\n"
             finally:
-                subs = _stream_event_subscribers.get(session_stream_id)
+                subs = _stream_event_subscribers.get(session_key)
                 if subs:
                     subs.discard(queue)
                     if not subs:
-                        _stream_event_subscribers.pop(session_stream_id, None)
+                        _stream_event_subscribers.pop(session_key, None)
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -14015,7 +14038,10 @@ npm run build</pre>
         if not agents.get(name):
             raise HTTPException(404, f"Agent '{name}' not found")
         all_sessions = manager.list()
-        agent_sessions = [s for s in all_sessions if s.agent_name == name or s.id.startswith(f"{name}-")]
+        ownership = _agent_session_ownership(name, all_sessions)
+        agent_sessions = [s for s in all_sessions
+                          if (s.agent_name == name or s.id.startswith(f"{name}-"))
+                          and ownership.keeps(s.id)]
         return {
             "agent": name,
             "sessions": [SessionResponse(**s.to_dict()).model_dump() for s in agent_sessions],
@@ -14937,6 +14963,7 @@ npm run build</pre>
     autonomy = AutonomyEngine(
         agents, tasks, store,
         session_sender=_wake_callback,
+        session_ownership_provider=_agent_session_ownership,
     )
 
     # ── Session Watchdog ───────────────────────────────────────
