@@ -125,6 +125,24 @@ def granted_read_allow(grants) -> frozenset[tuple[str, str]]:
     return frozenset(route for route in granted_mutation_allow(grants) if route[0] == "GET")
 
 
+def can_read_skill(store, caller: str, skill) -> bool:
+    """Use the store's assignment rule and explicit refresh delegation."""
+    return skill is not None and (
+        skill.refresh_delegate == caller or store.is_assigned(caller, skill.name)
+    )
+
+
+def read_route_names_caller(template: str | None, params: dict, caller: str) -> bool:
+    """Require a resolved agent parameter bound to the signed caller."""
+    if not template or not template.startswith("/agents/"):
+        return False
+    segment = template.split("/", 3)[2]
+    if not (segment.startswith("{") and segment.endswith("}")):
+        return False
+    parameter = segment[1:-1].split(":", 1)[0]
+    return bool(caller) and params.get(parameter) == caller
+
+
 def isolated_read_caller(request) -> str:
     """Scope only enforced reads, using the verified identity and cached flag."""
     caller = getattr(request.state, "internal_caller", "")

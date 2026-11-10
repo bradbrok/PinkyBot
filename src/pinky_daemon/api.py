@@ -202,6 +202,7 @@ from pinky_daemon.isolated_policy import (
     ISOLATED_MUTATION_ALLOW,
     ISOLATED_READ_ALLOW,
     ISOLATED_READ_SCOPED,
+    can_read_skill,
     granted_mutation_allow,
     granted_read_allow,
     granted_tool_routes,
@@ -209,6 +210,7 @@ from pinky_daemon.isolated_policy import (
     isolated_read_refusal,
     isolation_flag,
     isolation_grants,
+    read_route_names_caller,
     resolve_mutation_route,
 )
 from pinky_daemon.isolated_policy import (
@@ -6576,12 +6578,6 @@ def create_api(
             mode = _isolation_read_policy_mode(_log)
             if mode == "off":
                 return False
-            if _isolation_path_target(get_route_path(request.scope)) == caller_name:
-                return False
-            flag = isolation_flag(agents, caller_name)
-            request.state.isolated_read_flag = flag
-            if flag is False:
-                return False
             scope = dict(request.scope)
             if request.method == "HEAD":
                 scope["method"] = "GET"
@@ -6591,7 +6587,11 @@ def create_api(
                 scope["root_path"] = ""
                 template, params = resolve_mutation_route(app, scope)
             template = template or "<unknown>"
-            if _isolation_path_target(get_route_path(scope)) == caller_name:
+            if read_route_names_caller(template, params, caller_name):
+                return False
+            flag = isolation_flag(agents, caller_name)
+            request.state.isolated_read_flag = flag
+            if flag is False:
                 return False
             if ("GET", template) in ISOLATED_READ_SCOPED:
                 return False
@@ -6604,10 +6604,7 @@ def create_api(
             if allowed:
                 if mode == "shadow" and template == "/skills/{name}":
                     skill = skills.get(params.get("name", ""))
-                    if not skill or (
-                        skill.refresh_delegate != caller_name
-                        and caller_name not in skills.assigned_agents(skill.name)
-                    ):
+                    if not can_read_skill(skills, caller_name, skill):
                         reason = "unassigned-skill"
                     else:
                         return False
@@ -8307,10 +8304,23 @@ npm run build</pre>
     @app.get("/agents/{name}/skills/available")
     async def get_available_agent_skills(
         name: str,
+        request: Request,
         self_assignable: bool = False,
         category: str = "",
     ):
         """List skills from the catalog not yet assigned to this agent."""
+        if caller := isolated_read_caller(request):
+            try:
+                if agents.get(caller) is None:
+                    raise ValueError("caller unavailable")
+                result = skills.get_available_skills(
+                    caller, self_assignable_only=True, category=category,
+                )
+                fields = ("name", "description", "category", "self_assignable")
+                rows = [{key: getattr(skill, key) for key in fields} for skill in result]
+                return {"agent": caller, "skills": rows, "count": len(rows)}
+            except Exception:
+                return {"agent": caller, "skills": [], "count": 0}
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")

@@ -27,7 +27,7 @@ from pinky_daemon.api_models import (
     UpdateSkillRequest,
 )
 from pinky_daemon.auth import derive_skill_assignment_actor
-from pinky_daemon.isolated_policy import isolated_read_caller
+from pinky_daemon.isolated_policy import can_read_skill, isolated_read_caller
 from pinky_daemon.skill_loader import (
     _CONSECUTIVE_HYPHENS,
     _NAME_RE,
@@ -286,9 +286,7 @@ async def get_skill(name: str, request: Request):
     if caller := isolated_read_caller(request):
         try:
             skill = _skills.get(name)
-            allowed = skill is not None and (
-                skill.refresh_delegate == caller or caller in _skills.assigned_agents(name)
-            )
+            allowed = can_read_skill(_skills, caller, skill)
         except Exception:
             allowed = False
         if not allowed:
