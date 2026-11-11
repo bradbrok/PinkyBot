@@ -1491,6 +1491,22 @@ class BrokerSlackPoller:
         self._channel_title_cache: dict[str, str] = {}
         self._users_read_ok = True
 
+    @staticmethod
+    def register_group_dm_resolver(broker, agent_name: str, get_adapter) -> None:
+        """Bind the agent's Slack adapter independently of the inbound transport."""
+        def read(channel: str, deadline: float):
+            if time.monotonic() >= deadline:
+                return "timeout"
+            adapter = get_adapter()
+            if adapter is None:
+                return "no_resolver"
+            return adapter.resolve_group_dm_members(channel, deadline)
+
+        async def resolve(channel: str, deadline: float):
+            return await asyncio.to_thread(read, channel, deadline)
+
+        broker.set_slack_group_resolver(agent_name, resolve)
+
     @property
     def agent_name(self) -> str:
         return self._agent_name
@@ -1939,6 +1955,8 @@ class BrokerSlackPoller:
                 "mention_only_exempt": "button_tap",
             },
         )
+        if clicker in (self._bot_user_id, self._bot_id):
+            message.metadata["_slack_own_sender"] = True
         already_chosen = fields["chosen"]
         if not already_chosen:
             if not self._broker.button_tap_allowed(message):

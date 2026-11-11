@@ -811,6 +811,20 @@ class ApprovedUser:
         }
 
 
+@dataclass(frozen=True)
+class SlackGroupApproval:
+    status: str | None
+    own_user_id: str | None
+    sender_approved: bool
+
+    @property
+    def automatic(self) -> bool:
+        return self.own_user_id is not None
+
+    def lacks_person(self, sender_id: str, chat_id: str) -> bool:
+        return not self.own_user_id or not sender_id or sender_id in (chat_id, self.own_user_id)
+
+
 @dataclass
 class AgentSchedule:
     """A cron-based wake schedule for an agent."""
@@ -2320,6 +2334,10 @@ class AgentRegistry:
         if "timezone" not in au_existing:
             self._db.execute("ALTER TABLE approved_users ADD COLUMN timezone TEXT NOT NULL DEFAULT ''")
             _log("agent_registry: migrated — added timezone to approved_users")
+        if "slack_auto_member_ids" not in au_existing:
+            self._db.execute("ALTER TABLE approved_users ADD COLUMN slack_auto_member_ids TEXT")
+        if "slack_auto_checked_at" not in au_existing:
+            self._db.execute("ALTER TABLE approved_users ADD COLUMN slack_auto_checked_at REAL")
 
         # Migrate agent_contexts table
         ctx_existing = {
@@ -7281,7 +7299,8 @@ except Exception as exc:
                             display_name=COALESCE(
                                 NULLIF(excluded.display_name, ''),
                                 approved_users.display_name),
-                            approved_by=excluded.approved_by, updated_at=excluded.updated_at""",
+                            approved_by=excluded.approved_by, updated_at=excluded.updated_at,
+                            slack_auto_member_ids=NULL, slack_auto_checked_at=NULL""",
             (agent_name, chat_id, display_name, approved_by, now, now),
         )
         # Approval state and its durable notification aggregate must transition
@@ -7304,34 +7323,162 @@ except Exception as exc:
             status=row[4], approved_by=row[5], timezone=row[6] or "", created_at=row[7], updated_at=row[8],
         )
 
+    @contextmanager
+    def _approval_write(self):
+        """Use an owned connection so unrelated registry writes cannot commit a hold."""
+        db = open_store_connection(
+            self._catalog, "agents", self._db_path, owner=FLEET_SIGNING_KEY_OWNER,
+            check_same_thread=False,
+        )
+        try:
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("BEGIN IMMEDIATE")
+            yield db
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    @staticmethod
+    def _demote_slack_groups_for_member(db, agent_name: str, member_id: str, now: float) -> None:
+        db.execute(
+            """UPDATE approved_users SET status='pending', updated_at=?
+               WHERE agent_name=? AND status='approved' AND slack_auto_member_ids IS NOT NULL
+                 AND EXISTS (
+                     SELECT 1 FROM json_each(
+                         CASE WHEN json_valid(slack_auto_member_ids) THEN slack_auto_member_ids
+                              ELSE '[]' END
+                     ) AS member WHERE member.type='text' AND member.value=?
+                 )""",
+            (now, agent_name, member_id),
+        )
+
     def deny_user(self, agent_name: str, chat_id: str) -> bool:
         """Set a user's status to denied."""
         now = time.time()
-        cursor = self._db.execute(
-            """INSERT INTO approved_users
-               (agent_name, chat_id, status, created_at, updated_at)
-               VALUES (?, ?, 'denied', ?, ?)
-               ON CONFLICT (agent_name, chat_id)
-               DO UPDATE SET status='denied', updated_at=excluded.updated_at""",
-            (agent_name, chat_id, now, now),
-        )
-        self._db.execute(
-            """UPDATE approval_requests
-               SET gate_state='denied', next_retry_at=0, updated_at=?
-               WHERE agent_name=? AND chat_id=?""",
-            (now, agent_name, chat_id),
-        )
-        self._db.commit()
-        return cursor.rowcount > 0
+        with self._approval_write() as db:
+            cursor = db.execute(
+                """INSERT INTO approved_users
+                   (agent_name, chat_id, status, created_at, updated_at)
+                   VALUES (?, ?, 'denied', ?, ?)
+                   ON CONFLICT (agent_name, chat_id)
+                   DO UPDATE SET status='denied', updated_at=excluded.updated_at""",
+                (agent_name, chat_id, now, now),
+            )
+            db.execute(
+                """UPDATE approval_requests
+                   SET gate_state='denied', next_retry_at=0, updated_at=?
+                   WHERE agent_name=? AND chat_id=?""",
+                (now, agent_name, chat_id),
+            )
+            self._demote_slack_groups_for_member(db, agent_name, chat_id, now)
+            return cursor.rowcount > 0
 
     def revoke_user(self, agent_name: str, chat_id: str) -> bool:
         """Remove an approved user record entirely."""
-        cursor = self._db.execute(
-            "DELETE FROM approved_users WHERE agent_name=? AND chat_id=?",
-            (agent_name, chat_id),
-        )
-        self._db.commit()
-        return cursor.rowcount > 0
+        with self._approval_write() as db:
+            cursor = db.execute(
+                "DELETE FROM approved_users WHERE agent_name=? AND chat_id=?",
+                (agent_name, chat_id),
+            )
+            if cursor.rowcount:
+                self._demote_slack_groups_for_member(db, agent_name, chat_id, time.time())
+            return cursor.rowcount > 0
+
+    @staticmethod
+    def _slack_group_approval(
+        db, agent_name: str, chat_id: str, sender_id: str,
+    ) -> SlackGroupApproval:
+        row = db.execute(
+            """SELECT gate.status, gate.slack_auto_member_ids, sender.status
+               FROM approved_users AS gate
+               LEFT JOIN approved_users AS sender
+                 ON sender.agent_name=gate.agent_name AND sender.chat_id=?
+               WHERE gate.agent_name=? AND gate.chat_id=?""",
+            (sender_id, agent_name, chat_id),
+        ).fetchone()
+        if row is None:
+            return SlackGroupApproval(None, None, False)
+        status, stored_members, sender_status = row
+        own_user_id = None
+        if stored_members is not None:
+            # Automatic snapshots put the own user ID first. A damaged snapshot
+            # still denotes automatic provenance and cannot authorize a sender.
+            own_user_id = ""
+            try:
+                members = json.loads(stored_members)
+            except (ValueError, TypeError, RecursionError):
+                members = None
+            if isinstance(members, list) and members and isinstance(members[0], str):
+                own_user_id = members[0]
+        return SlackGroupApproval(status, own_user_id, sender_status == "approved")
+
+    def get_slack_group_approval(
+        self, agent_name: str, chat_id: str, sender_id: str = "",
+    ) -> SlackGroupApproval:
+        """Read the group gate and its sender's same-agent status together."""
+        return self._slack_group_approval(self._db, agent_name, chat_id, sender_id)
+
+    def claim_slack_group_check(
+        self, agent_name: str, chat_id: str, interval_seconds: float,
+    ) -> tuple[int, float] | None:
+        """Reserve one lookup on this pending row."""
+        with self._approval_write() as db:
+            now = time.time()
+            row = db.execute(
+                """UPDATE approved_users SET slack_auto_checked_at=?
+                   WHERE agent_name=? AND chat_id=? AND status='pending'
+                     AND (slack_auto_checked_at IS NULL OR slack_auto_checked_at<=?)
+                   RETURNING id""",
+                (now, agent_name, chat_id, now - interval_seconds),
+            ).fetchone()
+            return (row[0], now) if row else None
+
+    def finish_slack_group_check(
+        self, agent_name: str, chat_id: str, claim: tuple[int, float],
+        member_ids: tuple[str, ...] | None,
+    ) -> tuple[str, str]:
+        """Complete a lookup and approve only a still-pending, fully approved group."""
+        with self._approval_write() as db:
+            now = time.time()
+            # Count the cooldown from completion so a slow lookup cannot put
+            # two membership reads inside the same rolling interval.
+            gate = db.execute(
+                """UPDATE approved_users SET slack_auto_checked_at=?
+                   WHERE agent_name=? AND chat_id=? AND status='pending'
+                     AND id=? AND slack_auto_checked_at=?""",
+                (now, agent_name, chat_id, *claim),
+            )
+            if not gate.rowcount:
+                return "gate_changed", ""
+            if member_ids is None:
+                return "pending", ""
+
+            participants = member_ids[1:]
+            placeholders = ",".join("?" for _ in participants)
+            names = dict(db.execute(
+                f"""SELECT chat_id, display_name FROM approved_users
+                    WHERE agent_name=? AND status='approved' AND chat_id IN ({placeholders})""",
+                (agent_name, *participants),
+            ))
+            if len(names) != len(participants):
+                return "unapproved_member", ""
+
+            display_name = ", ".join(names[member] or member for member in participants)
+            db.execute(
+                """UPDATE approved_users
+                   SET status='approved', approved_by='slack-group-auto', display_name=?,
+                       slack_auto_member_ids=?, updated_at=? WHERE id=?""",
+                (display_name or chat_id, json.dumps(member_ids), now, claim[0]),
+            )
+            db.execute(
+                """UPDATE approval_requests SET gate_state='approved', next_retry_at=0, updated_at=?
+                   WHERE agent_name=? AND chat_id=?""",
+                (now, agent_name, chat_id),
+            )
+            return "approved", display_name or chat_id
 
     def list_approved_users(self, agent_name: str) -> list[ApprovedUser]:
         """List all approved users for an agent."""
@@ -7513,7 +7660,7 @@ except Exception as exc:
         return cursor.lastrowid
 
     def get_pending_messages(
-        self, agent_name: str, chat_id: str = "",
+        self, agent_name: str, chat_id: str = "", *, include_slack_provenance: bool = False,
     ) -> list[dict]:
         """Get undelivered pending messages. If chat_id given, filter by it."""
         if chat_id:
@@ -7548,6 +7695,8 @@ except Exception as exc:
                 except (ValueError, TypeError, RecursionError):
                     envelope = None
                 if isinstance(envelope, dict):
+                    if not include_slack_provenance:
+                        envelope.pop("own_sender", None)
                     message["slack_envelope"] = envelope
                 else:
                     _log(
@@ -7850,10 +7999,19 @@ except Exception as exc:
         self, agent_name: str, chat_id: str, *, target_name: str = "",
         is_channel: bool = False, held_at: float | None = None,
         db: sqlite3.Connection | None = None,
+        reopen: bool = False,
     ) -> None:
         """Upsert the legacy aggregate without committing (transaction helper)."""
         connection = db or self._db
         now = held_at if held_at is not None else time.time()
+        if reopen:
+            connection.execute(
+                """UPDATE approval_requests
+                   SET notification_state='retrying', notification_attempts=0, next_retry_at=0,
+                       last_error='', aging_reprompt_count=0, high_signal_alerted_at=0
+                   WHERE agent_name=? AND chat_id=? AND gate_state<>'pending'""",
+                (agent_name, chat_id),
+            )
         connection.execute(
             """INSERT INTO approval_requests
                (agent_name, chat_id, target_name, is_channel, gate_state,
@@ -7884,36 +8042,58 @@ except Exception as exc:
         a durable held row always has the request discovered by the restart
         retry loop; before commit, neither side survives.
         """
-        transaction_db = open_store_connection(
-            self._catalog,
-            "agents",
-            self._db_path,
-            owner=FLEET_SIGNING_KEY_OWNER,
-            check_same_thread=False,
-        )
-        transaction_db.execute("PRAGMA foreign_keys=ON")
-        try:
-            transaction_db.execute("BEGIN IMMEDIATE")
+        with self._approval_write() as db:
             message_id = self._queue_pending_message_uncommitted(
                 agent_name=agent_name, platform=platform, chat_id=chat_id,
                 sender_name=sender_name, content=content,
                 reply_chat_id=reply_chat_id, is_group=is_group,
-                sender_id=sender_id, slack_envelope=slack_envelope, db=transaction_db,
+                sender_id=sender_id, slack_envelope=slack_envelope, db=db,
             )
+            reopen = platform == "slack" and is_group and self._slack_group_approval(
+                db, agent_name, chat_id, sender_id,
+            ).automatic
             self._record_approval_hold_uncommitted(
                 agent_name, chat_id, target_name=target_name,
-                is_channel=is_group, held_at=held_at, db=transaction_db,
+                is_channel=is_group, held_at=held_at, db=db, reopen=reopen,
             )
-            transaction_db.commit()
-        except BaseException:
-            transaction_db.rollback()
-            raise
-        finally:
-            transaction_db.close()
         request = self.get_approval_request(agent_name, chat_id)
         if request is None:  # defensive invariant check after successful commit
             raise RuntimeError("approval request missing after atomic hold commit")
         return message_id, request
+
+    def hold_automatic_slack_group_message(
+        self, *, agent_name: str, chat_id: str, sender_id: str, sender_name: str,
+        content: str, held_at: float, slack_envelope: dict | None,
+    ) -> tuple[bool, str | None, dict | None]:
+        """Keep senderless rows or atomically demote and hold for an unapproved sender."""
+        with self._approval_write() as db:
+            gate = self._slack_group_approval(db, agent_name, chat_id, sender_id)
+            if not gate.automatic or gate.status not in ("pending", "approved"):
+                return False, gate.status, None
+            keep_only = gate.lacks_person(sender_id, chat_id) or bool(
+                slack_envelope and slack_envelope.get("own_sender") is True
+            )
+            if not keep_only and (gate.status != "approved" or gate.sender_approved):
+                return False, gate.status, None
+            if not keep_only:
+                db.execute(
+                    """UPDATE approved_users SET status='pending', updated_at=?
+                       WHERE agent_name=? AND chat_id=?""",
+                    (time.time(), agent_name, chat_id),
+                )
+            self._queue_pending_message_uncommitted(
+                agent_name=agent_name, platform="slack", chat_id=chat_id,
+                sender_name=sender_name, content=content, is_group=True,
+                sender_id=sender_id, slack_envelope=slack_envelope, db=db,
+            )
+            if not keep_only:
+                self._record_approval_hold_uncommitted(
+                    agent_name, chat_id, target_name=chat_id, is_channel=True,
+                    held_at=held_at, db=db, reopen=True,
+                )
+        if keep_only:
+            return True, gate.status, None
+        return True, "pending", self.get_approval_request(agent_name, chat_id)
 
     def begin_approval_notification(
         self,
