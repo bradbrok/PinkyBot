@@ -3739,6 +3739,24 @@ def create_api(
             broker_sessions=broker._streaming,
         )
 
+    def _rename_claim_refused(name: str, session_ids: tuple[str, ...]) -> bool:
+        """Return whether either id has a claim the caller cannot move."""
+        ownership = _agent_session_ownership(name)
+        return bool(
+            any(
+                not ownership.keeps(sid)
+                or (ownership.live_owners.get(sid, "") not in ("", name))
+                or (ownership.explicit_owners.get(sid, frozenset()) - {name})
+                for sid in session_ids
+            )
+            or (
+                ownership.family_names - {name}
+                and agents.has_streaming_session_id_claim(
+                    ownership.family_names - {name}, session_ids,
+                )
+            )
+        )
+
     def _collect_agent_session_ids(agent_name: str) -> set[str]:
         """Return all known session IDs and aliases attributable to an agent."""
         session_ids: set[str] = set()
@@ -12150,18 +12168,8 @@ npm run build</pre>
             raise HTTPException(409, f"Session '{new_label}' already exists for {name}")
         old_conv_id = session_id_for_agent(name, label)
         new_conv_id = session_id_for_agent(name, new_label)
-        ownership = _agent_session_ownership(name)
         session_ids = (old_conv_id, new_conv_id)
-        if any(
-            (ownership.live_owners.get(sid, "") not in ("", name))
-            or (ownership.explicit_owners.get(sid, frozenset()) - {name})
-            for sid in session_ids
-        ) or (
-            ownership.family_names - {name}
-            and agents.has_streaming_session_id_claim(
-                ownership.family_names - {name}, session_ids,
-            )
-        ):
+        if _rename_claim_refused(name, session_ids):
             raise HTTPException(
                 409,
                 f"Session label '{label}' cannot be renamed because another session claim exists.",
@@ -12169,6 +12177,11 @@ npm run build</pre>
         if _startup_fencing_enabled():
             async with _label_scope(name, new_label):
                 await _settle_startup_debt(name, new_label)
+            if _rename_claim_refused(name, session_ids):
+                raise HTTPException(
+                    409,
+                    f"Session label '{label}' cannot be renamed because another session claim exists.",
+                )
         # Move in broker registry
         sessions[new_label] = sessions.pop(label)
         # Retarget the live session: its id derives from _config.label and the
