@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from pinky_daemon.agent_registry import AgentRegistry
-from pinky_daemon.session_identity import session_ownership
+from pinky_daemon.session_identity import resolve_session_owner, session_ownership
 from tests.isolated_policy_support import daemon as daemon
 from tests.test_label_rename_claims import _claim_decision
 from tests.test_label_rename_refresh import _capture
@@ -90,16 +90,22 @@ def test_actual_guard_refuses_each_id_rejected_by_the_read_rule(daemon):
                     "session_ids": session_ids,
                     "name": caller,
                     "agents": registry,
+                    "resolve_session_owner": resolve_session_owner,
                 },
             )
         )
         explicit_foreign = bool(ownership.explicit_owners.get(target, frozenset()) - {caller})
         foreign_record = any(owner != caller for owner, sid in records)
+        # With no evidence arguments, this is the read rule's text tier.
         expected = (
             not all(ownership.keeps(sid) for sid in session_ids)
             or bool(live_owner and live_owner != caller)
             or explicit_foreign
             or foreign_record
+            or any(
+                resolve_session_owner(sid, ownership.registered_names) not in ("", caller)
+                for sid in session_ids
+            )
         )
         assert denied == expected, (caller, bits, live_owner)
         if not ownership.keeps(target) and not denied:

@@ -218,14 +218,19 @@ async def test_each_explicit_claim_kind_refuses_on_either_id(daemon, position, k
     _assert_claim_refusal(response, "peer-old")
 
 
-@pytest.mark.parametrize("scenario", ["no-family", "family-unclaimed", "own-evidence"])
+@pytest.mark.parametrize(
+    "scenario",
+    ["no-family", "family-unclaimed", "own-evidence", "own-evidence-caller-text"],
+)
 async def test_unclaimed_rename_preserves_the_existing_success_contract(daemon, scenario):
     instance = daemon("off")
     if scenario != "no-family":
         _register(instance, "tenant-peer")
-    old_label, new_label = ("peer-old", "peer-new") if scenario == "own-evidence" else ("old", "new")
+    old_label, new_label = (
+        ("peer-old", "peer-new") if scenario == "own-evidence" else ("old", "new")
+    )
     session = await _own_session(instance, old_label)
-    if scenario == "own-evidence":
+    if scenario in {"own-evidence", "own-evidence-caller-text"}:
         instance.agents.set_streaming_session_id("tenant", "", label=new_label)
     assert await session.send("renameclaimneedle own row") is True
     session._client.query.assert_awaited_once()
@@ -233,10 +238,18 @@ async def test_unclaimed_rename_preserves_the_existing_success_contract(daemon, 
     before = _rows(store, session.id)
     old_id = session.id
     new_id = session_id_for_agent("tenant", new_label)
+    before_state = _state(instance, session, old_id, new_id)
     response = _patch(instance, old_label, new_label)
+    if scenario == "own-evidence":
+        _assert_claim_refusal(response, old_label)
+        _assert_unchanged(instance, session, old_id, new_id, before_state)
+        return
     assert response.status_code == 200, response.text
     assert response.json() == {
-        "renamed": True, "agent": "tenant", "old_label": old_label, "new_label": new_label,
+        "renamed": True,
+        "agent": "tenant",
+        "old_label": old_label,
+        "new_label": new_label,
     }
     assert store.count(old_id) == 0
     assert _rows(store, new_id) == [dict(row, session_id=new_id) for row in before]

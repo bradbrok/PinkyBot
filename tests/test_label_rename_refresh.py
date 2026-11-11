@@ -194,9 +194,182 @@ async def _late_claim_after_settle(daemon, monkeypatch, position, kind, *, call_
     _assert_unchanged(instance, session, old_id, new_id, before)
 
 
+async def _add_shorter_claim(instance, monkeypatch, client, position, kind, target):
+    other_label = "peer-old" if position == "old" else "peer-new"
+    if kind == "actual-post":
+
+        async def fixture_start(name, *, label="main", resume_id=""):
+            assert name == "tenant"
+            return streaming_session(instance, name, label)
+
+        replace_cell(
+            monkeypatch,
+            inspect.unwrap(closure(instance.app, "create_streaming_session")),
+            "_start_streaming_session",
+            fixture_start,
+        )
+        path = "/agents/tenant/streaming-sessions"
+        created = await client.post(
+            path + "?label=" + other_label,
+            headers=signed(instance, "POST", path, "normal"),
+        )
+        assert created.status_code == 200, created.text
+        other = instance.app.state.broker.get_streaming_session("tenant", other_label)
+        assert await other.send("renameclaimneedle late foreign row")
+    elif kind == "broker":
+        other = streaming_session(instance, "tenant", other_label)
+        assert await other.send("renameclaimneedle late foreign row")
+    else:
+        instance.agents.set_streaming_session_id(
+            "tenant",
+            "" if kind == "label" else target,
+            label=other_label if kind == "label" else "recorded",
+        )
+        instance.app.state.conversation_store.append(
+            target,
+            "assistant",
+            "renameclaimneedle late foreign row",
+            timestamp=17,
+        )
+
+
+
+async def _late_claim_from_shorter_name_after_settle(
+    daemon, monkeypatch, position, kind, *, call_one=False
+):
+    instance = daemon("off")
+    _register(instance, "tenant-peer")
+    monkeypatch.setenv("PINKY_ISOLATED_READ_POLICY_MODE", "enforce")
+    session = streaming_session(instance, "tenant-peer", "old")
+    instance.agents.set_streaming_session_id("tenant-peer", session.resume_handle, label="old")
+    cells = _rename_cells(instance)
+    cells["_resume_owners"][("tenant-peer", "old")] = session
+    cells["_resume_epochs"][("tenant-peer", "old")] = object()
+    session._on_resume_handle = await cells["_make_streaming_resume_handle_callback"](
+        "tenant-peer",
+        "old",
+        owner=session,
+    )
+    session._on_resume_handle_sync = cells["_make_streaming_resume_handle_sync_callback"](
+        "tenant-peer",
+        "old",
+        owner=session,
+    )
+    assert await session.send("renameclaimneedle original own row")
+    new_label = "after-rename" if position == "old" else "new"
+    old_id, new_id = session.id, "tenant-peer-" + new_label
+    target = old_id if position == "old" else new_id
+    if position == "new" and not call_one:
+        instance.agents.set_streaming_session_id("tenant-peer", "", label=new_label)
+    initial = closure(instance.app, "_agent_session_ownership")("tenant-peer")
+    if call_one:
+        assert not initial.keeps(new_id)
+    else:
+        assert initial.keeps(old_id) and initial.keeps(new_id)
+    monkeypatch.setenv("PINKY_RESUME_FAILSAFE", "1")
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Debt:
+        _replacement_cleanup_strict = False
+        _recovery_retired = False
+        disconnected = 0
+
+        async def _quiesce_recovery_owner(self):
+            assert self._replacement_cleanup_strict is True
+            assert self._recovery_retired is True
+            entered.set()
+            await release.wait()
+
+        async def disconnect(self):
+            self.disconnected += 1
+
+    settle = closure(instance.app, "_settle_startup_debt")
+    debt_map = inspect.getclosurevars(settle).nonlocals["_candidate_cleanup_debts"]
+    debt = Debt()
+    debt_map[("tenant-peer", new_label)] = debt
+    before = _state(instance, session, old_id, new_id)
+    path = "/agents/tenant-peer/streaming-sessions/old"
+    transport = httpx.ASGITransport(app=instance.app)
+    would_refuse = None
+    async with httpx.AsyncClient(transport=transport, base_url="http://fixture") as client:
+        pending = asyncio.create_task(
+            client.patch(
+                path,
+                json={"label": new_label},
+                headers=signed(instance, "PATCH", path, "tenant-peer"),
+            )
+        )
+        observed = asyncio.create_task(entered.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {pending, observed},
+                timeout=3,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            assert done, "rename neither entered settlement nor returned"
+            if not call_one:
+                assert entered.is_set(), "first check refused before settlement"
+            if entered.is_set():
+                assert not pending.done()
+                await _add_shorter_claim(instance, monkeypatch, client, position, kind, target)
+                snapshot = closure(instance.app, "_agent_session_ownership")("tenant-peer")
+                would_refuse = any(
+                    snapshot.live_owners.get(sid, "") not in ("", "tenant-peer")
+                    or snapshot.explicit_owners.get(sid, frozenset()) - {"tenant-peer"}
+                    for sid in (old_id, new_id)
+                ) or _recorded_claim(
+                    instance,
+                    snapshot.family_names - {"tenant-peer"},
+                    (old_id, new_id),
+                )
+                assert would_refuse
+                before = _state(instance, session, old_id, new_id)
+        finally:
+            release.set()
+            observed.cancel()
+            await asyncio.gather(observed, return_exceptions=True)
+        response = await asyncio.wait_for(pending, 3)
+        read_path = "/agents/tenant-peer/chat-history"
+        history = await client.get(
+            read_path, headers=signed(instance, "GET", read_path, "tenant-peer")
+        )
+    after = _state(instance, session, old_id, new_id)
+    _capture(
+        ("early-" if call_one else "late-") + kind + "-" + position,
+        {
+            "status": response.status_code,
+            "body": response.text,
+            "entered": entered.is_set(),
+            "would_refuse_before_release": bool(would_refuse),
+            "before_old": before["old_rows"],
+            "before_new": before["new_rows"],
+            "after_old": after["old_rows"],
+            "after_new": after["new_rows"],
+            "final_label": session._config.label,
+            "tenant_history": history.json(),
+            "startup_debt_removed": ("tenant-peer", new_label) not in debt_map,
+        },
+    )
+    if call_one:
+        assert not entered.is_set(), "settlement ran before the first refusal"
+        assert debt_map[("tenant-peer", new_label)] is debt
+        assert debt._replacement_cleanup_strict is False
+        assert debt._recovery_retired is False
+        assert debt.disconnected == 0
+    else:
+        assert entered.is_set()
+        assert debt._replacement_cleanup_strict is False
+        assert debt._recovery_retired is True
+        assert debt.disconnected == 1
+        assert ("tenant-peer", new_label) not in debt_map
+    assert response.status_code == 409, response.text
+    _assert_claim_refusal(response, "old")
+    _assert_unchanged(instance, session, old_id, new_id, before)
+
+
 @pytest.mark.parametrize("kind", KINDS)
 async def test_late_old_id_claim_refuses_after_settle(daemon, monkeypatch, kind):
-    await _late_claim_after_settle(daemon, monkeypatch, "old", kind)
+    await _late_claim_from_shorter_name_after_settle(daemon, monkeypatch, "old", kind)
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -205,7 +378,7 @@ async def test_late_destination_claim_with_own_empty_label_refuses_after_settle(
     monkeypatch,
     kind,
 ):
-    await _late_claim_after_settle(daemon, monkeypatch, "new", kind)
+    await _late_claim_from_shorter_name_after_settle(daemon, monkeypatch, "new", kind)
 
 
 @pytest.mark.parametrize("kind", KINDS)
