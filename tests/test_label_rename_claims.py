@@ -25,6 +25,10 @@ def _rename_cells(instance):
     return inspect.getclosurevars(_rename_function(instance)).nonlocals
 
 
+def _claim_decision(instance):
+    return _rename_cells(instance).get("_rename_claim_refused", _rename_function(instance))
+
+
 async def _own_session(instance, label):
     session = streaming_session(instance, "tenant", label)
     instance.agents.set_streaming_session_id("tenant", session.resume_handle, label=label)
@@ -328,22 +332,16 @@ async def test_claim_refusal_precedes_startup_settle(daemon, monkeypatch, flag):
     _assert_claim_refusal(response, "peer-old")
 
 
-async def test_new_id_text_without_an_explicit_claim_keeps_the_existing_rename(daemon):
+async def test_new_id_text_without_an_explicit_claim_refuses_the_rename(daemon):
     instance = daemon("off")
     _register(instance, "tenant-peer")
     session = await _own_session(instance, "notes")
     assert await session.send("renameclaimneedle text control") is True
-    store = instance.app.state.conversation_store
-    before = _rows(store, session.id)
+    old_id, new_id = session.id, "tenant-peer-unused"
+    before = _state(instance, session, old_id, new_id)
     response = _patch(instance, "notes", "peer-unused")
-    assert response.status_code == 200, response.text
-    assert response.json() == {
-        "renamed": True, "agent": "tenant", "old_label": "notes", "new_label": "peer-unused",
-    }
-    assert store.count("tenant-notes") == 0
-    assert _rows(store, "tenant-peer-unused") == [
-        dict(row, session_id="tenant-peer-unused") for row in before
-    ]
+    _assert_claim_refusal(response, "notes")
+    _assert_unchanged(instance, session, old_id, new_id, before)
 
 
 @pytest.mark.parametrize(
@@ -371,9 +369,8 @@ async def test_existing_validation_precedes_claim_checks(
         calls.append((args, kwargs))
         return ownership(*args, **kwargs)
 
-    # The base has no ownership dependency in this handler yet.
-    if "_agent_session_ownership" in _rename_cells(instance):
-        replace_cell(monkeypatch, _rename_function(instance), "_agent_session_ownership", observe)
+    if "_agent_session_ownership" in inspect.getclosurevars(_claim_decision(instance)).nonlocals:
+        replace_cell(monkeypatch, _claim_decision(instance), "_agent_session_ownership", observe)
     before = _state(instance, session, session.id, "tenant-fresh")
     response = _patch(instance, label, new_label)
     assert response.status_code == status, response.text

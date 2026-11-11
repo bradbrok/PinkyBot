@@ -1,14 +1,14 @@
 """Exact recorded claims and the rename lookup budget."""
 
 import sqlite3
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
 from pinky_daemon.agent_registry import AgentRegistry
 from tests.isolated_policy_support import closure, replace_cell
 from tests.isolated_policy_support import daemon as daemon
-from tests.test_label_rename_claims import _own_session, _patch, _rename_function, _rows
+from tests.test_label_rename_claims import _claim_decision, _own_session, _patch, _rows
 from tests.test_session_owner_reads import _register
 
 pytestmark = pytest.mark.real_auth
@@ -85,24 +85,28 @@ def test_recorded_claim_collections_have_a_bounded_parameter_count(registry):
 
 
 @pytest.mark.parametrize("family", [False, True], ids=["no-family", "family"])
-async def test_rename_takes_one_snapshot_and_only_a_family_needs_a_claim_read(
-    daemon, monkeypatch, family,
+@pytest.mark.parametrize("fencing", [False, True], ids=["fencing-off", "fencing-on"])
+async def test_rename_takes_one_snapshot_per_check_and_only_a_family_needs_a_claim_read(
+    daemon, monkeypatch, family, fencing,
 ):
     instance = daemon("off")
+    monkeypatch.setenv("PINKY_RESUME_FAILSAFE", "1" if fencing else "0")
+    monkeypatch.setenv("PINKY_SESSION_CLASS_REBUILD", "0")
     if family:
         _register(instance, "tenant-peer")
     await _own_session(instance, "notes")
     snapshot = Mock(wraps=closure(instance.app, "_agent_session_ownership"))
     claim_read = Mock(wraps=instance.agents.has_streaming_session_id_claim)
-    replace_cell(monkeypatch, _rename_function(instance), "_agent_session_ownership", snapshot)
+    replace_cell(monkeypatch, _claim_decision(instance), "_agent_session_ownership", snapshot)
     monkeypatch.setattr(instance.agents, "has_streaming_session_id_claim", claim_read)
     response = _patch(instance, "notes", "renamed")
     assert response.status_code == 200, response.text
-    snapshot.assert_called_once_with("tenant")
+    checks = 2 if fencing else 1
+    assert snapshot.call_args_list == [call("tenant")] * checks
     if family:
-        claim_read.assert_called_once_with(
-            frozenset({"tenant-peer"}), ("tenant-notes", "tenant-renamed"),
-        )
+        assert claim_read.call_args_list == [
+            call(frozenset({"tenant-peer"}), ("tenant-notes", "tenant-renamed")),
+        ] * checks
     else:
         claim_read.assert_not_called()
 
