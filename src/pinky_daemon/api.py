@@ -12148,6 +12148,24 @@ npm run build</pre>
             raise HTTPException(404, f"Streaming session '{label}' not found for {name}")
         if new_label in sessions:
             raise HTTPException(409, f"Session '{new_label}' already exists for {name}")
+        old_conv_id = session_id_for_agent(name, label)
+        new_conv_id = session_id_for_agent(name, new_label)
+        ownership = _agent_session_ownership(name)
+        session_ids = (old_conv_id, new_conv_id)
+        if any(
+            (ownership.live_owners.get(sid, "") not in ("", name))
+            or (ownership.explicit_owners.get(sid, frozenset()) - {name})
+            for sid in session_ids
+        ) or (
+            ownership.family_names - {name}
+            and agents.has_streaming_session_id_claim(
+                ownership.family_names - {name}, session_ids,
+            )
+        ):
+            raise HTTPException(
+                409,
+                f"Session label '{label}' cannot be renamed because another session claim exists.",
+            )
         if _startup_fencing_enabled():
             async with _label_scope(name, new_label):
                 await _settle_startup_debt(name, new_label)
@@ -12177,8 +12195,6 @@ npm run build</pre>
             agents.set_streaming_session_id(name, old_sid, label=new_label)
             agents.set_streaming_session_id(name, "", label=label)
         # Rename conversation history so it follows the new session ID
-        old_conv_id = f"{name}-{label}"
-        new_conv_id = f"{name}-{new_label}"
         store.rename_session(old_conv_id, new_conv_id)
         return {"renamed": True, "agent": name, "old_label": label, "new_label": new_label}
 
