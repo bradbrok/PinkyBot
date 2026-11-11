@@ -209,3 +209,75 @@ async def test_owner_approval_ignores_extra_provenance_fields(case, was_automati
     await case.broker.handle_inbound(case.message("fixture manual arrival", member=FORMER))
     assert case.delivered() == ["fixture backlog", "fixture manual arrival"]
     assert case.held() == [] and case.owner_texts() == [] and case.wire.calls == []
+
+
+async def test_manual_replay_keeps_own_sender_fact_after_an_automatic_grant(case):
+    case.grant()
+    case.grant(OWN_BOT_ID)
+    case.seed_auto()
+    case.seed_hold("first eligible", MEMBER)
+    poller = make_poller(case)
+    payload = _payload(channel=GROUP, user=OWN_BOT_ID)
+    payload["message"].update(user=OWN_BOT, bot_id=OWN_BOT_ID)
+    await poller._handle_button_tap(payload)
+    await drain_poller_delivery()
+    rows = case.agents.get_pending_messages(SELF, GROUP, include_slack_provenance=True)
+    own_row = next(row for row in rows if row["sender_id"] == OWN_BOT_ID)
+    assert own_row["slack_envelope"]["own_sender"] is True
+    assert case.delivered() == []
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def hold_first(agent, message):
+        if message.content == "first eligible":
+            entered.set()
+            await release.wait()
+        return True
+    case.route.side_effect = hold_first
+    cookie = create_session_cookie(os.environ["PINKY_SESSION_SECRET"])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=case.app),
+            base_url="http://fixture", cookies={SESSION_COOKIE_NAME: cookie}) as client:
+        path = f"/agents/{SELF}/approved-users"
+        approval = asyncio.create_task(client.post(path, json={"chat_id": GROUP}))
+        await entered.wait()
+        trigger = None
+        try:
+            assert (await client.delete(f"{path}/{GROUP}")).status_code == 200
+            trigger = asyncio.create_task(case.broker.handle_inbound(case.message("fresh trigger")))
+            assert await until(lambda: case.agents.get_user_status(SELF, GROUP) == "approved")
+            assert case.agents.get_slack_group_approval(SELF, GROUP).automatic
+        finally:
+            release.set()
+            response = await approval
+            if trigger is not None:
+                await trigger
+        assert response.status_code == 200
+    assert [call.args[1].sender_id for call in case.route.await_args_list] == [MEMBER, MEMBER]
+    assert [row["id"] for row in case.held()] == [own_row["id"]]
+
+
+async def test_public_pending_reads_omit_private_sender_fact(case):
+    case.grant(OWN_BOT_ID)
+    case.seed_auto()
+    poller = make_poller(case)
+    payload = _payload(channel=GROUP, user=OWN_BOT_ID)
+    payload["message"].update(user=OWN_BOT, bot_id=OWN_BOT_ID)
+    await poller._handle_button_tap(payload)
+    await drain_poller_delivery()
+    internal = case.agents.get_pending_messages(SELF, GROUP, include_slack_provenance=True)
+    assert len(internal) == 1 and internal[0]["slack_envelope"]["own_sender"] is True
+    scoped = case.agents.get_pending_messages(SELF, GROUP)
+    unscoped = case.agents.get_pending_messages(SELF)
+    assert scoped == unscoped
+    assert "own_sender" not in scoped[0]["slack_envelope"]
+    cookie = create_session_cookie(os.environ["PINKY_SESSION_SECRET"])
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=case.app),
+        base_url="http://fixture", cookies={SESSION_COOKIE_NAME: cookie},
+    ) as client:
+        response = await client.get(f"/agents/{SELF}/pending-messages")
+    assert response.status_code == 200
+    public_rows = response.json()["by_sender"][GROUP]
+    assert public_rows == scoped
+    assert "own_sender" not in public_rows[0]["slack_envelope"]
+    assert case.agents.get_pending_messages(
+        SELF, GROUP, include_slack_provenance=True,
+    ) == internal

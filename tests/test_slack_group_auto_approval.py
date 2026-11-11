@@ -842,3 +842,96 @@ async def test_existing_token_resolves_from_api_assembly_without_socket_mode(cas
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         second.state.store_catalog.close()
+
+
+async def test_manual_replay_rechecks_rows_after_an_automatic_grant(case):
+    case.grant()
+    case.agents.approve_user(SELF, GROUP, "Manual Fixture", "manual")
+    case.seed_hold("first eligible", MEMBER)
+    kept = case.seed_hold("unapproved suffix", FORMER)
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def hold_first(agent, message):
+        if message.content == "first eligible":
+            entered.set()
+            await release.wait()
+        return True
+    case.route.side_effect = hold_first
+    manual_replay = asyncio.create_task(case.broker.handle_approval(SELF, GROUP))
+    await entered.wait()
+    # Owner removes the old conversation grant. A real later message starts
+    # the production membership resolver and establishes a NEW automatic grant.
+    case.agents.revoke_user(SELF, GROUP)
+    trigger = asyncio.create_task(case.broker.handle_inbound(case.message("fresh trigger")))
+    try:
+        assert await until(lambda: case.agents.get_user_status(SELF, GROUP) == "approved")
+        assert case.agents.get_slack_group_approval(SELF, GROUP).automatic
+    finally:
+        release.set()
+        await asyncio.gather(manual_replay, trigger)
+    assert "unapproved suffix" not in case.delivered(), case.delivered()
+    assert [row["id"] for row in case.held()] == [kept]
+
+    assert case.delivered() == ["first eligible", "fresh trigger"]
+
+
+async def test_owner_routes_recheck_rows_after_an_automatic_grant(case):
+    import os
+    case.grant()
+    case.agents.add_pending_user(SELF, GROUP)
+    case.seed_hold("first eligible", MEMBER)
+    former = case.seed_hold("unapproved suffix", FORMER)
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def hold_first(agent, message):
+        if message.content == "first eligible":
+            entered.set()
+            await release.wait()
+        return True
+    case.route.side_effect = hold_first
+    cookie = create_session_cookie(os.environ["PINKY_SESSION_SECRET"])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=case.app),
+            base_url="http://fixture", cookies={SESSION_COOKIE_NAME: cookie}) as client:
+        path = f"/agents/{SELF}/approved-users"
+        approval = asyncio.create_task(client.post(path, json={"chat_id": GROUP}))
+        await entered.wait()
+        trigger = None
+        try:
+            assert (await client.delete(f"{path}/{GROUP}")).status_code == 200
+            assert case.agents.get_user_status(SELF, GROUP) is None
+            trigger = asyncio.create_task(case.broker.handle_inbound(case.message("fresh trigger")))
+            assert await until(lambda: case.agents.get_user_status(SELF, GROUP) == "approved")
+            assert case.agents.get_slack_group_approval(SELF, GROUP).automatic
+            assert case.wire.read_count("conversations.members") == 1
+        finally:
+            release.set()
+            response = await approval
+            if trigger is not None:
+                await trigger
+        assert response.status_code == 200
+    assert "unapproved suffix" not in case.delivered(), case.delivered()
+    assert [row["id"] for row in case.held()] == [former]
+
+    assert case.delivered() == ["first eligible", "fresh trigger"]
+
+
+async def test_manual_replay_without_a_new_automatic_grant_keeps_draining(case):
+    case.grant()
+    case.agents.approve_user(SELF, GROUP, "Manual Fixture", "manual")
+    case.seed_hold("first eligible", MEMBER)
+    case.seed_hold("manual suffix", FORMER)
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def hold_first(agent, message):
+        if message.content == "first eligible":
+            entered.set()
+            await release.wait()
+        return True
+    case.route.side_effect = hold_first
+    replay = asyncio.create_task(case.broker.handle_approval(SELF, GROUP))
+    await entered.wait()
+    try:
+        case.agents.revoke_user(SELF, GROUP)
+        assert case.agents.get_user_status(SELF, GROUP) is None
+    finally:
+        release.set()
+        assert await replay == 2
+    assert case.delivered() == ["first eligible", "manual suffix"]
+    assert case.held() == []

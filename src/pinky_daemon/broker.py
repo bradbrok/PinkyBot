@@ -2023,7 +2023,7 @@ class MessageBroker:
         """
         automatic = automatic or self._registry.get_slack_group_approval(agent_name, chat_id).automatic
         pending = self._registry.get_pending_messages(
-            agent_name, chat_id, include_slack_provenance=automatic,
+            agent_name, chat_id, include_slack_provenance=True,
         )
         if not pending:
             _log(f"broker: delivered 0/0 pending messages for {chat_id} to {agent_name}")
@@ -2038,6 +2038,7 @@ class MessageBroker:
         delivered = 0
         for msg in pending:
             envelope = msg.get("slack_envelope") or {}
+            automatic = automatic or self._registry.get_slack_group_approval(agent_name, chat_id).automatic
             if automatic:
                 sender_id = msg.get("sender_id") or ""
                 gate = self._registry.get_slack_group_approval(agent_name, chat_id, sender_id)

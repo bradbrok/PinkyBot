@@ -1,9 +1,21 @@
 """Prove the additive approved-user migration using a copied fixture store."""
 
+import json
+import os
 import shutil
 import sqlite3
+import time
+from pathlib import Path
+
+import httpx
+import pytest
 
 from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.auth import SESSION_COOKIE_NAME, create_session_cookie
+from tests.test_slack_group_auto_approval import FORMER, GROUP, SELF
+from tests.test_slack_group_auto_approval import case as case
+
+pytestmark = pytest.mark.real_auth
 
 NEW_COLUMNS = {"slack_auto_member_ids", "slack_auto_checked_at"}
 
@@ -67,3 +79,36 @@ def test_legacy_approved_users_table_is_extended_without_rewriting(tmp_path):
                 "SELECT slack_auto_member_ids, slack_auto_checked_at FROM approved_users",
             ).fetchall() == [(None, None)] * len(old_rows)
         connection.close()
+
+
+@pytest.fixture(autouse=True)
+def _freeze_creation_time_before_case(monkeypatch):
+    monkeypatch.setattr(time, "time", lambda: 1700000000.0)
+
+
+async def test_manual_public_bodies_and_handoffs_keep_the_base_shape(case, monkeypatch):
+    monkeypatch.setattr(time, "time", lambda: 1700000000.0)
+    path = f"/agents/{SELF}/approved-users"
+    case.agents.add_pending_user(SELF, GROUP, "Fixture Group")
+    case.seed_hold("fixture unknown sender", FORMER)
+    cookie = create_session_cookie(os.environ["PINKY_SESSION_SECRET"])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=case.app),
+            base_url="http://fixture", cookies={SESSION_COOKIE_NAME: cookie}) as client:
+        approved = await client.post(path, json={"chat_id": GROUP, "display_name": "Manual Fixture"})
+        assert approved.status_code == 200 and approved.json()["pending_delivered"] == 1
+        listed = await client.get(path)
+        assert listed.status_code == 200
+        denied = await client.put(f"{path}/{GROUP}/deny")
+        assert denied.status_code == 200
+        removed = await client.delete(f"{path}/{GROUP}")
+        assert removed.status_code == 200
+    payload = {
+        "approve": approved.text,
+        "list": listed.text,
+        "deny": denied.text,
+        "delete": removed.text,
+        "delivered": case.delivered(),
+        "held": case.held(),
+    }
+    assert payload["delivered"] == ["fixture unknown sender"]
+    Path(os.environ["TMPDIR"], "manual-bodies.json").write_text(json.dumps(payload, indent=2))
