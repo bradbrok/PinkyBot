@@ -3745,6 +3745,7 @@ def create_api(
         return bool(
             any(
                 not ownership.keeps(sid)
+                or (resolve_session_owner(sid, ownership.registered_names) not in ("", name))
                 or (ownership.live_owners.get(sid, "") not in ("", name))
                 or (ownership.explicit_owners.get(sid, frozenset()) - {name})
                 for sid in session_ids
