@@ -7136,6 +7136,30 @@ except Exception as exc:
         ).fetchall()
         return [{"agent_name": row[0], "label": row[1]} for row in rows]
 
+    def has_streaming_session_id_claim(
+        self, agent_names: Collection[str], session_ids: Collection[str],
+    ) -> bool:
+        """Check exact recorded IDs for only the requested registered names."""
+        if not agent_names or not session_ids:
+            return False
+        names = json.dumps(list(agent_names))
+        ids = json.dumps(list(session_ids))
+        row = self._db.execute(
+            """SELECT EXISTS (
+                   SELECT 1 FROM streaming_session_labels
+                   WHERE agent_name IN (SELECT value FROM json_each(?))
+                     AND session_id != ''
+                     AND session_id IN (SELECT value FROM json_each(?))
+                   UNION ALL
+                   SELECT 1 FROM agents
+                   WHERE name IN (SELECT value FROM json_each(?))
+                     AND streaming_session_id != ''
+                     AND streaming_session_id IN (SELECT value FROM json_each(?))
+               )""",
+            (names, ids, names, ids),
+        ).fetchone()
+        return bool(row[0])
+
     # ── Custom MCP Servers ──────────────────────────────────
 
     def list_mcp_servers(self, agent_name: str) -> list[dict]:
