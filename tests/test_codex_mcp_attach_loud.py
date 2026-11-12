@@ -659,7 +659,9 @@ async def test_recovery_callback_clears_codex_resume_state(
     else:
         await h.real_recover("test-agent", "main", "test attach recovery", expected)
     assert configs == [True]
-    assert session.resume_handle == config.resume_handle == ""
+    assert config.resume_handle == ""
+    expected_handle = f"pinky-codex-{config.agent_name}" if transport == "tmux" else ""
+    assert session.resume_handle == expected_handle
     assert config.force_fresh_context_once is True
     assert h.app.state.agents.get_streaming_session_id("test-agent") == ""
     if transport == "sdk":

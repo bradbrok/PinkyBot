@@ -2128,8 +2128,8 @@ class MessageBroker:
         Resolution order:
 
         1. Existing session for this channel/label is connected → use it.
-        2. Existing session is disconnected with a persisted session_id →
-           reconnect in-place (idle-sleep wake).
+        2. Existing session is idle-sleeping → wake via the ensurer, or
+           reconnect in-place with a retained handle.
         3. No session object yet OR reconnect failed → cold-start a fresh
            session via ``_ensure_session_callback`` (sibling boot policy:
            non-main agents have no session at startup; see api.py boot
@@ -2157,20 +2157,19 @@ class MessageBroker:
                 streaming = await self._ensure_session_callback(agent_name, label=label)
             except Exception:
                 return False
-        idle_ensurer_attempted = False
+        idle_wake_attempted = False
 
-        # Auto-wake: deliberate idle-sleep with a retained resume_handle can be
-        # woken in-line by calling connect(). Per @murzik on PR #492 review,
-        # we must NOT route RECONNECTING through connect() here — that would
-        # race the in-flight reconnect (force_restart or attempt_reconnect)
-        # and produce a double-connect. RECONNECTING falls through to the
-        # wait-for-reconnect block below instead. DEAD also falls through:
-        # resurrection is the scheduler/watchdog's job, not the broker's.
+        # The ensurer derives idle-wake configuration even without a handle.
+        # Direct connect still requires a retained handle. RECONNECTING and
+        # BOOTING wait below so an in-flight connection is never duplicated.
+        # DEAD recovery remains the scheduler/watchdog's responsibility.
         if (
             streaming
             and streaming.state == SessionState.IDLE_SLEEPING
-            and streaming.resume_handle
+            and (self._ensure_session_callback or streaming.resume_handle)
         ):
+            # A blocked or failed idle wake must not retry as a cold start.
+            idle_wake_attempted = True
             # #149 P1: don't relaunch the transport for an agent whose
             # isolation_mode has no runnable provisioner (e.g. a local session
             # later relabeled unix_user) — that would wake it under the daemon
@@ -2192,7 +2191,6 @@ class MessageBroker:
                             (key for key, session in labels.items() if session is streaming),
                             "main",
                         )
-                        idle_ensurer_attempted = True
                         streaming = await self._ensure_session_callback(
                             agent_name, label=label
                         )
@@ -2218,7 +2216,7 @@ class MessageBroker:
         if (
             streaming is None
             and self._ensure_session_callback
-            and not idle_ensurer_attempted
+            and not idle_wake_attempted
         ):
             label = "main"
             try:
@@ -2237,9 +2235,9 @@ class MessageBroker:
         # Wait-for-reconnect: if the session object still exists but isn't
         # CONNECTED, an in-flight reconnect or context_restart is most likely
         # the cause (RECONNECTING state). disconnect()→connect() runs in a
-        # separate task and briefly leaves state != CONNECTED, with
-        # ``resume_handle`` possibly wiped so the auto-wake branch above
-        # cannot help. Poll for a bounded window before falling back to the
+        # separate task and briefly leaves state != CONNECTED. That state
+        # keeps the session outside the idle auto-wake branch above.
+        # Poll for a bounded window before falling back to the
         # user-visible "not running" error so the message gets delivered as
         # soon as the new session comes up instead of being dropped.
         # See _INBOUND_RECONNECT_WAIT_SEC.
