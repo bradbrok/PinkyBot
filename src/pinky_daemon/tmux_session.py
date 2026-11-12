@@ -59,6 +59,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -2458,7 +2459,6 @@ class TmuxSession(TransportReplacementMixin):
         # name preserves cwd → ``claude --continue`` resumes via that cwd's
         # most-recent transcript automatically.
         self._session_name = self._build_session_name()
-        self.resume_handle = self._session_name
 
         # Tmux subprocess control. Injectable for tests (mock the whole
         # ``_TmuxControl`` rather than monkeypatching subprocess primitives).
@@ -2766,6 +2766,19 @@ class TmuxSession(TransportReplacementMixin):
         self._wake_context_reload_guard: _WakeContextReloadGuard | None = None
 
     # ── Identity ────────────────────────────────────────────────────────
+
+    @property
+    def resume_handle(self) -> str:
+        """The tmux session name remains stable across context restarts."""
+        return self._session_name
+
+    @resume_handle.setter
+    def resume_handle(self, value: str | None) -> None:
+        # Fresh-context intent belongs to force_fresh_context_once.
+        if value is None or value == "":
+            logging.getLogger(__name__).debug(
+                "Ignoring blank tmux resume handle for %s", self.agent_name,
+            )
 
     @property
     def id(self) -> str:
