@@ -16,6 +16,8 @@ import os
 import sys
 from typing import Any, AsyncIterator, Callable
 
+from pinky_daemon.anthropic_text import message_text
+
 _HAIKU_MODEL = "claude-haiku-4-5-20251001"
 _OPUS_MODEL = "claude-opus-4-8"
 
@@ -352,7 +354,7 @@ Respond with JSON only:
             system=system,
             messages=[{"role": "user", "content": user}],
         )
-        text = response.content[0].text if response.content else "{}"
+        text = message_text(response)  # raises if no text block
         # Extract JSON from response (may be wrapped in markdown)
         if "```" in text:
             text = text.split("```")[1]
