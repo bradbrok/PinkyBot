@@ -680,7 +680,10 @@ async def test_t5_queue_full_preserves_authoritative_acceptance(registry, monkey
         release.set()
         flush(registry)
     assert writer.failure_counts(since=0)["accept"] == 1
-    errors = [r for r in caplog.records if "schedule fire trace" in r.message.lower()]
+    errors = [
+        r for r in caplog.records
+        if "schedule fire trace" in r.message.lower() and "edge=accept" in r.message
+    ]
     assert len(errors) == 1 and "Full" in errors[0].message
     assert writer.report()["rows"][0]["outcome"] == "trace_incomplete"
     assert rows(registry)[0]["replay_count"] == 2
@@ -894,5 +897,8 @@ async def test_t5_unserializable_observer_pointer_cannot_block_acceptance(pane, 
     assert record["matched_at"] > 0 and record["receipt_accept_result"] == 1
     assert record["user_message_observed_at"] == 0
     assert pane.registry._fire_trace.failure_counts(since=0)["observed"] == 1
-    errors = [r for r in caplog.records if "schedule fire trace" in r.message.lower()]
+    errors = [
+        r for r in caplog.records
+        if "schedule fire trace" in r.message.lower() and "edge=observed" in r.message
+    ]
     assert len(errors) == 1 and "observed" in errors[0].message
