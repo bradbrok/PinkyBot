@@ -762,7 +762,10 @@ def test_t5_non_busy_error_has_no_retry(registry, monkeypatch, caplog):
     assert time.perf_counter() - started < 0.5
     assert len(calls) == 1
     assert writer.failure_counts(since=0)["paste"] == 1
-    assert len([r for r in caplog.records if "schedule fire trace" in r.message.lower()]) == 1
+    assert len([
+        r for r in caplog.records
+        if "schedule fire trace" in r.message.lower() and "edge=paste" in r.message
+    ]) == 1
 
 
 async def test_t1_sdk_pointer_uses_session_submission_sequence(tmp_path):
