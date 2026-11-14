@@ -4950,26 +4950,31 @@ except Exception as exc:
             parts.append(ULTRACODE_DIRECTIVE)
 
         # Boundaries
-        def _append_default_boundaries() -> None:
-            """Load the default boundaries template."""
+        def _append_default_boundaries() -> bool:
+            """Report whether the default boundaries template was appended."""
             try:
                 from pathlib import Path
                 default_boundaries = Path(__file__).parent / "templates" / "default_boundaries.md"
                 if default_boundaries.exists():
                     parts.append(default_boundaries.read_text())
+                    return True
             except Exception:
                 pass
+            _log("agent_registry: default boundaries could not be loaded")
+            return False
 
         if agent.boundaries:
             safe_bounds = _safe(agent.boundaries, f"boundaries:{agent_name}")
-            if safe_bounds:
+            if safe_bounds and safe_bounds.strip():
                 parts.append(safe_bounds)
             else:
-                parts.append(
-                    "<!-- custom boundaries redacted: content scanner blocked them; "
-                    "default boundaries loaded -->"
+                comment_index = len(parts)
+                load_status = "loaded" if _append_default_boundaries() else "could not be loaded"
+                parts.insert(
+                    comment_index,
+                    "<!-- custom boundaries not used: blocked or empty after the content scan; "
+                    f"default boundaries {load_status} -->",
                 )
-                _append_default_boundaries()
         else:
             _append_default_boundaries()
 
