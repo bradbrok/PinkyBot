@@ -4950,12 +4950,8 @@ except Exception as exc:
             parts.append(ULTRACODE_DIRECTIVE)
 
         # Boundaries
-        if agent.boundaries:
-            safe_bounds = _safe(agent.boundaries, f"boundaries:{agent_name}")
-            if safe_bounds:
-                parts.append(safe_bounds)
-        else:
-            # Load default boundaries template
+        def _append_default_boundaries() -> None:
+            """Load the default boundaries template."""
             try:
                 from pathlib import Path
                 default_boundaries = Path(__file__).parent / "templates" / "default_boundaries.md"
@@ -4963,6 +4959,19 @@ except Exception as exc:
                     parts.append(default_boundaries.read_text())
             except Exception:
                 pass
+
+        if agent.boundaries:
+            safe_bounds = _safe(agent.boundaries, f"boundaries:{agent_name}")
+            if safe_bounds:
+                parts.append(safe_bounds)
+            elif safe_bounds is None:
+                parts.append(
+                    "<!-- custom boundaries redacted: content scanner blocked them; "
+                    "default boundaries loaded -->"
+                )
+                _append_default_boundaries()
+        else:
+            _append_default_boundaries()
 
         directives = self.get_directives(agent_name)
         if directives:
