@@ -124,7 +124,7 @@ class TestToolHintIsAlwaysPresent:
         # Explicit outreach tool surface.
         assert "send, thread, react, send_gif, send_voice, send_photo, send_document, send_video, broadcast" in out
         # The fundamental Telegram delivery instruction.
-        assert "Users will message you through Telegram" in out
+        assert "Users will message you through your connected channels" in out
         assert "Use send(chat_id, platform, text) for normal responses" in out
 
 
@@ -203,7 +203,7 @@ class TestContractRegression:
         # are all present in the right order.
         idx_header = out.index("New session started")
         idx_lead = out.index("You're connected via Pinky's message broker")
-        idx_msg = out.index("Users will message you through Telegram")
+        idx_msg = out.index("Users will message you through your connected channels")
         idx_hint = out.index("If your tools are deferred")
         assert idx_header < idx_lead < idx_msg < idx_hint
 

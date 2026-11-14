@@ -507,13 +507,13 @@ class CodexSession(TransportReplacementMixin):
             )
             wake_prompt = (
                 f"Session resumed after daemon restart.{ctx_block}\n\n"
-                "Pick up where you left off. Users will message you through Telegram. "
+                "Pick up where you left off. Users will message you through your connected channels. "
                 "Use send(chat_id, platform, text) for normal responses. "
                 "Use thread(message_id, text) only when you want to quote/thread a specific message. "
                 f"{tools_hint}"
                 if is_resume else
                 f"New session started.{ctx_block}\n\n"
-                "You're connected via Pinky's message broker. Users will message you through Telegram. "
+                "You're connected via Pinky's message broker. Users will message you through your connected channels. "
                 "Use send(chat_id, platform, text) for normal responses. "
                 "Use thread(message_id, text) only when you want to quote/thread a specific message. "
                 f"{tools_hint}"
