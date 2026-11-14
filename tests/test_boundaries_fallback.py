@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from pinky_daemon import api
+from pinky_daemon.content_scanner import sanitize
 
 REDACTION_COMMENT = (
     "<!-- custom boundaries redacted: content scanner blocked them; "
@@ -64,3 +65,20 @@ def test_empty_boundaries_load_default(registry, default_boundaries):
 
     assert default_boundaries in prompt
     assert REDACTION_COMMENT not in prompt
+
+
+def test_custom_boundaries_sanitized_to_empty_load_default(registry, default_boundaries):
+    custom = "\u200b\u200b"
+    registry.update("test-agent", boundaries=custom)
+    assert registry.get("test-agent").boundaries == custom
+    assert custom
+    cleaned, result = sanitize(custom, "boundaries:test-agent")
+    assert cleaned == ""
+    assert not result.threats
+
+    prompt = registry.build_system_prompt("test-agent")
+
+    assert "The Meta-Principle" in prompt
+    assert default_boundaries in prompt
+    assert REDACTION_COMMENT in prompt
+    assert custom not in prompt

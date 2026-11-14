@@ -4964,7 +4964,7 @@ except Exception as exc:
             safe_bounds = _safe(agent.boundaries, f"boundaries:{agent_name}")
             if safe_bounds:
                 parts.append(safe_bounds)
-            elif safe_bounds is None:
+            else:
                 parts.append(
                     "<!-- custom boundaries redacted: content scanner blocked them; "
                     "default boundaries loaded -->"
