@@ -669,6 +669,7 @@ class _StoreConnectionAuthority:
         self._catalog = catalog
         self._lock = threading.RLock()
         self._handles: dict[int, _ManagedConnection] = {}
+        self._finalization_locks: dict[str, threading.Lock] = {}
         self._next_handle_id = 1
         self._accepting = True
 
@@ -753,12 +754,20 @@ class _StoreConnectionAuthority:
         with self._lock:
             self._accepting = False
             handles = sorted(self._handles.values(), key=lambda handle: handle.sequence)
+            for handle in handles:
+                self._finalization_locks.setdefault(handle.path, threading.Lock())
+
+        def finalize(handle: _ManagedConnection) -> None:
+            # A straggling worker can overlap later handles for the same file.
+            with self._finalization_locks[handle.path]:
+                self._finalize(handle)
+
         coordinator = StoreShutdownCoordinator(deadline_seconds=deadline_seconds)
         for handle in handles:
             coordinator.register(
                 handle.logical_name,
                 self._catalog.effective_criticality(handle.logical_name),
-                lambda handle=handle: self._finalize(handle),
+                lambda handle=handle: finalize(handle),
             )
         return coordinator.shutdown()
 
