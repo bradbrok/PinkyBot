@@ -3647,13 +3647,15 @@ async def test_cold_start_timeout_uses_strict_rollback_and_leaves_no_session(
         first_kill="non_ok_then_ok", new_session_hangs=True
     )
     session, tmux = _spawn_rollback_session(tmp_path, monkeypatch, trace)
+    # Allow the preamble to finish before timing out the hanging new-session.
     monkeypatch.setattr(
-        "pinky_daemon.tmux_session._COLD_START_TIMEOUT_SEC", 0.01
+        "pinky_daemon.tmux_session._COLD_START_TIMEOUT_SEC", 0.5
     )
 
     with pytest.raises(RuntimeError, match="cold-start timed out"):
         await session._spawn_tmux_repl()
 
+    assert trace.spawned.is_set(), "timeout fired before new-session"
     assert trace.kill_calls == 2
     assert trace.live is False
     assert await tmux.has_session() is False
@@ -3715,7 +3717,7 @@ async def test_persistent_spawn_ambiguity_retains_and_reaps_cleanup_debt_per_sit
 
     if failure_site == "cold_timeout":
         monkeypatch.setattr(
-            "pinky_daemon.tmux_session._COLD_START_TIMEOUT_SEC", 0.01
+            "pinky_daemon.tmux_session._COLD_START_TIMEOUT_SEC", 0.5
         )
     elif failure_site == "tailer_failure":
         trace.ambiguous_verify = False
@@ -3729,6 +3731,7 @@ async def test_persistent_spawn_ambiguity_retains_and_reaps_cleanup_debt_per_sit
     if failure_site == "cold_timeout":
         with pytest.raises(RuntimeError, match="cold-start timed out"):
             await session._spawn_tmux_repl()
+        assert trace.spawned.is_set(), "timeout fired before new-session"
     elif failure_site == "tailer_failure":
         with pytest.raises(RuntimeError, match="synthetic tailer-start failure"):
             await session._spawn_tmux_repl()

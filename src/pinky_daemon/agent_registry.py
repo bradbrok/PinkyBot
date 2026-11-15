@@ -5085,7 +5085,7 @@ except Exception as exc:
         parts.append(
             "## GitHub Attribution\n"
             "When creating GitHub issues or PRs, always end the body with the result of `get_attribution()`.\n"
-            "Example footer: `🤖 Opened by Barsik`"
+            "Example footer: `🤖 Opened by <your display name>`"
         )
 
         return "\n\n".join(parts)

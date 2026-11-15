@@ -2782,7 +2782,7 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
 
         @mcp.tool()
         def get_attribution() -> str:
-            """Get the attribution footer for GitHub issues/PRs (e.g. "🤖 Opened by Barsik")."""
+            """Get the attribution footer for GitHub issues/PRs (e.g. "🤖 Opened by <display name>")."""
             agent_info = _api("GET", f"/agents/{agent_name}")
             if "error" in agent_info:
                 display = agent_name.capitalize()
