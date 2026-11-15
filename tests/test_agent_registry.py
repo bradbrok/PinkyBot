@@ -1675,6 +1675,25 @@ class TestDirectives:
     def test_build_system_prompt_missing_agent(self, registry):
         assert registry.build_system_prompt("nope") == ""
 
+    def test_build_system_prompt_memory_guidance(self, registry):
+        registry.register("sample-agent", soul="Fixture instructions")
+
+        prompt = registry.build_system_prompt("sample-agent")
+        memory_sections = [
+            section for section in prompt.split("\n\n") if section.startswith("## Memory\n")
+        ]
+
+        assert memory_sections == [
+            "## Memory\n"
+            "- Long-term memory lives in the pinky-memory MCP tools; if your runtime also keeps "
+            "a native memory folder (MEMORY.md and topic files), use it for active working state "
+            "and don't duplicate the same fact in both\n"
+            "- Use reflect() to store cross-session learnings, preferences, and task state\n"
+            "- Use recall(\"query\") to search memory when context is missing\n"
+            "- Use introspect() to review your stored memories\n"
+            "- On context restart or session wake, recall() your recent state to restore continuity"
+        ]
+
     def test_cascade_delete(self, registry):
         registry.register("temp")
         registry.add_directive("temp", "Will be deleted")
