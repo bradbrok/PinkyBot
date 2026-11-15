@@ -1679,11 +1679,11 @@ class TestDirectives:
         registry.register("sample-agent", soul="Fixture instructions")
 
         prompt = registry.build_system_prompt("sample-agent")
-        memory_sections = [
-            section for section in prompt.split("\n\n") if section.startswith("## Memory\n")
-        ]
+        assert prompt.count("## Memory\n") == 1
+        memory_start = prompt.index("## Memory\n")
+        memory_section, next_heading, _ = prompt[memory_start:].partition("\n## ")
 
-        assert memory_sections == [
+        expected_memory = (
             "## Memory\n"
             "- Long-term memory lives in the pinky-memory MCP tools; if your runtime also keeps "
             "a native memory folder (MEMORY.md and topic files), use it for active working state "
@@ -1692,7 +1692,8 @@ class TestDirectives:
             "- Use recall(\"query\") to search memory when context is missing\n"
             "- Use introspect() to review your stored memories\n"
             "- On context restart or session wake, recall() your recent state to restore continuity"
-        ]
+        )
+        assert memory_section == expected_memory + ("\n" if next_heading else "")
 
     def test_cascade_delete(self, registry):
         registry.register("temp")
