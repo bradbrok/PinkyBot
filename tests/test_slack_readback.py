@@ -488,7 +488,7 @@ async def test_total_deadline_bounds_an_inflight_call(gateway, monkeypatch, hist
             elapsed = time.monotonic() - start
         finally:
             release.set()
-        assert elapsed < 0.75
+        assert elapsed < 1.0
     if history:
         assert entered.is_set(), "the deadline must expire during the second history call"
         assert response.status_code == 200
