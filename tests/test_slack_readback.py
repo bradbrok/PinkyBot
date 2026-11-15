@@ -469,13 +469,14 @@ def test_identity_failure_never_returns_success(gateway, body, status):
 @pytest.mark.parametrize("history", [False, True])
 async def test_total_deadline_bounds_an_inflight_call(gateway, monkeypatch, history):
     module = sys.modules["pinky_daemon.slack_readback"]
-    monkeypatch.setattr(module, "REQUEST_SECONDS", 0.1)
-    release = threading.Event()
+    monkeypatch.setattr(module, "REQUEST_SECONDS", 0.5 if history else 0.1)
+    entered, release = threading.Event(), threading.Event()
     if history:
         gateway.outcomes.extend([_page([_message()], more=True, cursor="one"), _page()])
 
     def slow(method):
         if method == "conversations.history" and (not history or len(gateway.calls) == 3):
+            entered.set()
             release.wait(2)
 
     gateway.before = slow
@@ -489,6 +490,7 @@ async def test_total_deadline_bounds_an_inflight_call(gateway, monkeypatch, hist
             release.set()
         assert elapsed < 0.75
     if history:
+        assert entered.is_set(), "the deadline must expire during the second history call"
         assert response.status_code == 200
         body = response.json()
         assert (body["complete"], body["stopped_reason"], body["pages"]) == (False, "deadline", 1)
