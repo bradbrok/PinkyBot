@@ -74,18 +74,47 @@ def _join_and_close(workers, connections):
 @pytest.mark.parametrize("alias", [False, True])
 def test_same_path_checkpoint_overlap_is_serialized(tmp_path, monkeypatch, alias):
     catalog, connections, path = _catalog(tmp_path, alias=alias)
-    workers, started = _workers(monkeypatch)
+    workers, _ = _workers(monkeypatch)
     reader = sqlite3.connect(path, check_same_thread=False)
     reader.execute("BEGIN")
     reader.execute("SELECT * FROM payload").fetchall()
     connections["blocked"].execute("INSERT INTO payload VALUES ('newer')")
     connections["blocked"].commit()
     checkpoint_started = threading.Event()
-    second_checkpoint_done = threading.Event()
+    contender_seen = threading.Event()
+    waiting_on_path_lock = threading.Event()
     release_reader = threading.Event()
+    reader_lock = threading.Lock()
     checkpoint_rows = {}
-    controller_errors = []
     execute = store_catalog._ManagedSQLiteConnection.execute
+
+    def unblock_reader():
+        with reader_lock:
+            if not release_reader.is_set():
+                reader.rollback()
+                release_reader.set()
+
+    class ObservedPathLock:
+        def __init__(self):
+            self.lock = threading.Lock()
+
+        def __enter__(self):
+            if threading.current_thread() is workers.get("waiting"):
+                assert checkpoint_started.wait(3)
+            if not self.lock.acquire(blocking=False):
+                waiting_on_path_lock.set()
+                contender_seen.set()
+                # A failed acquire proves the waiter cannot reach its checkpoint.
+                unblock_reader()
+                self.lock.acquire()
+
+        def __exit__(self, *exc):
+            self.lock.release()
+
+    monkeypatch.setattr(
+        catalog._connection_authority, "_finalization_locks",
+        {str(path.resolve()): ObservedPathLock()}, raising=False,
+    )
 
     class CheckpointCursor:
         def __init__(self, cursor, name):
@@ -94,8 +123,9 @@ def test_same_path_checkpoint_overlap_is_serialized(tmp_path, monkeypatch, alias
         def fetchone(self):
             row = self.cursor.fetchone()
             checkpoint_rows[self.name] = row
-            if self.name == "waiting":
-                second_checkpoint_done.set()
+            if row[0]:
+                # Without serialization, release only after a real SQLite collision.
+                unblock_reader()
             return row
 
     def traced_execute(connection, sql, parameters=()):
@@ -104,41 +134,21 @@ def test_same_path_checkpoint_overlap_is_serialized(tmp_path, monkeypatch, alias
         name = "blocked" if connection is connections["blocked"] else "waiting"
         if name == "blocked":
             checkpoint_started.set()
+            assert contender_seen.wait(3)
+        elif not waiting_on_path_lock.is_set():
+            assert checkpoint_started.wait(3)
+            contender_seen.set()
         return CheckpointCursor(execute(connection, sql, parameters), name)
 
-    def unblock_reader():
-        try:
-            assert checkpoint_started.wait(3)
-            probe = sqlite3.connect(path)
-            try:
-                deadline = time.monotonic() + 3
-                while probe.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()[0] != 1:
-                    assert time.monotonic() < deadline, "first checkpoint did not take its lock"
-                    time.sleep(0.005)
-            finally:
-                probe.close()
-            assert started["waiting"].wait(3)
-            # A serialized worker cannot reach SQLite until the reader is released.
-            second_checkpoint_done.wait(0.5)
-        except BaseException as exc:
-            controller_errors.append(exc)
-        finally:
-            reader.rollback()
-            release_reader.set()
-
     monkeypatch.setattr(store_catalog._ManagedSQLiteConnection, "execute", traced_execute)
-    controller = threading.Thread(target=unblock_reader)
-    controller.start()
     try:
         with gc_quiet():
             report = catalog.shutdown(deadline_seconds=4)
     finally:
-        controller.join(8)
-        assert not controller.is_alive()
-        assert release_reader.is_set()
-        reader.close()
+        unblock_reader()
         _join_and_close(workers, connections)
-    assert controller_errors == []
+        reader.close()
+    assert waiting_on_path_lock.is_set()
     assert report.ok and report.finalized == ("blocked", "waiting")
     assert set(checkpoint_rows) == {"blocked", "waiting"}
     assert all(row[0] == 0 for row in checkpoint_rows.values())
