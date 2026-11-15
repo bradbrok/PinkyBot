@@ -65,7 +65,7 @@ def _workers(monkeypatch):
 def _join_and_close(workers, connections):
     for worker in workers.values():
         worker.join(3)
-        assert not worker.is_alive()
+    assert all(not worker.is_alive() for worker in workers.values())
     for connection in connections.values():
         if not connection._store_closed:
             connection.close()
@@ -88,11 +88,16 @@ def test_same_path_checkpoint_overlap_is_serialized(tmp_path, monkeypatch, alias
     checkpoint_rows = {}
     execute = store_catalog._ManagedSQLiteConnection.execute
 
-    def unblock_reader():
-        with reader_lock:
+    def unblock_reader(*, timeout=-1):
+        if not reader_lock.acquire(timeout=timeout):
+            return False
+        try:
             if not release_reader.is_set():
                 reader.rollback()
                 release_reader.set()
+        finally:
+            reader_lock.release()
+        return True
 
     class ObservedPathLock:
         def __init__(self):
@@ -145,9 +150,17 @@ def test_same_path_checkpoint_overlap_is_serialized(tmp_path, monkeypatch, alias
         with gc_quiet():
             report = catalog.shutdown(deadline_seconds=4)
     finally:
-        unblock_reader()
-        _join_and_close(workers, connections)
+        reader_unblocked = unblock_reader(timeout=3)
+        join_error = None
+        try:
+            _join_and_close(workers, connections)
+        except AssertionError as exc:
+            join_error = exc
+        if not reader_unblocked:
+            pytest.fail("READER_CLEANUP_LOCK_TIMEOUT: caller reader_lock acquire exceeded 3 seconds")
         reader.close()
+        if join_error is not None:
+            raise join_error
     assert waiting_on_path_lock.is_set()
     assert report.ok and report.finalized == ("blocked", "waiting")
     assert set(checkpoint_rows) == {"blocked", "waiting"}
