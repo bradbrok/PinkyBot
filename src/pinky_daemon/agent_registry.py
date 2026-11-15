@@ -5064,7 +5064,9 @@ except Exception as exc:
         # Append memory guidance for all agents
         parts.append(
             "## Memory\n"
-            "- All persistent memory goes through pinky-memory MCP tools\n"
+            "- Long-term memory lives in the pinky-memory MCP tools; if your runtime also keeps "
+            "a native memory folder (MEMORY.md and topic files), use it for active working state "
+            "and don't duplicate the same fact in both\n"
             "- Use reflect() to store cross-session learnings, preferences, and task state\n"
             "- Use recall(\"query\") to search memory when context is missing\n"
             "- Use introspect() to review your stored memories\n"
