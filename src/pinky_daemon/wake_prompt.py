@@ -287,7 +287,7 @@ def build_wake_prompt(inp: WakePromptInput) -> str:
 
     return (
         f"{header}{ctx_block}\n\n"
-        f"{lead} Users will message you through Telegram. "
+        f"{lead} Users will message you through your connected channels. "
         "Use send(chat_id, platform, text) for normal responses. "
         "Use thread(message_id, text) only when you want to quote/thread a specific message. "
         f"{_TOOLS_HINT}"
