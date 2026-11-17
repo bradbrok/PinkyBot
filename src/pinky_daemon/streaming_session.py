@@ -82,6 +82,34 @@ DEFAULT_STREAMING_ALLOWED_TOOLS = [
 ]
 
 
+# #1521: Linux caps a single argv string at MAX_ARG_STRLEN (32 pages = 131072
+# bytes). A system prompt bigger than this margin is passed as a file instead.
+SYSTEM_PROMPT_ARG_MAX_BYTES = 100_000
+SYSTEM_PROMPT_FILENAME = "system-prompt.md"
+
+
+def write_system_prompt_file(working_dir: str, prompt: str) -> Path:
+    """Write ``prompt`` atomically to ``<working_dir>/.pinky/system-prompt.md``
+    (directory 0700, file 0600) and return its path. Rewritten at every session
+    start, so it always matches the prompt being passed."""
+    import os
+    import tempfile
+
+    folder = Path(working_dir) / ".pinky"
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target = folder / SYSTEM_PROMPT_FILENAME
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".system-prompt.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(prompt)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return target.resolve()
+
+
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
@@ -511,14 +539,33 @@ class StreamingSession(TransportReplacementMixin):
             options.max_turns = self._config.max_turns
 
         if self._config.system_prompt:
-            # snapshot=False: Claude Code >= 2.1.265 otherwise records the prompt
-            # on the first request and reuses it after resume, so soul, directive
-            # and skill changes would not apply until the next compaction.
-            options.system_prompt = {
-                "type": "custom",
-                "prompt": self._config.system_prompt,
-                "snapshot": False,
-            }
+            prompt = self._config.system_prompt
+            size = len(prompt.encode("utf-8"))
+            if size > SYSTEM_PROMPT_ARG_MAX_BYTES:
+                # #1521: the SDK hands a "custom" prompt to the CLI as ONE argv
+                # string, and Linux refuses any single argument over 128 KiB
+                # (MAX_ARG_STRLEN), so the spawn fails with E2BIG ("Argument
+                # list too long") and the agent never starts. Past the safety
+                # margin the prompt goes to a private file instead
+                # (--system-prompt-file). The SDK does not forward `snapshot`
+                # for file prompts, so this path is only the fallback.
+                path = write_system_prompt_file(self._config.working_dir, prompt)
+                _log(
+                    f"streaming[{self._config.agent_name}]: system prompt is "
+                    f"{size} bytes (> {SYSTEM_PROMPT_ARG_MAX_BYTES}): passing it "
+                    f"as a file ({path}) to avoid E2BIG"
+                )
+                options.system_prompt = {"type": "file", "path": str(path)}
+            else:
+                # snapshot=False: Claude Code >= 2.1.265 otherwise records the
+                # prompt on the first request and reuses it after resume, so soul,
+                # directive and skill changes would not apply until the next
+                # compaction.
+                options.system_prompt = {
+                    "type": "custom",
+                    "prompt": prompt,
+                    "snapshot": False,
+                }
 
         if self._config.subagents:
             options.agents = self._config.subagents
