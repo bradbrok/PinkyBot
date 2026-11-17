@@ -1,7 +1,7 @@
 {
   "schema": "pinky-model-roster/1",
-  "revision": 9,
-  "updated": "2026-11-09",
+  "revision": 10,
+  "updated": "2026-11-17",
   "models": [
     {
       "provider": "anthropic",
@@ -458,6 +458,44 @@
       "supports_thinking": false,
       "active": true,
       "sort_order": 80
+    },
+    {
+      "provider": "openai",
+      "model_id": "gpt-6.2-astra",
+      "display_name": "GPT-6.2 Astra",
+      "description": "Newest OpenAI flagship (GPT-6.2 family). Frontier reasoning + long-horizon agentic coding. 1.05M context, 128K output. Available via the Responses API.",
+      "tier": "flagship",
+      "context_window": 1050000,
+      "is_1m": true,
+      "pricing": {
+        "input": 8.0,
+        "output": 40.0,
+        "cached_input": 0.4,
+        "cache_write_5m": 10.0,
+        "cache_write_1h": 10.0
+      },
+      "supports_thinking": false,
+      "active": true,
+      "sort_order": 49
+    },
+    {
+      "provider": "openai",
+      "model_id": "gpt-6.2-sol",
+      "display_name": "GPT-6.2 Sol",
+      "description": "GPT-6.2 general-purpose at $2/$10 per MTok. Strong reasoning + coding. 1.05M context, 128K output. Available via the Responses API.",
+      "tier": "flagship",
+      "context_window": 1050000,
+      "is_1m": true,
+      "pricing": {
+        "input": 2.0,
+        "output": 10.0,
+        "cached_input": 0.1,
+        "cache_write_5m": 2.5,
+        "cache_write_1h": 2.5
+      },
+      "supports_thinking": false,
+      "active": true,
+      "sort_order": 50
     },
     {
       "provider": "openai",
