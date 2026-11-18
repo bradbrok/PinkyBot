@@ -244,8 +244,17 @@ class TestContextAutorestartPrompt:
         assert "Agent-tool subagents, background shell jobs, or monitors" in out
         assert "still running in this session, do NOT call context_restart yet" in out
         assert "Start no new work" in out
-        assert "Wait for them to finish (or park them safely), then restart right away" in out
+        assert "Wait for them to finish (or park them safely), then call save_my_context again" in out
+        assert "Restart right away after saving" in out
         assert "A restart kills in-flight runs" in out
+
+    def test_waiting_path_saves_again_before_restart(self):
+        out = build_context_autorestart_prompt(168_000, 200_000, 84.0)
+        waiting = out.split("Wait for them to finish (or park them safely)", 1)[1]
+        assert "call save_my_context again right before context_restart" in waiting
+        assert waiting.index("save_my_context") < waiting.index("context_restart")
+        assert "the restart guard needs a fresh save" in waiting
+        assert "Restart right away after saving" in waiting
 
 
 class TestContextNudgePrompt:

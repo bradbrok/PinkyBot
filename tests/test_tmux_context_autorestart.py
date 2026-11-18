@@ -129,7 +129,10 @@ async def test_nudge_defers_restart_for_inflight_work() -> None:
     assert "save_my_context NOW" in prompt
     assert prompt.index("save_my_context") < prompt.index("context_restart")
     assert "Start no new work" in prompt
-    assert "Wait for them to finish (or park them safely), then restart right away" in prompt
+    assert "Wait for them to finish (or park them safely), then call save_my_context again" in prompt
+    assert "save_my_context again right before context_restart" in prompt
+    assert "the restart guard needs a fresh save" in prompt
+    assert "Restart right away after saving" in prompt
     assert "A restart kills in-flight runs" in prompt
     assert "context_restart immediately when nothing is in flight" in prompt
     assert "168,000 / 200,000 tokens (84%)" in prompt

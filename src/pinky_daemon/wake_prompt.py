@@ -58,9 +58,10 @@ def build_context_autorestart_prompt(total: int, max_tokens: int, pct: float) ->
         "(2) Call context_restart immediately when nothing is in flight.\n\n"
         "If Agent-tool subagents, background shell jobs, or monitors are still "
         "running in this session, do NOT call context_restart yet. Start no new "
-        "work. Wait for them to finish (or park them safely), then restart right "
-        "away. A restart kills in-flight runs. A clean restart keeps your "
-        "reasoning sharp."
+        "work. Wait for them to finish (or park them safely), then call "
+        "save_my_context again right before context_restart because the restart "
+        "guard needs a fresh save. Restart right away after saving. A restart "
+        "kills in-flight runs. A clean restart keeps your reasoning sharp."
     )
 
 
