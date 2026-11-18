@@ -17,6 +17,7 @@ from pinky_daemon.wake_prompt import (
     DEFAULT_TIMEZONE,
     WakePromptInput,
     WakeReason,
+    build_context_autorestart_prompt,
     build_context_nudge_prompt,
     build_wake_prompt,
 )
@@ -216,6 +217,35 @@ class TestContractRegression:
         idx_saved_close = out.index("──────────────────")
         idx_lead = out.index("Fresh context — pick up from saved state")
         assert idx_header < idx_saved_open < idx_body < idx_saved_close < idx_lead
+
+
+class TestContextAutorestartPrompt:
+    @pytest.mark.parametrize(
+        ("total", "max_tokens", "pct", "expected"),
+        [
+            (168_000, 200_000, 84.0, "168,000 / 200,000 tokens (84%)"),
+            (450_000, 967_000, 46.54, "450,000 / 967,000 tokens (47%)"),
+        ],
+    )
+    def test_reports_context_usage(self, total, max_tokens, pct, expected):
+        out = build_context_autorestart_prompt(total, max_tokens, pct)
+        assert expected in out
+        assert "past your restart-for-sanity threshold" in out
+
+    def test_saves_now_before_conditional_restart(self):
+        out = build_context_autorestart_prompt(168_000, 200_000, 84.0)
+        assert "(1) Call save_my_context NOW with a concrete wake_action" in out
+        assert "exactly what to resume" in out
+        assert "(2) Call context_restart immediately when nothing is in flight" in out
+        assert out.index("save_my_context") < out.index("context_restart")
+
+    def test_holds_restart_until_inflight_work_is_safe(self):
+        out = build_context_autorestart_prompt(168_000, 200_000, 84.0)
+        assert "Agent-tool subagents, background shell jobs, or monitors" in out
+        assert "still running in this session, do NOT call context_restart yet" in out
+        assert "Start no new work" in out
+        assert "Wait for them to finish (or park them safely), then restart right away" in out
+        assert "A restart kills in-flight runs" in out
 
 
 class TestContextNudgePrompt:

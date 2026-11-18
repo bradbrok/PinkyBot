@@ -43,8 +43,25 @@ __all__ = [
     "wake_reason_from_runtime",
     "build_idle_sleep_prompt",
     "build_context_nudge_prompt",
+    "build_context_autorestart_prompt",
     "DEFAULT_TIMEZONE",
 ]
+
+
+def build_context_autorestart_prompt(total: int, max_tokens: int, pct: float) -> str:
+    """Request an immediate checkpoint and restart once in-session work is safe."""
+    return (
+        f"⚠️ Context budget check — you're at {total:,} / {max_tokens:,} tokens "
+        f"({pct:.0f}%), past your restart-for-sanity threshold.\n\n"
+        "(1) Call save_my_context NOW with a concrete wake_action capturing "
+        "exactly what to resume.\n"
+        "(2) Call context_restart immediately when nothing is in flight.\n\n"
+        "If Agent-tool subagents, background shell jobs, or monitors are still "
+        "running in this session, do NOT call context_restart yet. Start no new "
+        "work. Wait for them to finish (or park them safely), then restart right "
+        "away. A restart kills in-flight runs. A clean restart keeps your "
+        "reasoning sharp."
+    )
 
 
 def build_context_nudge_prompt(pct: float, threshold: float) -> str:
