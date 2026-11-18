@@ -293,7 +293,10 @@ def create_server(
             """Discard one stranded wake from your own durable outbox by row ID.
 
             Find the row ID in "pending #<id>" in the restart context's
-            "Owed scheduled wakes" list.
+            "Owed scheduled wakes" list. Discard works only on rows that are
+            not yet abandoned. Lost-paste entries are already abandoned:
+            they cannot be discarded and leave the list 24 hours after
+            they were abandoned.
 
             This removes the frozen pending prompt without marking its schedule
             delivered. It cannot erase another agent's or a terminal ledger row.

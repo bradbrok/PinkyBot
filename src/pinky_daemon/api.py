@@ -327,6 +327,8 @@ from pinky_outreach.telegram import TelegramError
 # Feature flag: shared MCP mode uses a single HTTP/SSE server instead of per-agent stdio
 SHARED_MCP_ENABLED = os.environ.get("PINKY_SHARED_MCP", "0") == "1"
 
+ABANDONED_PASTE_OWED_WINDOW_SECONDS = 24 * 60 * 60
+
 _RESPONSE_SENT_HANDOFF_SCOPE_KEY = "pinky.response_sent_handoff"
 
 try:
@@ -4230,9 +4232,15 @@ def create_api(
         # Owed work is informational here; rendering never consumes a fire.
         try:
             owed = []
+            now = time.time()
             for row in agents.list_pending_schedule_wakes(agent_name, include_parked=True):
                 if row.pasted_at:
-                    if row.parked_at > 0 or row.abandoned_at > 0:
+                    if row.parked_at > 0:
+                        continue
+                    if (
+                        row.abandoned_at > 0
+                        and now - row.abandoned_at >= ABANDONED_PASTE_OWED_WINDOW_SECONDS
+                    ):
                         continue
                     schedule = agents.get_schedule(row.schedule_id)
                     if (
