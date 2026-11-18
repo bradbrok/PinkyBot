@@ -292,6 +292,9 @@ def create_server(
         def discard_pending_schedule_wake(pending_id: int) -> str:
             """Discard one stranded wake from your own durable outbox by row ID.
 
+            Find the row ID in "pending #<id>" in the restart context's
+            "Owed scheduled wakes" list.
+
             This removes the frozen pending prompt without marking its schedule
             delivered. It cannot erase another agent's or a terminal ledger row.
             """

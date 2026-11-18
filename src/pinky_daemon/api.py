@@ -4232,6 +4232,8 @@ def create_api(
             owed = []
             for row in agents.list_pending_schedule_wakes(agent_name, include_parked=True):
                 if row.pasted_at:
+                    if row.parked_at > 0 or row.abandoned_at > 0:
+                        continue
                     schedule = agents.get_schedule(row.schedule_id)
                     if (
                         schedule is not None
@@ -4240,14 +4242,18 @@ def create_api(
                         and row.fired_at <= schedule.last_accepted_fired_at
                     ):
                         continue
-                    owed.append(f"- {row.name} (fired_at={row.fired_at}): pasted before the restart, may not have run; check before redoing")
+                    owed.append(
+                        f"- {row.name} (pending #{row.id}, fired_at={row.fired_at}): "
+                        "pasted before the restart, may not have run; check before redoing"
+                    )
                 elif not (row.parked_at or row.abandoned_at):
                     schedule = agents.get_schedule(row.schedule_id)
                     if schedule is not None and not schedule.one_shot:
                         # The scheduler still delivers the stored prompt with an exact
                         # receipt; say so, or a bare name reads as an instruction to run it.
                         owed.append(
-                            f"- {row.name} (fired_at={row.fired_at}): not delivered yet; "
+                            f"- {row.name} (pending #{row.id}, fired_at={row.fired_at}): "
+                            "not delivered yet; "
                             "the full prompt arrives as its own message, so don't start it "
                             "from this list"
                         )
