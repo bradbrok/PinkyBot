@@ -116,6 +116,34 @@ async def test_crossing_enqueues_nudge_once() -> None:
 
 @pytest.mark.usefixtures("reference_static_context")
 @pytest.mark.asyncio
+async def test_nudge_defers_restart_for_inflight_work() -> None:
+    ss = _make_session(model=_MODEL_200K)
+
+    await ss._enqueue_autorestart_nudge(total=168_000, max_tokens=200_000, pct=84.0)
+
+    ss._enqueue_internal_prompt.assert_awaited_once()
+    prompt = ss._enqueue_internal_prompt.await_args.args[0]
+    assert "do NOT call context_restart yet" in prompt
+    assert "Agent-tool subagents, background shell jobs, or monitors" in prompt
+    assert "still running in this session" in prompt
+    assert "save_my_context NOW" in prompt
+    assert prompt.index("save_my_context") < prompt.index("context_restart")
+    assert "Start no new work" in prompt
+    assert "Wait for them to finish (or park them safely), then call save_my_context again" in prompt
+    assert "save_my_context again right before context_restart" in prompt
+    assert "the restart guard needs a fresh save" in prompt
+    assert "Restart right away after saving" in prompt
+    assert "A restart kills in-flight runs" in prompt
+    assert "context_restart immediately when nothing is in flight" in prompt
+    assert "168,000 / 200,000 tokens (84%)" in prompt
+    kwargs = ss._enqueue_internal_prompt.await_args.kwargs
+    assert kwargs["reason"] == "context_autorestart_nudge"
+    assert kwargs.get("wait_for_completion", False) is False
+    assert kwargs.get("front", False) is False
+
+
+@pytest.mark.usefixtures("reference_static_context")
+@pytest.mark.asyncio
 async def test_nudge_is_tail_enqueued_not_front() -> None:
     """Lock the tail-vs-front decision (Dymok #618 review, Q1).
 

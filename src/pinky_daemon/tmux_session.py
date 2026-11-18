@@ -138,6 +138,7 @@ from pinky_daemon.wake_context import WakeContextDelivery
 from pinky_daemon.wake_prompt import (
     WakePromptInput,
     WakeReason,
+    build_context_autorestart_prompt,
     build_context_nudge_prompt,
     build_idle_sleep_prompt,
     build_wake_prompt,
@@ -6824,14 +6825,7 @@ class TmuxSession(TransportReplacementMixin):
         slightly tighter context bound; left as a follow-up call for
         review. One nudge per crossing (caller latched).
         """
-        prompt = (
-            f"⚠️ Context budget check — you're at {total:,} / {max_tokens:,} tokens "
-            f"({pct:.0f}%), past your restart-for-sanity threshold. Finish the "
-            f"thought you're on, then: (1) call save_my_context with a concrete "
-            f"wake_action capturing exactly what to resume, and (2) call "
-            f"context_restart to continue in a fresh session. Do this now — don't "
-            f"pick up new work first. A clean restart keeps your reasoning sharp."
-        )
+        prompt = build_context_autorestart_prompt(total, max_tokens, pct)
         # MUST stay fire-and-forget (wait_for_completion=False). This runs
         # inside the tailer's _handle_turn_complete callback — the very code
         # that SETS turn completion events. Waiting here for THIS nudge's
