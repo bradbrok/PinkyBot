@@ -18,6 +18,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
+from pinky_identity.live_sqlite import LiveSQLiteConnection
 from pinky_outreach.types import Chat, Message, Platform
 
 # chat.db open() is a C-level syscall that can block indefinitely under some
@@ -91,6 +92,7 @@ class iMessageAdapter:  # noqa: N801
                     f"file:{self._db_path}?mode=ro",
                     uri=True,
                     check_same_thread=False,
+                    factory=LiveSQLiteConnection,
                 )
                 # Test read access + seed last_rowid so we only get new messages.
                 db.execute("SELECT COUNT(*) FROM message").fetchone()

@@ -22,7 +22,9 @@ from urllib.parse import parse_qsl
 from pinky_daemon.store_shutdown import StoreShutdownCoordinator, StoreShutdownReport
 from pinky_identity.live_sqlite import (
     LiveSQLiteConnection,
+    MaterializedSQLiteCursor,
     refuse_live_sqlite_file,
+    serialized_sqlite_call,
     track_sqlite_connection,
 )
 
@@ -399,6 +401,7 @@ class _ManagedSQLiteConnection(LiveSQLiteConnection):
     _store_closed = False
 
     @property
+    @serialized_sqlite_call
     def in_transaction(self) -> bool:
         """Preserve the final false state for post-close ledger inspection."""
         if self._store_closed:
@@ -411,7 +414,7 @@ class _ManagedSQLiteConnection(LiveSQLiteConnection):
         sql: str,
         parameters: Any = (),
         /,
-    ) -> sqlite3.Cursor:
+    ) -> MaterializedSQLiteCursor:
         execute = super().execute
         return self._run_observed_statement(sql, lambda: execute(sql, parameters))
 
@@ -420,23 +423,25 @@ class _ManagedSQLiteConnection(LiveSQLiteConnection):
         sql: str,
         seq_of_parameters: Iterable[Any],
         /,
-    ) -> sqlite3.Cursor:
+    ) -> MaterializedSQLiteCursor:
         executemany = super().executemany
         return self._run_observed_statement(
             sql,
             lambda: executemany(sql, seq_of_parameters),
         )
 
-    def executescript(self, sql_script: str, /) -> sqlite3.Cursor:
+    def executescript(self, sql_script: str, /) -> MaterializedSQLiteCursor:
         executescript = super().executescript
         return self._run_observed_statement(sql_script, lambda: executescript(sql_script))
 
+    @serialized_sqlite_call
     def commit(self) -> None:
         commit = super().commit
         if self._store_boundary_observation_depth:
             return commit()
         self._run_observed_transaction_boundary(commit, sql_token="COMMIT")
 
+    @serialized_sqlite_call
     def rollback(self) -> None:
         rollback = super().rollback
         if self._store_boundary_observation_depth:
@@ -447,6 +452,7 @@ class _ManagedSQLiteConnection(LiveSQLiteConnection):
         super().__enter__()
         return self
 
+    @serialized_sqlite_call
     def __exit__(self, exc_type, exc, traceback) -> bool:
         exit_context = super().__exit__
         if self._store_boundary_observation_depth:
@@ -457,6 +463,7 @@ class _ManagedSQLiteConnection(LiveSQLiteConnection):
         )
         return bool(suppressed)
 
+    @serialized_sqlite_call
     def _run_observed_transaction_boundary(
         self,
         call: Callable[[], Any],
@@ -514,11 +521,12 @@ class _ManagedSQLiteConnection(LiveSQLiteConnection):
         )
         return result
 
+    @serialized_sqlite_call
     def _run_observed_statement(
         self,
         statement: str,
-        call: Callable[[], sqlite3.Cursor],
-    ) -> sqlite3.Cursor:
+        call: Callable[[], MaterializedSQLiteCursor],
+    ) -> MaterializedSQLiteCursor:
         observability = self._store_observability
         logical_name = self._store_logical_name
         if observability is None or logical_name is None:
@@ -611,6 +619,7 @@ class _ManagedSQLiteConnection(LiveSQLiteConnection):
                 finished_ns,
             )
 
+    @serialized_sqlite_call
     def close(self) -> None:
         transaction_active = self.in_transaction
         observability = self._store_observability
@@ -2692,6 +2701,8 @@ def open_store_connection(
     kwargs["timeout"] = (
         _SQLITE_DEFAULT_TIMEOUT_SECONDS if requested_timeout is None else float(requested_timeout)
     )
+    if not kwargs.get("check_same_thread", True):
+        kwargs.setdefault("factory", LiveSQLiteConnection)
     connection = sqlite3.connect(database, **kwargs)
     try:
         apply_store_connection_policy(connection, policy)
