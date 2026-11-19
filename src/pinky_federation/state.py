@@ -43,6 +43,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from pinky_identity.live_sqlite import LiveSQLiteConnection
+
 DEFAULT_DB_PATH = "data/federation/state.db"
 
 # Instance-key lifecycle states.
@@ -272,7 +274,7 @@ class FederationStateStore:
     def __init__(self, db_path: str = DEFAULT_DB_PATH) -> None:
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(db_path, check_same_thread=False)
+        self._db = sqlite3.connect(db_path, check_same_thread=False, factory=LiveSQLiteConnection)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.row_factory = sqlite3.Row

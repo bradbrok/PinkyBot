@@ -375,7 +375,7 @@ def test_entry_point_preserves_process_creation_mode_before_configuration(monkey
 
 
 @pytest.mark.parametrize("kind", ["bearer", "signer", "catalog"])
-def test_unfinished_cursor_keeps_registry_and_locks_after_close(tmp_path, kind):
+def test_materialized_shared_cursor_releases_native_locks_before_close(tmp_path, kind):
     import gc
 
     from pinky_daemon.store_catalog import DaemonStoreCatalog
@@ -383,7 +383,7 @@ def test_unfinished_cursor_keeps_registry_and_locks_after_close(tmp_path, kind):
     from pinky_identity.bearer_tokens import BearerTokenStore
     from pinky_identity.fs_security import harden_secret_file
     from pinky_identity.keystore import DeviceKey
-    from pinky_identity.live_sqlite import LiveSQLiteFileError
+    from pinky_identity.live_sqlite import MaterializedSQLiteCursor
     from pinky_identity.signer_store import EncryptedSignerStore
 
     path = tmp_path / "store.db"
@@ -401,11 +401,13 @@ def test_unfinished_cursor_keeps_registry_and_locks_after_close(tmp_path, kind):
     store._db.executemany("INSERT INTO cursor_probe VALUES (?)", [(1,), (2,), (3,)])
     store._db.commit()
     cursor = store._db.execute("SELECT * FROM cursor_probe")
+    assert store._db._sqlite_lock is not None
+    assert isinstance(cursor, MaterializedSQLiteCursor)
     assert cursor.fetchone()[0] == 1
     store.close()
-    with pytest.raises(LiveSQLiteFileError):
-        harden_secret_file(path)
-    assert _probe(path) == [[True, os.getpid()], [True, os.getpid()]]
+    harden_secret_file(path)
+    assert [tuple(row) for row in cursor.fetchall()] == [(2,), (3,)]
+    assert not Path(str(path) + "-shm").exists()
     replacement = make()
     try:
         assert _probe(path) == [[True, os.getpid()], [True, os.getpid()]]

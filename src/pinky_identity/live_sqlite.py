@@ -7,10 +7,14 @@ Registration and inspection use stat only; they never open a database.
 
 from __future__ import annotations
 
+import operator
 import os
 import sqlite3
 import threading
 import weakref
+from contextlib import ExitStack
+from functools import wraps
+from itertools import islice
 from pathlib import Path
 
 _SUFFIXES = ("", "-wal", "-shm", "-journal")
@@ -102,12 +106,97 @@ class LiveSQLiteCursor(sqlite3.Cursor):
         unregister_live_sqlite(self)
 
 
+def serialized_sqlite_call(method):
+    """Serialize operations only on connections that permit cross-thread use."""
+
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        if self._sqlite_lock is None:
+            return method(self, *args, **kwargs)
+        with self._sqlite_lock:
+            return method(self, *args, **kwargs)
+
+    return locked
+
+
+_USE_ARRAYSIZE = object()
+
+
+class MaterializedSQLiteCursor:
+    """DB-API results with no open native cursor or statement after execution."""
+
+    def __init__(self, connection, factory=sqlite3.Cursor):
+        self.connection = connection
+        self._factory = sqlite3.Cursor if factory is LiveSQLiteCursor else factory
+        self.row_factory = connection.row_factory
+        self.arraysize = 1
+        self.description = None
+        self.lastrowid = None
+        self.rowcount = -1
+        self._rows = iter(())
+
+    def _execute(self, operation, *args):
+        with self.connection._sqlite_lock:
+            self._rows = iter(())
+            self.description = None
+            self.rowcount = -1
+            cursor = sqlite3.Connection.cursor(self.connection, self._factory)
+            try:
+                cursor.row_factory = self.row_factory
+                getattr(cursor, operation)(*args)
+                rows = cursor.fetchall()
+                self.description = cursor.description
+                self.lastrowid = cursor.lastrowid
+                self.rowcount = cursor.rowcount
+                self._rows = iter(rows)
+            finally:
+                cursor.close()
+        return self
+
+    def execute(self, sql, parameters=(), /):
+        return self._execute("execute", sql, parameters)
+
+    def executemany(self, sql, parameters, /):
+        return self._execute("executemany", sql, parameters)
+
+    def executescript(self, script, /):
+        return self._execute("executescript", script)
+
+    def fetchone(self):
+        return next(self._rows, None)
+
+    def fetchmany(self, size=_USE_ARRAYSIZE):
+        size = operator.index(self.arraysize if size is _USE_ARRAYSIZE else size)
+        return list(self._rows) if size <= 0 else list(islice(self._rows, size))
+
+    def fetchall(self):
+        return list(self._rows)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._rows)
+
+    def close(self):
+        # Execution already closed the native cursor under connection ownership.
+        pass
+
+
 class LiveSQLiteConnection(sqlite3.Connection):
-    """Track connection and cursor lifetimes, including SQLite zombie handles."""
+    """Track live inodes; materialize cursors when cross-thread use is enabled."""
 
     _live_sqlite_path: str | None = None
 
+    def __init__(self, *args, **kwargs):
+        check_same_thread = kwargs.get("check_same_thread", args[4] if len(args) > 4 else True)
+        self._sqlite_lock = None if check_same_thread else threading.RLock()
+        super().__init__(*args, **kwargs)
+
+    @serialized_sqlite_call
     def cursor(self, factory=LiveSQLiteCursor):
+        if self._sqlite_lock is not None:
+            return MaterializedSQLiteCursor(self, factory)
         cursor = super().cursor(factory)
         if self._live_sqlite_path is not None:
             with _lock:
@@ -116,16 +205,66 @@ class LiveSQLiteConnection(sqlite3.Connection):
                     _owners[cursor] = paths
         return cursor
 
+    @serialized_sqlite_call
     def execute(self, sql, parameters=(), /):
         return self.cursor().execute(sql, parameters)
 
+    @serialized_sqlite_call
     def executemany(self, sql, parameters, /):
         return self.cursor().executemany(sql, parameters)
 
+    @serialized_sqlite_call
     def executescript(self, script, /):
         return self.cursor().executescript(script)
 
+    commit = serialized_sqlite_call(sqlite3.Connection.commit)
+    rollback = serialized_sqlite_call(sqlite3.Connection.rollback)
+    __enter__ = serialized_sqlite_call(sqlite3.Connection.__enter__)
+    __exit__ = serialized_sqlite_call(sqlite3.Connection.__exit__)
+    create_function = serialized_sqlite_call(sqlite3.Connection.create_function)
+    create_aggregate = serialized_sqlite_call(sqlite3.Connection.create_aggregate)
+    create_collation = serialized_sqlite_call(sqlite3.Connection.create_collation)
+    create_window_function = serialized_sqlite_call(sqlite3.Connection.create_window_function)
+    set_authorizer = serialized_sqlite_call(sqlite3.Connection.set_authorizer)
+    set_progress_handler = serialized_sqlite_call(sqlite3.Connection.set_progress_handler)
+    set_trace_callback = serialized_sqlite_call(sqlite3.Connection.set_trace_callback)
+    getlimit = serialized_sqlite_call(sqlite3.Connection.getlimit)
+    setlimit = serialized_sqlite_call(sqlite3.Connection.setlimit)
+    if hasattr(sqlite3.Connection, "serialize"):
+        serialize = serialized_sqlite_call(sqlite3.Connection.serialize)
+        deserialize = serialized_sqlite_call(sqlite3.Connection.deserialize)
+    if hasattr(sqlite3.Connection, "enable_load_extension"):
+        enable_load_extension = serialized_sqlite_call(sqlite3.Connection.enable_load_extension)
+        load_extension = serialized_sqlite_call(sqlite3.Connection.load_extension)
+    if hasattr(sqlite3.Connection, "setconfig"):
+        getconfig = serialized_sqlite_call(sqlite3.Connection.getconfig)
+        setconfig = serialized_sqlite_call(sqlite3.Connection.setconfig)
+
+    def backup(self, target, **kwargs):
+        # Both handles participate; stable ordering prevents opposite backups
+        # from each taking their source lock and waiting for the other's target.
+        locks = {lock for db in (self, target) if (lock := getattr(db, "_sqlite_lock", None))}
+        with ExitStack() as stack:
+            for lock in sorted(locks, key=id):
+                stack.enter_context(lock)
+            return super().backup(target, **kwargs)
+
+    @serialized_sqlite_call
+    def iterdump(self, *args, **kwargs):
+        dump = super().iterdump(*args, **kwargs)
+        return iter(tuple(dump)) if self._sqlite_lock is not None else dump
+
+    @serialized_sqlite_call
+    def blobopen(self, *args, **kwargs):
+        if self._sqlite_lock is not None:
+            raise sqlite3.NotSupportedError("incremental blobs require a same-thread connection")
+        return super().blobopen(*args, **kwargs)
+
+    # interrupt deliberately bypasses ownership: another thread must be able
+    # to cancel a long-running operation while that operation holds the lock.
+
+    @serialized_sqlite_call
     def close(self) -> None:
         super().close()
-        # Any unfinished cursor remains registered until close or collection.
+        # Only same-thread cursors can still own an unfinished native statement.
         unregister_live_sqlite(self)

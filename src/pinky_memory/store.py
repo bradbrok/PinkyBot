@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from pinky_identity.live_sqlite import LiveSQLiteConnection
 from pinky_memory.ephemeral_guard import (
     guard_enabled,
     is_ephemeral_entity,
@@ -157,7 +158,7 @@ class ReflectionStore:
         # introspect() so health checks can detect a degraded vec backend.
         self._vec_fallback_count = 0
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False, factory=LiveSQLiteConnection)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
@@ -2511,7 +2512,7 @@ class ReflectionStore:
                 # Connection may already be closed — ignore and proceed to
                 # reopen below. #295
                 logger.debug("close on reopen failed (already closed?): %s", e)
-            self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            self._conn = sqlite3.connect(self._db_path, check_same_thread=False, factory=LiveSQLiteConnection)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA busy_timeout=5000")
