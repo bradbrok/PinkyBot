@@ -478,11 +478,20 @@ async def test_dream_readiness_wait_ignores_prefix_neighbour(dream_tmux, tmp_pat
 
 
 async def test_dream_submit_check_never_sends_enter_to_prefix_neighbour(dream_tmux, tmp_path):
+    def wait_for_parked_cursor(name: str) -> None:
+        # The prompt can appear before printf finishes drawing and moves the cursor.
+        # Four newlines, then up two rows and right two columns, end at (2, 2).
+        deadline = time.monotonic() + 10.0
+        while (cursor := dream_tmux.pane_format(name, "#{cursor_x},#{cursor_y}")) != "2,2":
+            assert time.monotonic() < deadline, f"{name} cursor stayed at {cursor}, expected 2,2"
+            time.sleep(0.05)
+
     instruction = "Read the file /nowhere/prompt.md and follow it"
     parked_command = "printf 'Provider\\n────────────────────────────────────────────────────────────\\n❯ \\n────────────────────────────────────────────────────────────\\n\\033[2A\\033[2C'; exec cat"
     dream_tmux.new("pinky-dream-x-old", parked_command)
+    wait_for_parked_cursor("pinky-dream-x-old")
     dream_tmux.type_literal("pinky-dream-x-old", instruction)
-    dream_tmux.wait_for_text("pinky-dream-x-old", instruction)
+    dream_tmux.wait_for_text("pinky-dream-x-old", "❯ " + instruction)
     runner = _dream_runner(tmp_path)
 
     await runner._ensure_submitted(instruction)
@@ -491,8 +500,9 @@ async def test_dream_submit_check_never_sends_enter_to_prefix_neighbour(dream_tm
     assert dream_tmux.capture("pinky-dream-x-old").count(instruction) == 1
 
     dream_tmux.new("pinky-dream-x", parked_command)
+    wait_for_parked_cursor("pinky-dream-x")
     dream_tmux.type_literal("pinky-dream-x", instruction)
-    dream_tmux.wait_for_text("pinky-dream-x", instruction)
+    dream_tmux.wait_for_text("pinky-dream-x", "❯ " + instruction)
     await runner._ensure_submitted(instruction)
     pane = dream_tmux.wait_for_text("pinky-dream-x", instruction + "\n" + instruction)
     assert pane.count(instruction) == 2
