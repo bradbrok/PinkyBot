@@ -47,7 +47,18 @@ def fire(registry, *, at=NOW, name="periodic", cron="0 * * * *"):
 
 
 @pytest.fixture
-def wake_context_app(tmp_path):
+def wake_context_clock(monkeypatch):
+    from pinky_daemon import api
+
+    clock = SimpleNamespace(now=NOW + 10_000)
+    monkeypatch.setattr(api, "time", SimpleNamespace(
+        **{**vars(api.time), "time": lambda: clock.now},
+    ))
+    return clock
+
+
+@pytest.fixture
+def wake_context_app(tmp_path, wake_context_clock):
     from pinky_daemon.api import create_api
 
     app = create_api(default_working_dir=str(tmp_path), db_path=str(tmp_path / "api.db"))
@@ -86,14 +97,16 @@ def accept_fire(registry, pending, *, delivered_at=NOW + 5000):
 
 def pasted_line(pending):
     return (
-        f"- {pending.name} (fired_at={pending.fired_at}): pasted before the restart, "
+        f"- {pending.name} (pending #{pending.id}, fired_at={pending.fired_at}): "
+        "pasted before the restart, "
         "may not have run; check before redoing"
     )
 
 
 def unpasted_line(pending):
     return (
-        f"- {pending.name} (fired_at={pending.fired_at}): not delivered yet; "
+        f"- {pending.name} (pending #{pending.id}, fired_at={pending.fired_at}): "
+        "not delivered yet; "
         "the full prompt arrives as its own message, so don't start it from this list"
     )
 
@@ -969,3 +982,92 @@ async def test_default_busy_policy_advances_then_stale_drops_notification_cohort
     assert alerts == []
     assert all(registry.get_schedule_wake_by_fire(row.schedule_id, row.fired_at) is None for row in rows)
     assert sum(n.drop_count for n in registry.list_recurring_schedule_stale_drops('worker')) == len(rows)
+
+
+@pytest.mark.parametrize("commit", [False, True])
+@pytest.mark.parametrize("one_shot", [False, True])
+@pytest.mark.parametrize("retire", ["discard", "park"])
+def test_restart_context_omits_parked_pasted_wake(
+    wake_context_app, commit, one_shot, retire,
+):
+    registry = wake_context_app.state.agents
+    pending = fire(registry, name="retired")
+    assert registry.update_schedule(pending.schedule_id, one_shot=one_shot) is not None
+    pasted_fire(registry, pending, abandoned=False)
+    if retire == "discard":
+        assert registry.discard_pending_schedule_wake(pending.id, agent_name="worker")
+    else:
+        assert registry.park_pending_schedule_wake(pending.id, parked_at=NOW + 1)
+    stored = registry.get_schedule_wake_by_fire(pending.schedule_id, pending.fired_at)
+    assert stored.pasted_at > 0
+    assert stored.parked_at > 0
+    assert stored.abandoned_at == 0
+    assert stored.accepted_at == 0
+    assert_owed_context(wake_context_app, [pending], [], commit=commit)
+    retained = fire(registry, name="retained", at=NOW + 60)
+    pasted_fire(registry, retained, abandoned=False)
+    assert_owed_context(
+        wake_context_app, [pending, retained], [pasted_line(retained)], commit=commit,
+    )
+
+
+@pytest.mark.parametrize("commit", [False, True])
+@pytest.mark.parametrize("pasted", [False, True])
+@pytest.mark.parametrize("drain_parked", [False, True])
+def test_restart_context_names_pending_row_id(wake_context_app, commit, pasted, drain_parked):
+    registry = wake_context_app.state.agents
+    registry.add_schedule("worker", "0 * * * *", name="unused", prompt="unused")
+    pending = fire(registry)
+    assert pending.id != pending.schedule_id
+    if pasted:
+        pasted_fire(registry, pending, abandoned=False)
+    if drain_parked:
+        assert registry.drain_park_pending_schedule_wake(pending.id, drain_parked_at=NOW + 1)
+    stored = registry.get_schedule_wake_by_fire(pending.schedule_id, pending.fired_at)
+    assert stored.parked_at == stored.abandoned_at == stored.accepted_at == 0
+    assert (stored.drain_parked_at > 0) is drain_parked
+    expected = pasted_line(pending) if pasted else unpasted_line(pending)
+    text = assert_owed_context(wake_context_app, [pending], [expected], commit=commit)
+    assert f"pending #{pending.id}," in text
+    assert f"pending #{pending.schedule_id}," not in text
+
+
+@pytest.mark.parametrize("commit", [False, True])
+@pytest.mark.parametrize("one_shot", [False, True])
+@pytest.mark.parametrize("age", [86_399, 86_400, 86_401], ids=["inside", "boundary", "expired"])
+def test_restart_context_bounds_abandoned_paste(
+    wake_context_app, wake_context_clock, commit, one_shot, age,
+):
+    registry = wake_context_app.state.agents
+    wake_context_clock.now = NOW
+    pending = fire(registry, name="lost", at=NOW - 3 * 86_400)
+    assert registry.update_schedule(pending.schedule_id, one_shot=one_shot) is not None
+    pasted_fire(registry, pending, pasted_at=pending.fired_at, abandoned=False)
+    assert registry.abandon_pending_schedule_wake(
+        pending.id, abandoned_at=NOW - age, reason="PASTED_UNCONFIRMED_SESSION_LOST",
+    )
+    stored = registry.get_schedule_wake_by_fire(pending.schedule_id, pending.fired_at)
+    assert stored.abandoned_at == NOW - age
+    assert stored.parked_at == stored.accepted_at == 0
+    # Abandoned rows cannot be discarded; only their warning ages out.
+    assert not registry.discard_pending_schedule_wake(pending.id, agent_name="worker")
+    expected = [pasted_line(pending)] if age < 86_400 else []
+    assert_owed_context(wake_context_app, [pending], expected, commit=commit)
+    retained = fire(registry, name="retained")
+    pasted_fire(registry, retained, abandoned=False)
+    assert_owed_context(
+        wake_context_app, [pending, retained], expected + [pasted_line(retained)], commit=commit,
+    )
+
+
+@pytest.mark.parametrize("commit", [False, True])
+@pytest.mark.parametrize("one_shot", [False, True])
+def test_restart_context_retains_old_active_paste(
+    wake_context_app, wake_context_clock, commit, one_shot,
+):
+    registry = wake_context_app.state.agents
+    wake_context_clock.now = NOW
+    pending = fire(registry, at=NOW - 30 * 86_400)
+    assert registry.update_schedule(pending.schedule_id, one_shot=one_shot) is not None
+    pasted_fire(registry, pending, pasted_at=pending.fired_at, abandoned=False)
+    assert_owed_context(wake_context_app, [pending], [pasted_line(pending)], commit=commit)

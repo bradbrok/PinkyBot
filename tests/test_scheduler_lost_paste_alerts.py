@@ -280,8 +280,8 @@ async def test_api_uses_non_tmux_session_normal_notice_route(api_session, after_
         )
         body = ss._config.wake_context_builder("worker", WakeReason.CONTEXT_RESTART)
         assert "Owed scheduled wakes:" in body
-        assert f"- periodic (fired_at={FIRED})" in body
-        assert f"- secondary (fired_at={FIRED + 1})" in body
+        assert f"- periodic (pending #{row.id}, fired_at={FIRED})" in body
+        assert f"- secondary (pending #{other.id}, fired_at={FIRED + 1})" in body
         # Deliver that rebuilt context through the SDK's actual wake hook.
         await ss.connect()
         await ss._initial_wake_task
