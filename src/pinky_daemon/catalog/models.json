@@ -1,7 +1,7 @@
 {
   "schema": "pinky-model-roster/1",
-  "revision": 11,
-  "updated": "2026-11-18",
+  "revision": 12,
+  "updated": "2026-11-19",
   "models": [
     {
       "provider": "anthropic",
@@ -420,6 +420,25 @@
       "supports_thinking": false,
       "active": true,
       "sort_order": 60
+    },
+    {
+      "provider": "openai",
+      "model_id": "gpt-5.2",
+      "display_name": "GPT-5.2",
+      "description": "Earlier flagship. Complex professional reasoning + coding. 400K context, 128K output. Available via the Responses API.",
+      "tier": "flagship",
+      "context_window": 400000,
+      "is_1m": false,
+      "pricing": {
+        "input": 1.75,
+        "output": 14.0,
+        "cached_input": 0.175,
+        "cache_write_5m": 0.0,
+        "cache_write_1h": 0.0
+      },
+      "supports_thinking": false,
+      "active": true,
+      "sort_order": 62
     },
     {
       "provider": "openai",
