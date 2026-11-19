@@ -481,8 +481,9 @@ async def test_dream_submit_check_never_sends_enter_to_prefix_neighbour(dream_tm
     instruction = "Read the file /nowhere/prompt.md and follow it"
     parked_command = "printf 'Provider\\n────────────────────────────────────────────────────────────\\n❯ \\n────────────────────────────────────────────────────────────\\n\\033[2A\\033[2C'; exec cat"
     dream_tmux.new("pinky-dream-x-old", parked_command)
+    dream_tmux.wait_for_text("pinky-dream-x-old", "❯")
     dream_tmux.type_literal("pinky-dream-x-old", instruction)
-    dream_tmux.wait_for_text("pinky-dream-x-old", instruction)
+    dream_tmux.wait_for_text("pinky-dream-x-old", "❯ " + instruction)
     runner = _dream_runner(tmp_path)
 
     await runner._ensure_submitted(instruction)
@@ -491,8 +492,9 @@ async def test_dream_submit_check_never_sends_enter_to_prefix_neighbour(dream_tm
     assert dream_tmux.capture("pinky-dream-x-old").count(instruction) == 1
 
     dream_tmux.new("pinky-dream-x", parked_command)
+    dream_tmux.wait_for_text("pinky-dream-x", "❯")
     dream_tmux.type_literal("pinky-dream-x", instruction)
-    dream_tmux.wait_for_text("pinky-dream-x", instruction)
+    dream_tmux.wait_for_text("pinky-dream-x", "❯ " + instruction)
     await runner._ensure_submitted(instruction)
     pane = dream_tmux.wait_for_text("pinky-dream-x", instruction + "\n" + instruction)
     assert pane.count(instruction) == 2
