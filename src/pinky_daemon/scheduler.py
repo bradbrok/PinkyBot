@@ -342,10 +342,12 @@ class ScheduleWakeReceipt:
         self.fired_at = fired_at
         self._registry = registry
         self._trace_matched_by = "on_accept"
+        self._trace_evidence = ""
 
     def trace(self, edge: str, **fields) -> None:
         if edge == "accept_source":
             self._trace_matched_by = fields.get("matched_by", "transcript_receipt")
+            self._trace_evidence = fields.get("evidence", "")
             return
         trace_event(self._registry, edge, schedule_id=self.schedule_id,
                     fired_at=self.fired_at, **fields)
@@ -369,6 +371,7 @@ class ScheduleWakeReceipt:
             self.fired_at,
             delivered_at=time.time(),
             trace_matched_by=self._trace_matched_by,
+            evidence=self._trace_evidence,
         )
 
 class AgentScheduler:

@@ -2702,3 +2702,17 @@ class TestRegisterAgent:
         with patch("urllib.request.urlopen", side_effect=_urlopen):
             _tools(srv)["register_agent"](name="mora")
         assert bodies and bodies[0]["isolation_mode"] == "local"
+
+
+@pytest.mark.parametrize("last_run,last_delivered,detail", [
+    (120.0, 125.5, "last ran at 120.0, last delivered at 125.5"),
+    (0, 0, "never run, never delivered"),
+])
+def test_schedule_list_distinguishes_fire_and_delivery(srv, last_run, last_delivered, detail):
+    response = {"schedules": [{
+        "id": 7, "name": "hourly", "cron": "0 * * * *", "enabled": True,
+        "prompt": "work", "last_run": last_run, "last_delivered": last_delivered,
+    }]}
+    with _ok(response):
+        result = _tools(srv)["list_my_schedules"]()
+    assert result == "#7 [active] hourly: 0 * * * * — work (" + detail + ")"

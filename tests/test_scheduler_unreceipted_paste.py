@@ -909,9 +909,9 @@ def _observe_accept_edges(session, monkeypatch):
     edges = []
     mark = session._mark_transport_accepted
 
-    def observe(turn):
+    def observe(turn, *, evidence=""):
         accepted = turn.transport_accepted
-        result = mark(turn)
+        result = mark(turn, evidence=evidence)
         if not accepted and turn.transport_accepted:
             edges.append(turn)
         return result
