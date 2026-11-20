@@ -14593,8 +14593,8 @@ npm run build</pre>
                     pass
             receipt = await scheduler_send(prompt, **scheduler_kwargs)
             _log(
-                f"scheduler: queued confirmed-delivery wake for "
-                f"{agent_name} via streaming main"
+                f"scheduler: queued wake for {agent_name} via streaming main; "
+                "awaiting exact receipt"
             )
             return receipt
 
