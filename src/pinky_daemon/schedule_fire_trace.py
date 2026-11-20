@@ -51,6 +51,7 @@ _COLUMNS = {
     "user_message_pointer": "TEXT NOT NULL DEFAULT ''",
     "matched_at": "REAL NOT NULL DEFAULT 0",
     "matched_by": "TEXT NOT NULL DEFAULT ''",
+    "accept_evidence": "TEXT NOT NULL DEFAULT ''",
     "receipt_accept_result": "INTEGER",
     "abandoned_at": "REAL NOT NULL DEFAULT 0",
     "abandon_reason": "TEXT NOT NULL DEFAULT ''",
@@ -685,6 +686,7 @@ class ScheduleFireTrace:
             if result and not row["matched_at"]:
                 row["matched_at"] = at
                 row["matched_by"] = event.get("matched_by", "on_accept")
+                row["accept_evidence"] = event.get("evidence", "")
             row["receipt_accept_result"] = max(row["receipt_accept_result"] or 0, int(result))
             row["late_accept_after_abandon"] = int(
                 bool(row["abandoned_at"] and row["matched_at"] >= row["abandoned_at"])

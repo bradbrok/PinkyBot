@@ -9726,7 +9726,9 @@ class TmuxSession(TransportReplacementMixin):
                             # Reuse the exact-transcript acceptance edge so a
                             # scheduler's durable accept callback runs before
                             # its positive in-process receipt (#1068 contract).
-                            self._mark_transport_accepted(turn)
+                            self._mark_transport_accepted(
+                                turn, evidence="idle_phantom_probe",
+                            )
                             if delivery is not None and not delivery.done():
                                 # Defensive for an inconsistent pre-accepted
                                 # turn whose receipt somehow remained pending.
@@ -10824,7 +10826,9 @@ class TmuxSession(TransportReplacementMixin):
             for row_offset, row_identity in rows
         ):
             return
-        self._mark_transport_accepted(queued.turn)
+        self._mark_transport_accepted(
+            queued.turn, evidence="mid_turn_fold",
+        )
 
     def _handle_fold_attachment(
         self,
@@ -11114,7 +11118,9 @@ class TmuxSession(TransportReplacementMixin):
             consumed = self._phantom_consumption_verdicts([entry])[0]
             outcome = "undelivered"
             if consumed is True:
-                self._mark_transport_accepted(turn)
+                self._mark_transport_accepted(
+                    turn, evidence="pending_paste_probe",
+                )
                 outcome, reason = "accepted", "consumed"
             else:
                 pending.qualifying_ticks += 1
@@ -11276,7 +11282,9 @@ class TmuxSession(TransportReplacementMixin):
             occupied.append(span)
             self._trace_scheduler_turn(turn, "observed", pointer=pointer)
 
-    def _mark_transport_accepted(self, turn: _QueuedTurn | None) -> bool:
+    def _mark_transport_accepted(
+        self, turn: _QueuedTurn | None, *, evidence: str = ""
+    ) -> bool:
         """Resolve exact receipts only on observed pane acceptance."""
         if turn is None:
             return False
@@ -11289,7 +11297,9 @@ class TmuxSession(TransportReplacementMixin):
         if self._wake_requires_submission_receipt(turn):
             self._finish_turn_delivery(turn, fire_on_delivered=False)
         if turn.scheduler_accept is not None:
-            self._trace_scheduler_turn(turn, "accept_source", matched_by="transcript_receipt")
+            self._trace_scheduler_turn(
+                turn, "accept_source", matched_by="transcript_receipt", evidence=evidence,
+            )
             try:
                 persisted = turn.scheduler_accept()
             except Exception as exc:
@@ -11410,7 +11420,9 @@ class TmuxSession(TransportReplacementMixin):
                 turn = (
                     None if queued_evidence.retired else queued_evidence.turn
                 )
-                accepted = self._mark_transport_accepted(turn)
+                accepted = self._mark_transport_accepted(
+                    turn, evidence="queue_dequeue",
+                )
                 self._pane_dequeued_turns.append(
                     _DequeuedPromptEvidence(
                         content,
@@ -11497,7 +11509,9 @@ class TmuxSession(TransportReplacementMixin):
                     evidence = self._pane_dequeued_turns[matching_dequeue]
                     del self._pane_dequeued_turns[matching_dequeue]
                     if not evidence.accepted_at_dequeue and not evidence.retired:
-                        self._mark_transport_accepted(evidence.turn)
+                        self._mark_transport_accepted(
+                            evidence.turn, evidence="dequeued_user_row",
+                        )
                     return
                 turn = self._match_acceptance_content(prompt)
                 if turn is not None:
@@ -11506,7 +11520,9 @@ class TmuxSession(TransportReplacementMixin):
                         entry_offset=entry_offset,
                         source_identity=source_identity,
                     ):
-                        self._mark_transport_accepted(turn)
+                        self._mark_transport_accepted(
+                            turn, evidence="user_row",
+                        )
                 else:
                     for folded_turn in self._folded_acceptance_turns(prompt):
                         folded_meta = next(
@@ -11530,7 +11546,9 @@ class TmuxSession(TransportReplacementMixin):
                             ticket_identity=ticket_identity,
                         ):
                             continue
-                        self._mark_transport_accepted(folded_turn)
+                        self._mark_transport_accepted(
+                            folded_turn, evidence="folded_user_row",
+                        )
 
     @staticmethod
     def _resolve_submission_receipt(
@@ -12317,7 +12335,9 @@ class TmuxSession(TransportReplacementMixin):
                         if consumed is not False:
                             reason = "probe_unavailable"
                             if consumed is True:
-                                self._mark_transport_accepted(turn)
+                                self._mark_transport_accepted(
+                                    turn, evidence="redelivery_recheck",
+                                )
                                 reason = "consumed_before_redelivery"
                             else:
                                 # The under-lock terminal check fenced this receipt.

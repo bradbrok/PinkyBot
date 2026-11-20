@@ -6370,6 +6370,7 @@ except Exception as exc:
         *,
         delivered_at: float = 0.0,
         trace_matched_by: str = "on_accept",
+        evidence: str = "",
     ) -> bool:
         """Atomically persist acceptance for one exact fire before replay."""
         timestamp = delivered_at or time.time()
@@ -6405,16 +6406,17 @@ except Exception as exc:
             released = self._release_drain_parked_locked(str(row[2]), timestamp)
             self._db.commit()
         trace_event(self, "accept", fire_id=row[0], schedule_id=schedule_id, fired_at=fired_at,
-                    at=timestamp, result=True, matched_by=trace_matched_by)
+                    at=timestamp, result=True, matched_by=trace_matched_by, evidence=evidence)
         for released_id, released_schedule, released_fire in released:
             trace_event(self, "abandon", at=timestamp, release_agent=str(row[2]), reason="released",
                         fire_id=released_id, schedule_id=released_schedule, fired_at=released_fire)
         newly_receipted = float(row[1]) == 0
         if newly_receipted:
+            evidence_suffix = f", evidence={evidence}" if evidence else ""
             _log(
                 "agent_registry: SCHEDULE_WAKE_RECEIPTED "
                 f"pending #{row[0]}, schedule #{schedule_id}, "
-                f"fired_at={fired_at}"
+                f"fired_at={fired_at}{evidence_suffix}"
             )
         return True
 
