@@ -28,3 +28,19 @@ def test_missing_schedule_row_keeps_positive_receipt(registry, capsys, by_fire):
         f"pending #{pending.id}, schedule #{pending.schedule_id}, fired_at={pending.fired_at}"
     )
     assert capsys.readouterr().err.splitlines().count(expected) == 1
+
+
+@pytest.mark.parametrize("by_fire", [False, True])
+def test_present_schedule_row_logs_no_missing_diagnostic(registry, capsys, by_fire):
+    pending, _ = fire(registry)
+    capsys.readouterr()
+    delivered_at = pending.fired_at + 30
+    if by_fire:
+        result = registry.confirm_pending_schedule_wake_by_fire(
+            pending.schedule_id, pending.fired_at, delivered_at=delivered_at,
+        )
+    else:
+        result = registry.confirm_pending_schedule_wake(pending.id, delivered_at=delivered_at)
+    assert result is True
+    assert "SCHEDULE_ROW_MISSING" not in capsys.readouterr().err
+    assert registry.get_schedule(pending.schedule_id).last_delivered == delivered_at
