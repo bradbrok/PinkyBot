@@ -9768,6 +9768,7 @@ class TmuxSession(TransportReplacementMixin):
                             state=self.state.value, progress_stale_s=age,
                             inflight_turns=depth, inflight_active=False,
                         )
+                    self._notify_scheduler_idle_if_ready()
                     continue
                 if verdict == "unknown":
                     # #943 prevents one stale sample from proving a wedge.
