@@ -237,7 +237,7 @@ def create_server(
 
         @mcp.tool()
         def list_my_schedules() -> str:
-            """List all your cron schedules with status and last run time."""
+            """List all your cron schedules with status, fire and delivery times."""
             result = _api("GET", f"/agents/{agent_name}/schedules?enabled_only=false")
             if "error" in result:
                 return f"Failed to list schedules: {result['error']}"
@@ -249,16 +249,19 @@ def create_server(
                 status = "active" if s["enabled"] else "disabled"
                 last = s.get("last_run", 0)
                 last_str = f"last ran at {last}" if last else "never run"
-                lines.append(f"#{s['id']} [{status}] {s['name']}: {s['cron']} — {s.get('prompt', '')[:80]} ({last_str})")
+                delivered = s.get("last_delivered", 0)
+                delivered_str = f"last delivered at {delivered}" if delivered else "never delivered"
+                lines.append(f"#{s['id']} [{status}] {s['name']}: {s['cron']} — {s.get('prompt', '')[:80]} ({last_str}, {delivered_str})")
             return "\n".join(lines)
 
         @mcp.tool()
         def get_schedule(schedule_id: int) -> str:
             """Return the full record of one of your own wake schedules as JSON.
 
-            Same rows as list_my_schedules, with the prompt untruncated: id, name,
+            Same rows as list_my_schedules, with the prompt untruncated: id, agent_name, name, prompt,
             cron, timezone, enabled, one_shot, direct_send, target_channel,
-            last_run and next_run. A schedule owned by another agent is refused.
+            last_run, last_delivered, last_accepted_fired_at, next_run and created_at.
+            A schedule owned by another agent is refused.
             """
             result = _api("GET", f"/agents/{agent_name}/schedules?enabled_only=false")
             if not isinstance(result, dict):
