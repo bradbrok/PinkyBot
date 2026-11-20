@@ -1,7 +1,7 @@
 {
   "schema": "pinky-model-roster/1",
-  "revision": 12,
-  "updated": "2026-11-19",
+  "revision": 13,
+  "updated": "2026-11-20",
   "models": [
     {
       "provider": "anthropic",
@@ -330,7 +330,7 @@
       "provider": "anthropic",
       "model_id": "claude-sonnet-4-5",
       "display_name": "Claude Sonnet 4.5",
-      "description": "Previous-gen Sonnet.",
+      "description": "Previous-gen Sonnet. Deprecated 2026-09-30; retires 2026-11-30 (use claude-sonnet-5-5).",
       "tier": "sonnet",
       "context_window": 200000,
       "is_1m": false,
@@ -463,7 +463,7 @@
       "provider": "openai",
       "model_id": "gpt-5.4-nano",
       "display_name": "GPT-5.4 Nano",
-      "description": "Cheapest. High-volume tasks.",
+      "description": "Cheapest. High-volume tasks. Deprecated 2026-10-01; retires 2027-04-01 (use gpt-6-luna).",
       "tier": "low",
       "context_window": 200000,
       "is_1m": false,
