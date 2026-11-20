@@ -6334,13 +6334,14 @@ except Exception as exc:
             ).fetchone()
             if row is None:
                 return False
-            self._db.execute(
+            schedule_update = self._db.execute(
                 """UPDATE agent_schedules
                    SET last_delivered=MAX(last_delivered, ?),
                        last_accepted_fired_at=MAX(last_accepted_fired_at, ?)
                    WHERE id=?""",
                 (timestamp, float(row[2]), row[0]),
             )
+            schedule_missing = schedule_update.rowcount == 0
             self._db.execute(
                 """UPDATE pending_schedule_wakes
                    SET accepted_at=CASE
@@ -6356,6 +6357,11 @@ except Exception as exc:
             # other drain-parked row this agent holds (#635, #991 seam).
             released = self._release_drain_parked_locked(str(row[3]), timestamp)
             self._db.commit()
+        if schedule_missing:
+            _log(
+                "agent_registry: SCHEDULE_ROW_MISSING "
+                f"pending #{pending_id}, schedule #{row[0]}, fired_at={float(row[2])}"
+            )
         trace_event(self, "accept", fire_id=pending_id, schedule_id=row[0], fired_at=float(row[2]),
                     at=timestamp, result=True, matched_by=trace_matched_by)
         for released_id, released_schedule, released_fire in released:
@@ -6383,13 +6389,14 @@ except Exception as exc:
             ).fetchone()
             if row is None:
                 return False
-            self._db.execute(
+            schedule_update = self._db.execute(
                 """UPDATE agent_schedules
                    SET last_delivered=MAX(last_delivered, ?),
                        last_accepted_fired_at=MAX(last_accepted_fired_at, ?)
                    WHERE id=?""",
                 (timestamp, fired_at, schedule_id),
             )
+            schedule_missing = schedule_update.rowcount == 0
             self._db.execute(
                 """UPDATE pending_schedule_wakes
                    SET accepted_at=CASE
@@ -6405,6 +6412,11 @@ except Exception as exc:
             # other drain-parked row this agent holds (#635, #991 seam).
             released = self._release_drain_parked_locked(str(row[2]), timestamp)
             self._db.commit()
+        if schedule_missing:
+            _log(
+                "agent_registry: SCHEDULE_ROW_MISSING "
+                f"pending #{row[0]}, schedule #{schedule_id}, fired_at={fired_at}"
+            )
         trace_event(self, "accept", fire_id=row[0], schedule_id=schedule_id, fired_at=fired_at,
                     at=timestamp, result=True, matched_by=trace_matched_by, evidence=evidence)
         for released_id, released_schedule, released_fire in released:
