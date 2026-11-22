@@ -1,4 +1,5 @@
 """Bounded fold-history progress, validation, equivalence and cold-start coverage."""
+
 from __future__ import annotations
 
 import asyncio
@@ -32,14 +33,24 @@ BUDGET = 4 * 1024 * 1024
 
 def _bind(session, path):
     session._tailer = TmuxTranscriptTailer(
-        transcript_path=path, on_turn_complete=lambda _response: None,
+        transcript_path=path,
+        on_turn_complete=lambda _response: None,
         agent_name=session.agent_name,
     )
 
 
 def _fill(path, size, *, single=False):
-    row = json.dumps({"type": "assistant", "message": {"content": [
-        {"type": "text", "text": "x" * (size if single else 2000)}]}}).encode() + b"\n"
+    row = (
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "text", "text": "x" * (size if single else 2000)}]
+                },
+            }
+        ).encode()
+        + b"\n"
+    )
     with path.open("ab") as handle:
         for _ in range(1 if single else math.ceil(size / len(row))):
             handle.write(row)
@@ -57,7 +68,9 @@ def _warm(session, path, *, maximum=100):
 @pytest.mark.parametrize("history_bytes", [0, BUDGET // 2, BUDGET + 1024, 2 * BUDGET])
 @pytest.mark.parametrize("attachment_first", [False, True])
 def test_checkpoint_proves_long_history_after_bounded_warmup(
-    tmp_path, history_bytes, attachment_first,
+    tmp_path,
+    history_bytes,
+    attachment_first,
 ):
     session = _make_session()
     path = tmp_path / "history.jsonl"
@@ -76,14 +89,33 @@ def test_checkpoint_proves_long_history_after_bounded_warmup(
 
 def test_existing_fold_scenarios_match_the_classified_reference(tmp_path):
     root = Path(__file__).resolve().parents[1]
-    files = sorted(str(p.relative_to(root)) for p in (root / "tests").glob("test_tmux_fold_*.py")
-                   if p.name != Path(__file__).name)
+    files = sorted(
+        str(p.relative_to(root))
+        for p in (root / "tests").glob("test_tmux_fold_*.py")
+        if p.name != Path(__file__).name
+    )
     assert len(files) == 4
-    result = subprocess.run([
-        sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
-        "-p", "tests._fold_history_reference", "--fold-history-differential",
-        "--basetemp=" + str(tmp_path / "reference"), *files,
-    ], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "-p",
+            "tests._fold_history_reference",
+            "--fold-history-differential",
+            "--basetemp=" + str(tmp_path / "reference"),
+            *files,
+        ],
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=180,
+    )
     assert result.returncode == 0, result.stdout
 
 
@@ -98,7 +130,9 @@ def test_seeded_incremental_fold_differential(tmp_path, monkeypatch):
         path = tmp_path / (str(case) + ".jsonl")
         path.write_text('{"type":"system"}\n')
         prompts = ["repeat", "repeat", "other", "cancel"]
-        entries = [_seed_inflight(session, prompt=rng.choice(prompts)) for _ in range(rng.randint(1, 4))]
+        entries = [
+            _seed_inflight(session, prompt=rng.choice(prompts)) for _ in range(rng.randint(1, 4))
+        ]
         for entry in entries:
             _bind_ticket(entry, path)
         _bind(session, path)
@@ -128,7 +162,9 @@ def test_seeded_incremental_fold_differential(tmp_path, monkeypatch):
             if case % 3 == 0:
                 session._warm_fold_history()
             with monkeypatch.context() as patch:
-                patch.setattr(tmux_session, "_PHANTOM_TRANSCRIPT_SCAN_BYTES", 64 if case % 7 == 0 else BUDGET)
+                patch.setattr(
+                    tmux_session, "_PHANTOM_TRANSCRIPT_SCAN_BYTES", 64 if case % 7 == 0 else BUDGET
+                )
                 verdicts, classes = _probe_with_classes(session, entries)
                 _assert_reference(session, entries, verdicts, classes)
             observed.update(classes)
@@ -136,7 +172,10 @@ def test_seeded_incremental_fold_differential(tmp_path, monkeypatch):
     elapsed = time.perf_counter() - started
     assert observed == {"a", "b", "c"}
     assert elapsed < 60
-    print("fold_differential=" + json.dumps({"cases": 2000, "classes": sorted(observed), "seconds": elapsed}))
+    print(
+        "fold_differential="
+        + json.dumps({"cases": 2000, "classes": sorted(observed), "seconds": elapsed})
+    )
 
 
 @pytest.mark.parametrize("change", ["truncate", "replace", "anchor", "path", "exception"])
@@ -154,7 +193,7 @@ def test_checkpoint_validation_discards_stale_history(tmp_path, monkeypatch, cha
         path.write_text('{"type":"system"}\n')
     elif change == "replace":
         replacement = tmp_path / "replacement"
-        replacement.write_text('{"type":"system"}\n')
+        replacement.write_bytes(path.read_bytes())
         replacement.replace(path)
     elif change == "anchor":
         text = path.read_text()
@@ -167,14 +206,14 @@ def test_checkpoint_validation_discards_stale_history(tmp_path, monkeypatch, cha
         entry = _seed_inflight(session, prompt="new path prompt")
         _bind_ticket(entry, other)
     else:
+
         def fail(*_args):
             raise OSError("injected validation failure")
+
         monkeypatch.setattr(os, "pread", fail)
     assert session._phantom_consumption_verdicts([entry]) == [False]
     if change == "replace":
-        state = session._fold_history._states[path]
-        current = path.stat()
-        assert state.identity == (current.st_dev, current.st_ino)
+        assert path not in session._fold_history._states
     if change in ("path", "exception"):
         assert path not in session._fold_history._states
 
@@ -235,7 +274,9 @@ def test_reconciliation_budget_and_mid_delta_progress(tmp_path, monkeypatch, sin
     _bind(session, path)
     counter = [0]
     opened, pread = session._open_transcript, os.pread
-    monkeypatch.setattr(session, "_open_transcript", lambda *args: _ReadCounter(opened(*args), counter))
+    monkeypatch.setattr(
+        session, "_open_transcript", lambda *args: _ReadCounter(opened(*args), counter)
+    )
 
     def counted_pread(*args):
         data = pread(*args)
@@ -271,6 +312,51 @@ def test_pending_row_cap_drops_the_buffer(tmp_path):
     state = session._fold_history._states[path]
     assert state.oversized and not state.complete
     assert state.pending_size == 0 and state.pending_chunks == []
+
+
+def test_warmup_slice_includes_validation_reads(tmp_path, monkeypatch):
+    session = _make_session()
+    path = tmp_path / "warm-budget.jsonl"
+    path.write_text('{"type":"system"}\n')
+    _fill(path, 10 * 1024 * 1024)
+    _bind(session, path)
+    counter = [0]
+    opened, pread = session._open_transcript, os.pread
+    monkeypatch.setattr(
+        session, "_open_transcript", lambda *args: _ReadCounter(opened(*args), counter)
+    )
+
+    def counted(*args):
+        data = pread(*args)
+        counter[0] += len(data)
+        return data
+
+    monkeypatch.setattr(os, "pread", counted)
+    for _ in range(6):
+        before = counter[0]
+        session._warm_fold_history()
+        assert counter[0] - before <= 2 * 1024 * 1024
+    assert session._fold_history._states[path].complete
+
+
+def test_history_lru_and_accepted_rebind_reset(tmp_path):
+    session = _make_session()
+    paths = []
+    for index in range(5):
+        path = tmp_path / (str(index) + ".jsonl")
+        path.write_text('{"type":"system"}\n')
+        identity = path.stat()
+        with path.open("rb") as handle:
+            result = session._fold_history.read(
+                handle, path, (identity.st_dev, identity.st_ino), BUDGET
+            )
+        assert result.complete
+        paths.append(path)
+    assert len(session._fold_history._states) == 4
+    assert paths[0] not in session._fold_history._states
+    _bind(session, paths[-1])
+    session._set_transcript_path_internal(paths[-1])
+    assert not session._fold_history._states
 
 
 @pytest.mark.parametrize("rewrite", [False, True])
@@ -375,11 +461,19 @@ async def test_real_watchdog_cold_start_has_zero_replays(tmp_path, monkeypatch, 
     assert session._fold_history._states[path].complete
     assert session._phantom_consumption_verdicts([entry]) == [True]
     ordered = sorted(elapsed)
-    print("fold_tick_timing=" + json.dumps({
-        "size": size, "ticks": ticks, "tick_s": tmux_session._WATCHDOG_TICK_SEC,
-        "threshold_s": tmux_session._TURN_DONE_TIMEOUT_SEC,
-        "max_ms": max(ordered) * 1000, "p95_ms": ordered[math.ceil(len(ordered) * .95) - 1] * 1000,
-    }))
+    print(
+        "fold_tick_timing="
+        + json.dumps(
+            {
+                "size": size,
+                "ticks": ticks,
+                "tick_s": tmux_session._WATCHDOG_TICK_SEC,
+                "threshold_s": tmux_session._TURN_DONE_TIMEOUT_SEC,
+                "max_ms": max(ordered) * 1000,
+                "p95_ms": ordered[math.ceil(len(ordered) * 0.95) - 1] * 1000,
+            }
+        )
+    )
 
 
 @pytest.mark.asyncio

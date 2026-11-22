@@ -128,6 +128,18 @@ from pinky_daemon.tmux_transcript import (
     TurnResponse,
     claude_project_slug,
 )
+from pinky_daemon.transcript_fold_history import (
+    FoldHistoryIndex,
+)
+from pinky_daemon.transcript_fold_history import (
+    _TranscriptProbeFoldChain as _TranscriptProbeFoldChain,
+)
+from pinky_daemon.transcript_fold_history import (
+    _TranscriptProbeFoldOccurrence as _TranscriptProbeFoldOccurrence,
+)
+from pinky_daemon.transcript_fold_history import (
+    _TranscriptProbeRow as _TranscriptProbeRow,
+)
 from pinky_daemon.transport import TransportReplacementMixin
 from pinky_daemon.transport_state import (
     SessionState,
@@ -1854,34 +1866,6 @@ class _RemovedPromptEvidence:
 
 
 @dataclass(frozen=True)
-class _TranscriptProbeRow:
-    """One complete JSONL row retained inside the phantom scan budget."""
-
-    offset: int
-    end: int
-    raw: bytes
-
-
-@dataclass(frozen=True)
-class _TranscriptProbeFoldChain:
-    """One exact enqueue/remove/queued-command occurrence from a scan."""
-
-    prompt: str
-    enqueue: _TranscriptProbeRow
-    remove: _TranscriptProbeRow
-    attachment: _TranscriptProbeRow
-
-
-@dataclass
-class _TranscriptProbeFoldOccurrence:
-    """One enqueue-created occurrence while reconstructing fold history."""
-
-    prompt: str
-    enqueue: _TranscriptProbeRow
-    attachment: _TranscriptProbeRow | None = None
-
-
-@dataclass(frozen=True)
 class _DequeuedPromptEvidence:
     """Content proof carried from a native queue dequeue to its user row."""
 
@@ -2237,6 +2221,7 @@ def _inflight_replay_tail_cap() -> int:
 # evidence must have a fixed synchronous I/O ceiling. The bound is cumulative
 # per opened physical file, not per candidate/path alias.
 _PHANTOM_TRANSCRIPT_SCAN_BYTES = 4 * 1024 * 1024
+_FOLD_HISTORY_WARMUP_BYTES = 2 * 1024 * 1024
 
 # Live attachment/remove pairing may span many minutes, so it is occurrence-
 # bounded rather than time-windowed. Each side owns both caps independently;
@@ -2494,6 +2479,8 @@ class TmuxSession(TransportReplacementMixin):
         self._pane_fold_ambiguous_keys: set[_FoldPairKey] = set()
         self._pane_fold_ambiguous_bytes = 0
         self._pane_fold_certification_disabled = False
+        self._fold_history = FoldHistoryIndex(anchor_bytes=_TRANSCRIPT_BOUNDARY_ANCHOR_BYTES)
+        self._fold_history_bound_path: Path | None = None
         # Dashboard terminal requests start immediately and may arrive out of
         # order. Serialize pane input and remember each client's acknowledged
         # sequence so cumulative retries never duplicate text or Enter.
@@ -6015,6 +6002,7 @@ class TmuxSession(TransportReplacementMixin):
         )
         if accepted is False:
             return False
+        self._clear_fold_history()
         if isinstance(self._tailer, TmuxTranscriptTailer):
             self._transcript_discovery_floor = 0.0
         # Consume the first-bind flag only after an accepted attempt, including
@@ -7257,6 +7245,7 @@ class TmuxSession(TransportReplacementMixin):
         ``_attempt_first_bind_recovery`` for what the scheduled task
         does on the deadline.
         """
+        self._clear_fold_history()
         if self._tailer is None:
             # ── Construction (first call only) ──────────────────────
             # Reused names need SessionStart; a lost hook leaves them pending.
@@ -7550,6 +7539,7 @@ class TmuxSession(TransportReplacementMixin):
         stopped tailer. The ``_attempt_first_bind_recovery`` method
         also re-checks ``self._tailer is None`` defensively.
         """
+        self._clear_fold_history()
         if (
             self._first_bind_recovery_task is not None
             and not self._first_bind_recovery_task.done()
@@ -8252,6 +8242,53 @@ class TmuxSession(TransportReplacementMixin):
         predicate = self._transcript_predicate()
         return open_owned_transcript(path, predicate) if predicate else path.open("rb")
 
+    def _clear_fold_history(self) -> None:
+        history = getattr(self, "_fold_history", None)
+        if history is None:
+            self._fold_history = FoldHistoryIndex(anchor_bytes=_TRANSCRIPT_BOUNDARY_ANCHOR_BYTES)
+        else:
+            history.clear()
+        self._fold_history_bound_path = None
+
+    def _observe_fold_history_path(self) -> None:
+        raw_path = getattr(self._tailer, "transcript_path", None) if self._tailer else None
+        try:
+            path = Path(raw_path) if raw_path is not None else None
+        except (TypeError, ValueError):
+            path = None
+        if not hasattr(self, "_fold_history") or path != self._fold_history_bound_path:
+            self._clear_fold_history()
+            self._fold_history_bound_path = path
+
+    def _warm_fold_history(self, budget: int | None = None, *, skip_paths=()) -> int:
+        available = _FOLD_HISTORY_WARMUP_BYTES if budget is None else budget
+        limit = min(available, _FOLD_HISTORY_WARMUP_BYTES, _PHANTOM_TRANSCRIPT_SCAN_BYTES)
+        if limit <= 0 or not isinstance(self._tailer, TmuxTranscriptTailer):
+            return available
+        self._observe_fold_history_path()
+        path = self._fold_history_bound_path
+        if path is None or path == _PLACEHOLDER_TRANSCRIPT_PATH or path in skip_paths:
+            return available
+        try:
+            opened = self._open_transcript(path)
+            if opened is None:
+                self._fold_history.discard(path)
+                return available
+            with opened as handle:
+                current = handle
+                for _ in range(4):
+                    if hasattr(current, "fileno"):
+                        break
+                    current = current._wrapped
+                stat = os.fstat(current.fileno())
+                result = self._fold_history.read(
+                    handle, path, (stat.st_dev, stat.st_ino), limit,
+                )
+                return available - (limit - result.remaining)
+        except Exception:
+            self._fold_history.discard(path)
+            return available
+
     def _phantom_consumption_verdicts(
         self, candidates: list[_InflightMeta]
     ) -> list[bool | None]:
@@ -8270,8 +8307,10 @@ class TmuxSession(TransportReplacementMixin):
         # Per candidate: opened physical source, allocation boundary, whether
         # row-local post-ticket proof is available, and the conservative result
         # when no paste-bound row can be proved.
+        self._observe_fold_history_path()
         sources: list[_TranscriptCandidateSource | None] = []
         handles: dict[_TranscriptSourceKey, object] = {}
+        source_paths: dict[_TranscriptSourceKey, Path] = {}
         scan_starts: dict[_TranscriptSourceKey, int] = {}
         # One reconciliation gets one bounded synchronous-read budget across
         # every physical transcript source, including boundary-anchor reads.
@@ -8325,6 +8364,7 @@ class TmuxSession(TransportReplacementMixin):
                     continue
 
                 key = (opened.st_dev, opened.st_ino)
+                source_paths.setdefault(key, transcript)
                 handles.setdefault(key, handle)
                 ticket_identity = entry.transcript_file_identity_at_paste
                 offset = entry.transcript_offset_at_paste
@@ -8553,190 +8593,29 @@ class TmuxSession(TransportReplacementMixin):
                     )
                     break
 
-            # Fold chains need the complete enqueue-created occurrence history.
-            # A ticket-start scan can begin between an old remove and its delayed
-            # attachment, allowing that orphan to donate itself to a new cancel.
-            # Re-read only sources needed by phase 3 from byte zero, on the
-            # already-open descriptor and inside the same cumulative I/O budget.
+            # An uncertain source retains the original shared-budget scan order.
+            # Cache savings must not change a later source's capped fallback.
+            legacy_only = bool(incomplete) or any(source is None for source in sources)
             phase3_keys = {
                 source[0]
                 for index, source in enumerate(sources)
-                if (
-                    claims[index] is None
-                    and source is not None
-                    and bool(candidates[index].turn.prompt)
-                )
+                if claims[index] is None and source is not None and bool(candidates[index].turn.prompt)
             }
-            chains: dict[
-                _TranscriptSourceKey,
-                list[_TranscriptProbeFoldChain],
-            ] = {}
+            chains: dict[_TranscriptSourceKey, list[_TranscriptProbeFoldChain]] = {}
             fold_history_incomplete: set[_TranscriptSourceKey] = set()
             for key in phase3_keys:
-                open_occurrences: list[_TranscriptProbeFoldOccurrence] = []
-                pending_removes: list[
-                    tuple[_TranscriptProbeFoldOccurrence, _TranscriptProbeRow]
-                ] = []
-                complete_chains: list[_TranscriptProbeFoldChain] = []
-                primary_chains: list[_TranscriptProbeFoldChain] = []
-                history_complete = False
-                handle = handles[key]
-
-                def _record_primary_chain(
-                    occurrence: _TranscriptProbeFoldOccurrence,
-                    remove: _TranscriptProbeRow,
-                    attachment: _TranscriptProbeRow,
-                ) -> None:
-                    """Record one FIFO chain plus two-attachment alternatives."""
-                    primary = _TranscriptProbeFoldChain(
-                        occurrence.prompt,
-                        occurrence.enqueue,
-                        remove,
-                        attachment,
-                    )
-                    primary_chains.append(primary)
-                    complete_chains.append(primary)
-                    # A replay can leave one attachment-first occurrence open
-                    # before its fresh redelivery. When both occurrences carry
-                    # attachments but only one remove lands, every realizable
-                    # attribution consumed the content at least once: either
-                    # the stale fold completed late or the redelivery folded.
-                    # Requiring this primary attachment and each alternative's
-                    # attachment is the two-attachment discriminator; a cancel
-                    # with only one attachment never gains this attribution.
-                    complete_chains.extend(
-                        _TranscriptProbeFoldChain(
-                            occurrence.prompt,
-                            alternative.enqueue,
-                            remove,
-                            alternative.attachment,
-                        )
-                        for alternative in open_occurrences
-                        if (
-                            alternative.prompt == occurrence.prompt
-                            and alternative.attachment is not None
-                        )
-                    )
-
-                try:
-                    handle.seek(0)
-                    while budget_remaining > 0:
-                        row_offset = handle.tell()
-                        raw = handle.readline(budget_remaining)
-                        if not raw:
-                            history_complete = True
-                            break
-                        budget_remaining -= len(raw)
-                        if not raw.endswith(b"\n"):
-                            break
-                        try:
-                            parsed = json.loads(raw)
-                        except (json.JSONDecodeError, UnicodeDecodeError):
-                            break
-                        if not isinstance(parsed, dict):
-                            continue
-                        row = _TranscriptProbeRow(
-                            row_offset,
-                            row_offset + len(raw),
-                            raw,
-                        )
-                        entry_type = parsed.get("type")
-                        if entry_type == "queue-operation":
-                            operation = parsed.get("operation")
-                            content = parsed.get("content")
-                            if operation == "enqueue" and isinstance(content, str):
-                                open_occurrences.append(
-                                    _TranscriptProbeFoldOccurrence(content, row)
-                                )
-                            elif operation == "remove" and isinstance(content, str):
-                                matching_enqueue = next(
-                                    (
-                                        index
-                                        for index, occurrence in enumerate(
-                                            open_occurrences
-                                        )
-                                        if occurrence.prompt == content
-                                    ),
-                                    None,
-                                )
-                                if matching_enqueue is None:
-                                    continue
-                                occurrence = open_occurrences.pop(
-                                    matching_enqueue
-                                )
-                                if occurrence.attachment is None:
-                                    pending_removes.append((occurrence, row))
-                                else:
-                                    _record_primary_chain(
-                                        occurrence,
-                                        row,
-                                        occurrence.attachment,
-                                    )
-                            continue
-
-                        if entry_type != "attachment":
-                            continue
-                        attachment = parsed.get("attachment")
-                        if (
-                            not isinstance(attachment, dict)
-                            or attachment.get("type") != "queued_command"
-                            or not isinstance(attachment.get("prompt"), str)
-                        ):
-                            continue
-                        prompt = attachment["prompt"]
-                        matching_remove = next(
-                            (
-                                index
-                                for index, (occurrence, _remove) in enumerate(
-                                    pending_removes
-                                )
-                                if occurrence.prompt == prompt
-                            ),
-                            None,
-                        )
-                        if matching_remove is not None:
-                            occurrence, remove = pending_removes.pop(
-                                matching_remove
-                            )
-                            _record_primary_chain(
-                                occurrence,
-                                remove,
-                                row,
-                            )
-                            continue
-                        open_occurrence = next(
-                            (
-                                occurrence
-                                for occurrence in open_occurrences
-                                if (
-                                    occurrence.prompt == prompt
-                                    and occurrence.attachment is None
-                                )
-                            ),
-                            None,
-                        )
-                        if open_occurrence is not None:
-                            open_occurrence.attachment = row
-                            # The primary remove may have landed before this
-                            # fresh attachment. Complete the same A-prime
-                            # alternative only now that both attachments exist.
-                            complete_chains.extend(
-                                _TranscriptProbeFoldChain(
-                                    prompt,
-                                    open_occurrence.enqueue,
-                                    primary.remove,
-                                    row,
-                                )
-                                for primary in primary_chains
-                                if primary.prompt == prompt
-                            )
-                except (AttributeError, OSError, TypeError, ValueError):
-                    history_complete = False
-                if history_complete:
-                    chains[key] = complete_chains
-                else:
-                    chains[key] = []
+                result = self._fold_history.read(
+                    handles[key], source_paths[key], key, budget_remaining,
+                    use_cache=not legacy_only,
+                )
+                budget_remaining = result.remaining
+                chains[key] = result.chains
+                if not result.complete:
                     fold_history_incomplete.add(key)
+            if not legacy_only:
+                budget_remaining = self._warm_fold_history(
+                    budget_remaining, skip_paths={source_paths[key] for key in phase3_keys},
+                )
 
             # Phase 3 allocates exact three-leg fold chains to candidates that
             # own no user-row claim. A chain is reserved before provenance is
@@ -8805,8 +8684,10 @@ class TmuxSession(TransportReplacementMixin):
                     return False
                 prior_start = overlap_start - anchor_start
                 prior_end = overlap_end - anchor_start
-                current_start = overlap_start - row.offset
-                current_end = overlap_end - row.offset
+                current_start = overlap_start - row.offset - row.raw_start
+                current_end = overlap_end - row.offset - row.raw_start
+                if current_start < 0 or current_end > len(row.raw):
+                    return False
                 prior = anchor[prior_start:prior_end]
                 current = row.raw[current_start:current_end]
                 # JSONL rows are atomic: any changed byte in the captured
@@ -9467,6 +9348,8 @@ class TmuxSession(TransportReplacementMixin):
                     # either recovery threshold.
                     self._watchdog_frozen_live_status = None
                 verdict = self._inflight_stall_verdict(now, live)
+                if verdict != "idle":
+                    self._warm_fold_history()
                 if verdict == "ok":
                     continue
                 age = now - (self._head_started_at or now)
