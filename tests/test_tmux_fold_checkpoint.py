@@ -377,7 +377,8 @@ def test_compact_rows_preserve_anchor_rewrite_proof(tmp_path, rewrite):
     verdicts, classes = _probe_with_classes(session, [entry])
     _assert_reference(session, [entry], verdicts, classes)
     assert verdicts == [rewrite]
-    state = session._fold_history._states[path]
+    assert (path in session._fold_history._states) is (not rewrite)
+    state = _warm(session, path)
     assert state.complete
     for chain in state.complete_chains:
         for row in [chain.enqueue, chain.remove, chain.attachment]:
