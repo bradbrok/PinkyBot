@@ -161,23 +161,27 @@ def build_ferry_app(*, host_pinky: Any, config: Any):
                 status_code=400, content={"ok": False, "error": f"bad envelope: {e}"}
             )
 
-        from pinky_daemon.ferry.config import _configured_fleet_name
+        from pinky_daemon.ferry.config import _CONTROL_CHARACTERS, _configured_fleet_name
         from pinky_daemon.ferry.host_pinky import parse_peer_card
         from pinky_daemon.ferry.outbound import parse_address
 
-        claimed_fleet, _ = parse_peer_card(envelope.from_)
-        kind, fleet = credential
         parsed = parse_address(envelope.from_)
+        claimed_fleet, agent = parsed or ("", "")
+        raw_fleet, _ = parse_peer_card(envelope.from_)
         valid_sender = (
             parsed is not None
-            and parsed[0] == claimed_fleet
-            and "/" not in parsed[1]
-            and not any(character.isspace() for character in parsed[1])
+            and bool(claimed_fleet)
+            and raw_fleet == claimed_fleet
+            and envelope.from_ in (f"ferry://{claimed_fleet}/{agent}", f"{agent}@{claimed_fleet}")
+            and _CONTROL_CHARACTERS.search(envelope.from_) is None
+            and "/" not in agent
+            and not any(character.isspace() for character in envelope.from_)
         )
-        refused = (
-            kind == "peer" and (not valid_sender or claimed_fleet != fleet)
-            or kind == "global" and claimed_fleet in config.peer_secrets
-        )
+        kind, fleet = credential
+        if kind == "global":
+            refused = not valid_sender or claimed_fleet in config.peer_secrets
+        else:
+            refused = not valid_sender or claimed_fleet != fleet
         if refused:
             _LOGGER.warning(
                 "ferry sender refused credential_fleet=%s claimed_fleet=%s source_ip=%s",

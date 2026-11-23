@@ -48,6 +48,8 @@ DEFAULT_FERRY_PORT = 8899
 
 _TRUTHY = ("1", "true", "yes", "on")
 _FLEET_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*", re.ASCII)
+_HEADER_CREDENTIAL = re.compile(r"[\x21-\x7e]{32,}", re.ASCII)
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -150,6 +152,8 @@ def _parse_peer_secrets(
             reason = "own fleet"
         elif not isinstance(secret, str) or len(secret) < 32:
             reason = "secret must contain at least 32 characters"
+        elif _HEADER_CREDENTIAL.fullmatch(secret) is None:
+            reason = "credential contains characters not allowed in a header"
         elif secret == shared_secret:
             reason = "secret equals global credential"
         elif counts[secret] > 1:
@@ -186,7 +190,19 @@ class FerryConfig:
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "FerryConfig":
         e = dict(env) if env is not None else dict(os.environ)
-        secret = (e.get("PINKYBOT_FERRY_SHARED_SECRET") or "").strip()
+        raw_secret = e.get("PINKYBOT_FERRY_SHARED_SECRET") or ""
+        invalid_secret = _CONTROL_CHARACTERS.search(raw_secret) is not None
+        try:
+            raw_secret.encode("utf-8")
+        except UnicodeError:
+            invalid_secret = True
+        if invalid_secret:
+            _LOGGER.warning(
+                "ferry global credential ignored: credential contains characters not allowed in a header"
+            )
+            secret = ""
+        else:
+            secret = raw_secret.strip()
         own_fleet = fleet_name(e)
         peers = _parse_peers(e.get("PINKYBOT_FERRY_PEERS") or "")
         peer_secrets = _parse_peer_secrets(
