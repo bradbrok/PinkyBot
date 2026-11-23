@@ -1,7 +1,7 @@
 {
   "schema": "pinky-model-roster/1",
-  "revision": 13,
-  "updated": "2026-11-20",
+  "revision": 14,
+  "updated": "2026-11-23",
   "models": [
     {
       "provider": "anthropic",
@@ -311,7 +311,7 @@
       "provider": "anthropic",
       "model_id": "claude-opus-4-5",
       "display_name": "Claude Opus 4.5",
-      "description": "Previous-gen Opus.",
+      "description": "Previous-gen Opus. Deprecated 2026-11-23; retires 2027-01-22 (use claude-opus-5-5).",
       "tier": "opus",
       "context_window": 200000,
       "is_1m": false,
