@@ -4,6 +4,8 @@ from collections.abc import Iterable, Mapping
 
 from pinky_daemon.tmux_launch_env_loader import DAEMON_ONLY
 
+FERRY_DAEMON_ONLY = DAEMON_ONLY - {"PINKY_SESSION_SECRET"}
+
 
 def permitted(name: str, owned: Iterable[str] = ()) -> bool:
     """Inherited builder outputs and daemon authority are never candidates."""

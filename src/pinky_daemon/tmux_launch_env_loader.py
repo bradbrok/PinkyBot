@@ -1,5 +1,4 @@
-# 4 KiB max.
-
+# 4KiB
 import json
 import os
 import re
@@ -13,25 +12,20 @@ BASE_ALLOWLIST = frozenset((
     "http_proxy https_proxy no_proxy SSL_CERT_FILE SSL_CERT_DIR NODE_EXTRA_CA_CERTS "
     "REQUESTS_CA_BUNDLE"
 ).split())
-DAEMON_ONLY = frozenset({"PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET"})
+DAEMON_ONLY = frozenset({"PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET", "PINKYBOT_FERRY_PEER_SECRETS"})
 _SHELL_NAMES = frozenset((
     "PWD OLDPWD SHLVL _ BASHOPTS BASH_VERSINFO EUID PPID SHELLOPTS UID IFS ENV BASH_ENV PS4"
 ).split())
-
 def is_valid_key_name(key):
     return isinstance(key, str) and _KEY.fullmatch(key) is not None
-
 def is_base_name(k):
     return k in BASE_ALLOWLIST or is_valid_key_name(k) and k.startswith(("LC_", "XDG_"))
-
 def key_policy(key):
     if not is_valid_key_name(key):
         return "invalid"
     return "shell" if key in _SHELL_NAMES else ("reserved" if key.startswith("__PINKY_LAUNCH_") else None)
-
 def _invalid():
     raise ValueError("invalid launch environment") from None
-
 def validate_env(env):
     if not isinstance(env, dict):
         _invalid()
@@ -42,16 +36,13 @@ def validate_env(env):
             value.encode("utf-8")
         except UnicodeError:
             _invalid()
-
 def _private_regular(st):
     return stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o077
-
 def validate_inherit(env, inherit):
     if inherit not in ("all", "none"):
         _invalid()
     if inherit == "none" and DAEMON_ONLY.intersection(env):
         raise PermissionError("daemon-only key")
-
 def load_env(path, nonce, command):
     fd, owned = None, False
     try:
@@ -60,7 +51,7 @@ def load_env(path, nonce, command):
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         st = os.fstat(fd)
         owned = (os.path.basename(path) == f"env-{nonce}.json"
-                 and stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid())
+            and stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid())
         if not owned or not _private_regular(st):
             raise PermissionError("unsafe launch file")
         with os.fdopen(fd, "r", encoding="utf-8") as stream:
@@ -92,7 +83,7 @@ def load_env(path, nonce, command):
         env.update(kept)
         if inherit == "none":
             print(f"inherited environment scrubbed; {len(before - env.keys())} names dropped; granted: "
-                  + json.dumps(granted), file=sys.stderr, flush=True)
+            + json.dumps(granted), file=sys.stderr, flush=True)
         os.execv("/bin/sh", ["/bin/sh", "-c", command])
     except Exception:
         if owned:
@@ -105,7 +96,5 @@ def load_env(path, nonce, command):
     finally:
         if fd is not None:
             os.close(fd)
-
-
 if __name__ == "__main__":
     load_env(*sys.argv[1:])

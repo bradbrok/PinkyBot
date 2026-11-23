@@ -621,20 +621,24 @@ class TestIsolationStatus:
     def test_container_mode_isolated_despite_false_flag(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         monkeypatch.setenv("PINKY_SESSION_SECRET", "fleet-secret")
+        monkeypatch.setenv("PINKYBOT_FERRY_PEER_SECRETS", "synthetic-peer-map")
         ss = _session(registry=_FakeRegistry(
             _FakeAgent("agentx", "container", isolated=False)
         ))
         assert ss._isolation_status() == "isolated"
         # And the env builder withholds the global secret accordingly.
         assert "PINKY_SESSION_SECRET" not in ss._build_repl_env()
+        assert "PINKYBOT_FERRY_PEER_SECRETS" not in ss._build_repl_env()
 
     def test_local_mode_not_isolated_gets_secret(self, monkeypatch):
         monkeypatch.setenv("PINKY_SESSION_SECRET", "fleet-secret")
+        monkeypatch.setenv("PINKYBOT_FERRY_PEER_SECRETS", "synthetic-peer-map")
         ss = _session(registry=_FakeRegistry(
             _FakeAgent("agentx", "local", isolated=False)
         ))
         assert ss._isolation_status() == "not_isolated"
         assert ss._build_repl_env()["PINKY_SESSION_SECRET"] == "fleet-secret"
+        assert "PINKYBOT_FERRY_PEER_SECRETS" not in ss._build_repl_env()
 
 
 class TestIsDeadRuntimeStderr:

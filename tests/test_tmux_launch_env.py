@@ -282,6 +282,7 @@ async def test_wrapped_runner_stages_in_target_home_and_host_argv_is_clean(
         session._registry.get.return_value.isolation_mode = "container"
     env = {**session._build_repl_env(), "UNKNOWN_CREDENTIAL": SENTINEL}
     assert "PINKY_SESSION_SECRET" not in env
+    assert "PINKYBOT_FERRY_PEER_SECRETS" not in env
     await tmux.new_session(
         cwd=str(target),
         command=probe_command(target),
@@ -306,6 +307,7 @@ async def test_wrapped_runner_stages_in_target_home_and_host_argv_is_clean(
     assert payload["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == SENTINEL
     assert payload["env"]["PINKY_AGENT_KEY"] == "synthetic-agent-signing-key"
     assert "PINKY_SESSION_SECRET" not in payload["env"]
+    assert "PINKYBOT_FERRY_PEER_SECRETS" not in payload["env"]
     assert {key: payload["env"][key] for key in env} == env
     assert not path.exists()
 
@@ -314,6 +316,7 @@ def claude_session(home, monkeypatch, *, isolated=False, dedicated=False):
     monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", SENTINEL)
     monkeypatch.setenv("PINKY_SESSION_SECRET", "synthetic-global-signing-secret")
+    monkeypatch.setenv("PINKYBOT_FERRY_PEER_SECRETS", "synthetic-peer-map")
     agent = SimpleNamespace(
         name="test-agent",
         isolated=isolated,
@@ -345,6 +348,7 @@ async def test_claude_builder_preserves_withholding_markers_and_empty_shadow(
         assert not secret_files(private_home, SENTINEL)
     if isolated:
         assert "PINKY_SESSION_SECRET" not in env
+        assert "PINKYBOT_FERRY_PEER_SECRETS" not in env
         assert not secret_files(private_home, "synthetic-global-signing-secret")
     payload = child_payload(run_pane(recorder.tmux_calls[-1], private_home))
     assert {key: payload["env"][key] for key in env} == env

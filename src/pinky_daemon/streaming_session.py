@@ -29,6 +29,7 @@ from pinky_daemon.api_readiness import (
 )
 from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.effort import CLI_EFFORT_LEVELS, resolve_cli_effort
+from pinky_daemon.launch_env_authority import FERRY_DAEMON_ONLY
 from pinky_daemon.model_roster import load_bundled
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.transport import TransportReplacementMixin
@@ -564,6 +565,11 @@ class StreamingSession(TransportReplacementMixin):
             provider_env["PINKY_EXPECTED_EFFORT"] = effort
         if self._config.strict_effort_enforcement:
             provider_env["PINKY_STRICT_EFFORT"] = "1"
+
+        # The SDK copies the parent environment before applying options.env.
+        # Ferry credentials have no child consumer; legacy hook authority still
+        # reads the session secret on this path.
+        provider_env.update(dict.fromkeys(FERRY_DAEMON_ONLY, ""))
 
         if provider_env:
             # Generous timeout for slow local/third-party models (30 min)

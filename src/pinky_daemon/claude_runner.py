@@ -17,6 +17,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pinky_daemon.launch_env_authority import FERRY_DAEMON_ONLY
+
 
 @dataclass
 class RunResult:
@@ -270,6 +272,8 @@ class ClaudeRunner:
     def _build_env(self) -> dict[str, str]:
         """Build environment variables for the subprocess."""
         env = os.environ.copy()
+        for name in FERRY_DAEMON_ONLY:
+            env.pop(name, None)
         # Ensure non-interactive mode
         env["CLAUDE_CODE_NON_INTERACTIVE"] = "1"
         return env

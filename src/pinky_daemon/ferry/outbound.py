@@ -398,8 +398,8 @@ class HttpMeshSender:
 
     @property
     def configured(self) -> bool:
-        """True iff a shared secret and at least one peer URL are set."""
-        return bool(self._config.shared_secret and self._config.peers)
+        """True iff at least one configured destination has a credential."""
+        return any(self._config.secret_for_fleet(fleet) for fleet in self._config.peers)
 
     def diagnostics(self) -> dict[str, Any]:
         """Operator-facing health snapshot. Never includes the secret value."""
@@ -432,7 +432,8 @@ class HttpMeshSender:
                 sent=False, correlation_id=cid, subject="", ts=ts,
                 error=f"no ferry peer URL configured for fleet {fleet!r}",
             )
-        if not self._config.shared_secret:
+        secret = self._config.secret_for_fleet(fleet)
+        if not secret:
             return SendResult(
                 sent=False, correlation_id=cid, subject=url, ts=ts,
                 error="ferry shared secret not configured",
@@ -445,7 +446,7 @@ class HttpMeshSender:
             method="POST",
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {self._config.shared_secret}",
+                "Authorization": f"Bearer {secret}",
             },
         )
         try:

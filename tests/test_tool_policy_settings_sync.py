@@ -221,6 +221,7 @@ async def test_registry_lookup_failure_defers_policy_to_server(
     tmp_path, monkeypatch, capsys, mode, transport,
 ):
     monkeypatch.setenv("PINKY_TOOL_POLICY", mode)
+    monkeypatch.setenv("PINKYBOT_FERRY_PEER_SECRETS", "synthetic-peer-map")
     registry = MagicMock()
     registry.get.side_effect = RuntimeError("test registry unavailable")
     registry.get_signing_key.return_value = "sample-agent-key"
@@ -245,6 +246,10 @@ async def test_registry_lookup_failure_defers_policy_to_server(
         env = captured[0].env
     assert env["PINKY_TOOL_POLICY"] == mode
     assert "PINKY_SESSION_SECRET" not in env
+    if transport == "sdk":
+        assert env["PINKYBOT_FERRY_PEER_SECRETS"] == ""
+    else:
+        assert "PINKYBOT_FERRY_PEER_SECRETS" not in env
     warning = capsys.readouterr().err
     assert "WARNING" in warning
     assert "tool policy flag lookup failed" in warning

@@ -1757,9 +1757,11 @@ def test_build_repl_env_removes_pinky_session_secret_when_set(
 ) -> None:
     """Local Claude hosts never receive daemon-wide signing authority."""
     monkeypatch.setenv("PINKY_SESSION_SECRET", "test-secret-32-bytes-min-xyz")
+    monkeypatch.setenv("PINKYBOT_FERRY_PEER_SECRETS", "synthetic-peer-map")
     ss, _ = _make_session()
     env = ss._build_repl_env()
     assert "PINKY_SESSION_SECRET" not in env
+    assert "PINKYBOT_FERRY_PEER_SECRETS" not in env
 
 
 def test_build_repl_env_omits_pinky_session_secret_when_unset(
@@ -1774,6 +1776,7 @@ def test_build_repl_env_omits_pinky_session_secret_when_unset(
     ss, _ = _make_session()
     env = ss._build_repl_env()
     assert "PINKY_SESSION_SECRET" not in env
+    assert "PINKYBOT_FERRY_PEER_SECRETS" not in env
 
 
 def test_build_repl_env_strips_whitespace_in_pinky_session_secret(
@@ -1786,6 +1789,7 @@ def test_build_repl_env_strips_whitespace_in_pinky_session_secret(
     ss, _ = _make_session()
     env = ss._build_repl_env()
     assert "PINKY_SESSION_SECRET" not in env
+    assert "PINKYBOT_FERRY_PEER_SECRETS" not in env
 
 
 def test_build_repl_env_provisions_per_agent_key(monkeypatch) -> None:
@@ -1805,6 +1809,7 @@ def test_build_repl_env_provisions_per_agent_key(monkeypatch) -> None:
     own_key = env.get("PINKY_AGENT_KEY") == "dymok-per-agent-key"
     assert own_key
     assert "PINKY_SESSION_SECRET" not in env
+    assert "PINKYBOT_FERRY_PEER_SECRETS" not in env
     ss._registry.get_signing_key.assert_called_once_with("dymok")
 
 
@@ -1816,6 +1821,7 @@ async def test_build_repl_env_isolated_withholds_global_secret(tmp_path, monkeyp
         names = await probe.launch(registry=Registry())
         assert "PINKY_AGENT_KEY" in names
         assert "PINKY_SESSION_SECRET" not in names
+        assert "PINKYBOT_FERRY_PEER_SECRETS" not in names
 
 
 async def test_build_repl_env_isolated_without_key_withholds_secret(tmp_path, monkeypatch) -> None:
@@ -1826,6 +1832,7 @@ async def test_build_repl_env_isolated_without_key_withholds_secret(tmp_path, mo
         names = await probe.launch(registry=Registry(key=""))
         assert "PINKY_AGENT_KEY" not in names
         assert "PINKY_SESSION_SECRET" not in names
+        assert "PINKYBOT_FERRY_PEER_SECRETS" not in names
 
 
 async def test_build_repl_env_withholds_secret_when_isolation_unknown_but_key_present(
@@ -1838,6 +1845,7 @@ async def test_build_repl_env_withholds_secret_when_isolation_unknown_but_key_pr
         names = await probe.launch(registry=Registry("unknown"))
         assert "PINKY_AGENT_KEY" in names
         assert "PINKY_SESSION_SECRET" not in names
+        assert "PINKYBOT_FERRY_PEER_SECRETS" not in names
 
 
 def test_build_repl_env_omits_agent_key_when_registry_absent() -> None:

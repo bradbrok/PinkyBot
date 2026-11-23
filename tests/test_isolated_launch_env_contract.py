@@ -43,7 +43,7 @@ async def test_nonisolated_child_retains_parity(tmp_path, monkeypatch, kind):
 
 
 @pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])
-@pytest.mark.parametrize("forbidden", ["PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET"])
+@pytest.mark.parametrize("forbidden", ["PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET", "PINKYBOT_FERRY_PEER_SECRETS"])
 async def test_daemon_only_payload_is_refused_loudly(tmp_path, monkeypatch, kind, forbidden):
     async with launch_probe(tmp_path, monkeypatch, mode="enforce") as probe:
         with pytest.raises(PermissionError, match="daemon-only"):
