@@ -22,6 +22,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time as _time
 from collections.abc import Iterator
@@ -404,7 +405,7 @@ def _make_session(
     """
     cfg = StreamingSessionConfig(
         agent_name=agent_name,
-        working_dir="/tmp/tmux-session-test",
+        working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
         restart_guard=restart_guard,
     )
     tmux = tmux or _make_mock_tmux()
@@ -2592,7 +2593,7 @@ def _make_session_with_response_cb(
     """TmuxSession built with the response-side callbacks wired up."""
     cfg = StreamingSessionConfig(
         agent_name="dymok",
-        working_dir="/tmp/tmux-session-test",
+        working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
     )
     tmux = _make_mock_tmux()
     ss = TmuxSession(
@@ -3200,7 +3201,7 @@ async def test_discover_transcript_path_returns_none_for_empty_project_dir(tmp_p
     # Point HOME at a tmp dir so the glob has nowhere to find anything.
     monkeypatch.setenv("HOME", str(tmp_path))
     ss, _ = _make_session()
-    # working_dir is /tmp/tmux-session-test from the fixture; project dir
+    # working_dir is a private temp directory from the fixture; project dir
     # path under our fake HOME does not exist.
     assert ss._discover_transcript_path() is None
 
@@ -7267,7 +7268,7 @@ def _make_session_with_analytics(
     """
     cfg = StreamingSessionConfig(
         agent_name=agent_name,
-        working_dir="/tmp/tmux-session-test",
+        working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
     )
     tmux = _make_mock_tmux()
     analytics = MagicMock()
@@ -7629,7 +7630,7 @@ def _make_usage_session(
     """
     cfg = StreamingSessionConfig(
         agent_name="dymok",
-        working_dir="/tmp/tmux-session-test",
+        working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
         model=model,
     )
     ss = TmuxSession(
@@ -7803,7 +7804,7 @@ def _make_usage_session_of(
     """_make_usage_session for a TmuxSession SUBCLASS (transport variants)."""
     cfg = StreamingSessionConfig(
         agent_name="dymok",
-        working_dir="/tmp/tmux-session-test",
+        working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
         model=model,
     )
     ss = cls(
@@ -8027,7 +8028,7 @@ async def test_raw_max_tokens_for_1m_vs_200k_model() -> None:
         _ss_mod._1M_MODELS = {"claude-opus-4-7"}
         cfg = StreamingSessionConfig(
             agent_name="dymok",
-            working_dir="/tmp/tmux-session-test",
+            working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
             model="claude-opus-4-7",
         )
         tmux = _make_mock_tmux()
@@ -8036,7 +8037,7 @@ async def test_raw_max_tokens_for_1m_vs_200k_model() -> None:
 
         cfg2 = StreamingSessionConfig(
             agent_name="dymok",
-            working_dir="/tmp/tmux-session-test",
+            working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
             model="claude-haiku-4-5",
         )
         ss2 = TmuxSession(cfg2, tmux_control=tmux)
@@ -8061,7 +8062,7 @@ async def test_max_tokens_subtracts_autocompact_buffer(monkeypatch) -> None:
 
         cfg = StreamingSessionConfig(
             agent_name="dymok",
-            working_dir="/tmp/tmux-session-test",
+            working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
             model="claude-haiku-4-5",
         )
         ss = TmuxSession(cfg, tmux_control=_make_mock_tmux())
@@ -8070,7 +8071,7 @@ async def test_max_tokens_subtracts_autocompact_buffer(monkeypatch) -> None:
 
         cfg_big = StreamingSessionConfig(
             agent_name="dymok",
-            working_dir="/tmp/tmux-session-test",
+            working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
             model="claude-opus-4-7",
         )
         ss_big = TmuxSession(cfg_big, tmux_control=_make_mock_tmux())
@@ -8089,7 +8090,7 @@ async def test_autocompact_override_env_sets_effective_cap(monkeypatch) -> None:
     SDK behavior."""
     cfg = StreamingSessionConfig(
         agent_name="dymok",
-        working_dir="/tmp/tmux-session-test",
+        working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
         model="claude-haiku-4-5",
     )
     tmux = _make_mock_tmux()
@@ -8124,7 +8125,7 @@ async def test_get_context_info_exposes_raw_and_effective_caps(monkeypatch) -> N
 
     cfg = StreamingSessionConfig(
         agent_name="dymok",
-        working_dir="/tmp/tmux-session-test",
+        working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
         model="claude-haiku-4-5",
     )
     ss = TmuxSession(cfg, tmux_control=_make_mock_tmux())
