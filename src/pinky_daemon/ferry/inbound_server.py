@@ -161,6 +161,7 @@ def build_ferry_app(*, host_pinky: Any, config: Any):
                 status_code=400, content={"ok": False, "error": f"bad envelope: {e}"}
             )
 
+        from pinky_daemon.ferry.config import _configured_fleet_name
         from pinky_daemon.ferry.host_pinky import parse_peer_card
         from pinky_daemon.ferry.outbound import parse_address
 
@@ -180,8 +181,15 @@ def build_ferry_app(*, host_pinky: Any, config: Any):
         if refused:
             _LOGGER.warning(
                 "ferry sender refused credential_fleet=%s claimed_fleet=%s source_ip=%s",
-                json.dumps(fleet if kind == "peer" else "global"),
-                json.dumps(claimed_fleet), json.dumps(_client_ip(request)),
+                json.dumps(
+                    (_configured_fleet_name(fleet, config.fleet_name, config.peers) or "unconfigured")
+                    if kind == "peer" else "global"
+                ),
+                json.dumps(
+                    _configured_fleet_name(claimed_fleet, config.fleet_name, config.peers)
+                    or "unconfigured"
+                ),
+                json.dumps(_client_ip(request)),
             )
             return JSONResponse(
                 status_code=403,

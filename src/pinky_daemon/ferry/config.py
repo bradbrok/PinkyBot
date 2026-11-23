@@ -118,7 +118,17 @@ def _parse_peers(raw: str) -> dict[str, str]:
     return out
 
 
-def _parse_peer_secrets(raw: str, own_fleet: str, shared_secret: str) -> dict[str, str]:
+def _configured_fleet_name(fleet: str, own_fleet: str, peers: dict[str, str]) -> str | None:
+    """Return only a name sourced independently of credential-bearing input."""
+    for configured in (*peers, own_fleet):
+        if configured == fleet:
+            return configured
+    return None
+
+
+def _parse_peer_secrets(
+    raw: str, own_fleet: str, shared_secret: str, peers: dict[str, str]
+) -> dict[str, str]:
     """Resolve peer credentials without echoing values in startup warnings."""
     if not raw.strip():
         return {}
@@ -145,7 +155,16 @@ def _parse_peer_secrets(raw: str, own_fleet: str, shared_secret: str) -> dict[st
         elif counts[secret] > 1:
             reason = "duplicate credential"
         if reason:
-            _LOGGER.warning("ferry peer secret ignored for fleet %s: %s", json.dumps(fleet), reason)
+            configured = _configured_fleet_name(fleet, own_fleet, peers)
+            if configured is None:
+                _LOGGER.warning(
+                    "ferry peer secret ignored for an entry with an unconfigured fleet name: %s",
+                    reason,
+                )
+            else:
+                _LOGGER.warning(
+                    "ferry peer secret ignored for fleet %s: %s", json.dumps(configured), reason
+                )
         else:
             result[fleet] = secret
     return result
@@ -169,8 +188,9 @@ class FerryConfig:
         e = dict(env) if env is not None else dict(os.environ)
         secret = (e.get("PINKYBOT_FERRY_SHARED_SECRET") or "").strip()
         own_fleet = fleet_name(e)
+        peers = _parse_peers(e.get("PINKYBOT_FERRY_PEERS") or "")
         peer_secrets = _parse_peer_secrets(
-            e.get("PINKYBOT_FERRY_PEER_SECRETS") or "", own_fleet, secret
+            e.get("PINKYBOT_FERRY_PEER_SECRETS") or "", own_fleet, secret, peers
         )
         enabled_flag = (e.get("PINKYBOT_FERRY_ENABLED") or "").strip().lower() in _TRUTHY
         bind_host = (e.get("PINKYBOT_FERRY_BIND_HOST") or "").strip()
@@ -180,7 +200,6 @@ class FerryConfig:
             for ip in (e.get("PINKYBOT_FERRY_ALLOWED_PEER_IPS") or "").split(",")
             if ip.strip()
         )
-        peers = _parse_peers(e.get("PINKYBOT_FERRY_PEERS") or "")
         # The inbound listener only starts when explicitly enabled AND it has a
         # secret AND a SAFE (tailnet/private, non-wildcard) bind host —
         # fail-closed, never an unauthenticated or publicly-bound listener by
@@ -240,7 +259,7 @@ class FerryConfig:
             "fleet_name": self.fleet_name,
             "bind": f"{self.bind_host}:{self.bind_port}" if self.bind_host else "",
             "shared_secret_set": bool(self.shared_secret),
-            "peer_secret_fleets": sorted(self.peer_secrets),
+            "peer_secret_fleets": sorted(name for name in self.peers if name in self.peer_secrets),
             "allowed_peer_ips": sorted(self.allowed_peer_ips),
             "peers": dict(self.peers),
         }

@@ -249,7 +249,11 @@ def test_invalid_or_local_fleet_key_is_dropped_without_secret_values(caplog, fle
     assert config.peer_secrets == {}
     records = [record.getMessage() for record in caplog.records if record.name == "pinky_daemon.ferry.config"]
     assert len(records) == 1
-    assert json.dumps(fleet) in records[0]
+    if fleet == "local":
+        assert json.dumps(fleet) in records[0]
+    else:
+        assert "an entry with an unconfigured fleet name:" in records[0]
+        assert json.dumps(fleet) not in records[0]
     absent = PEER_SECRET not in records[0] and GLOBAL_SECRET not in records[0]
     assert absent, "configured secret appeared in warning"
     assert "\n" not in records[0]
