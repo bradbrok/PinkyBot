@@ -52,7 +52,7 @@ def test_source_derived_bounds_and_production_ceiling():
     assert MARGIN == OP_CAP == 16 * MIB
     assert row_pages(8) == 1188
     assert [operation_bound(n, 1188) for n in range(1, 5)] == [
-        4_968_368, 9_862_928, 14_757_488, 19_684_816,
+        5_034_288, 9_928_848, 14_823_408, 19_750_736,
     ]
     assert row_pages(856) > row_pages(8)
 

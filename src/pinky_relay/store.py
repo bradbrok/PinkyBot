@@ -76,7 +76,11 @@ def row_pages(fleet_bytes: int) -> int:
 
 def operation_bound(rows: int, pages: int) -> int:
     dirty = 2 + rows * pages
-    return 32 + dirty * (PAGE_SIZE + 24) + 32768 * (math.ceil(dirty / 4096) + 1)
+    # FULL synchronous commits may repeat the last frame up to the next
+    # 64 KiB sector boundary even with cache spilling disabled. Budget the
+    # additional frames in both the WAL bytes and its shared-memory index.
+    frames = dirty + 16
+    return 32 + frames * (PAGE_SIZE + 24) + 32768 * (math.ceil(frames / 4096) + 1)
 
 
 class QueueStore:
