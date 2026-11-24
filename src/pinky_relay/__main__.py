@@ -27,7 +27,7 @@ def main(argv=None):
     try:
         uvicorn.run(create_relay_app(config, store), host="127.0.0.1", port=args.port,
                     http="h11", h11_max_incomplete_event_size=16 * 1024, workers=1,
-                    access_log=False)
+                    access_log=False, proxy_headers=False)
     finally:
         store.close()
 

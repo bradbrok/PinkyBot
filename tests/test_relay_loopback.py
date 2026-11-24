@@ -111,4 +111,4 @@ def test_cli_pins_single_worker_h11_header_cap_and_disables_raw_access_log(tmp_p
     main(["--config", str(config), "--db", str(tmp_path / "queue.db")])
     assert calls == [{"host": "127.0.0.1", "port": 8898, "http": "h11",
                       "h11_max_incomplete_event_size": 16384, "workers": 1,
-                      "access_log": False}]
+                      "access_log": False, "proxy_headers": False}]

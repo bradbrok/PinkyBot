@@ -26,6 +26,7 @@ check; local tests do not claim to reproduce a different build's compile default
 Use TLS at the proxy, strip the `/ferry-relay/` prefix, and overwrite X-Real-IP.
 The ASGI app advertises `root_path=/ferry-relay`; daemon URLs retain that prefix.
 The application also enforces its own 16 KiB total header limit.
+Uvicorn preserves the TCP peer; overwriting X-Forwarded-For also prevents caller-supplied forwarding identity from surviving the proxy.
 
 ```nginx
 client_header_buffer_size 1k;
@@ -36,6 +37,7 @@ location /ferry-relay/ {
     proxy_http_version 1.1;
     proxy_pass http://127.0.0.1:8898/;
     proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $remote_addr;
     proxy_set_header Host $host;
     proxy_read_timeout 45s;
     proxy_send_timeout 35s;
