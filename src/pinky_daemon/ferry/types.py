@@ -85,6 +85,7 @@ class DeliveryResult:
     status: Literal["delivered", "queued", "rejected", "transient_failure"]
     reason: str | None = None
     detail: dict[str, Any] = field(default_factory=dict)
+    pre_dispatch: bool = False
 
 
 # -- AgentCardSelector — peer-fleet ACL primitive ------------------------------

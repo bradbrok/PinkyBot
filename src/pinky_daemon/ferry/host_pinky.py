@@ -230,6 +230,7 @@ class HostPinky:
             return self._transient(
                 "acl_load_failed",
                 f"could not load peer_fleet_acl for {agent_name}: {e}",
+                pre_dispatch=True,
             )
         if not allowed:
             return self._reject(
@@ -659,7 +660,9 @@ class HostPinky:
             detail={"detail": detail_text},
         )
 
-    def _transient(self, reason: str, detail_text: str) -> DeliveryResult:
+    def _transient(
+        self, reason: str, detail_text: str, *, pre_dispatch: bool = False,
+    ) -> DeliveryResult:
         """Return a ``transient_failure`` result. Broker should retry."""
         self._stats["transient_failures"] += 1
         _log(f"transient_failure reason={reason}: {detail_text}")
@@ -667,4 +670,5 @@ class HostPinky:
             status="transient_failure",
             reason=reason,
             detail={"detail": detail_text},
+            pre_dispatch=pre_dispatch,
         )
