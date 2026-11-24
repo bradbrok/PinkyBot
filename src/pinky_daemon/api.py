@@ -2199,6 +2199,13 @@ def create_api(
     _guard_repo_dir = str(Path(__file__).resolve().parents[2])
     _guard_state_dir = _data_dir / "deploy"
     store_manifest = _derive_api_store_manifest(db_path)
+    ferry_config = FerryConfig.from_env()
+    if ferry_config.relay is not None:
+        # Replay safety is authoritative and cannot be rebuilt from an old snapshot.
+        store_manifest["ferry_replay"] = StoreIntegrityTarget(
+            "ferry_replay", str(_data_dir / "ferry_relay_replay.db"),
+            criticality="authoritative", recovery="manual", journal_mode="wal",
+        )
     store_catalog = DaemonStoreCatalog(expected_root=_data_dir, log=_log)
     store_catalog.configure_manifest(store_manifest)
     storage_observability = StorageObservability(store_manifest)
@@ -2256,7 +2263,7 @@ def create_api(
     app.state.startup_started_at = startup_started_at
     app.state.store_snapshot_service = store_snapshot_service
     app.state.storage_observability = storage_observability
-    app.state.ferry_listener = FerryListenerState.from_config(FerryConfig.from_env())
+    app.state.ferry_listener = FerryListenerState.from_config(ferry_config)
 
     @app.middleware("http")
     async def _activate_storage_runtime(request: Request, call_next):
@@ -5938,6 +5945,13 @@ def create_api(
         mesh_store=mesh_store,
         fleet_name=_ferry_fleet_name(),
     )
+    app.state.relay_receiver = None
+    if ferry_config.relay is not None:
+        from pinky_daemon.ferry.relay_inbound import RelayReceiver
+        from pinky_daemon.ferry.relay_replay import ReplayStore
+
+        replay = ReplayStore(store_manifest["ferry_replay"].path, catalog=store_catalog)
+        app.state.relay_receiver = RelayReceiver(ferry_config.relay, replay, app.state.host_pinky)
 
     # Knowledge Base — project-level, all agents share
     kb = KBStore(
@@ -11841,6 +11855,8 @@ npm run build</pre>
         if not isinstance(listener_state, FerryListenerState):
             listener_state = FerryListenerState()
         diagnostics["ferry_listener"] = listener_state.snapshot()
+        if app.state.relay_receiver is not None:
+            diagnostics["relay_receiver"] = app.state.relay_receiver.diagnostics()
         return diagnostics
 
     @app.post("/agents/{name}/mesh/send")
@@ -15604,6 +15620,11 @@ npm run build</pre>
 
         storage_observability.enable_runtime()
 
+        # Relay-only fleets receive through the API lifecycle even when the
+        # independent direct ferry listener is disabled.
+        if app.state.relay_receiver is not None:
+            app.state.relay_receiver.start()
+
         holds = _storage_hold_for()
         for hold in holds:
             first = hold["findings"][0]
@@ -16099,6 +16120,8 @@ npm run build</pre>
     @app.on_event("shutdown")
     async def on_shutdown():
         """Stop scheduler, autonomy, broker pollers, and streaming sessions on shutdown."""
+        if app.state.relay_receiver is not None:
+            await app.state.relay_receiver.close()
         permission_task = getattr(app.state, "db_permission_sweep_task", None)
         if permission_task is not None:
             permission_task.cancel()

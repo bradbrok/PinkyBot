@@ -186,6 +186,7 @@ class FerryConfig:
     allowed_peer_ips: frozenset[str]
     peers: dict[str, str]  # fleet -> base URL (no trailing /ferry/inbound)
     peer_secrets: dict[str, str] = field(default_factory=dict, repr=False)
+    relay: object | None = field(default=None, repr=False)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "FerryConfig":
@@ -205,6 +206,14 @@ class FerryConfig:
             secret = raw_secret.strip()
         own_fleet = fleet_name(e)
         peers = _parse_peers(e.get("PINKYBOT_FERRY_PEERS") or "")
+        from pinky_daemon.ferry.relay_config import RelaySettings
+
+        relay = RelaySettings.from_env(e, own_fleet)
+        if relay is not None:
+            overlap = [name for name in peers if relay.is_reserved(name)]
+            if overlap:
+                _LOGGER.warning("ferry HTTP peer ignored for relay-reserved destination")
+                peers = {name: url for name, url in peers.items() if name not in overlap}
         peer_secrets = _parse_peer_secrets(
             e.get("PINKYBOT_FERRY_PEER_SECRETS") or "", own_fleet, secret, peers
         )
@@ -235,6 +244,7 @@ class FerryConfig:
             allowed_peer_ips=peer_ips,
             peers=peers,
             peer_secrets=peer_secrets,
+            relay=relay,
         )
 
     def why_disabled(self, env: dict[str, str] | None = None) -> str:
@@ -270,7 +280,7 @@ class FerryConfig:
 
     def diagnostics(self) -> dict:
         """Operator-facing snapshot. Never leaks the secret value."""
-        return {
+        snapshot = {
             "enabled": self.enabled,
             "fleet_name": self.fleet_name,
             "bind": f"{self.bind_host}:{self.bind_port}" if self.bind_host else "",
@@ -279,3 +289,6 @@ class FerryConfig:
             "allowed_peer_ips": sorted(self.allowed_peer_ips),
             "peers": dict(self.peers),
         }
+        if self.relay is not None:
+            snapshot["relay"] = self.relay.diagnostics()
+        return snapshot

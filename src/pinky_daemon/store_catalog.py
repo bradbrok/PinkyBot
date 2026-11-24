@@ -325,6 +325,9 @@ class StoreConnectionPolicy:
 
 def default_store_connection_policy(logical_name: str) -> StoreConnectionPolicy:
     """Return the behavior-preserving policy for a logical daemon store."""
+    if logical_name == "ferry_replay":
+        # A receiver must cancel within five seconds even while this DB is busy.
+        return StoreConnectionPolicy(busy_timeout_ms=50)
     if logical_name in {"schedule_fire_trace", "schedule_fire_trace_read"}:
         return StoreConnectionPolicy(busy_timeout_ms=0 if logical_name == "schedule_fire_trace" else 1000)
     busy_timeout_ms = 30_000 if logical_name in _THIRTY_SECOND_BUSY_STORES else 5_000
@@ -2268,6 +2271,11 @@ class StoreCatalog:
                     "Fix the storage directory permissions before restarting: "
                     f"path={detail.path!r} mode={detail.mode:04o}; {command}."
                 )
+        elif any(target.recovery == "manual" for target in targets):
+            recovery = (
+                "Replay safety state must not be rebuilt or restored from a stale snapshot. "
+                "Stop and reconcile delivery history before restarting."
+            )
         elif any(
             target.criticality == "authoritative" or target.recovery == "snapshot"
             for target in targets

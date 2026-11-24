@@ -178,7 +178,7 @@ def test_base_allowlist_and_explicit_names_do_not_hide_daemon_only(monkeypatch):
     report = reports(logs)[0]
     assert set(report["would_drop_names"]) == drop
     assert "\n" not in logs[0]
-    assert isolated_launch_env.DAEMON_ONLY == {"PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET", "PINKYBOT_FERRY_PEER_SECRETS"}
+    assert isolated_launch_env.DAEMON_ONLY == {"PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET", "PINKYBOT_FERRY_PEER_SECRETS", "PINKYBOT_FERRY_RELAY_TOKEN", "PINKYBOT_FERRY_RELAY_KEY_FILE"}
 
 
 @pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])

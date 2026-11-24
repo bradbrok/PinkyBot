@@ -52,6 +52,10 @@ def main() -> None:
     )
 
     # ACP daemon-backed stdio connector
+    from pinky_cli.ferry import add_commands as add_ferry_commands
+
+    add_ferry_commands(subparsers.add_parser("ferry", help="Manage ferry relay identities"))
+
     acp_parser = subparsers.add_parser(
         "acp",
         help="Run an ACP stdio connector backed by the Pinky daemon",
@@ -88,6 +92,10 @@ def main() -> None:
             "--working-dir", args.working_dir,
         ]
         daemon_main()
+    elif args.command == "ferry":
+        from pinky_cli.ferry import run as run_ferry
+
+        run_ferry(args)
     elif args.command == "acp":
         if not args.agent:
             acp_parser.error("--agent is required when PINKY_AGENT is not set")
