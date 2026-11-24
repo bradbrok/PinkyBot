@@ -78,3 +78,44 @@ def test_valid_storage_classes_open_with_the_original_row(tmp_path):
         ]
     finally:
         store.close()
+
+
+async def test_real_send_and_poll_rows_reopen_with_valid_storage_classes(tmp_path):
+    from pinky_relay.app import create_relay_app
+    from tests.test_relay_service import TOKENS, encoded, request, service
+
+    with service(tmp_path) as (app, store):
+        config = app.state.relay.config
+        first = await request(app, "/v1/send", method="POST", body=encoded(target="receiver"))
+        second = await request(app, "/v1/send", method="POST", body=encoded(target="peer-two"))
+        assert first[0] == second[0] == 200
+        leased_id, unleased_id = first[1]["id"], second[1]["id"]
+        assert leased_id != unleased_id
+        page = await request(app, "/v1/poll", token=TOKENS["receiver"])
+        assert page[0] == 200 and [row["id"] for row in page[1]["rows"]] == [leased_id]
+        with store.reader() as reader:
+            before = reader.execute("SELECT id,lease_until FROM messages ORDER BY id").fetchall()
+        assert set(dict(before)) == {leased_id, unleased_id}
+        assert dict(before)[leased_id] > 0 and dict(before)[unleased_id] == 0
+
+    reopened = None
+    refusal = None
+    try:
+        try:
+            reopened = QueueStore(tmp_path / "queue.db", config.digests, disk_cap=96 * MIB)
+        except StoreRefusalError as exc:
+            refusal = exc
+        assert refusal is None, "production send/poll rows refused on reopen: " + str(refusal)
+        assert reopened is not None
+        with reopened.reader() as reader:
+            assert reader.execute("SELECT id,lease_until FROM messages ORDER BY id").fetchall() == before
+            rows = reader.execute("SELECT id," + ",".join("typeof(" + c + ")" for c in COLUMNS)
+                                  + " FROM messages ORDER BY id").fetchall()
+        assert [row[0] for row in rows] == sorted([leased_id, unleased_id])
+        assert [row[1:] for row in rows] == [CLASSES, CLASSES]
+        app = create_relay_app(config, reopened)
+        page = await request(app, "/v1/poll", token=TOKENS["peer-two"])
+        assert page[0] == 200 and [row["id"] for row in page[1]["rows"]] == [unleased_id]
+    finally:
+        if reopened is not None:
+            reopened.close()
