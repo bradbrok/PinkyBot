@@ -18,7 +18,8 @@ from pinky_daemon.ferry.outbound import (
 from pinky_federation.fingerprint import fingerprint
 from pinky_federation.keys import EncryptionKeyPair, SigningKeyPair
 from pinky_federation.sealed_box import seal, unseal
-from tests.test_codex_launch_env_boundary import KINDS, harness as harness
+from tests.test_codex_launch_env_boundary import KINDS
+from tests.test_codex_launch_env_boundary import harness as harness
 
 
 def _environment():
