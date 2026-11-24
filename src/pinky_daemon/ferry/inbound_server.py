@@ -161,7 +161,11 @@ def build_ferry_app(*, host_pinky: Any, config: Any):
                 status_code=400, content={"ok": False, "error": f"bad envelope: {e}"}
             )
 
-        from pinky_daemon.ferry.config import _CONTROL_CHARACTERS, _configured_fleet_name
+        from pinky_daemon.ferry.config import (
+            _CONTROL_CHARACTERS,
+            _FLEET_KEY,
+            _configured_fleet_name,
+        )
         from pinky_daemon.ferry.host_pinky import parse_peer_card
         from pinky_daemon.ferry.outbound import parse_address
 
@@ -171,6 +175,7 @@ def build_ferry_app(*, host_pinky: Any, config: Any):
         valid_sender = (
             parsed is not None
             and bool(claimed_fleet)
+            and _FLEET_KEY.fullmatch(claimed_fleet) is not None
             and raw_fleet == claimed_fleet
             and envelope.from_ in (f"ferry://{claimed_fleet}/{agent}", f"{agent}@{claimed_fleet}")
             and _CONTROL_CHARACTERS.search(envelope.from_) is None
