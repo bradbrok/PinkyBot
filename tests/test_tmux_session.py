@@ -22,6 +22,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time as _time
 from collections.abc import Iterator
@@ -404,7 +405,7 @@ def _make_session(
     """
     cfg = StreamingSessionConfig(
         agent_name=agent_name,
-        working_dir="/tmp/tmux-session-test",
+        working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
         restart_guard=restart_guard,
     )
     tmux = tmux or _make_mock_tmux()
@@ -1756,9 +1757,11 @@ def test_build_repl_env_removes_pinky_session_secret_when_set(
 ) -> None:
     """Local Claude hosts never receive daemon-wide signing authority."""
     monkeypatch.setenv("PINKY_SESSION_SECRET", "test-secret-32-bytes-min-xyz")
+    monkeypatch.setenv("PINKYBOT_FERRY_PEER_SECRETS", "synthetic-peer-map")
     ss, _ = _make_session()
     env = ss._build_repl_env()
     assert "PINKY_SESSION_SECRET" not in env
+    assert "PINKYBOT_FERRY_PEER_SECRETS" not in env
 
 
 def test_build_repl_env_omits_pinky_session_secret_when_unset(
@@ -1773,6 +1776,7 @@ def test_build_repl_env_omits_pinky_session_secret_when_unset(
     ss, _ = _make_session()
     env = ss._build_repl_env()
     assert "PINKY_SESSION_SECRET" not in env
+    assert "PINKYBOT_FERRY_PEER_SECRETS" not in env
 
 
 def test_build_repl_env_strips_whitespace_in_pinky_session_secret(
@@ -1785,6 +1789,7 @@ def test_build_repl_env_strips_whitespace_in_pinky_session_secret(
     ss, _ = _make_session()
     env = ss._build_repl_env()
     assert "PINKY_SESSION_SECRET" not in env
+    assert "PINKYBOT_FERRY_PEER_SECRETS" not in env
 
 
 def test_build_repl_env_provisions_per_agent_key(monkeypatch) -> None:
@@ -1804,6 +1809,7 @@ def test_build_repl_env_provisions_per_agent_key(monkeypatch) -> None:
     own_key = env.get("PINKY_AGENT_KEY") == "dymok-per-agent-key"
     assert own_key
     assert "PINKY_SESSION_SECRET" not in env
+    assert "PINKYBOT_FERRY_PEER_SECRETS" not in env
     ss._registry.get_signing_key.assert_called_once_with("dymok")
 
 
@@ -1815,6 +1821,7 @@ async def test_build_repl_env_isolated_withholds_global_secret(tmp_path, monkeyp
         names = await probe.launch(registry=Registry())
         assert "PINKY_AGENT_KEY" in names
         assert "PINKY_SESSION_SECRET" not in names
+        assert "PINKYBOT_FERRY_PEER_SECRETS" not in names
 
 
 async def test_build_repl_env_isolated_without_key_withholds_secret(tmp_path, monkeypatch) -> None:
@@ -1825,6 +1832,7 @@ async def test_build_repl_env_isolated_without_key_withholds_secret(tmp_path, mo
         names = await probe.launch(registry=Registry(key=""))
         assert "PINKY_AGENT_KEY" not in names
         assert "PINKY_SESSION_SECRET" not in names
+        assert "PINKYBOT_FERRY_PEER_SECRETS" not in names
 
 
 async def test_build_repl_env_withholds_secret_when_isolation_unknown_but_key_present(
@@ -1837,6 +1845,7 @@ async def test_build_repl_env_withholds_secret_when_isolation_unknown_but_key_pr
         names = await probe.launch(registry=Registry("unknown"))
         assert "PINKY_AGENT_KEY" in names
         assert "PINKY_SESSION_SECRET" not in names
+        assert "PINKYBOT_FERRY_PEER_SECRETS" not in names
 
 
 def test_build_repl_env_omits_agent_key_when_registry_absent() -> None:
@@ -2592,7 +2601,7 @@ def _make_session_with_response_cb(
     """TmuxSession built with the response-side callbacks wired up."""
     cfg = StreamingSessionConfig(
         agent_name="dymok",
-        working_dir="/tmp/tmux-session-test",
+        working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
     )
     tmux = _make_mock_tmux()
     ss = TmuxSession(
@@ -3200,7 +3209,7 @@ async def test_discover_transcript_path_returns_none_for_empty_project_dir(tmp_p
     # Point HOME at a tmp dir so the glob has nowhere to find anything.
     monkeypatch.setenv("HOME", str(tmp_path))
     ss, _ = _make_session()
-    # working_dir is /tmp/tmux-session-test from the fixture; project dir
+    # working_dir is a private temp directory from the fixture; project dir
     # path under our fake HOME does not exist.
     assert ss._discover_transcript_path() is None
 
@@ -7267,7 +7276,7 @@ def _make_session_with_analytics(
     """
     cfg = StreamingSessionConfig(
         agent_name=agent_name,
-        working_dir="/tmp/tmux-session-test",
+        working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
     )
     tmux = _make_mock_tmux()
     analytics = MagicMock()
@@ -7629,7 +7638,7 @@ def _make_usage_session(
     """
     cfg = StreamingSessionConfig(
         agent_name="dymok",
-        working_dir="/tmp/tmux-session-test",
+        working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
         model=model,
     )
     ss = TmuxSession(
@@ -7803,7 +7812,7 @@ def _make_usage_session_of(
     """_make_usage_session for a TmuxSession SUBCLASS (transport variants)."""
     cfg = StreamingSessionConfig(
         agent_name="dymok",
-        working_dir="/tmp/tmux-session-test",
+        working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
         model=model,
     )
     ss = cls(
@@ -8027,7 +8036,7 @@ async def test_raw_max_tokens_for_1m_vs_200k_model() -> None:
         _ss_mod._1M_MODELS = {"claude-opus-4-7"}
         cfg = StreamingSessionConfig(
             agent_name="dymok",
-            working_dir="/tmp/tmux-session-test",
+            working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
             model="claude-opus-4-7",
         )
         tmux = _make_mock_tmux()
@@ -8036,7 +8045,7 @@ async def test_raw_max_tokens_for_1m_vs_200k_model() -> None:
 
         cfg2 = StreamingSessionConfig(
             agent_name="dymok",
-            working_dir="/tmp/tmux-session-test",
+            working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
             model="claude-haiku-4-5",
         )
         ss2 = TmuxSession(cfg2, tmux_control=tmux)
@@ -8061,7 +8070,7 @@ async def test_max_tokens_subtracts_autocompact_buffer(monkeypatch) -> None:
 
         cfg = StreamingSessionConfig(
             agent_name="dymok",
-            working_dir="/tmp/tmux-session-test",
+            working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
             model="claude-haiku-4-5",
         )
         ss = TmuxSession(cfg, tmux_control=_make_mock_tmux())
@@ -8070,7 +8079,7 @@ async def test_max_tokens_subtracts_autocompact_buffer(monkeypatch) -> None:
 
         cfg_big = StreamingSessionConfig(
             agent_name="dymok",
-            working_dir="/tmp/tmux-session-test",
+            working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
             model="claude-opus-4-7",
         )
         ss_big = TmuxSession(cfg_big, tmux_control=_make_mock_tmux())
@@ -8089,7 +8098,7 @@ async def test_autocompact_override_env_sets_effective_cap(monkeypatch) -> None:
     SDK behavior."""
     cfg = StreamingSessionConfig(
         agent_name="dymok",
-        working_dir="/tmp/tmux-session-test",
+        working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
         model="claude-haiku-4-5",
     )
     tmux = _make_mock_tmux()
@@ -8124,7 +8133,7 @@ async def test_get_context_info_exposes_raw_and_effective_caps(monkeypatch) -> N
 
     cfg = StreamingSessionConfig(
         agent_name="dymok",
-        working_dir="/tmp/tmux-session-test",
+        working_dir=tempfile.mkdtemp(prefix="tmux-session-test-"),
         model="claude-haiku-4-5",
     )
     ss = TmuxSession(cfg, tmux_control=_make_mock_tmux())

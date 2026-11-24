@@ -229,6 +229,7 @@ def test_flag_off_preserves_shared_path_and_performs_no_bootstrap(tmp_path, monk
     working_dir = tmp_path / "agent"
     override = tmp_path / "override"
     monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv("PINKYBOT_FERRY_PEER_SECRETS", "synthetic-peer-map")
     monkeypatch.delenv(PER_AGENT_CODEX_HOME_ENV, raising=False)
     monkeypatch.setenv(codex_home_mod.MIGRATION_LOCK_TIMEOUT_ENV, "invalid")
     scope = _scope(
@@ -432,6 +433,7 @@ def test_subprocess_transport_flag_off_preserves_home_and_does_not_write_soul(
     shared_home = tmp_path / "shared"
     working_dir = tmp_path / "agent"
     monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv("PINKYBOT_FERRY_PEER_SECRETS", "synthetic-peer-map")
     monkeypatch.delenv(PER_AGENT_CODEX_HOME_ENV, raising=False)
     config = StreamingSessionConfig(
         agent_name="test-agent",
@@ -450,6 +452,7 @@ def test_subprocess_transport_flag_off_preserves_home_and_does_not_write_soul(
     assert env.get("PINKY_AGENT_NAME") == "test-agent"
     assert "PINKY_SESSION_SECRET" not in env
     assert "PINKYBOT_FERRY_SHARED_SECRET" not in env
+    assert "PINKYBOT_FERRY_PEER_SECRETS" not in env
     assert soul_store.calls == []
     assert not (shared_home / "AGENTS.md").exists()
     assert not (working_dir / ".codex" / "AGENTS.md").exists()
@@ -2783,6 +2786,7 @@ async def test_tmux_repl_absent_server_cold_start_proceeds(
     session = TmuxSession(config, tmux_control=tmux)
     _mark_tmux_server_socket(tmp_path, monkeypatch)
     monkeypatch.setenv("PINKY_SESSION_SECRET", "daemon-env-marker")
+    monkeypatch.setenv("PINKYBOT_FERRY_PEER_SECRETS", "daemon-env-marker")
     monkeypatch.setenv("ORDINARY_TOOL_CONFIG", "daemon-env-marker")
     tmux_calls: list[tuple[str, ...]] = []
     has_session_calls = 0
@@ -2807,6 +2811,7 @@ async def test_tmux_repl_absent_server_cold_start_proceeds(
             retained = child["env"].get("ORDINARY_TOOL_CONFIG") == "daemon-env-marker"
             assert retained
             assert "PINKY_SESSION_SECRET" not in child["env"]
+            assert "PINKYBOT_FERRY_PEER_SECRETS" not in child["env"]
             assert not paths[0].exists()
             return TmuxCommandResult(returncode=0, stdout="", stderr="")
         raise AssertionError(f"unexpected tmux call: {args}")

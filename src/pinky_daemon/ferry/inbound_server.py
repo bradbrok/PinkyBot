@@ -2,11 +2,10 @@
 
 Route A (Tailscale bridge). A *separate* tiny FastAPI app + uvicorn server,
 bound to the daemon's Tailscale IP only, so the cross-fleet attack surface is
-exactly one authenticated endpoint — the main API keeps its existing bind
-(localhost on TOD, LAN on the Mini) untouched.
+exactly one authenticated endpoint; the main API keeps its existing bind.
 
 Defense in depth, all fail-closed:
-  1. shared-secret bearer token (``PINKYBOT_FERRY_SHARED_SECRET``, both fleets)
+  1. global or fleet-bound per-peer bearer token
   2. source-IP allowlist (``PINKYBOT_FERRY_ALLOWED_PEER_IPS`` — peer tailnet IPs)
   3. peer-fleet ACL (enforced inside ``HostPinky.deliver``)
   4. listener bound to the Tailscale IP — never ``0.0.0.0`` / public
@@ -18,12 +17,16 @@ until then trust = Tailscale WireGuard + the three checks above. See task #202.
 from __future__ import annotations
 
 import hmac
+import json
+import logging
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from pinky_daemon.ferry.types import FerryEnvelope, TraversalRecord
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _opt_str(value: Any) -> str | None:
@@ -113,19 +116,22 @@ def build_ferry_app(*, host_pinky: Any, config: Any):
     def _client_ip(request: Request) -> str:
         return request.client.host if request.client else ""
 
-    def _authorized(request: Request) -> bool:
+    def _credential(request: Request) -> tuple[str, str] | None:
         auth = request.headers.get("authorization", "")
         token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
-        # Constant-time compare; fail-closed when no secret configured.
-        if not config.shared_secret or not token:
-            return False
-        if not hmac.compare_digest(token, config.shared_secret):
-            return False
+        credential = None
+        candidates = [(('global', ''), config.shared_secret)] + [
+            (('peer', fleet), secret) for fleet, secret in config.peer_secrets.items()
+        ]
+        for identity, secret in candidates:
+            matched = hmac.compare_digest(token.encode("utf-8"), secret.encode("utf-8"))
+            if matched and token and secret:
+                credential = identity
         # Source-IP allowlist — only enforced when configured. Empty list means
         # "any tailnet source" (the bind + bearer are the boundary then).
         if config.allowed_peer_ips and _client_ip(request) not in config.allowed_peer_ips:
-            return False
-        return True
+            return None
+        return credential
 
     @app.get("/ferry/health")
     async def ferry_health():  # noqa: ANN202
@@ -133,11 +139,12 @@ def build_ferry_app(*, host_pinky: Any, config: Any):
 
     @app.post("/ferry/inbound")
     async def ferry_inbound(request: Request):  # noqa: ANN202
-        if not config.shared_secret:
+        if not config.shared_secret and not config.peer_secrets:
             return JSONResponse(
                 status_code=503, content={"ok": False, "error": "ferry not configured"}
             )
-        if not _authorized(request):
+        credential = _credential(request)
+        if credential is None:
             return JSONResponse(
                 status_code=401, content={"ok": False, "error": "unauthorized"}
             )
@@ -152,6 +159,50 @@ def build_ferry_app(*, host_pinky: Any, config: Any):
         except (ValueError, TypeError) as e:
             return JSONResponse(
                 status_code=400, content={"ok": False, "error": f"bad envelope: {e}"}
+            )
+
+        from pinky_daemon.ferry.config import (
+            _CONTROL_CHARACTERS,
+            _FLEET_KEY,
+            _configured_fleet_name,
+        )
+        from pinky_daemon.ferry.host_pinky import parse_peer_card
+        from pinky_daemon.ferry.outbound import parse_address
+
+        parsed = parse_address(envelope.from_)
+        claimed_fleet, agent = parsed or ("", "")
+        raw_fleet, _ = parse_peer_card(envelope.from_)
+        valid_sender = (
+            parsed is not None
+            and bool(claimed_fleet)
+            and _FLEET_KEY.fullmatch(claimed_fleet) is not None
+            and raw_fleet == claimed_fleet
+            and envelope.from_ in (f"ferry://{claimed_fleet}/{agent}", f"{agent}@{claimed_fleet}")
+            and _CONTROL_CHARACTERS.search(envelope.from_) is None
+            and "/" not in agent
+            and not any(character.isspace() for character in envelope.from_)
+        )
+        kind, fleet = credential
+        if kind == "global":
+            refused = not valid_sender or claimed_fleet in config.peer_secrets
+        else:
+            refused = not valid_sender or claimed_fleet != fleet
+        if refused:
+            _LOGGER.warning(
+                "ferry sender refused credential_fleet=%s claimed_fleet=%s source_ip=%s",
+                json.dumps(
+                    (_configured_fleet_name(fleet, config.fleet_name, config.peers) or "unconfigured")
+                    if kind == "peer" else "global"
+                ),
+                json.dumps(
+                    _configured_fleet_name(claimed_fleet, config.fleet_name, config.peers)
+                    or "unconfigured"
+                ),
+                json.dumps(_client_ip(request)),
+            )
+            return JSONResponse(
+                status_code=403,
+                content={"ok": False, "error": "sender fleet does not match credential"},
             )
 
         result = await host_pinky.deliver(envelope)

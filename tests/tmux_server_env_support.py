@@ -57,7 +57,8 @@ def seed(monkeypatch, root):
     home.mkdir(mode=0o700, exist_ok=True)
     values = {"HOME": str(home), "USER": "synthetic-user", "LOGNAME": "synthetic-user", "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
               "TERM": "xterm-256color", "SHELL": "/bin/sh", "TMPDIR": str(root),
-              "PINKY_SESSION_SECRET": CANARY, "UNLISTED_DAEMON_NAME": CANARY,
+              "PINKY_SESSION_SECRET": CANARY, "PINKYBOT_FERRY_SHARED_SECRET": CANARY,
+              "PINKYBOT_FERRY_PEER_SECRETS": CANARY, "UNLISTED_DAEMON_NAME": CANARY,
               "BASH_ENV": CANARY, "TMUX_PANE": CANARY,
               "PINKY_CODEX_MCP_HEADER_AGENT_AUTHORIZATION": CANARY}
     for name, value in values.items():

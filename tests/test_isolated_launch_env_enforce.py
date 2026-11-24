@@ -47,7 +47,7 @@ async def test_granted_name_present_and_ungranted_name_removed(tmp_path, monkeyp
         )
         names = await probe.launch(kind)
         assert "HRPOS_PASSWORD" in names and "PINKY_AGENT_KEY" in names
-        assert not {"PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET"} & names
+        assert not {"PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET", "PINKYBOT_FERRY_PEER_SECRETS"} & names
 
 
 @pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])
@@ -94,7 +94,7 @@ async def test_one_policy_snapshot_per_real_spawn(tmp_path, monkeypatch, kind, f
 @pytest.mark.parametrize("bad", [
     "missing", "malformed", "wildcard", "daemon_only", "not_mapping", "not_list",
     "duplicate_agent", "shell_name", "reserved_name", "symlink", "public", "fifo",
-    "wildcard_agent", "duplicate_name", "ferry_key", "deep", "oversized", "unset",
+    "wildcard_agent", "duplicate_name", "ferry_key", "peer_key", "deep", "oversized", "unset",
 ])
 def test_bad_grants_refuse_isolated_payload_loudly(grants, tmp_path, monkeypatch, kind, bad):
     data = {
@@ -107,6 +107,7 @@ def test_bad_grants_refuse_isolated_payload_loudly(grants, tmp_path, monkeypatch
         "wildcard_agent": '{"*":["HRPOS_PASSWORD"]}',
         "duplicate_name": '{"test-tenant":["HRPOS_PASSWORD","HRPOS_PASSWORD"]}',
         "ferry_key": '{"test-tenant":["PINKYBOT_FERRY_SHARED_SECRET"]}',
+        "peer_key": '{"test-tenant":["PINKYBOT_FERRY_PEER_SECRETS"]}',
         "deep": "[" * 2000 + "0" + "]" * 2000,
         "oversized": " " * 65537,
     }
@@ -249,7 +250,7 @@ async def test_clean_policy_stages_even_without_populated_values(tmp_path, monke
     assert str(paths[0]) in recorder.tmux_calls[-1][-1]
 
 
-@pytest.mark.parametrize("key", ["PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET"])
+@pytest.mark.parametrize("key", ["PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET", "PINKYBOT_FERRY_PEER_SECRETS"])
 async def test_direct_boundary_daemon_only_refusal(tmp_path, monkeypatch, key):
     recorder = LaunchRecorder(tmp_path)
     logs = []
@@ -275,12 +276,13 @@ def loader_probe(tmp_path, data):
     result = subprocess.run(
         [sys.executable, "-I", "-c", source, str(path), NONCE, command],
         env={"HOME": str(tmp_path), "PATH": os.defpath, "HRPOS_PASSWORD": "synthetic-secret",
-             "PINKY_SESSION_SECRET": "synthetic-global", "LC_ALL": "C", "XDG_CONFIG_HOME": str(tmp_path),
+             "PINKY_SESSION_SECRET": "synthetic-global", "PINKYBOT_FERRY_PEER_SECRETS": "synthetic-peer-map", "LC_ALL": "C", "XDG_CONFIG_HOME": str(tmp_path),
              "HTTPS_PROXY": "https://proxy.invalid", "SSL_CERT_FILE": "/synthetic-ca"},
         capture_output=True, timeout=5,
     )
     assert not path.exists()
     assert b"synthetic-secret" not in result.stderr and b"synthetic-global" not in result.stderr
+    assert b"synthetic-peer-map" not in result.stderr
     return result
 
 
@@ -304,7 +306,7 @@ def test_loader_malformed_policy_refuses_without_exec(tmp_path, policy):
     assert result.returncode != 0 and not result.stdout
 
 
-@pytest.mark.parametrize("key", ["PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET"])
+@pytest.mark.parametrize("key", ["PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET", "PINKYBOT_FERRY_PEER_SECRETS"])
 def test_loader_independently_refuses_daemon_only(tmp_path, key):
     result = loader_probe(tmp_path, {"env": {key: "synthetic"}, "inherit": "none"})
     assert result.returncode != 0 and not result.stdout

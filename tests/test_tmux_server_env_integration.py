@@ -73,7 +73,7 @@ async def test_daemon_cold_start_globals_and_child_authority(tmp_path, monkeypat
             monkeypatch.setenv("PINKY_ISOLATED_ENV", "enforce")
             monkeypatch.setenv("PINKY_ISOLATED_ENV_GRANTS_FILE", str(grants))
         names = await probe.launch(kind, registry=Registry("isolated" if clean else "not_isolated"))
-        assert not {"PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET"} & names
+        assert not {"PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET", "PINKYBOT_FERRY_PEER_SECRETS"} & names
         assert "EXPLICIT_ALLOWED_NAME" in names and "CLAUDE_CODE_OAUTH_TOKEN" in names
         assert ("HRPOS_PASSWORD" in names) is (not clean)
         assert allowed(globals_names(probe), globals=True)
@@ -117,7 +117,7 @@ async def test_dream_cold_start_uses_managed_globals_and_raw_ancillary_route(tmp
         monkeypatch.setattr(dream, "_wait_for_result", result)
         outcome = await dream.run("synthetic prompt")
         assert outcome.ok
-        assert not {"PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET"} & captured[0]
+        assert not {"PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET", "PINKYBOT_FERRY_PEER_SECRETS"} & captured[0]
         assert "HRPOS_PASSWORD" in captured[0]
         assert allowed(captured[1], globals=True)
         assert json.loads(probe.base_path.read_text())["home_matches"]

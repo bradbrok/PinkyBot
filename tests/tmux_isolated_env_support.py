@@ -19,7 +19,7 @@ from pinky_daemon.tmux_session import TmuxSession, _TmuxControl
 from tests.child_report_support import wait_for_child_report
 from tests.tmux_socket_support import private_socket
 
-DAEMON_NAMES = {"PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET", "HRPOS_PASSWORD"}
+DAEMON_NAMES = {"PINKY_SESSION_SECRET", "PINKYBOT_FERRY_SHARED_SECRET", "PINKYBOT_FERRY_PEER_SECRETS", "HRPOS_PASSWORD"}
 SYNTHETIC_VALUES = {name: "synthetic-only-" + name.lower() for name in DAEMON_NAMES}
 
 

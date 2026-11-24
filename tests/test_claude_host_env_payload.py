@@ -195,6 +195,7 @@ async def private_server(root, monkeypatch):
             "result['TMUX_CUSTOM_MARKER']={'pane':os.environ.get('TMUX_CUSTOM_MARKER')=='server-marker'}\n"
             "result['TMUX_PANE']={'pane':os.environ.get('TMUX_PANE','').startswith('%')}\n"
             "result['PINKYBOT_FERRY_SHARED_SECRET']={'present':'PINKYBOT_FERRY_SHARED_SECRET' in os.environ}\n"
+            "result['PINKYBOT_FERRY_PEER_SECRETS']={'present':'PINKYBOT_FERRY_PEER_SECRETS' in os.environ}\n"
             "result['CUSTOM_TOOL_TOKEN']={'daemon':os.environ.get('CUSTOM_TOOL_TOKEN')==marker+'daemon'}\n"
             # Publish the report in one step: the test reads it as soon as the name exists.
             f"_tmp=pathlib.Path({str(report)!r}+'.tmp')\n"
@@ -432,6 +433,8 @@ BUILDER_OWNED_NAMES = {
     "PINKY_STRICT_EFFORT",
     "PINKY_TOOL_POLICY",
     "PINKY_SESSION_SECRET",
+    "PINKYBOT_FERRY_SHARED_SECRET",
+    "PINKYBOT_FERRY_PEER_SECRETS",
     "PINKY_TMUX_TRANSCRIPT_BIND",
 }
 
@@ -449,12 +452,13 @@ def test_overlay_cannot_fill_an_omitted_builder_name(clean_daemon, monkeypatch, 
 
 
 @pytest.mark.parametrize("kind", ["host", "dream"])
-async def test_ferry_secret_is_not_newly_forwarded(clean_daemon, tmp_path, monkeypatch, kind):
+@pytest.mark.parametrize("secret_name", ["PINKYBOT_FERRY_SHARED_SECRET", "PINKYBOT_FERRY_PEER_SECRETS"])
+async def test_ferry_secret_is_not_newly_forwarded(clean_daemon, tmp_path, monkeypatch, kind, secret_name):
     async with private_server(tmp_path, monkeypatch) as probe:
-        monkeypatch.setenv("PINKYBOT_FERRY_SHARED_SECRET", SENTINEL)
+        monkeypatch.setenv(secret_name, SENTINEL)
         launch = launch_host if kind == "host" else launch_dream
         report = await launch(tmp_path, probe, monkeypatch)
-        assert not report["PINKYBOT_FERRY_SHARED_SECRET"]["present"]
+        assert not report[secret_name]["present"]
 
 
 @pytest.mark.parametrize("args", [["has-session"], ["-L", "default", "has-session"]])

@@ -712,15 +712,17 @@ def test_shared_default_home_is_not_forced_when_absent(harness, kind):
     assert absent, "unset default home became an explicit path override"
 
 
-def test_suite_scrub_removes_daemon_namespace_before_diagnostics(monkeypatch):
+@pytest.mark.parametrize("secret_name", ["PINKYBOT_FERRY_SHARED_SECRET", "PINKYBOT_FERRY_PEER_SECRETS"])
+def test_suite_scrub_removes_daemon_namespace_before_diagnostics(monkeypatch, secret_name):
     from tests.conftest import _scrub_test_env
 
-    monkeypatch.setenv("PINKYBOT_FERRY_SHARED_SECRET", SENTINEL)
+    monkeypatch.setenv(secret_name, SENTINEL)
     _scrub_test_env()
-    assert "PINKYBOT_FERRY_SHARED_SECRET" not in os.environ
+    assert secret_name not in os.environ
 
 
-def test_parent_secret_never_reaches_environment_equality_diagnostic(tmp_path):
+@pytest.mark.parametrize("secret_name", ["PINKYBOT_FERRY_SHARED_SECRET", "PINKYBOT_FERRY_PEER_SECRETS"])
+def test_parent_secret_never_reaches_environment_equality_diagnostic(tmp_path, secret_name):
     import subprocess
     import sys
 
@@ -738,7 +740,7 @@ def test_parent_secret_never_reaches_environment_equality_diagnostic(tmp_path):
     repo = Path(__file__).resolve().parents[1]
     env = dict(
         os.environ,
-        PINKYBOT_FERRY_SHARED_SECRET=SENTINEL,
+        **{secret_name: SENTINEL},
         TMPDIR=str(private_tmp),
         PYTHONPATH=str(repo / "src") + os.pathsep + str(repo),
     )

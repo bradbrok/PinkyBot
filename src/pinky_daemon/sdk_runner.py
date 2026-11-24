@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pinky_daemon.claude_runner import RunResult
 from pinky_daemon.effort import resolve_cli_effort
 from pinky_daemon.hooks import HookContext, HookEvent, HookManager
+from pinky_daemon.launch_env_authority import FERRY_DAEMON_ONLY
 
 
 def _log(msg: str) -> None:
@@ -201,6 +202,7 @@ class SDKRunner:
             env_overrides["PINKY_EXPECTED_EFFORT"] = effort
         if self._config.strict_effort_enforcement:
             env_overrides["PINKY_STRICT_EFFORT"] = "1"
+        env_overrides.update(dict.fromkeys(FERRY_DAEMON_ONLY, ""))
         options.env = env_overrides
 
         # Session management

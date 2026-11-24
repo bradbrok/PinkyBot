@@ -46,7 +46,7 @@ def _launch(tmp_path, monkeypatch, *, session_dir, registry_dir, mode="enforce",
     grants = tmp_path / "grants.json"
     grants.write_text("{}")
     grants.chmod(0o600)
-    for name in ("PINKY_SESSION_SECRET", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+    for name in ("PINKY_SESSION_SECRET", "PINKYBOT_FERRY_PEER_SECRETS", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
                  "ANTHROPIC_BASE_URL"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HOME", str(home))
