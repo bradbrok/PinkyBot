@@ -493,6 +493,12 @@ def select_mesh_sender(config: Any | None = None):
     from pinky_daemon.ferry.config import FerryConfig
 
     cfg = config if config is not None else FerryConfig.from_env()
+    relay = getattr(cfg, "relay", None)
+    if relay is not None and (relay.reserved or relay.block_all):
+        from pinky_daemon.ferry.relay_outbound import RoutingMeshSender
+
+        legacy = HttpMeshSender(config=cfg) if cfg.enabled and cfg.peers else MeshSender()
+        return RoutingMeshSender(relay, legacy)
     if cfg.enabled and cfg.peers:
         return HttpMeshSender(config=cfg)
     return MeshSender()
