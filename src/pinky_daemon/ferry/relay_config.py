@@ -6,6 +6,7 @@ import base64
 import hmac
 import ipaddress
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
@@ -16,6 +17,7 @@ from pinky_federation.keys import EncryptionPublicKey, SigningPublicKey
 from pinky_relay.config import canonical_fleet, parse_json
 
 NAMES = ("URL", "TOKEN", "KEY_FILE", "PEERS")
+_log = logging.getLogger(__name__)
 
 
 def validate_url(value):
@@ -98,8 +100,10 @@ class RelaySettings:
                     error = "case-alias relay fleet identities"
                 reserved.add(folded)
                 try:
-                    canonical_fleet(raw_name)
+                    if canonical_fleet(raw_name) != raw_name:
+                        raise ValueError
                 except ValueError:
+                    error = error or "relay peer fleet must be canonical"
                     peers[folded] = RelayPeer(folded, reason="invalid fleet identity")
                 else:
                     peers[folded] = _peer(folded, data)
@@ -115,6 +119,9 @@ class RelaySettings:
         except ValueError:
             own = ""
             error = error or "invalid own relay fleet"
+        else:
+            if own != own_fleet:
+                error = error or "own relay fleet must be canonical"
         try:
             url = validate_url(values["URL"])
         except ValueError:
@@ -128,6 +135,8 @@ class RelaySettings:
                 identity = load_identity(key_file, own_fleet=own)
             except ValueError:
                 error = error or "relay identity is unavailable or unsafe"
+        if error:
+            _log.error("relay configuration blocked: %s", error)
         return cls(own, frozenset(reserved), peers, url, token, key_file, identity, error, block_all)
 
     @property

@@ -23,7 +23,15 @@ class RelayMeshSender:
             reason = self.settings.error or (peer.reason if peer is not None else "peer pin missing")
             raise RelayClientError("relay route unavailable: " + reason)
         sender = parse_address(envelope.from_)
-        if sender is None or canonical_fleet(sender[0]) != self.settings.own_fleet:
+        target = parse_address(envelope.to)
+        try:
+            if (sender is None or target is None
+                    or sender[0] != canonical_fleet(sender[0])
+                    or target[0] != canonical_fleet(target[0])):
+                raise ValueError
+        except ValueError:
+            raise RelayClientError("relay envelope fleets must be canonical") from None
+        if sender[0] != self.settings.own_fleet:
             raise RelayClientError("relay sender does not match local identity")
         plaintext = envelope_to_wire(envelope).encode("utf-8")
         if len(plaintext) > MAX_SEALED:

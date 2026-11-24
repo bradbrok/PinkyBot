@@ -123,10 +123,13 @@ class QueueStore:
             self._assert_geometry(self._db, writer=True)
             self._assert_schema()
             longest = max(len(n.encode("ascii")) for n in self.fleets)
-            for sender, target, ident, size in self._db.execute(
-                "SELECT sender_fleet,to_fleet,id,length(blob) FROM messages"
+            for sender, target, ident, size, *storage_classes in self._db.execute(
+                "SELECT sender_fleet,to_fleet,id,length(blob),typeof(sender_fleet),"
+                "typeof(to_fleet),typeof(id),typeof(blob),typeof(received_at),typeof(lease_until) "
+                "FROM messages"
             ):
-                if (canonical_fleet(sender) != sender or canonical_fleet(target) != target
+                if (storage_classes != ["text", "text", "text", "blob", "integer", "integer"]
+                        or canonical_fleet(sender) != sender or canonical_fleet(target) != target
                         or not isinstance(ident, str) or not ident.isascii() or len(ident) > 64
                         or not isinstance(size, int) or size > MAX_BLOB):
                     raise StoreRefusalError("stored relay row violates geometry")

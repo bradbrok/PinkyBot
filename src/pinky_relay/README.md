@@ -76,7 +76,10 @@ not identity verification. There is no discovery, TOFU or automatic rotation.
 Configure the daemon with `PINKYBOT_FERRY_RELAY_URL`, `PINKYBOT_FERRY_RELAY_TOKEN`,
 `PINKYBOT_FERRY_RELAY_KEY_FILE`, and `PINKYBOT_FERRY_RELAY_PEERS`. The peer map is
 `{fleet: {signing_pk, encryption_pk, fingerprint}}` using the public JSON values.
-Fleet names are canonical lowercase ASCII slugs. A peer is reserved for relay
+Fleet names are canonical lowercase ASCII slugs. The daemon's `PINKYBOT_FLEET_NAME`
+and every relay peer-map key must already use that spelling; otherwise relay
+configuration is blocked. Relay sends also refuse noncanonical sender or
+destination fleets before sealing or sending. A peer is reserved for relay
 routing even when its pin or local configuration is unusable. An overlapping
 direct HTTP entry is ignored; relay failure never falls back to HTTP or NATS.
 Non-reserved destinations retain the existing route. HTTPS is required except
