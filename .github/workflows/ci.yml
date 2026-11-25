@@ -75,7 +75,7 @@ jobs:
 
       - name: Install and verify tmux
         run: |
-          sudo apt-get update && sudo apt-get install -y tmux
+          command -v tmux >/dev/null || { sudo apt-get update && sudo apt-get install -y tmux; }
           command -v tmux && tmux -V
 
       - name: Run tests
