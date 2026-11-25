@@ -131,6 +131,14 @@ def pytest_configure(config: pytest.Config) -> None:
     """Register suite-specific opt-in markers."""
     if config.option.basetemp:
         _assert_private_fixture_paths([config.option.basetemp], _LIVE_FIXTURE_ROOTS)
+    else:
+        # The store_catalog ancestor-chain preflight requires that every directory
+        # above the daemon's data root is non-world-writable. pytest's default
+        # basetemp is under /tmp (mode 1777), which fails that check. Use a
+        # subdirectory of /home/user (mode 755) instead so the full chain passes.
+        secure_base = Path("/home/user/pinky-pytest-tmp")
+        secure_base.mkdir(mode=0o700, exist_ok=True)
+        config.option.basetemp = secure_base
     config.addinivalue_line(
         "markers",
         "real_auth: test exercises real auth flow — skip conftest auto-cookie patch",
